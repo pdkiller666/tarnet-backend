@@ -1032,6 +1032,53 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+/* ===== Rate limiting (in-memory, без внешних пакетов) =====
+ * 10 запросов в минуту с одного IP по умолчанию (RATE_LIMIT_MAX/WINDOW_MS).
+ * Сервер стоит за Caddy, поэтому доверяем ТОЛЬКО loopback: реальный адрес
+ * клиента Caddy дописывает в конец X-Forwarded-For, а присланный клиентом
+ * оказывается в начале. При `trust proxy = true` Express взял бы левое
+ * (подделываемое) значение, и лимит обходился бы одним заголовком. */
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 10);
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
+app.set('trust proxy', 'loopback');
+
+const rateBuckets = new Map();
+
+function rateLimiter(req, res, next) {
+  if (!RATE_LIMIT_MAX || RATE_LIMIT_MAX <= 0) return next();
+  const now = Date.now();
+  const key = req.ip || req.socket.remoteAddress || 'unknown';
+  let b = rateBuckets.get(key);
+  if (!b || now >= b.resetAt) {
+    b = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    rateBuckets.set(key, b);
+  }
+  b.count += 1;
+  const retryAfterSec = Math.max(1, Math.ceil((b.resetAt - now) / 1000));
+  res.set('X-RateLimit-Limit', String(RATE_LIMIT_MAX));
+  res.set('X-RateLimit-Remaining', String(Math.max(0, RATE_LIMIT_MAX - b.count)));
+  res.set('X-RateLimit-Reset', String(Math.ceil(b.resetAt / 1000)));
+  if (b.count > RATE_LIMIT_MAX) {
+    res.set('Retry-After', String(retryAfterSec));
+    return res.status(429).json({
+      error: 'too_many_requests',
+      message: `Не больше ${RATE_LIMIT_MAX} запросов за ${Math.round(RATE_LIMIT_WINDOW_MS / 1000)} с с одного IP`,
+      limit: RATE_LIMIT_MAX,
+      windowMs: RATE_LIMIT_WINDOW_MS,
+      retryAfterSec,
+    });
+  }
+  return next();
+}
+
+app.use(rateLimiter);
+
+/* Чистка: без неё Map рос бы на каждый новый IP и держал память вечно. */
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of rateBuckets) if (now >= b.resetAt) rateBuckets.delete(k);
+}, 60000).unref();
+
 /* --- Health --- */
 app.get('/health', (_req, res) => {
   const totals = ledger.totals();

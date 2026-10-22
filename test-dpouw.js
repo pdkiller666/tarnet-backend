@@ -63,6 +63,10 @@ async function spawnServer(envOverrides = {}) {
       PORT: String(port),
       TARNET_DB: path.join(dir, 'test.db'),
       TARNET_SECRETS_DIR: path.join(dir, 'secrets'),
+      /* Приёмка делает ~100 запросов с одного IP за секунды — при рабочем
+       * лимите она упала бы на 429. Лимит проверяется отдельной секцией
+       * 8.16 на собственном сервере с маленьким окном. */
+      RATE_LIMIT_MAX: '0',
       ...envOverrides,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -1037,6 +1041,43 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     routeNodes: [onRoute[0].addr], prompt: 'A'.repeat(65 * 1024),
   });
   ok('промпт больше 64 KiB — 413', tooLong.status === 413, tooLong.body);
+
+  // ---------- Rate limiting ----------
+  section('8.16. Rate limiting: 10 запросов в минуту с одного IP');
+  {
+    /* Свой сервер с рабочим лимитом: основной идёт с RATE_LIMIT_MAX=0,
+     * иначе сто запросов приёмки упирались бы в 429. */
+    const rl = await spawnServer({ RATE_LIMIT_MAX: '10', RATE_LIMIT_WINDOW_MS: '60000' });
+    try {
+      /* Разные X-Forwarded-For дают разные бакеты: прямой пир — loopback,
+       * а loopback в trust proxy доверенный, поэтому крайний правый адрес
+       * становится req.ip. Так проверяем и лимит, и ключевание по IP. */
+      const hit = (ip, path = '/health') =>
+        fetch(rl.base + path, { headers: { 'X-Forwarded-For': ip } });
+
+      const codes = [];
+      let last = null;
+      for (let i = 0; i < 11; i++) {
+        const r = await hit('203.0.113.7');
+        codes.push(r.status);
+        if (i === 0) ok('заголовок X-RateLimit-Limit = 10', r.headers.get('x-ratelimit-limit') === '10',
+          r.headers.get('x-ratelimit-limit'));
+        if (i === 10) last = { status: r.status, retryAfter: r.headers.get('retry-after'), body: await r.json().catch(() => null) };
+      }
+      ok('первые 10 запросов — 200', codes.slice(0, 10).every((c) => c === 200), codes);
+      ok('11-й запрос — 429 Too Many Requests', last.status === 429, last.status);
+      ok('в теле 429 есть error: too_many_requests', last.body?.error === 'too_many_requests', last.body);
+      ok('в 429 есть Retry-After', Number(last.retryAfter) > 0, last.retryAfter);
+
+      const other = await hit('203.0.113.8');
+      ok('другой IP не затронут лимитом', other.status === 200, other.status);
+
+      const spoof = await hit('203.0.113.7, 203.0.113.7');
+      ok('подмена X-Forwarded-For не сбрасывает счётчик', spoof.status === 429, spoof.status);
+    } finally {
+      rl.stop();
+    }
+  }
 
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
