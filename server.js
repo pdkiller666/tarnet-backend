@@ -663,31 +663,38 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
   const threshold = receiptThreshold(t);
   const tokensUsed = round(pendingTokens + Number(tokens));
 
+  /* Накопление работы в pending_work. Вынесено в функцию, потому что
+   * причин не выпускать чек две: объём ниже порога и нулевое начисление
+   * при достигнутом пороге. Тело записи должно быть одно — иначе два пути
+   * разойдутся в мелочах вроде обрезки списка actions. */
+  const enqueue = (reason) => tx(() => {
+    /* Список ограничен: pending — это счётчик, а не журнал. 200 хватает,
+     * чтобы показать состав чека и не растить строку бесконечно. */
+    const actions = [...pendingActions, id].slice(-200);
+    run(`INSERT INTO pending_work (workerAddress, tier, adapterId, tokens, actions, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(workerAddress, tier, adapterId) DO UPDATE SET
+           tokens = excluded.tokens, actions = excluded.actions, updatedAt = excluded.updatedAt`,
+      [workerAddress, t, pendAdapter, tokensUsed, JSON.stringify(actions), Date.now()]);
+    return {
+      queued: true,
+      reason,
+      pending_work: tokensUsed,
+      threshold,
+      actionId: id,
+      workerAddress,
+      tier: t,
+      adapterId: pendAdapter || BASE_MODEL,
+      receipt: null,
+      settled: null,
+    };
+  });
+
   /* Провал качества не копим: γ=0 означает «работы не было», а накопление
    * подразумевает, что она была. Иначе мусорный actionId раздувал бы
    * следующий чек. */
   if (quality.gamma > 0 && tokensUsed < threshold) {
-    return tx(() => {
-      /* Список ограничен: pending — это счётчик, а не журнал. 200 хватает,
-       * чтобы показать состав чека и не растить строку бесконечно. */
-      const actions = [...pendingActions, id].slice(-200);
-      run(`INSERT INTO pending_work (workerAddress, tier, adapterId, tokens, actions, updatedAt)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(workerAddress, tier, adapterId) DO UPDATE SET
-             tokens = excluded.tokens, actions = excluded.actions, updatedAt = excluded.updatedAt`,
-        [workerAddress, t, pendAdapter, tokensUsed, JSON.stringify(actions), Date.now()]);
-      return {
-        queued: true,
-        pending_work: tokensUsed,
-        threshold,
-        actionId: id,
-        workerAddress,
-        tier: t,
-        adapterId: pendAdapter || BASE_MODEL,
-        receipt: null,
-        settled: null,
-      };
-    });
+    return enqueue('below_threshold');
   }
 
   /* Работа достигла порога: поглощаем накопленное и выпускаем один чек на
@@ -717,6 +724,36 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
     mode: CONFIG.REWARD_MODE,
   });
   const conservation = RewardEngine.checkConservation(settled);
+
+  /* 3.5) Нулевое начисление при достигнутом пороге. Порог гарантирует
+   * ненулевую выплату только при γ=1 и известных константах, но не может
+   * покрыть все случаи: пустая эмиссия эпохи, обнулённый share, будущие
+   * изменения κ. Чек с rewardTar = 0 — это документ о выплате нуля: он
+   * занимает seq, попадает в цепочку подписей, раздувает cumulativeTotal
+   * и выглядит для клиента как долг протокола. Работа при этом не теряется:
+   * токены уходят в pending_work и суммируются со следующей задачей того же
+   * воркера в том же тире и на том же адаптере.
+   *
+   * Дебет клиента и состояние эпохи здесь не трогаются вовсе: раз выплаты
+   * не было, списывать потребление и увеличивать denominator не за что. */
+  if (settled.fee.worker === 0 && settled.block.amount === 0) {
+    /* γ=0 — работа не выполнена, а не недоплачена. Копить её нельзя: тогда
+     * следующий чек оплатил бы проваленную проверку качества. Возвращаем
+     * отказ без чека: нулевой документ не нужен ни в цепочке, ни клиенту. */
+    if (quality.gamma === 0) {
+      return {
+        rejected: true,
+        reason: 'quality_rejected',
+        actionId: id,
+        workerAddress,
+        tier: t,
+        quality,
+        receipt: null,
+        settled: null,
+      };
+    }
+    return enqueue('below_min_payout');
+  }
 
   // 4) Атомарная запись: чек + балансы + реестр + состояние эпохи.
   return tx(() => {
@@ -1029,12 +1066,27 @@ function handleWork(req, res) {
     if (outcome.queued) {
       return res.status(202).json({
         queued: true,
+        reason: outcome.reason,
         pending_work: outcome.pending_work,
         threshold: outcome.threshold,
         actionId: outcome.actionId,
         workerAddress: outcome.workerAddress,
         tier: outcome.tier,
         adapterId: outcome.adapterId,
+        receipt: null,
+      });
+    }
+
+    /* Провал проверки качества: работы не было, значит ни чека, ни накопления.
+     * 422, а не 400: запрос корректен по форме, но результат непригоден. */
+    if (outcome.rejected) {
+      return res.status(422).json({
+        queued: false,
+        reason: outcome.reason,
+        actionId: outcome.actionId,
+        workerAddress: outcome.workerAddress,
+        tier: outcome.tier,
+        quality: outcome.quality,
         receipt: null,
       });
     }
@@ -1498,13 +1550,20 @@ async function runInference(req, res) {
   run('INSERT INTO inferenceLogs (workerAddress, tokensGenerated, adapterId, source, emulated, resultJson) VALUES (?, ?, ?, ?, ?, ?)',
     [workerAddress, tokensGenerated, adapterId, result.source, result.emulated ? 1 : 0,
       JSON.stringify({ ...result, receiptSeq: outcome.receipt ? outcome.receipt.seq : null,
-        queued: Boolean(outcome.queued), pendingWork: outcome.pending_work ?? null })]);
+        queued: Boolean(outcome.queued), rejected: Boolean(outcome.rejected),
+        reason: outcome.reason ?? null,
+        pendingWork: outcome.pending_work ?? null })]);
 
   /* Короткий ответ модели не даёт чека сам по себе: токены накоплены.
    * Поля receipt/breakdown/conservation при этом остаются null, а не
    * выбрасываются — клиент видит разницу между «начислено» и «в очереди». */
   const queuedBlock = outcome.queued
-    ? { queued: true, pending_work: outcome.pending_work, threshold: outcome.threshold }
+    ? { queued: true, reason: outcome.reason, pending_work: outcome.pending_work, threshold: outcome.threshold }
+    : {};
+  /* Провал качества виден явно: без этого inference вернул бы 200 с пустым
+   * чеком, и клиент не отличил бы отказ от нулевой выплаты. */
+  const rejectedBlock = outcome.rejected
+    ? { rejected: true, reason: outcome.reason, quality: outcome.quality }
     : {};
 
   res.json({
@@ -1519,6 +1578,7 @@ async function runInference(req, res) {
     payment: outcome.payment ?? null,
     tokensGenerated,
     ...queuedBlock,
+    ...rejectedBlock,
     cumulative_receipt: ledger.getCumulativeReceipt(workerAddress),
     receipt: outcome.receipt,
     breakdown: outcome.settled ? {
@@ -1595,6 +1655,7 @@ app.post('/batch-test', async (req, res) => {
             /* В батче tokens ≥ 1e6, порог не достигается, но защита нужна:
              * иначе один короткий тир уронил бы весь прогон на null. */
             queued: Boolean(out.queued),
+            rejected: Boolean(out.rejected),
             cwu: out.receipt ? out.receipt.cwu : 0,
             feeRewardTar: out.receipt ? out.receipt.feeRewardTar : 0,
             blockRewardTar: out.receipt ? out.receipt.blockRewardTar : 0,
