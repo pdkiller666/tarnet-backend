@@ -103,6 +103,11 @@ class Transport {
       framesOut: 0,
       requests: 0,
       responses: 0,
+      /* Ответы, полученные клиентом и отданные в pending. Отдельно от
+       * `responses`: та считает ответы, СОЗДАННЫЕ этим узлом как воркером.
+       * Смешивать нельзя — у клиента responses всегда 0, и по одному счётчику
+       * нельзя отличить «ответил воркер» от «клиент дождался ответа». */
+      responsesIn: 0,
       errors: 0,
       dropped: 0,
     };
@@ -319,6 +324,7 @@ class Transport {
     if (waiting) {
       this.pending.delete(frame.rid);
       clearTimeout(waiting.timer);
+      this.stats.responsesIn++;
       waiting.resolve(frame.payload);
       return;
     }
@@ -458,6 +464,11 @@ class Transport {
       ttlMs: built.ttlMs,
       entryNode: built.entryNode,
       packetBytes: Buffer.from(built.onionPacket, 'base64').length,
+      /* Пакет и ключ возвращаются вызывающему: HTTP-эндпоинт обязан отдать
+       * их клиенту, а собирать луковицу второй раз ради этого нельзя —
+       * второй сбор дал бы другой responseAesKey и другой requestId. */
+      onionPacket: built.onionPacket,
+      responseAesKey: built.responseAesKey.toString('base64'),
     };
   }
 

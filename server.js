@@ -24,6 +24,7 @@ const { CumulativeLedger, receiptPayload, epochState, releasedFor, bumpEpoch } =
 const { getGenesisHash, receiptPayloadV2, computeReceiptHash, verifyWorkerDagChain } = require('./dag-chain');
 const LLM = require('./llm-adapter');
 const onion = require('./onion');
+const { startDemoMesh, describeMesh } = require('./p2p-demo');
 
 // ===== Configuration =====
 const PORT = process.env.PORT || 3001;
@@ -1101,7 +1102,7 @@ const RATE_LIMITS = {
 /* Пути, которые UI опрашивает постоянно. Статика вроде console.html идёт
  * тем же классом: иначе открытие страницы съедало бы бюджет записи. */
 const RATE_READ_PATH =
-  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config)$/;
+  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|p2p\/status)$/;
 const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$/;
 const RATE_READ_ASSET = /\.(html|css|js|svg|webmanifest|png|ico|woff2?)$/;
 /* Оболочки UI: `/` и `/app/` — это HTML-контейнеры без расширения, без этой
@@ -1535,19 +1536,91 @@ function handleWork(req, res) {
   }
 }
 
-/* --- Onion Routing: сборка луковичного пакета (Фаза 2) ---
+/* ===== Демо-сеть P2P (Фаза 3) =====
+ * Два реле и воркер в этом же процессе на loopback. Публичные ключи узлов
+ * регистрируются в таблице nodes, чтобы клиент мог собрать маршрут по
+ * обычному `/nodes`; приватные ключи не покидают память процесса.
+ *
+ * Стейк и репутация демо-узлов — нули: `omega()` даёт вес 0, поэтому
+ * демо-воркер не попадает в `pickWorker` и не искажает экономику начислений.
+ * Он существует только как конец onion-маршрута. */
+let demoMesh = null;
+let demoMeshStarting = null;
+
+/* Ответ демо-воркера. Внешняя модель подключается только если она реально
+ * настроена окружением; иначе детерминированный ответ, и это честно написано
+ * в тексте. Промпт не логируется ни в одной ветке. */
+async function demoWorkerHandler(inner) {
+  const prompt = String((inner && inner.prompt) || '');
+  if (LLM.externalConfigured()) {
+    try {
+      const out = await LLM.callExternal({ prompt, ...LLM.env() });
+      if (out && out.response) return out.response;
+    } catch (_e) {
+      /* Молча уходим в детерминированный ответ: падение воркера вернуло бы
+       * клиенту код транспорта, хотя вопрос был к модели. */
+    }
+  }
+  return LLM.deterministicFallback(prompt, 'p2p_demo_worker').response;
+}
+
+async function ensureDemoMesh() {
+  if (demoMesh) return demoMesh;
+  if (demoMeshStarting) return demoMeshStarting;
+
+  demoMeshStarting = (async () => {
+    const mesh = await startDemoMesh({ handler: demoWorkerHandler });
+    for (const n of mesh.nodes) {
+      /* ON CONFLICT, а не INSERT OR REPLACE: перезапуск сервера не должен
+       * обнулять стейк узла, если он когда-то был выставлен вручную. */
+      run(`INSERT INTO nodes (address, stake, reputation, isTeeAttested, routingWeight, rsaPublicKeyPem)
+           VALUES (?, 0, 0, 0, 0, ?)
+           ON CONFLICT(address) DO UPDATE SET rsaPublicKeyPem = excluded.rsaPublicKeyPem`,
+        [n.address, n.publicKeyPem]);
+    }
+    demoMesh = mesh;
+    return mesh;
+  })().catch((e) => {
+    demoMeshStarting = null;
+    throw e;
+  });
+
+  return demoMeshStarting;
+}
+
+app.get('/p2p/status', async (_req, res) => {
+  let mesh;
+  try {
+    mesh = await ensureDemoMesh();
+  } catch (e) {
+    return res.status(503).json({ ok: false, error: 'P2P_MESH_UNAVAILABLE', detail: e.message });
+  }
+  const d = describeMesh(mesh);
+  res.json({
+    ok: true,
+    transport: 'websocket',
+    /* Порядок важен: это готовый маршрут «реле 1 → реле 2 → воркер»,
+     * который можно сразу подставить в routeNodes. */
+    routeNodes: mesh.nodes.map(n => n.address),
+    nodes: d.nodes,
+    client: d.client,
+  });
+});
+
+/* --- Onion Routing: сборка и доставка луковичного пакета (Фаза 2/3) ---
  * Тело: { routeNodes: [адрес, ...], prompt, clientAddress, model? }
  *
- * ЧЕГО ЭТОТ ЭНДПОИНТ НЕ ДЕЛАЕТ: он НЕ доставляет пакет по сети. Ни один
- * ретранслятор его не получает, промпт не уходит воркеру, ответа нет.
- * Возвращается собранный пакет и одноразовый ключ клиента — этого достаточно,
- * чтобы клиент сам прогнал пакет по цепи, но P2P-транспорт между реле это
- * Фаза 3. Называть эндпоинт «работающим инференсом» было бы ложью.
+ * ЧТО ЭТОТ ЭНДПОИНТ ДЕЛАЕТ ТЕПЕРЬ: если все узлы маршрута входят в демо-сеть
+ * (два реле и воркер, поднятые в этом же процессе на loopback), пакет реально
+ * уходит по WebSocket через цепь и возвращается расшифрованным — `delivered:
+ * true` и поле `answer`. Если маршрут включает узлы не из демо-сети, пакет
+ * только собирается, ровно как раньше: чужие узлы недостижимы по сети, и
+ * обещать их доставку было бы ложью.
  *
  * PROMISE: промпт не записывается ни в БД, ни в лог. Он живёт только в
  * памяти на время сборки пакета и уходит вон зашифрованным. Иначе весь смысл
  * луковой схемы теряется в первом же слое на сервере. */
-app.post('/inference/onion', (req, res) => {
+app.post('/inference/onion', async (req, res) => {
   const { routeNodes, prompt, clientAddress, model } = req.body || {};
 
   if (!Array.isArray(routeNodes) || routeNodes.length === 0) {
@@ -1598,6 +1671,68 @@ app.post('/inference/onion', (req, res) => {
     return res.status(400).json({ error: e.message });
   }
 
+  /* Доставка возможна только по демо-сети. Узлы из БД — это записи без
+   * транспортного адреса: открыть сокет к ним некуда, поэтому обещать
+   * доставку по произвольному маршруту нельзя. */
+  let mesh = null;
+  try {
+    mesh = await ensureDemoMesh();
+  } catch (_e) {
+    mesh = null; /* сеть не поднялась — остаётся сборка пакета */
+  }
+
+  if (mesh) {
+    const inMesh = new Set(mesh.nodes.map(n => n.address));
+    const reachable = route.every(n => inMesh.has(n.address));
+
+    if (reachable) {
+      try {
+        /* Внутрь слоя кладём те же поля, что собирались бы локально. */
+        const delivered = await mesh.client.sendOnion({
+          route: route.map(n => ({ address: n.address, rsaPublicKeyPem: n.rsaPublicKeyPem })),
+          innerRequest: { prompt, model: model || null, clientAddress: clientAddress || null },
+        });
+
+        return res.json({
+          ok: true,
+          delivered: true,
+          answer: delivered.answer,
+          hops: delivered.hops,
+          entryNode: delivered.entryNode,
+          route: route.map(n => n.address),
+          /* Пакет и ключ — те, что реально ушли в сеть. Отдавать здесь
+           * `built` нельзя: второй сбор дал бы другой responseAesKey и
+           * другой requestId, и клиент не расшифровал бы ответ. */
+          onionPacket: delivered.onionPacket,
+          packetBytes: delivered.packetBytes,
+          /* TODO: Phase 3 - Move responseAesKey to client-side generation only,
+           * remove from API response for production privacy. */
+          responseAesKey: delivered.responseAesKey,
+          transport: 'websocket',
+          ttlMs: delivered.ttlMs,
+        });
+      } catch (e) {
+        /* Сеть есть, но конкретный запрос не прошёл: воркер умер, слой
+         * протух, сокет закрылся. Пакет при этом валиден, поэтому отдаём
+         * его вместе с честной причиной — клиент может повторить. */
+        return res.json({
+          ok: true,
+          delivered: false,
+          deliveryError: e.message,
+          hops: built.hops,
+          entryNode: built.entryNode,
+          route: route.map(n => n.address),
+          onionPacket: built.onionPacket,
+          packetBytes: Buffer.from(built.onionPacket, 'base64').length,
+          /* TODO: Phase 3 - Move responseAesKey to client-side generation only,
+           * remove from API response for production privacy. */
+          responseAesKey: built.responseAesKey.toString('base64'),
+          transport: 'websocket',
+        });
+      }
+    }
+  }
+
   const packetBuf = Buffer.from(built.onionPacket, 'base64');
   res.json({
     ok: true,
@@ -1606,12 +1741,11 @@ app.post('/inference/onion', (req, res) => {
     route: route.map(n => n.address),
     onionPacket: built.onionPacket,
     packetBytes: packetBuf.length,
-    /* Ключ ответа возвращается только потому, что транспорт пока не готов:
-     * клиенту иначе нечем расшифровать ответ. В Фазе 3 он останется
-     * исключительно у клиента и из ответа API уйдёт. */
+    /* TODO: Phase 3 - Move responseAesKey to client-side generation only,
+     * remove from API response for production privacy. */
     responseAesKey: built.responseAesKey.toString('base64'),
     delivered: false,
-    note: 'пакет собран, но не отправлен: транспорт между реле — Фаза 3',
+    note: 'маршрут содержит узлы вне демо-сети: пакет собран, но по сети не отправлен',
   });
 });
 

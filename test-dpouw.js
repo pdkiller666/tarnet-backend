@@ -1201,6 +1201,109 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+  // ---------- 8.17. P2P Transport подключён к /inference/onion ----------
+  section('8.17. /inference/onion доставляет пакет по демо-сети');
+
+  const p2p = await api('/p2p/status');
+  ok('/p2p/status отвечает 200', p2p.status === 200, p2p.body);
+  ok('транспорт — websocket', p2p.body?.transport === 'websocket', p2p.body?.transport);
+  ok('демо-сеть даёт готовый маршрут из 3 узлов',
+    Array.isArray(p2p.body?.routeNodes) && p2p.body.routeNodes.length === 3,
+    p2p.body?.routeNodes);
+  ok('порядок ролей: реле 1 → реле 2 → воркер',
+    JSON.stringify((p2p.body?.nodes || []).map(n => n.role)) === JSON.stringify(['relay1', 'relay2', 'worker']),
+    (p2p.body?.nodes || []).map(n => n.role));
+  ok('узлы слушают loopback',
+    (p2p.body?.nodes || []).every(n => /^ws:\/\/127\.0\.0\.1:\d+$/.test(n.url || '')),
+    (p2p.body?.nodes || []).map(n => n.url));
+
+  /* Публичные ключи демо-узлов должны быть в таблице nodes: иначе клиент
+   * не сможет собрать маршрут по обычному /nodes, зная только адреса. */
+  const nodesList = await api('/nodes');
+  const nodeAddrs = new Set((nodesList.body || []).map(n => n.address));
+  ok('публичные ключи демо-узлов зарегистрированы в /nodes',
+    (p2p.body?.routeNodes || []).every(a => nodeAddrs.has(a)),
+    (p2p.body?.routeNodes || []).filter(a => !nodeAddrs.has(a)));
+
+  const LIVE_PROMPT = `луковица-вживую-${RUN}-никогда-не-на-диске`;
+  const live = await api('/inference/onion', 'POST', {
+    routeNodes: p2p.body.routeNodes,
+    prompt: LIVE_PROMPT,
+    model: 'qwen2.5-coder-7b',
+  });
+  ok('/inference/onion доставил пакет: delivered = true',
+    live.status === 200 && live.body?.delivered === true,
+    { status: live.status, delivered: live.body?.delivered, err: live.body?.deliveryError });
+  ok('ответ воркера вернулся и расшифрован',
+    typeof live.body?.answer === 'string' && live.body.answer.length > 0,
+    typeof live.body?.answer);
+  ok('в ответе именно наш промпт (детерминированный шаблон)',
+    String(live.body?.answer || '').includes(LIVE_PROMPT),
+    String(live.body?.answer || '').slice(0, 120));
+  ok('маршрут из 3 прыжков, транспорт websocket',
+    live.body?.hops === 3 && live.body?.transport === 'websocket',
+    { hops: live.body?.hops, transport: live.body?.transport });
+  ok('пакет и ключ ответа отданы клиенту',
+    typeof live.body?.onionPacket === 'string'
+      && Buffer.from(live.body.onionPacket, 'base64').length > 0
+      && Buffer.from(live.body?.responseAesKey || '', 'base64').length === 32,
+    { bytes: live.body?.packetBytes });
+
+  /* Доказательство, что доставка шла по сети, а не была сымитирована:
+   * воркер — единственный, кто обработал запрос, реле остались реле. */
+  const after = await api('/p2p/status');
+  const statsOf = (role) => (after.body?.nodes || []).find(n => n.role === role)?.stats || {};
+  ok('воркер обработал запрос', statsOf('worker').requests >= 1, statsOf('worker'));
+  ok('реле 1 не был концом маршрута', statsOf('relay1').requests === 0, statsOf('relay1'));
+  ok('реле 2 не был концом маршрута', statsOf('relay2').requests === 0, statsOf('relay2'));
+  ok('клиент получил ответ по обратному пути',
+    (after.body?.client?.stats?.responsesIn || 0) >= 1, after.body?.client?.stats);
+  ok('реле пересылали кадры дальше',
+    (statsOf('relay1').framesOut || 0) >= 1 && (statsOf('relay2').framesOut || 0) >= 1);
+
+  /* PROMISE эндпоинта остаётся в силе и после реальной доставки. */
+  let livePromptOnDisk = null;
+  if (tmpDir) {
+    const dbPath = path.join(tmpDir, 'test.db');
+    if (fs.existsSync(dbPath)) {
+      livePromptOnDisk = fs.readFileSync(dbPath).includes(Buffer.from(LIVE_PROMPT, 'utf8'));
+    }
+  }
+  ok('промпт не осел в файле БД и после доставки', livePromptOnDisk === false, { found: livePromptOnDisk });
+  ok('промпт не виден в /p2p/status',
+    !JSON.stringify(after.body).includes(LIVE_PROMPT));
+
+  /* Повторный запрос: сокет переиспользуется, доставка снова работает. */
+  const live2 = await api('/inference/onion', 'POST', {
+    routeNodes: p2p.body.routeNodes, prompt: `второй-${RUN}`, model: 'demo',
+  });
+  ok('второй запрос тоже доставлен (сокет переиспользован)',
+    live2.body?.delivered === true && String(live2.body?.answer || '').includes(`второй-${RUN}`),
+    { delivered: live2.body?.delivered });
+
+  /* Маршрут с узлом вне демо-сети: доставки быть не может, и эндпоинт
+   * обязан сказать это честно, а не притвориться выполненным. */
+  const mixKp = onion.generateNodeRsaKeypair();
+  const mixAddr = runAddress('mix');
+  await api('/node', 'POST', {
+    address: mixAddr, stake: 5000, reputation: 0.8, rsaPublicKeyPem: mixKp.publicKeyPem,
+  });
+  const mixed = await api('/inference/onion', 'POST', {
+    routeNodes: [p2p.body.routeNodes[0], mixAddr], prompt: 'смешанный-маршрут',
+  });
+  ok('узел вне демо-сети: delivered = false и причина в note',
+    mixed.body?.delivered === false && typeof mixed.body?.note === 'string',
+    { delivered: mixed.body?.delivered, note: mixed.body?.note });
+  ok('пакет при этом всё равно собран и отдан',
+    typeof mixed.body?.onionPacket === 'string'
+      && Buffer.from(mixed.body.onionPacket, 'base64').length > 0);
+
+  const stillUnknown = await api('/inference/onion', 'POST', {
+    routeNodes: [runAddress('nosuch')], prompt: 'x',
+  });
+  ok('проверки регистрации не ослабли: неизвестный узел — 404',
+    stillUnknown.status === 404, stillUnknown.status);
+
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
   const summary = await api('/summary');
