@@ -50,13 +50,32 @@ DIRTY=$(git status --porcelain)
 if [ -n "$DIRTY" ]; then
   [ -n "$MSG" ] || die "рабочее дерево грязное. Либо закоммить сам, либо передай сообщение:
     ./scripts/deploy.sh \"сообщение коммита\""
-  # Блоклист: сюда не должны попадать секреты и БД даже случайно.
-  BAD=$(printf '%s\n' "$DIRTY" | awk '{$1="";sub(/^ /,"");print}' \
-        | grep -E '(^|/)\.secrets/|\.db$|\.db-wal$|\.db-shm$|master\.key$|(^|/)\.env$|hosts\.yml$|(^|/)id_(rsa|ed25519)' || true)
-  [ -z "$BAD" ] || die "в коммит попали бы секреты/БД, отказываюсь:
-$BAD"
   info "коммичу изменения"
   git add -A || die "git add"
+
+  # Блоклист проверяет STAGED-список, а не `git status`.
+  # Почему: `.secrets/` и `*.db` перечислены в .gitignore, поэтому `git status`
+  # их вообще не показывает — проверка по статусу их не увидит, и файл уедет
+  # в коммит через `git add -f`. Staged-список видит всё, что реально попадёт.
+  STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+  SECRETS=$(printf '%s\n' "$STAGED" \
+    | grep -E '(^|/)\.secrets/|\.db$|\.db-wal$|\.db-shm$|master\.key$|(^|/)\.env$|hosts\.yml$|(^|/)id_(rsa|ed25519)|\.pem$' || true)
+  if [ -n "$SECRETS" ]; then
+    git reset -q
+    die "в коммит попали бы секреты/БД, отказываюсь (индекс сброшен):
+$SECRETS"
+  fi
+
+  # Мусор: временные и логовые файлы не должны попадать в историю. Именно так
+  # в неё уехал zz-guard-test.tmp при проверке самого блоклиста.
+  JUNK=$(printf '%s\n' "$STAGED" \
+    | grep -E '(^|/)(zz-.*|tmp-.*)|(^|/)npm-debug\.log$|\.tmp$|\.log$|\.swp$|~$' || true)
+  if [ -n "$JUNK" ]; then
+    git reset -q
+    die "в коммит попали бы временные файлы, отказываюсь (индекс сброшен):
+$JUNK
+Если это осознанно — убери файл или закоммить вручную."
+  fi
   git -c user.name="OpenClaw" -c user.email="agent@tarnet.local" \
       commit -q -m "$MSG" || die "git commit"
   git show --stat --oneline HEAD | head -20
