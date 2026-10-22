@@ -1540,6 +1540,10 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     address: '0x' + (i + 1).toString(16).padStart(40, '0'),
     stakeTar: (i + 1) * 10,
     reputation: 1,
+    /* tier обязателен с v2.4.1-tier-fix: комитет набирается только из
+     * expert/heavy. Без поля эти узлы считались бы 'base' и старые
+     * проверки комитета упали бы на пустом списке. */
+    tier: 'expert',
   }));
   const epochA = crypto.createHash('sha256').update('epoch-A').digest('hex');
   const epochB = crypto.createHash('sha256').update('epoch-B').digest('hex');
@@ -1563,6 +1567,41 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     benchmarkGate.selectCommittee('', vNodes).committee.length === 0);
   ok('нехватка кандидатов не добивается дублями',
     new Set(benchmarkGate.selectCommittee(epochA, vNodes.slice(0, 3)).committee).size === 3);
+
+  /* ---------- Фильтр по тиру узла (v2.4.1-tier-fix) ----------
+   * До этой правки колонки nodes.tier не существовало, и «5 валидаторов из
+   * Tier 3» выразить было нечем: кандидатами становились все узлы со stake>0,
+   * включая домашние base-машины. */
+  const tierNodes = [
+    { address: '0x' + 'a'.repeat(40), stakeTar: 50000, reputation: 1, tier: 'nano' },
+    { address: '0x' + 'b'.repeat(40), stakeTar: 50000, reputation: 1, tier: 'base' },
+    { address: '0x' + 'c'.repeat(40), stakeTar: 50000, reputation: 1, tier: 'expert' },
+    { address: '0x' + 'd'.repeat(40), stakeTar: 50000, reputation: 1, tier: 'heavy' },
+    { address: '0x' + 'e'.repeat(40), stakeTar: 50000, reputation: 1 }, // без tier = base
+  ];
+  const tierDraw = benchmarkGate.selectCommittee(epochA, tierNodes);
+  const expertAddr = '0x' + 'c'.repeat(40);
+  const heavyAddr = '0x' + 'd'.repeat(40);
+  ok('комитет только из expert/heavy',
+    tierDraw.committee.every(a => a === expertAddr || a === heavyAddr),
+    tierDraw.committee);
+  ok('в комитет не попали nano/base/без-тира',
+    !tierDraw.committee.some(a => a === '0x' + 'a'.repeat(40) || a === '0x' + 'b'.repeat(40) || a === '0x' + 'e'.repeat(40)),
+    tierDraw.committee);
+  ok('двое подходящих заполнили 2 места, не 5',
+    tierDraw.committee.length === 2 && tierDraw.candidates === 2,
+    { picked: tierDraw.committee.length, candidates: tierDraw.candidates });
+  ok('отброшенные по тиру посчитаны честно', tierDraw.skippedByTier === 3, tierDraw.skippedByTier);
+  ok('note объясняет недобор мест, а не молчит',
+    /of 5 seats/.test(tierDraw.note), tierDraw.note);
+  ok('opts.validatorTiers:null снимает фильтр — видны все 5',
+    benchmarkGate.selectCommittee(epochA, tierNodes, { validatorTiers: null }).candidates === 5);
+  ok('свой список тиров уважается',
+    benchmarkGate.selectCommittee(epochA, tierNodes, { validatorTiers: ['nano'] }).committee
+      .every(a => a === '0x' + 'a'.repeat(40)));
+  ok('tier в верхнем регистре нормализуется',
+    benchmarkGate.nodeTier({ tier: 'EXPERT' }) === 'expert');
+  ok('отсутствие tier трактуется как base', benchmarkGate.nodeTier({}) === 'base');
 
   const gateStub = benchmarkGate.verifyAdapter('0xdead', cmA.committee);
   ok('verifyAdapter — заглушка (implemented:false)', gateStub.implemented === false);

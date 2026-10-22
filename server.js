@@ -440,6 +440,29 @@ ensureColumn('adapters', 'deleted_at', 'deleted_at TEXT');
  * сознательно: делать её NOT NULL значило бы объявить все уже
  * зарегистрированные 43 узла неполноценными. */
 ensureColumn('nodes', 'rsaPublicKeyPem', 'rsaPublicKeyPem TEXT');
+/* nodes.tier — КЛАСС ЖЕЛЕЗА узла (nano/base/expert/heavy), а не κ работы.
+ * Нужен выбору комитета: benchmark-gate.js допускает к валидации только
+ * expert/heavy. DEFAULT 'base' сознательно: 133 уже зарегистрированных узла
+ * нельзя объявить экспертными по умолчанию — это была бы выдача желаемого за
+ * факт. Ниже — backfill ТОЛЬКО по доказательству: узел получает expert, если
+ * реально выполнял expert-работу и имеет ненулевой стейк. */
+ensureColumn('nodes', 'tier', "tier TEXT DEFAULT 'base'");
+{
+  /* Почему backfill вообще нужен. Без него миграция делает все 133 узла
+   * 'base', фильтр expert/heavy даёт ПУСТОЙ комитет, и submit-lora начинает
+   * отвечать «0 кандидатов» — то есть деплой ломает то, что работало, ровно
+   * перед демо. Источник истины — work_receipts.tier: он пишется на каждой
+   * работе и не зависит от того, что клиент заявил о своём железе. */
+  const backfilled = db.prepare(`
+    UPDATE nodes SET tier = 'expert'
+    WHERE (tier IS NULL OR tier = 'base')
+      AND stake > 0
+      AND address IN (SELECT workerAddress FROM work_receipts WHERE tier = 'expert')
+  `).run();
+  if (backfilled.changes > 0) {
+    console.log(`🏷  nodes.tier backfill: ${backfilled.changes} узлов → expert (по факту expert-работ и стейку)`);
+  }
+}
 /* adapterDeletedAt — снимок deleted_at адаптера в момент выпуска чека. Нужен,
  * чтобы чек оставался самодостаточным: состояние реестра может измениться
  * позже. В подписываемый payload не входит. */
@@ -1620,9 +1643,22 @@ app.get('/ledger', (req, res) => {
 
 /* --- Node --- */
 app.post('/node', (req, res) => {
-  const { address, stake, reputation, isTeeAttested, rsaPublicKeyPem } = req.body || {};
+  const { address, stake, reputation, isTeeAttested, rsaPublicKeyPem, tier } = req.body || {};
   if (typeof address !== 'string' || !address.length) {
     return res.status(400).json({ error: 'address is required' });
+  }
+  /* tier — КЛАСС ЖЕЛЕЗА узла. Допускаем four: nano/base/expert/heavy.
+   * heavy принимается как класс машины, хотя κ для heavy-РАБОТЫ в коде нет
+   * (TIER_WEIGHTS: nano/base/expert). Разные вещи: «на чём считают» и
+   * «сколько CWU даёт токен». Для выбора комитета heavy равен expert. */
+  const NODE_TIERS = ['nano', 'base', 'expert', 'heavy'];
+  let nodeTier = null;
+  if (tier !== undefined && tier !== null && String(tier).trim() !== '') {
+    const t = String(tier).trim().toLowerCase();
+    if (!NODE_TIERS.includes(t)) {
+      return res.status(400).json({ error: `tier must be one of ${NODE_TIERS.join('/')}`, got: t });
+    }
+    nodeTier = t;
   }
   /* Ключ для Onion Routing проверяем до записи: невалидный PEM обнаружится
    * только при попытке упаковки слоя, то есть далеко от регистрации, где его
@@ -1638,34 +1674,40 @@ app.post('/node', (req, res) => {
     }
   }
   const rw = routingWeight(stake, reputation);
-  /* INSERT OR REPLACE затирает строку целиком. Ключ, не переданный в этом
-   * запросе, не должен терять ранее сохранённое значение: клиент может
-   * перерегистрировать узел, не повторяя ключ. Поэтому берём прежний. */
-  const existing = get('SELECT rsaPublicKeyPem FROM nodes WHERE address = ?', [address]);
+  /* INSERT OR REPLACE затирает строку целиком. Поле, не переданное в этом
+   * запросе, не должно терять ранее сохранённое значение: клиент может
+   * перерегистрировать узел, не повторяя ключ или тир. Для tier это особенно
+   * важно: backfill выставил expert по факту работы, а клиент, не знающий о
+   * тирах, сбросил бы его в base первым же запросом и вывел себя из комитета. */
+  const existing = get('SELECT rsaPublicKeyPem, tier FROM nodes WHERE address = ?', [address]);
   const pubKey = rsaPublicKeyPem !== undefined
     ? (rsaPublicKeyPem || null)
     : (existing ? existing.rsaPublicKeyPem : null);
-  run('INSERT OR REPLACE INTO nodes (address, stake, reputation, isTeeAttested, routingWeight, rsaPublicKeyPem) VALUES (?, ?, ?, ?, ?, ?)',
-    [address, Number(stake) || 0, Number(reputation) || 0, isTeeAttested ? 1 : 0, rw, pubKey]);
+  const finalTier = nodeTier !== null ? nodeTier : (existing?.tier || 'base');
+  run('INSERT OR REPLACE INTO nodes (address, stake, reputation, isTeeAttested, routingWeight, rsaPublicKeyPem, tier) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [address, Number(stake) || 0, Number(reputation) || 0, isTeeAttested ? 1 : 0, rw, pubKey, finalTier]);
   run(`INSERT INTO balances (address, balanceTar, stakedTar, updatedAt) VALUES (?, 0, ?, ?)
        ON CONFLICT(address) DO UPDATE SET stakedTar = excluded.stakedTar, updatedAt = excluded.updatedAt`,
     [address, Number(stake) || 0, new Date().toISOString()]);
   res.json({ address, stake: Number(stake) || 0, reputation: Number(reputation) || 0,
-    isTeeAttested: !!isTeeAttested, routingWeight: rw,
+    isTeeAttested: !!isTeeAttested, routingWeight: rw, tier: finalTier,
+    validatorEligible: ['expert', 'heavy'].includes(finalTier),
     onionCapable: Boolean(pubKey) });
 });
 
 app.get('/nodes', (_req, res) => {
-  res.json(all('SELECT address, stake, reputation, routingWeight, isTeeAttested FROM nodes')
+  res.json(all('SELECT address, stake, reputation, routingWeight, isTeeAttested, tier FROM nodes')
     .map(r => ({ address: r.address, stake: r.stake, reputation: r.reputation,
-      routingWeight: r.routingWeight, isTeeAttested: !!r.isTeeAttested })));
+      routingWeight: r.routingWeight, isTeeAttested: !!r.isTeeAttested,
+      tier: r.tier || 'base', validatorEligible: ['expert', 'heavy'].includes(r.tier || 'base') })));
 });
 
 app.get('/node/:address', (req, res) => {
   const row = get('SELECT * FROM nodes WHERE address = ?', [req.params.address]);
   if (!row) return res.status(404).json({ error: 'Node not found' });
   res.json({ address: row.address, stake: row.stake, reputation: row.reputation,
-    routingWeight: row.routingWeight, isTeeAttested: !!row.isTeeAttested });
+    routingWeight: row.routingWeight, isTeeAttested: !!row.isTeeAttested,
+    tier: row.tier || 'base', validatorEligible: ['expert', 'heavy'].includes(row.tier || 'base') });
 });
 
 /* --- Adapters (LoRA royalty получает реальный автор) --- */

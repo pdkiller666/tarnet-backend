@@ -20,16 +20,32 @@
  * можно предсказать комитет до отправки адаптера. Это осознанная уступка
  * стенда, а не «VRF реализован». Помечено и в /health, и в отчёте.
  *
- * ЧЕГО НЕ ХВАТАЕТ В СХЕМЕ. Спека говорит «5 валидаторов из Tier 3». В таблице
- * nodes НЕТ колонки tier — есть только stake, reputation, isTeeAttested,
- * routingWeight. Поэтому фильтр «Tier 3» выразить нечем: кандидаты — все узлы
- * со stake > 0. Это не выбор автора, а пробел схемы; он перечислен в отчёте.
+ * КАКИЕ УЗЛЫ МОГУТ БЫТЬ ВАЛИДАТОРАМИ. Спека говорит «5 валидаторов из Tier 3».
+ * Колонка nodes.tier была добавлена миграцией (v2.4.1-tier-fix), поэтому фильтр
+ * выразим явно: кандидаты — только узлы тира expert или heavy.
+ *
+ * ПОЧЕМУ heavy ЗДЕСЬ ЕСТЬ, А В TIER_WEIGHTS НЕТ. Это два разных смысла одного
+ * слова. nodes.tier — КЛАСС ЖЕЛЕЗА узла (что машина может). Tier_weights —
+ * коэффициент κ для РАБОТЫ (сколько CWU даёт токен). heavy-машина физически
+ * способна на всё, что делает expert, поэтому как валидатор она равна expert.
+ * Отдельного κ для heavy в коде НЕТ, и придумывать его (старое κ=10.0 из
+ * отозванного манифеста) нельзя: /work с tier=heavy по-прежнему отвечает 400.
  */
 
 const crypto = require('crypto');
 
 const COMMITTEE_SIZE = 5;
 const QUORUM_REQUIRED = 4;
+
+/* Тиры узлов, допущенные к валидации. 'heavy' — класс железа, не κ работы:
+ * см. шапку файла. Узел без объявленного tier считается 'base' (тот же
+ * дефолт, что у колонки в БД) и валидатором быть не может. */
+const VALIDATOR_TIERS = ['expert', 'heavy'];
+
+function nodeTier(node) {
+  const raw = String(node?.tier ?? 'base').trim().toLowerCase();
+  return raw || 'base';
+}
 
 /* Ставка ниже этого порога не даёт права быть валидатором: иначе нулевой
  * стейк получает голос бесплатно, и слэшить нечего. */
@@ -91,12 +107,19 @@ function selectCommittee(epochHash, nodes, opts = {}) {
     };
   }
 
-  // Кандидаты: уникальные адреса с ненулевым весом, кроме исключённых.
+  /* Кандидаты: уникальные адреса нужного тира с ненулевым весом, кроме
+   * исключённых. opts.validatorTiers === null снимает фильтр по тиру — нужно
+   * для отчётов «кто вообще способен», но не для выбора комитета. */
+  const allowedTiers = opts.validatorTiers === null
+    ? null
+    : (Array.isArray(opts.validatorTiers) ? opts.validatorTiers : VALIDATOR_TIERS);
   const byAddress = new Map();
+  let skippedByTier = 0;
   for (const node of Array.isArray(nodes) ? nodes : []) {
     const address = node?.address;
     if (typeof address !== 'string' || !address.length) continue;
     if (exclude.has(address)) continue;
+    if (allowedTiers && !allowedTiers.includes(nodeTier(node))) { skippedByTier += 1; continue; }
     const weight = validatorWeight(node);
     if (!(weight > 0)) continue;
     const prev = byAddress.get(address);
@@ -137,10 +160,12 @@ function selectCommittee(epochHash, nodes, opts = {}) {
     committee: picked,
     weights,
     candidates: candidates.length,
+    validatorTiers: allowedTiers,
+    skippedByTier,
     deterministic: true,
     note: picked.length < size
       ? `Only ${picked.length} of ${size} seats filled: not enough funded validators (${candidates} candidates)`
-      : 'Deterministic weighted draw (sha256 stream, not a real VRF)',
+      : 'Deterministic weighted draw (sha256 stream, not a real VRF; ECVRF is [SPEC Phase 3])',
   };
 }
 
@@ -173,6 +198,8 @@ module.exports = {
   COMMITTEE_SIZE,
   QUORUM_REQUIRED,
   MIN_STAKE_FOR_COMMITTEE,
+  VALIDATOR_TIERS,
+  nodeTier,
   validatorWeight,
   selectCommittee,
   verifyAdapter,
