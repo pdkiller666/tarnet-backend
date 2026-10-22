@@ -13,6 +13,7 @@
 
 const crypto = require('crypto');
 const { CONFIG, round } = require('./config');
+const { getGenesisHash, receiptPayloadV2, payloadVersionOf } = require('./dag-chain');
 
 /* Каноническая строка для подписи. Поля фиксированы и отсортированы, чтобы
  * клиент мог собрать ту же строку и проверить подпись локально. */
@@ -76,6 +77,14 @@ class CumulativeLedger {
     const seq = Number(seqRow.nextSeq);
     const timestamp = Date.now();
 
+    /* Счётчик и сцепка берутся из последнего чека ЭТОГО воркера. */
+    const workerSeq = prev ? Number(prev.workerSeq || 0) + 1 : 1;
+    const prevReceiptHash = prev && prev.receiptHash
+      ? String(prev.receiptHash)
+      : getGenesisHash(workerAddress);
+    const cumulativeCwu = round((prev ? Number(prev.cumulativeCwu || 0) : 0) + Number(cwu));
+    const cumulativeTar = cumulativeTotal;
+
     const base = {
       seq, workerAddress,
       cwu: round(cwu), rewardTar: round(rewardTar),
@@ -84,17 +93,33 @@ class CumulativeLedger {
       royaltyTar: round(royaltyTar),
       epoch, timestamp,
       prevSignature: prev ? prev.signature : '',
+      /* --- DAG-сцепка ---
+       * workerSeq растёт ТОЛЬКО здесь, на выпуске чека. Путь pending_work
+       * до append не доходит, поэтому батчинг счётчик не двигает: иначе
+       * номер чека зависел бы от того, сколько мелких работ накопилось.
+       * cumulativeCwu считается независимо от cumulativeTotal: первое —
+       * объём работы, второе — деньги. Расхождение одного при верном
+       * другом и есть признак правки строки после записи. */
+      workerSeq,
+      prevReceiptHash,
+      cumulativeCwu,
+      cumulativeTar,
     };
-    const payload = receiptPayload(base);
+    /* Новые чеки подписываются строкой версии 2, где сцепка входит в
+     * подпись. Исторические остаются на версии 1: их подписи уже наложены
+     * на укороченную строку, и перевыпуск означал бы подделку истории. */
+    const payload = receiptPayloadV2(base);
     const signature = this.signFn(payload);
+    const receiptHash = crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
 
     this.db.run(
       `INSERT INTO work_receipts
          (seq, workerAddress, cwu, tier, feeGrossTar, feeRewardTar, blockRewardTar, rewardTar,
           burnTar, treasuryTar, royaltyTar, cumulativeTotal, epoch, omega, share,
           adapterId, actionId, timestamp, prevSignature, signature, signatureAlg, createdAt,
-          batchedFrom, adapterDeletedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          batchedFrom, adapterDeletedAt,
+          workerSeq, prevReceiptHash, cumulativeCwu, cumulativeTar, receiptHash, payloadVersion)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [seq, workerAddress, round(cwu), tier,
         round(feeGrossTar), round(feeRewardTar), round(blockRewardTar), round(rewardTar),
         round(burnTar), round(treasuryTar), round(royaltyTar), cumulativeTotal,
@@ -102,7 +127,8 @@ class CumulativeLedger {
         adapterId, actionId, timestamp, base.prevSignature, signature, 'ed25519',
         new Date(timestamp).toISOString(),
         batchedFrom && batchedFrom.length ? JSON.stringify(batchedFrom) : null,
-        adapterDeletedAt],
+        adapterDeletedAt,
+        workerSeq, prevReceiptHash, cumulativeCwu, cumulativeTar, receiptHash, 2],
     );
 
     return this.get(seq);
@@ -141,6 +167,15 @@ class CumulativeLedger {
        * входит: формат payload зафиксирован, а батчинг — метаданные о том,
        * из чего собран объём. Ценность чека от них не зависит. */
       batchedFrom: r.batchedFrom ? JSON.parse(r.batchedFrom) : [],
+      /* Сцепка: номер в цепи воркера, ссылка на предыдущий чек, нарастающие
+       * итоги и хеш содержимого. У исторических чеков (payloadVersion 1)
+       * сцепка восстановлена бэкфиллом при миграции. */
+      workerSeq: r.workerSeq === null || r.workerSeq === undefined ? null : Number(r.workerSeq),
+      prevReceiptHash: r.prevReceiptHash || null,
+      cumulativeCwu: r.cumulativeCwu === null || r.cumulativeCwu === undefined ? null : Number(r.cumulativeCwu),
+      cumulativeTar: r.cumulativeTar === null || r.cumulativeTar === undefined ? null : Number(r.cumulativeTar),
+      receiptHash: r.receiptHash || null,
+      payloadVersion: payloadVersionOf(r),
       /* Момент soft-delete адаптера на момент выпуска чека (ISO-строка) либо
        * null. Снимок, а не текущее состояние реестра: чек описывает прошлое,
        * а адаптер могли удалить позже. Вне подписываемого payload. */
@@ -170,9 +205,14 @@ class CumulativeLedger {
     return this.decorate(last);
   }
 
-  /* Локальная проверка чека: подпись + арифметика нарастающего итога. */
+  /* Локальная проверка чека: подпись + арифметика нарастающего итога.
+   * Строка собирается по версии чека: у новых (payloadVersion 2) в подпись
+   * входит сцепка, у исторических (1) — только исходные поля. Проверять
+   * старый чек по новой строке значило бы объявить валидную историю
+   * поддельной. */
   verify(receipt, publicKeyPem = this.publicKeyPem) {
-    const payload = receiptPayload({
+    const version = payloadVersionOf(receipt);
+    const fields = {
       seq: receipt.seq, workerAddress: receipt.workerAddress ?? receipt.workerId,
       cwu: Number(receipt.cwu), rewardTar: Number(receipt.rewardTar),
       cumulativeTotal: Number(receipt.cumulativeTotal),
@@ -180,9 +220,18 @@ class CumulativeLedger {
       royaltyTar: Number(receipt.royaltyTar),
       epoch: receipt.epoch, timestamp: receipt.timestamp,
       prevSignature: receipt.prevSignature || '',
-    });
+    };
+    const payload = version >= 2
+      ? receiptPayloadV2({
+        ...fields,
+        workerSeq: receipt.workerSeq,
+        prevReceiptHash: receipt.prevReceiptHash,
+        cumulativeCwu: Number(receipt.cumulativeCwu),
+        cumulativeTar: Number(receipt.cumulativeTar),
+      })
+      : receiptPayload(fields);
     const signatureValid = this.verifyFn(payload, receipt.signature, publicKeyPem);
-    return { signatureValid, payload };
+    return { signatureValid, payload, payloadVersion: version };
   }
 
   /* Формирует on-chain транзакцию ТОЛЬКО для итогового чека.

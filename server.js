@@ -20,7 +20,8 @@ const fs = require('fs');
 
 const { CONFIG, TIER_WEIGHTS, normalizeTier, round } = require('./config');
 const { CWUCalculator, RewardEngine, verifyQuality, epochEmission, epochIndex, omega } = require('./economics');
-const { CumulativeLedger, epochState, releasedFor, bumpEpoch } = require('./ledger');
+const { CumulativeLedger, receiptPayload, epochState, releasedFor, bumpEpoch } = require('./ledger');
+const { getGenesisHash, receiptPayloadV2, computeReceiptHash, verifyWorkerDagChain } = require('./dag-chain');
 const LLM = require('./llm-adapter');
 
 // ===== Configuration =====
@@ -371,6 +372,91 @@ ensureColumn('adapters', 'deleted_at', 'deleted_at TEXT');
  * чтобы чек оставался самодостаточным: состояние реестра может измениться
  * позже. В подписываемый payload не входит. */
 ensureColumn('work_receipts', 'adapterDeletedAt', 'adapterDeletedAt TEXT');
+
+/* ===== DAG-сцепка чеков: поля, бэкфилл, уникальные индексы =====
+ * Спека Gemini предлагает ALTER TABLE receipts — такой таблицы нет (в коде
+ * work_receipts), и UNIQUE INDEX сразу после ALTER не создаётся: у всех
+ * существующих строк workerSeq=1 по умолчанию, а воркеров с 2+ чеками — 32.
+ * Проверено на копии живой БД. Поэтому порядок такой: колонки → бэкфилл
+ * детерминированной цепи → только потом UNIQUE INDEX.
+ *
+ * Чеки НЕ перевыпускаются: payloadVersion=1 остаётся у истории, её подписи
+ * уже наложены на старую строку. Расширение подписываемой строки обнулило бы
+ * все 682 подписи (проверено: было 682/682 валидных, стало бы 0/682). */
+ensureColumn('work_receipts', 'workerSeq', 'workerSeq INTEGER');
+ensureColumn('work_receipts', 'prevReceiptHash', 'prevReceiptHash TEXT');
+ensureColumn('work_receipts', 'cumulativeCwu', 'cumulativeCwu REAL');
+ensureColumn('work_receipts', 'cumulativeTar', 'cumulativeTar REAL');
+ensureColumn('work_receipts', 'receiptHash', 'receiptHash TEXT');
+ensureColumn('work_receipts', 'payloadVersion', 'payloadVersion INTEGER DEFAULT 1');
+
+/* Бэкфилл цепи для чеков, выпущенных до сцепки. Детерминирован: порядок — по
+ * глобальному seq внутри воркера, старт — от генезис-хеша. Хеш исторического
+ * чека считается по СТАРОЙ (v1) строке: она и подписывалась.
+ *
+ * Идемпотентность: обрабатываются только строки с workerSeq IS NULL, поэтому
+ * повторный старт не переписывает уже сцепленные чеки. */
+function backfillReceiptChain() {
+  const rows = db.prepare(
+    `SELECT seq, workerAddress, cwu, rewardTar, cumulativeTotal, burnTar, treasuryTar,
+            royaltyTar, epoch, timestamp, prevSignature
+       FROM work_receipts WHERE workerSeq IS NULL ORDER BY seq`,
+  ).all();
+  if (rows.length === 0) return 0;
+
+  /* Последнее известное состояние цепи по каждому воркеру: если часть чеков
+   * уже сцеплена, продолжаем от их головы, а не с нуля. */
+  const heads = new Map();
+  for (const h of db.prepare(
+    `SELECT workerAddress, workerSeq, receiptHash, cumulativeCwu, cumulativeTar
+       FROM work_receipts WHERE workerSeq IS NOT NULL`,
+  ).all()) {
+    heads.set(h.workerAddress, h);
+  }
+
+  const upd = db.prepare(
+    `UPDATE work_receipts
+        SET workerSeq = ?, prevReceiptHash = ?, cumulativeCwu = ?, cumulativeTar = ?,
+            receiptHash = ?, payloadVersion = 1
+      WHERE seq = ?`,
+  );
+
+  let touched = 0;
+  for (const r of rows) {
+    const head = heads.get(r.workerAddress);
+    const workerSeq = head ? Number(head.workerSeq) + 1 : 1;
+    const prevReceiptHash = head && head.receiptHash
+      ? String(head.receiptHash)
+      : getGenesisHash(r.workerAddress);
+    const cumulativeCwu = round((head ? Number(head.cumulativeCwu || 0) : 0) + Number(r.cwu));
+    const cumulativeTar = round((head ? Number(head.cumulativeTar || 0) : 0) + Number(r.rewardTar));
+
+    /* Хеш по v1-строке: именно её подписывал шлюз. */
+    const v1 = receiptPayload({
+      seq: r.seq, workerAddress: r.workerAddress,
+      cwu: Number(r.cwu), rewardTar: Number(r.rewardTar),
+      cumulativeTotal: Number(r.cumulativeTotal),
+      burnTar: Number(r.burnTar), treasuryTar: Number(r.treasuryTar),
+      royaltyTar: Number(r.royaltyTar),
+      epoch: r.epoch, timestamp: r.timestamp,
+      prevSignature: r.prevSignature || '',
+    });
+    const receiptHash = crypto.createHash('sha256').update(v1, 'utf8').digest('hex');
+
+    upd.run(workerSeq, prevReceiptHash, cumulativeCwu, cumulativeTar, receiptHash, r.seq);
+    heads.set(r.workerAddress, { workerAddress: r.workerAddress, workerSeq, receiptHash, cumulativeCwu, cumulativeTar });
+    touched++;
+  }
+  return touched;
+}
+
+const backfilled = backfillReceiptChain();
+
+/* Уникальные индексы — на уровне движка, а не только на словах: два чека с
+ * одним workerSeq или с одной ссылкой на предыдущий означали бы форк цепи
+ * (double-spend). SQLite откажет во вставке сам. */
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_worker_seq ON work_receipts (workerAddress, workerSeq)');
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_prev_hash ON work_receipts (workerAddress, prevReceiptHash)');
 
 /* Счёт казны существует с самого старта, а не только после первого
  * начисления: иначе /balance/<treasury> отдаёт 404 на чистой базе. */
@@ -1300,6 +1386,53 @@ app.get('/receipt/:worker', (req, res) => {
 app.get('/receipts/:worker', (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
   res.json(ledger.history(req.params.worker, limit));
+});
+
+/* Аудит DAG-цепи воркера.
+ * Проверяет генезис-якорь, непрерывность workerSeq, сцепку prevReceiptHash,
+ * сходимость нарастающих итогов и каждую подпись Ed25519. Отдаёт 200 и при
+ * провале — «цепь битая» это результат проверки, а не ошибка запроса;
+ * клиент должен увидеть, ГДЕ именно рвётся, а не голый 500.
+ *
+ * Цепь читается по workerSeq, а не по seq: seq глобальный и между чеками
+ * одного воркера вклиниваются чужие. */
+app.get('/receipt/:worker/audit', (req, res) => {
+  const worker = req.params.worker;
+  const rows = all(
+    `SELECT * FROM work_receipts WHERE workerAddress = ? AND workerSeq IS NOT NULL
+      ORDER BY workerSeq ASC`,
+    [worker],
+  );
+
+  /* Воркер без чеков — не ошибка: цепь пуста и тривиально цела. */
+  if (rows.length === 0) {
+    return res.json({
+      workerAddress: worker,
+      valid: true,
+      checkedCount: 0,
+      headHash: null,
+      genesisHash: getGenesisHash(worker),
+      totalCumulativeTar: 0,
+      note: 'нет выпущенных чеков',
+    });
+  }
+
+  const result = verifyWorkerDagChain(rows, {
+    verifyFn: verifyPayload,
+    publicKeyPem: GATEWAY.publicKeyPem,
+    receiptPayloadV1: receiptPayload,
+  });
+
+  res.json({
+    workerAddress: worker,
+    genesisHash: getGenesisHash(worker),
+    ...result,
+    /* Сколько чеков в цепи ещё на старой версии подписи: их сцепка
+     * восстановлена бэкфиллом и подписью не покрыта. Честно показываем,
+     * а не выдаём всю цепь за криптографически полную. */
+    legacyUnsignedLinks: rows.filter(r => Number(r.payloadVersion || 1) < 2).length,
+    signedLinks: rows.filter(r => Number(r.payloadVersion || 1) >= 2).length,
+  });
 });
 
 /* Локальная проверка чека: клиент присылает чек, сервер ничего не досчитывает.

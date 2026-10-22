@@ -22,6 +22,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
+const dag = require('./dag-chain');
 
 /* Флаг --test поднимает собственный изолированный сервер на временной БД и
  * свободном порту. Позиционный аргумент (URL) сохраняется для прогона против
@@ -757,6 +758,108 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     { bt1: { status: bt1.status, seqs: seqs1, error: bt1.body?.error, details: bt1.body?.details },
       bt2: { status: bt2.status, seqs: seqs2, error: bt2.body?.error, details: bt2.body?.details },
       overlap });
+
+  // ---------- 8.13. DAG-сцепка чеков ----------
+  section('8.13. DAG-сцепка: workerSeq, prevReceiptHash, аудит цепи');
+  const dagW = runAddress('dag');
+  /* Воркер обязан быть зарегистрирован: без ноды /work отвечает 400
+   * «Unknown worker node», и весь блок молча получал receipt: null. */
+  await api('/node', 'POST', { address: dagW, stake: 50000, reputation: 0.9 });
+  const dagReceipts = [];
+  for (let i = 1; i <= 3; i++) {
+    const r = await api('/work', 'POST', {
+      workerAddress: dagW, tokens: 2000000, tier: 'base', actionId: runId(`dag-${i}`),
+    });
+    dagReceipts.push(r.body?.receipt);
+  }
+  ok('три чека подряд дают workerSeq 1,2,3',
+    dagReceipts.map(r => r?.workerSeq).join(',') === '1,2,3',
+    dagReceipts.map(r => r?.workerSeq));
+
+  /* Сцепка проверяется по двум осям сразу: первый чек опирается на генезис,
+   * каждый следующий — на хеш содержимого предыдущего. Версия payload важна:
+   * только во второй версии сцепка входит в подпись. */
+  ok('prevReceiptHash: первый — генезис, следующие — хеш предыдущего',
+    dagReceipts[0]?.prevReceiptHash === dag.getGenesisHash(dagW)
+      && dagReceipts[1]?.prevReceiptHash === dagReceipts[0]?.receiptHash
+      && dagReceipts[2]?.prevReceiptHash === dagReceipts[1]?.receiptHash,
+    dagReceipts.map(r => ({ wSeq: r?.workerSeq, prev: (r?.prevReceiptHash || '').slice(0, 10) })));
+
+  ok('новые чеки подписаны payloadVersion 2 (сцепка внутри подписи)',
+    dagReceipts.every(r => r?.payloadVersion === 2),
+    dagReceipts.map(r => r?.payloadVersion));
+
+  const dagAudit = await api(`/receipt/${dagW}/audit`);
+  ok('аудит цепи из 3 чеков: valid, 3 подписи проверены',
+    dagAudit.body?.valid === true
+      && dagAudit.body?.checkedCount === 3
+      && dagAudit.body?.signedLinks === 3
+      && dagAudit.body?.legacyUnsignedLinks === 0,
+    dagAudit.body);
+
+  /* Батчинг не должен двигать цепь. Работа без чека (в очереди ИЛИ
+   * отклонённая по качеству) не имеет права увеличить workerSeq: иначе номер
+   * чека зависел бы от того, сколько мелких работ накопилось. Проверяем оба
+   * исхода, потому что спот-чек сэмплируется случайно и тест не должен
+   * зависать от броска монеты. */
+  const auditBefore = await api(`/receipt/${dagW}/audit`);
+  const small = await api('/work', 'POST', {
+    workerAddress: dagW, tokens: 5, tier: 'base', actionId: runId('dag-small'),
+  });
+  const auditAfter = await api(`/receipt/${dagW}/audit`);
+  ok('работа без чека не двигает workerSeq (батчинг/отказ)',
+    (small.body?.queued === true || small.body?.rejected === true)
+      && small.body?.receipt === null
+      && auditAfter.body?.checkedCount === auditBefore.body?.checkedCount,
+    { queued: small.body?.queued, rejected: small.body?.rejected,
+      before: auditBefore.body?.checkedCount, after: auditAfter.body?.checkedCount });
+
+  /* ---------- Юнит-тесты верификатора ----------
+   * Собираем цепь собственным ключом: так проверяется сама логика сцепки,
+   * а не то, что сервер о ней думает. */
+  const unitKey = crypto.generateKeyPairSync('ed25519');
+  const unitPem = unitKey.publicKey.export({ type: 'spki', format: 'pem' });
+  const unitSign = (p) => crypto.sign(null, Buffer.from(p, 'utf8'), unitKey.privateKey).toString('base64');
+  const unitVerify = (p, s, pem) => {
+    try { return crypto.verify(null, Buffer.from(p, 'utf8'), pem, Buffer.from(s, 'base64')); }
+    catch (_e) { return false; }
+  };
+  const unitChain = [];
+  let unitPrev = dag.getGenesisHash('0xunit-worker');
+  let unitCwu = 0, unitTar = 0;
+  for (let i = 1; i <= 3; i++) {
+    unitCwu = Number((unitCwu + 1000).toFixed(6));
+    unitTar = Number((unitTar + 1).toFixed(6));
+    const base = {
+      seq: i, workerAddress: '0xunit-worker', cwu: 1000, rewardTar: 1,
+      cumulativeTotal: unitTar, burnTar: 0, treasuryTar: 0, royaltyTar: 0,
+      epoch: 1, timestamp: 1000 + i, prevSignature: '',
+      workerSeq: i, prevReceiptHash: unitPrev,
+      cumulativeCwu: unitCwu, cumulativeTar: unitTar,
+    };
+    const payload = dag.receiptPayloadV2(base);
+    const receiptHash = crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
+    unitChain.push({ ...base, receiptHash, payloadVersion: 2, signature: unitSign(payload) });
+    unitPrev = receiptHash;
+  }
+  const unitOpts = { verifyFn: unitVerify, publicKeyPem: unitPem, receiptPayloadV1: (r) => 'v1|' + r.seq };
+
+  const unitGood = dag.verifyWorkerDagChain(unitChain, unitOpts);
+  ok('юнит: корректная цепь из 3 чеков проходит аудит',
+    unitGood.valid === true && unitGood.checkedCount === 3, unitGood);
+
+  const unitTampered = JSON.parse(JSON.stringify(unitChain));
+  unitTampered[1].prevReceiptHash = 'f'.repeat(64);
+  const unitTamperedRes = dag.verifyWorkerDagChain(unitTampered, unitOpts);
+  ok('юнит: подмена prevReceiptHash в середине цепи ловится',
+    unitTamperedRes.valid === false && unitTamperedRes.error === 'BROKEN_PREV_HASH_LINK',
+    unitTamperedRes);
+
+  const unitGap = JSON.parse(JSON.stringify(unitChain));
+  unitGap[2].workerSeq = 7;
+  const unitGapRes = dag.verifyWorkerDagChain(unitGap, unitOpts);
+  ok('юнит: пропуск workerSeq ловится',
+    unitGapRes.valid === false && unitGapRes.error === 'SEQ_GAP', unitGapRes);
 
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
