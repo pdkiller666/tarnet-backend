@@ -46,40 +46,61 @@ function freePort() {
   });
 }
 
-async function startIsolatedServer() {
+/* Поднимает изолированный сервер и возвращает дескриптор с собственными
+ * base/child/tmpDir. Дескрипторный вид нужен, потому что тестам нулевых
+ * начислений требуется сервер с другим окружением (INITIAL_BLOCK_REWARD=0),
+ * а не тот, на котором идёт остальная приёмка: менять окружение у живого
+ * сервера нельзя, его можно только перезапустить. */
+async function spawnServer(envOverrides = {}) {
   const port = await freePort();
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-test-'));
-  const dbPath = path.join(tmpDir, 'test.db');
-  const secretsDir = path.join(tmpDir, 'secrets');
-
-  child = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-test-'));
+  const proc = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
     cwd: __dirname,
     env: {
       ...process.env,
       PORT: String(port),
-      TARNET_DB: dbPath,
-      TARNET_SECRETS_DIR: secretsDir,
+      TARNET_DB: path.join(dir, 'test.db'),
+      TARNET_SECRETS_DIR: path.join(dir, 'secrets'),
+      ...envOverrides,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
   let out = '';
-  child.stdout.on('data', (d) => { out += d.toString(); });
-  child.stderr.on('data', (d) => { out += d.toString(); });
+  proc.stdout.on('data', (d) => { out += d.toString(); });
+  proc.stderr.on('data', (d) => { out += d.toString(); });
 
   const base = `http://127.0.0.1:${port}`;
+  const stop = () => {
+    if (proc.exitCode === null) {
+      try { proc.kill('SIGTERM'); } catch (_e) { /* уже мёртв */ }
+    }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_e) { /* занято */ }
+  };
+
   const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) {
-      throw new Error(`сервер упал при старте (код ${child.exitCode}):\n${out.slice(-800)}`);
+    if (proc.exitCode !== null) {
+      stop();
+      throw new Error(`сервер упал при старте (код ${proc.exitCode}):\n${out.slice(-800)}`);
     }
     try {
       const r = await fetch(base + '/health');
-      if (r.ok) return base;
+      if (r.ok) return { base, proc, dir, stop };
     } catch (_e) { /* ещё не слушает */ }
     await new Promise((r) => setTimeout(r, 150));
   }
+  stop();
   throw new Error(`сервер не поднялся за 20 с:\n${out.slice(-800)}`);
+}
+
+/* Основной сервер приёмки: его дескриптор живёт в глобальных child/tmpDir,
+ * чтобы process.on('exit') мог его прибрать. */
+async function startIsolatedServer() {
+  const h = await spawnServer();
+  child = h.proc;
+  tmpDir = h.dir;
+  return h.base;
 }
 
 function stopIsolatedServer() {
@@ -110,8 +131,8 @@ function ok(name, cond, detail) {
 }
 function section(t) { console.log(`\n${t}`); }
 
-async function api(path, method = 'GET', body) {
-  const res = await fetch(BASE + path, {
+async function apiAt(base, path, method = 'GET', body) {
+  const res = await fetch(base + path, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
@@ -120,6 +141,12 @@ async function api(path, method = 'GET', body) {
   const text = await res.text();
   try { json = text ? JSON.parse(text) : null; } catch (_e) { json = text; }
   return { status: res.status, body: json };
+}
+
+/* Приёмка идёт против основного сервера; apiAt нужен там, где проверяется
+ * второй сервер с другим окружением. */
+async function api(path, method = 'GET', body) {
+  return apiAt(BASE, path, method, body);
 }
 
 /* Уникальный суффикс прогона: адреса и actionId не должны пересекаться с
@@ -426,6 +453,88 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   const wcHist = await api(`/receipts/${wC}`);
   ok('у воркера ровно один чек за 10 коротких работ',
     Array.isArray(wcHist.body) && wcHist.body.length === 1, wcHist.body?.length);
+
+  /* ---------- 8.9. Нулевое начисление при достигнутом пороге ----------
+  section('8.9. Нулевое начисление: чек не выпускается, работа копится');
+  /* Отдельный сервер, потому что сценарий требует другого окружения:
+   * bootstrap отключает fee-поток, INITIAL_BLOCK_REWARD=0 обнуляет эмиссию.
+   * На основном сервере (hybrid + живая эмиссия) получить fee=0 и block=0
+   * при γ=1 можно только сломав его конфиг, то есть нечестно. */
+  const zero = await spawnServer({ REWARD_MODE: 'bootstrap', INITIAL_BLOCK_REWARD: '0' });
+  try {
+    const wZ = runAddress('z');
+    await apiAt(zero.base, '/node', 'POST', { address: wZ, stake: 60000, reputation: 0.9 });
+    const beforeZ = await apiAt(zero.base, `/receipts/${wZ}`);
+
+    const r1 = await apiAt(zero.base, '/work', 'POST', {
+      workerAddress: wZ, tokens: 100, tier: 'base', response: 'zero payout work',
+    });
+    /* Вторая работа обязана прибавиться к накопленному: иначе «работа не
+     * потеряна» было бы неправдой — токены просто исчезли бы. */
+    const r2 = await apiAt(zero.base, '/work', 'POST', {
+      workerAddress: wZ, tokens: 7, tier: 'base', response: 'zero payout more',
+    });
+
+    const histZ = await apiAt(zero.base, `/receipts/${wZ}`);
+    const sumZ = await apiAt(zero.base, '/summary');
+    const receiptsZ = Array.isArray(histZ.body) ? histZ.body : [];
+    console.log(`  … A1: HTTP ${r1.status} reason=${r1.body?.reason} pending=${r1.body?.pending_work} receipt=${JSON.stringify(r1.body?.receipt)}`);
+    console.log(`  … A2: HTTP ${r2.status} pending=${r2.body?.pending_work} | чеков у воркера: ${receiptsZ.length}`);
+    console.log(`  … conservation: ${JSON.stringify(sumZ.body?.conservation)}`);
+
+    ok('γ=1 при нулевой эмиссии: 202 below_min_payout, чек не создан, токены накоплены',
+      r1.status === 202 && r1.body?.queued === true && r1.body?.reason === 'below_min_payout'
+        && r1.body?.pending_work === 100 && r1.body?.receipt === null
+        && r2.status === 202 && r2.body?.pending_work === 107
+        && receiptsZ.length === 0
+        && (Array.isArray(beforeZ.body) ? beforeZ.body.length : 0) === 0
+        && sumZ.body?.conservation?.delta === 0,
+      { r1: r1.body, r2: r2.body, receipts: receiptsZ.length, conservation: sumZ.body?.conservation });
+  } finally {
+    zero.stop();
+  }
+
+  /* ---------- 8.10. Провал качества не оплачивается и не копится ---------- */
+  section('8.10. Провал качества: 422 quality_rejected, провал НЕ копится');
+  const wQ = runAddress('q');
+  await api('/node', 'POST', { address: wQ, stake: 60000, reputation: 0.9 });
+
+  /* actionId сервер выводит сам из полей работы, поэтому нельзя задать
+   * «удобный» бакет напрямую: подбираем response, чей производный id попадает
+   * в 5% spot-check, и проваливает проверку (response из пробелов непуст по
+   * типу, но пуст по существу). Передаём тот же id в actionId — тест останется
+   * верным и после починки игнорируемого actionId. */
+  const deriveId = (resp) => crypto.createHash('sha256')
+    .update(`${wQ}::100:base::${resp}`).digest('hex').slice(0, 32);
+  let respFail = null;
+  let idFail = null;
+  for (let n = 1; n <= 5000 && !respFail; n++) {
+    const cand = ' '.repeat(n);
+    const id = deriveId(cand);
+    const bucket = crypto.createHash('sha256').update(id).digest().readUInt32BE(0) % 100;
+    if (bucket < 5) { respFail = cand; idFail = id; }
+  }
+  const rej = await api('/work', 'POST', {
+    workerAddress: wQ, tokens: 100, tier: 'base', response: respFail, actionId: idFail,
+  });
+  /* Следующая работа того же воркера: если провал попал в накопление, здесь
+   * оказалось бы 105 вместо 5 — и следующий чек оплатил бы провал. */
+  const afterRej = await api('/work', 'POST', {
+    workerAddress: wQ, tokens: 5, tier: 'base', response: 'после отказа',
+  });
+  const histQ = await api('/receipts/' + wQ);
+  const receiptsQ = Array.isArray(histQ.body) ? histQ.body : [];
+  console.log(`  … B: HTTP ${rej.status} reason=${rej.body?.reason} gamma=${rej.body?.quality?.gamma} sampled=${rej.body?.quality?.sampled} queued=${rej.body?.queued}`);
+  console.log(`  … после отказа: pending=${afterRej.body?.pending_work} (ожидаем 5, не 105) | чеков: ${receiptsQ.length}`);
+
+  ok('γ=0: 422 quality_rejected, чека нет и провал не попал в pending_work',
+    respFail !== null
+      && rej.status === 422 && rej.body?.reason === 'quality_rejected'
+      && rej.body?.quality?.gamma === 0 && rej.body?.quality?.sampled === true
+      && rej.body?.queued === false && rej.body?.receipt === null
+      && afterRej.body?.pending_work === 5
+      && receiptsQ.length === 0,
+    { rejected: rej.body, after: afterRej.body, receipts: receiptsQ.length });
 
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
