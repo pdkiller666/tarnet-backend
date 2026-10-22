@@ -1032,6 +1032,43 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+/* ===== PWA и загрузка воркера — ДО rate limiter =====
+ * Почему порядок важен: страница тянет 5 файлов (html, css, js, manifest,
+ * иконка) плюс дальше идут запросы к API. При лимите 10/мин одна загрузка
+ * съедала бы половину окна, и первый же вопрос в чате получал бы 429.
+ * Статика — не работа сети, её считаем бесплатной; API остаётся под лимитом. */
+const APP_DIR = path.join(__dirname, 'app');
+
+/* Без завершающего слеша относительные ссылки внутри index.html
+ * (styles.css, app.js) разрешались бы от корня и давали 404.
+ * Регулярка, а не строка: Express без strict routing считает '/app' и
+ * '/app/' одним путём, и строковый маршрут перехватывал бы '/app/',
+ * зацикливая редирект (проверено: '/app/' отдавал 308 вместо 200). */
+app.get(/^\/app$/, (_req, res) => res.redirect(308, '/app/'));
+app.use('/app', express.static(APP_DIR, {
+  // index.html отдаётся как /app/, остальное — по именам.
+  index: 'index.html',
+  // PWA обновляется вместе с сервером; кеш на час скрывал бы новые сборки.
+  maxAge: '1h',
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('manifest.webmanifest')) {
+      res.setHeader('Content-Type', 'application/manifest+json');
+    }
+  },
+}));
+
+/* Скачивание воркера одной кнопкой. Content-Disposition: attachment — иначе
+ * браузер откроет .js как текст, а не сохранит файл. */
+app.get('/download/worker.js', (_req, res) => {
+  const file = path.join(__dirname, 'worker-demo.js');
+  if (!fs.existsSync(file)) {
+    return res.status(404).json({ error: 'worker-demo.js not found on server' });
+  }
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="tarnet-worker.js"');
+  res.sendFile(file);
+});
+
 /* ===== Rate limiting (in-memory, без внешних пакетов) =====
  * 10 запросов в минуту с одного IP по умолчанию (RATE_LIMIT_MAX/WINDOW_MS).
  * Сервер стоит за Caddy, поэтому доверяем ТОЛЬКО loopback: реальный адрес

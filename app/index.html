@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TarNet — Synapse</title>
+<meta name="theme-color" content="#0b0e14">
+<meta name="description" content="TarNet: приватный инференс на распределённой сети">
+<link rel="manifest" href="/app/manifest.webmanifest">
+<link rel="icon" href="/app/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/app/icon.svg">
+<link rel="stylesheet" href="/app/styles.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+      <circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="2"/>
+      <circle cx="16" cy="16" r="4" fill="currentColor"/>
+      <circle cx="16" cy="5" r="2.2" fill="currentColor"/>
+      <circle cx="27" cy="16" r="2.2" fill="currentColor"/>
+    </svg>
+    <div>
+      <h1>TarNet <span class="dim">/ Synapse</span></h1>
+      <p class="sub" id="modeLine">проверяю режим…</p>
+    </div>
+  </div>
+  <button id="installBtn" class="ghost" hidden>Установить</button>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab active" role="tab" data-tab="chat" aria-selected="true">💬 Synapse Chat</button>
+  <button class="tab" role="tab" data-tab="devices" aria-selected="false">📱 Мои устройства</button>
+</nav>
+
+<main>
+  <!-- ================= ЧАТ ================= -->
+  <section id="tab-chat" class="panel">
+    <div class="controls">
+      <label class="field">
+        <span>Адаптер</span>
+        <select id="adapter"><option value="">загружаю…</option></select>
+      </label>
+      <label class="field">
+        <span>Контур</span>
+        <select id="contour">
+          <option value="private">🔒 Private (промпт не уходит наружу)</option>
+        </select>
+      </label>
+    </div>
+
+    <div id="chatLog" class="chat-log" aria-live="polite">
+      <div class="empty">Спросите что-нибудь. Под каждым ответом появится подписанный чек.</div>
+    </div>
+
+    <form id="chatForm" class="composer">
+      <textarea id="prompt" rows="2" placeholder="Ваш запрос… (Enter — отправить, Shift+Enter — новая строка)" maxlength="65536"></textarea>
+      <button type="submit" id="sendBtn">Отправить</button>
+    </form>
+    <p class="hint" id="chatHint"></p>
+  </section>
+
+  <!-- ================= УСТРОЙСТВА ================= -->
+  <section id="tab-devices" class="panel" hidden>
+    <div class="card">
+      <h2>Баланс</h2>
+      <p class="balance"><span id="balanceVal">—</span> <span class="unit">TAR</span></p>
+      <p class="mono dim" id="walletAddr">кошелёк: —</p>
+      <button id="refreshBal" class="ghost small">Обновить</button>
+    </div>
+
+    <div class="card">
+      <h2>Воркер для ПК</h2>
+      <p class="dim">Скрипт забирает задачи, считает моделью и возвращает результат. Нужен для режима <code>worker</code>.</p>
+      <a class="btn" href="/download/worker.js" download>⬇ Скачать worker.js</a>
+    </div>
+
+    <div class="card">
+      <h2>Nano-node в браузере</h2>
+      <p class="dim">Пока вкладка открыта, устройство раз в 10 секунд отправляет короткую работу. Токены копятся в <code>pending_work</code> — это демонстрация участия, а не полноценный инференс.</p>
+      <button id="nanoBtn" class="btn">▶ Включить Nano-Node</button>
+      <p class="mono dim" id="nanoAddr">—</p>
+      <div class="log" id="nanoLog"></div>
+    </div>
+  </section>
+</main>
+
+<script src="/app/app.js"></script>
+</body>
+</html>

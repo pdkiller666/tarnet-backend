@@ -1,0 +1,14 @@
+{
+  "name": "TarNet — Synapse",
+  "short_name": "TarNet",
+  "description": "Приватный инференс на распределённой сети TarNet",
+  "start_url": "/app/",
+  "scope": "/app/",
+  "display": "standalone",
+  "background_color": "#0b0e14",
+  "theme_color": "#0b0e14",
+  "lang": "ru",
+  "icons": [
+    { "src": "/app/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

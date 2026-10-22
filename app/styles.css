@@ -1,0 +1,234 @@
+/* TarNet PWA — тёмная тема, один файл, без внешних зависимостей.
+ * Всё на системных шрифтах: PWA грузится с VPS, лишний сетевой запрос
+ * к Google Fonts означал бы, что страница не работает без интернета. */
+
+:root {
+  --bg: #0b0e14;
+  --panel: #131823;
+  --panel-2: #1a2130;
+  --border: #263045;
+  --text: #e6ebf5;
+  --muted: #8b97ad;
+  --accent: #4f9cf9;
+  --accent-fg: #06101f;
+  --ok: #37d67a;
+  --warn: #f5a524;
+  --danger: #f2555a;
+  --radius: 12px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* iOS: safe-area, иначе контент уезжает под чёлку и домашнюю полоску */
+body {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  padding-bottom: calc(env(safe-area-inset-bottom) + 16px);
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px 10px;
+}
+
+.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.logo { width: 30px; height: 30px; color: var(--accent); flex: 0 0 auto; }
+
+h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+.sub { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+.dim { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+
+.tabs {
+  display: flex;
+  gap: 6px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 5;
+}
+
+.tab {
+  flex: 1;
+  padding: 11px 8px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: color .15s ease, border-color .15s ease;
+}
+.tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+main { padding: 12px; max-width: 860px; margin: 0 auto; }
+.panel { display: flex; flex-direction: column; gap: 12px; }
+
+.controls { display: flex; gap: 10px; flex-wrap: wrap; }
+.field { flex: 1 1 180px; display: flex; flex-direction: column; gap: 4px; }
+.field > span { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+
+select, textarea, button { font: inherit; color: inherit; }
+
+select {
+  width: 100%;
+  padding: 9px 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  appearance: none;
+}
+select:focus-visible, textarea:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.chat-log {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 220px;
+  max-height: 55vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.empty {
+  color: var(--muted);
+  font-size: 14px;
+  text-align: center;
+  padding: 40px 20px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+
+.msg { display: flex; flex-direction: column; gap: 6px; }
+.msg.user { align-items: flex-end; }
+.msg.user .bubble {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-radius: var(--radius) var(--radius) 4px var(--radius);
+  font-weight: 500;
+}
+.msg.bot .bubble {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius) var(--radius) var(--radius) 4px;
+}
+.bubble {
+  padding: 10px 12px;
+  max-width: min(88%, 620px);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* Чек под ответом: моноширинный блок, читается как распечатка */
+.receipt {
+  max-width: min(88%, 620px);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+.receipt .row { display: flex; justify-content: space-between; gap: 10px; }
+.receipt .row b { color: var(--text); font-weight: 600; }
+.receipt .sig-ok { color: var(--ok); }
+.receipt .sig-bad { color: var(--danger); }
+.receipt .queued { color: var(--warn); }
+
+.composer { display: flex; gap: 8px; align-items: flex-end; }
+textarea {
+  flex: 1;
+  resize: none;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  max-height: 140px;
+  min-height: 44px;
+}
+
+button, .btn {
+  padding: 10px 16px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  border: none;
+  border-radius: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+  text-align: center;
+}
+button:disabled { opacity: .5; cursor: not-allowed; }
+.ghost {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-weight: 500;
+}
+.ghost.small { padding: 6px 12px; font-size: 13px; }
+.btn { background: var(--accent); color: var(--accent-fg); }
+
+.hint { font-size: 12px; color: var(--muted); margin: 0; min-height: 16px; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+}
+.card h2 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+.card p { margin: 0 0 10px; font-size: 13px; }
+.balance { font-size: 28px; font-weight: 650; letter-spacing: -0.02em; margin: 0 0 4px !important; }
+.balance .unit { font-size: 14px; color: var(--muted); font-weight: 500; }
+
+.log {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  max-height: 150px;
+  overflow-y: auto;
+  margin-top: 8px;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: .92em;
+  background: var(--panel-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+/* Телефон: кнопки на всю ширину, таблетки не ломаются */
+@media (max-width: 520px) {
+  .composer { flex-direction: column; align-items: stretch; }
+  .composer button { width: 100%; }
+  .bubble, .receipt { max-width: 100%; }
+  .controls { flex-direction: column; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
