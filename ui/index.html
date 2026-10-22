@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TarNet — нейросеть на обычных компьютерах</title>
+<style>
+  :root {
+    --bg: #0a0e14; --panel: #11161f; --panel2: #161d29; --border: #212b3a;
+    --text: #e8eef6; --muted: #8fa1b8; --accent: #4fd1c5; --accent2: #7c9cff;
+    --ok: #3fb950; --warn: #e3b341; --danger: #f85149;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 20px 80px;
+    background: radial-gradient(1100px 600px at 15% -10%, #14202e 0%, var(--bg) 55%);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.65; -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+
+  /* ---------- Hero ---------- */
+  header { padding: 64px 0 40px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--accent); background: rgba(79,209,197,.09);
+    border: 1px solid rgba(79,209,197,.25); padding: 5px 12px; border-radius: 100px;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+  h1 {
+    font-size: clamp(30px, 5.2vw, 46px); line-height: 1.18; margin: 22px 0 16px;
+    letter-spacing: -.02em; font-weight: 700;
+  }
+  h1 .grad {
+    background: linear-gradient(96deg, var(--accent) 10%, var(--accent2) 90%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .lead { font-size: 18px; color: var(--muted); margin: 0 0 8px; max-width: 660px; }
+
+  /* ---------- Sections ---------- */
+  section { margin: 56px 0; }
+  h2 { font-size: 24px; margin: 0 0 8px; letter-spacing: -.01em; }
+  h2 .num {
+    font-size: 13px; color: var(--accent); border: 1px solid rgba(79,209,197,.3);
+    border-radius: 8px; padding: 2px 8px; margin-right: 10px; vertical-align: 3px; font-weight: 600;
+  }
+  .sub { color: var(--muted); margin: 0 0 22px; font-size: 15px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 24px;
+  }
+  .card + .card { margin-top: 14px; }
+
+  /* ---------- Flow ---------- */
+  .flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 10px; align-items: stretch; }
+  @media (max-width: 720px) { .flow { grid-template-columns: 1fr; } .arrow { transform: rotate(90deg); justify-self: center; } }
+  .step {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px 18px; text-align: center;
+  }
+  .step .ico { font-size: 28px; line-height: 1; margin-bottom: 10px; }
+  .step .t { font-weight: 650; margin-bottom: 6px; font-size: 15px; }
+  .step .d { font-size: 13.5px; color: var(--muted); line-height: 1.5; }
+  .arrow { display: flex; align-items: center; color: var(--border); font-size: 20px; }
+
+  /* ---------- Demo ---------- */
+  .demo { background: linear-gradient(180deg, var(--panel2) 0%, var(--panel) 100%); border-color: #24334a; }
+  .controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; margin-bottom: 20px; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 12.5px; color: var(--muted); font-weight: 500; }
+  select, input {
+    background: #0b1017; color: var(--text); border: 1px solid var(--border);
+    padding: 10px 12px; border-radius: 9px; font-size: 14px; font-family: inherit;
+  }
+  select:focus, input:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: linear-gradient(180deg, #5fe0d3, var(--accent)); color: #04120f;
+    border: none; padding: 12px 24px; border-radius: 9px;
+    font-size: 14.5px; font-weight: 700; cursor: pointer; font-family: inherit;
+    transition: transform .1s, opacity .15s;
+  }
+  button:hover:not(:disabled) { transform: translateY(-1px); }
+  button:disabled { opacity: .55; cursor: wait; }
+  button.ghost {
+    background: transparent; color: var(--accent); border: 1px solid var(--border);
+    font-weight: 600; padding: 10px 18px;
+  }
+
+  .result { display: none; margin-top: 4px; }
+  .result.on { display: block; animation: fade .35s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .bigres {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline;
+    padding: 18px 20px; background: rgba(79,209,197,.06);
+    border: 1px solid rgba(79,209,197,.22); border-radius: 12px; margin-bottom: 16px;
+  }
+  .bigres .v { font-size: 30px; font-weight: 700; color: var(--accent); letter-spacing: -.02em; }
+  .bigres .u { font-size: 15px; color: var(--muted); }
+  .bigres .cap { flex-basis: 100%; font-size: 14px; color: var(--text); }
+
+  .split { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .split .item {
+    background: #0b1017; border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px;
+  }
+  .split .k { font-size: 12.5px; color: var(--muted); margin-bottom: 3px; }
+  .split .val { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .item.fee .val { color: var(--accent); }
+  .item.worker .val { color: var(--ok); }
+  .item.burn .val { color: var(--warn); }
+  .item.treasury .val { color: var(--accent2); }
+  .item.royalty .val { color: #c98bff; }
+
+  /* ---------- Stats ---------- */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; text-align: center; }
+  .stat .v { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat .k { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+
+  /* ---------- Honest ---------- */
+  .honest { border-left: 3px solid var(--warn); background: rgba(227,179,65,.05); }
+  .fiat {
+    margin-top: 16px; padding: 14px 16px; border-radius: 12px;
+    background: rgba(63,185,80,.06); border: 1px solid rgba(63,185,80,.25);
+  }
+  .fiat .main { font-size: 17px; font-weight: 600; color: var(--ok); }
+  .fiat .main .u { font-size: 13.5px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+  .fiat .sub { font-size: 13px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
+  table.money { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 460px; }
+  table.money th, table.money td { text-align: right; padding: 9px 10px; border-bottom: 1px solid var(--border); }
+  table.money th:first-child, table.money td:first-child { text-align: left; }
+  table.money th { font-size: 11.5px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: .04em; }
+  table.money td { font-variant-numeric: tabular-nums; }
+  table.money tbody tr:last-child td { border-bottom: none; }
+  table.money tr.hi td { color: var(--ok); font-weight: 600; }
+  .tablewrap { overflow-x: auto; margin-top: 8px; }
+  .card h3 { margin: 0 0 10px; font-size: 16px; }
+  .split2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 10px; }
+  .mini { background: #0b1017; border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px; }
+  .mini .t { font-weight: 600; font-size: 14px; margin-bottom: 6px; }
+  .mini ul { margin: 0; padding-left: 18px; font-size: 13.5px; line-height: 1.6; color: #cfd9e6; }
+  .honest ul { margin: 10px 0 0; padding-left: 20px; }
+  .honest li { margin-bottom: 8px; font-size: 14.5px; color: #cfd9e6; }
+  .honest li b { color: var(--text); }
+
+  footer {
+    margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--border);
+    display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between;
+    align-items: center; font-size: 13.5px; color: var(--muted);
+  }
+  footer a { color: var(--accent2); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .err { color: var(--danger); font-size: 14px; margin-top: 10px; display: none; }
+  .err.on { display: block; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <span class="badge"><span class="dot"></span> <span id="liveBadge">сеть работает</span></span>
+    <h1>Нейросеть, которая работает<br>на <span class="grad">чужих компьютерах</span> —<br>и платит им за это</h1>
+    <p class="lead">
+      Обычный человек запускает приложение на своём компьютере. Пока он им не пользуется,
+      компьютер считает запросы других людей — и получает за каждый ответ деньги.
+      Без серверных залов, без посредников.
+    </p>
+  </header>
+
+  <section>
+    <h2><span class="num">1</span>В чём проблема сегодня</h2>
+    <p class="sub">Нейросети — это очень дорого. И очень централизованно.</p>
+    <div class="card">
+      Чтобы отвечать на вопросы, нужны мощные видеокарты. Они стоят как автомобиль, жрут электричество
+      и стоят в дата-центрах трёх корпораций. Поэтому:
+      <ul style="margin:12px 0 0; padding-left:20px; color:#cfd9e6; font-size:14.5px;">
+        <li>цена за один вопрос держится высокой — её диктует владелец серверов;</li>
+        <li>всё, что вы пишете, проходит через чужой компьютер и остаётся там;</li>
+        <li>миллионы домашних компьютеров простаивают без дела.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">2</span>Как это работает у нас</h2>
+    <p class="sub">Три шага. Ровно так же, как вы задаёте вопрос обычному чату — только исполнитель другой.</p>
+    <div class="flow">
+      <div class="step">
+        <div class="ico">💬</div>
+        <div class="t">Вы задаёте вопрос</div>
+        <div class="d">Приложение отправляет запрос в сеть. Запрос уходит напрямую исполнителю, минуя серверы компании.</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="step">
+        <div class="ico">💻</div>
+        <div class="t">Считает чужой компьютер</div>
+        <div class="d">Свободная машина рядом с вами генерирует ответ. Вы платите только за объём — за каждый токен текста.</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="step">
+        <div class="ico">💰</div>
+        <div class="t">Владелец получает оплату</div>
+        <div class="d">Деньги начисляются сразу и точно — по формуле, а не наугад. Сумма видна до начала работы.</div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px;">
+      <b style="font-size:15px;">Почему это выгодно всем</b>
+      <div class="split" style="margin-top:14px;">
+        <div class="item"><div class="k">Пользователю</div><div class="val" style="font-size:15px;">в разы дешевле</div></div>
+        <div class="item"><div class="k">Владельцу компьютера</div><div class="val" style="font-size:15px;">доход за простой</div></div>
+        <div class="item"><div class="k">Приватности</div><div class="val" style="font-size:15px;">текст не хранится</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">3</span>Вы одновременно и поставщик, и клиент</h2>
+    <p class="sub">Главное отличие от обычного майнинга: заработанное здесь же и тратится. Вы не выводите токен на биржу, чтобы купить подписку на ИИ — вы платите им внутри сети.</p>
+
+    <div class="card">
+      <div class="flow">
+        <div class="step">
+          <div class="ico">💻</div>
+          <div class="t">Ваша машина работает</div>
+          <div class="d">Простой компьютер считает чужие запросы и получает за это токены.</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="step">
+          <div class="ico">🪙</div>
+          <div class="t">Заработок остаётся у вас</div>
+          <div class="d">Токены лежат на вашем счёте внутри сети. Продавать их не обязательно.</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="step">
+          <div class="ico">💬</div>
+          <div class="t">Вы задаёте свои вопросы</div>
+          <div class="d">Те же токены уходят на ваши задачи: тексты, код, переводы, анализ.</div>
+        </div>
+      </div>
+
+      <div class="tablewrap" style="margin-top:18px;">
+        <table class="money" id="tblLoop"></table>
+      </div>
+
+      <p style="margin:12px 0 0; font-size:12.5px; color:var(--muted); line-height:1.55;">
+        Пример для обычного компьютера и объёма в 10 млн токенов. Считано по параметрам этого стенда:
+        цена $<span id="loopPrice">—</span> за миллион, курс 1 TAR = $<span id="loopRate">—</span>, комиссия сети <span id="loopFeePct">—</span>%.
+      </p>
+    </div>
+
+    <div class="card" style="margin-top:14px;">
+      <b style="font-size:15px;">Что здесь значит «условно бесплатно»</b>
+      <div class="split2" style="margin-top:12px;">
+        <div class="mini">
+          <div class="t" style="color:var(--ok);">Если вы и исполнитель, и заказчик</div>
+          <ul>
+            <li>Сеть забирает <b>5%</b> с каждого запроса — на сжигание и общий фонд.</li>
+            <li>Остальные <b>95%</b> достаются исполнителю, то есть в среднем тем же узлам сети.</li>
+            <li>Итог: круг замкнут, потеря — только эта комиссия.</li>
+          </ul>
+        </div>
+        <div class="mini">
+          <div class="t" style="color:var(--warn);">Почему пока не бесплатно</div>
+          <ul>
+            <li>Разницу сейчас покрывает <b>эмиссия</b> — новые токены за работу.</li>
+            <li>Эмиссия падает вдвое каждый год. Когда кончится, останется только скидка на комиссию.</li>
+            <li>Так что дешёвые запросы — это следствие роста сети, а не вечная гарантия.</li>
+          </ul>
+        </div>
+      </div>
+      <p style="margin:14px 0 0; padding:11px 13px; background:rgba(63,185,80,.07); border-left:3px solid var(--ok); border-radius:0 8px 8px 0; font-size:13.5px; color:#cfd9e6; line-height:1.6;">
+        Практический смысл: владельцу машины не нужно искать деньги на ИИ отдельно.
+        Заработал в простое — потратил на свои задачи. Пока сеть маленькая, это выгодно;
+        когда вырастет, цена определяется реальным спросом, а не субсидией.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">4</span>Попробуйте сами</h2>
+    <p class="sub">Это не картинка — кнопка делает настоящий запрос к работающей сети и показывает, как распределились деньги.</p>
+
+    <div class="card demo">
+      <div class="controls">
+        <div class="field">
+          <label>Сколько текста сгенерировать</label>
+          <select id="tokens">
+            <option value="1000000">1 млн токенов — короткий диалог</option>
+            <option value="10000000" selected>10 млн токенов — большая статья</option>
+            <option value="100000000">100 млн токенов — книга</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Кто выполняет работу</label>
+          <select id="tier">
+            <option value="nano">Слабый ноутбук (×0.1)</option>
+            <option value="base" selected>Обычный компьютер (×1)</option>
+            <option value="expert">Мощная видеокарта (×4)</option>
+          </select>
+        </div>
+        <button id="go">Отправить запрос в сеть →</button>
+      </div>
+
+      <div class="result" id="res">
+        <div class="bigres">
+          <span class="v" id="rReward">—</span><span class="u">TAR — оплата работы</span>
+          <span class="cap" id="rCaption"></span>
+        </div>
+        <div class="fiat" id="rFiat" style="display:none;">
+          <div class="main"><span id="rUsd">—</span> <span class="u">реальных денег от заказчика</span></div>
+          <div class="sub" id="rFiatNote"></div>
+        </div>
+        <div class="split">
+          <div class="item fee"><div class="k">Бонус из пула сети</div><div class="val" id="rBlock">—</div></div>
+          <div class="item worker"><div class="k">Итого владельцу</div><div class="val" id="rWorker">—</div></div>
+          <div class="item burn"><div class="k">Сжигается (дефляция)</div><div class="val" id="rBurn">—</div></div>
+          <div class="item treasury"><div class="k">В общий фонд сети</div><div class="val" id="rTreasury">—</div></div>
+          <div class="item royalty" id="royaltyItem" style="display:none;"><div class="k">Автору модели</div><div class="val" id="rRoyalty">—</div></div>
+        </div>
+        <p style="font-size:13px; color:var(--muted); margin:14px 0 0;" id="rNote"></p>
+      </div>
+      <div class="err" id="err"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">5</span>Что происходит прямо сейчас</h2>
+    <p class="sub">Живые цифры этого демо-стенда. Обновляются каждые 5 секунд.</p>
+    <div class="stats">
+      <div class="stat"><div class="v" id="sNodes">—</div><div class="k">компьютеров в сети</div></div>
+      <div class="stat"><div class="v" id="sReward">—</div><div class="k">TAR начислено</div></div>
+      <div class="stat"><div class="v" id="sJobs">—</div><div class="k">запросов выполнено</div></div>
+      <div class="stat"><div class="v" id="sBurn">—</div><div class="k">TAR сожжено</div></div>
+      <div class="stat"><div class="v" id="sUsd">—</div><div class="k">$ заплатили заказчики</div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">6</span>Сколько это в деньгах</h2>
+    <p class="sub">TAR — внутренняя единица сети. Ниже — что она значит в долларах, от чего зависит доход и как он растёт.</p>
+
+    <div class="card">
+      <p style="margin:0 0 14px;">
+        На этом стенде курс зафиксирован: <b>1 TAR = $<span id="cRate">—</span></b>.
+        Это учётная единица демо, а не рыночная цена токена. Она нужна только для одного:
+        чтобы переводить начисления в понятные деньги.
+      </p>
+
+      <div class="mini" style="background:#0b1017; border:1px solid var(--border); border-radius:10px; padding:13px 15px;">
+        <div style="font-size:12.5px; color:var(--muted); margin-bottom:9px;">Важно: доход — это две разные вещи</div>
+        <div style="font-size:14.5px; line-height:1.65;">
+          <div style="margin-bottom:8px;"><b style="color:var(--accent);">1. Оплата работы</b> — реальные деньги заказчика.
+            Зависит от того, сколько токенов вы посчитали и по какой цене их купили. Это заработок.</div>
+          <div><b style="color:var(--accent2);">2. Доля эмиссии</b> — субсидия сети из общего пула.
+            Заказчики за неё не платят: пул создаётся протоколом, делится между всеми и уменьшается вдвое раз в год.</div>
+        </div>
+      </div>
+
+      <p style="margin:14px 0 0; font-size:13.5px; color:#cfd9e6; line-height:1.6;" id="mixNote"></p>
+    </div>
+
+    <div class="card">
+      <h3>Сколько приносит одно устройство</h3>
+      <p class="sub" style="margin-bottom:6px;">Только оплата за работу — то, что реально платят заказчики. Цена $<span id="cPrice">—</span> за 1 млн токенов.</p>
+      <div class="tablewrap"><table class="money" id="tblDev"></table></div>
+      <p style="margin:13px 0 0; font-size:13px; color:var(--muted); line-height:1.55;">
+        Загрузка — не 100%: устройство заряжается, греется, бывает занято. Поэтому в расчёте стоит реальная доля суток.
+        Расчёт — для обычного тарифа. Работа уровня «мощная видеокарта» оплачивается в 4 раза дороже за тот же объём,
+        то есть верхняя строка таблицы — это нижняя оценка для сильного железа.
+      </p>
+    </div>
+
+    <div class="card">
+      <h3>От чего зависит доход</h3>
+      <div class="split2">
+        <div class="mini">
+          <div class="t" style="color:var(--ok);">Растёт, если</div>
+          <ul>
+            <li>больше людей покупают запросы;</li>
+            <li>выше цена за миллион токенов;</li>
+            <li>мощнее устройство или выше тариф;</li>
+            <li>дольше аптайм, меньше простоев.</li>
+          </ul>
+        </div>
+        <div class="mini">
+          <div class="t" style="color:var(--warn);">Падает, если</div>
+          <ul>
+            <li>в сеть приходит больше устройств — пул делится шире;</li>
+            <li>проходит халвинг: пул вдвое меньше раз в год;</li>
+            <li>устройство простаивает или перегревается.</li>
+          </ul>
+        </div>
+      </div>
+      <p style="margin:14px 0 0; font-size:13.5px; color:#cfd9e6; line-height:1.6;">
+        Поэтому доход — не фиксированная ставка. Это доля от реального спроса плюс доля от пула,
+        который со временем сжимается. Чем раньше устройство в сети и чем больше на нём реальной работы,
+        тем устойчивее заработок.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">7</span>Деньги считаются честно</h2>
+    <p class="sub">Не «повезло / не повезло», а арифметика, которую можно проверить.</p>
+    <div class="card">
+      <p style="margin:0 0 14px;">
+        За каждую единицу работы сеть начисляет сумму по открытой формуле:
+      </p>
+      <div style="background:#0b1017; border:1px solid var(--border); border-radius:10px; padding:16px 18px; text-align:center; font-size:17px; letter-spacing:.01em;">
+        Начисление = <span style="color:var(--accent)">объём работы</span> × <span style="color:var(--accent2)">мощность компьютера</span> × <span style="color:#c98bff">качество ответа</span>
+      </div>
+      <p style="margin:14px 0 0; font-size:14.5px; color:#cfd9e6;">
+        Одинаковая работа всегда даёт одинаковую оплату. Никакой случайности: два компьютера,
+        сделавшие одно и то же, получат одно и то же. Плюс сверху идёт награда из общего пула сети,
+        которая уменьшается вдвое раз в год — как у биткоина.
+      </p>
+      <p style="margin:12px 0 0; font-size:14.5px; color:#cfd9e6;">
+        Каждое начисление подписано криптографически. Подделать сумму нельзя — сеть это заметит
+        при первой же проверке.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">8</span>Почему это имеет смысл</h2>
+    <p class="sub">Сравнение по деньгам — с официальными тарифами крупнейших провайдеров.</p>
+
+    <div class="card">
+      <div class="tablewrap">
+        <table class="money">
+          <thead><tr><th>Кто считает</th><th>Вход, $/1M</th><th>Выход, $/1M</th><th>Смешанно*</th></tr></thead>
+          <tbody>
+            <tr class="hi"><td>TarNet (стенд)</td><td colspan="2" style="text-align:center;">$0.20 — единая цена</td><td>$0.20</td></tr>
+            <tr><td>Google Gemini 2.0 Flash</td><td>$0.10</td><td>$0.40</td><td>$0.33</td></tr>
+            <tr><td>OpenAI GPT-4o mini</td><td>$0.15</td><td>$0.60</td><td>$0.49</td></tr>
+            <tr><td>OpenAI GPT-4o</td><td>$2.50</td><td>$10.00</td><td>$8.13</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p style="margin:12px 0 0; font-size:12.5px; color:var(--muted); line-height:1.55;">
+        * Смешанно — при типичной пропорции 1 часть входа на 3 части выхода, чтобы сравнение не было подогнано под вход.
+      </p>
+      <p style="margin:14px 0 0; font-size:13.5px; color:#cfd9e6; line-height:1.6;">
+        По деньгам TarNet дешевле GPT-4o примерно в 40 раз и сопоставим с самыми дешёвыми моделями.
+        Честная оговорка: <b>дешевле — не значит лучше</b>. Здесь считает чужое железо, а сама модель пока
+        эмулируется. Ценность идеи не в том, что она дешевле сегодня, а в том, что её цена падает,
+        когда вычисления распределены, а не собраны в трёх дата-центрах.
+      </p>
+    </div>
+
+    <div class="card">
+      <h3>Когда проект перестаёт быть дотационным</h3>
+      <p style="margin:0 0 12px; font-size:13.5px; color:#cfd9e6; line-height:1.6;">
+        Главный вопрос к любой такой сети: сколько должно быть реальных заказов, чтобы доход перестал
+        зависеть от эмиссии. Сейчас на стенде <b>92% начислений — субсидия</b>. Ниже — точка, где оплата работы
+        сравнивается с субсидией и проект живёт на деньги заказчиков.
+      </p>
+      <div class="tablewrap">
+        <table class="money" id="tblBreak"></table>
+      </div>
+      <p style="margin:12px 0 0; font-size:12.5px; color:var(--muted); line-height:1.55;">
+        Считано по параметрам сети: эмиссия <span id="bE0">—</span> TAR в сутки, халвинг каждые <span id="bHalv">—</span> эпох.
+        Устройства — эквивалент RTX 4090 при загрузке 50%.
+      </p>
+      <p style="margin:14px 0 0; font-size:13.5px; color:#cfd9e6; line-height:1.6;">
+        Ключевое: <b>порог падает вдвое каждый год</b>, потому что вдвое падает эмиссия.
+        Значит сети не нужен взрывной рост — достаточно, чтобы спрос рос быстрее, чем сокращается субсидия.
+        И это единственная причина, по которой эмиссия вообще имеет смысл: она покупает время,
+        чтобы набрать реальных заказчиков, пока сеть ещё никому не известна.
+      </p>
+      <p style="margin:12px 0 0; padding:11px 13px; background:rgba(227,179,65,.07); border-left:3px solid var(--warn); border-radius:0 8px 8px 0; font-size:13px; color:#cfd9e6; line-height:1.6;" id="bNow"></p>
+    </div>
+
+    <div class="card">
+      <h3>В чём долгосрочная ценность</h3>
+      <div class="split2">
+        <div class="mini">
+          <div class="t" style="color:var(--accent);">Дешевле с ростом сети</div>
+          <div style="font-size:13.5px; color:#cfd9e6; line-height:1.6;">
+            Себестоимость не привязана к земле под дата-центр и электричеству по промышленному тарифу.
+            Больше участников — больше мощности без нового строительства.
+          </div>
+        </div>
+        <div class="mini">
+          <div class="t" style="color:var(--accent2);">Не зависит от одного провайдера</div>
+          <div style="font-size:13.5px; color:#cfd9e6; line-height:1.6;">
+            Нет единой компании, которая может отключить модель, поднять цену или отказать в доступе.
+            Отказ одного устройства не останавливает сеть.
+          </div>
+        </div>
+        <div class="mini">
+          <div class="t" style="color:var(--warn);">Дефляция вместо инфляции</div>
+          <div style="font-size:13.5px; color:#cfd9e6; line-height:1.6;">
+            Часть каждой комиссии сжигается навсегда, а пул эмиссии уменьшается вдвое раз в год.
+            Общего предложения становится меньше со временем — в отличие от печати по требованию.
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">9</span>Чего пока нет</h2>
+    <p class="sub">Это демонстрационный стенд, а не запущенная сеть. Честно о границах.</p>
+    <div class="card honest">
+      <ul>
+        <li><b>Выплаты не настоящие.</b> Транзакция «в блокчейн» рисуется локально, смарт-контракта нет. Показан поток денег, а не реальный перевод.</li>
+        <li><b>Модель сейчас эмулируется.</b> На этом стенде сам ответ генерирует не нейросеть, а сервер подставляет объём. Механика оплаты — настоящая.</li>
+        <li><b>Шифрование и анонимность не включены.</b> В архитектуре они есть (текст не должен оседать на сервере), но в этом демо трафик идёт по обычному HTTPS. Поэтому не пишите сюда ничего личного.</li>
+        <li><b>Списание с баланса — локальное.</b> В этом демо токены действительно уходят со счёта заказчика и приходят исполнителю, но всё это внутри одной базы стенда: реальной сети и биржи нет.</li>
+        <li><b>Открытый доступ.</b> Любой, у кого есть ссылка, может писать в демо-базу. Поэтому адрес временный.</li>
+        <li><b>Цена — $0.20 за миллион токенов.</b> Это намеренно ниже рынка; экономика проверяется, а не монетизируется.</li>
+        <li><b>Курс TAR к доллару зафиксирован.</b> 1 TAR = $<span id="cRate2">20</span> — учётная единица стенда, а не биржевая цена. Реального рынка токена пока нет, поэтому долларовая ценность доли эмиссии номинальная.</li>
+      </ul>
+    </div>
+  </section>
+
+  <footer>
+    <div>TarNet / Synapse · демонстрационный стенд · экономика v2.1</div>
+    <div><a href="/console.html">Консоль для инженеров →</a></div>
+  </footer>
+</div>
+
+<script>
+(function () {
+  var B = '';
+  var $ = function (id) { return document.getElementById(id); };
+  var demoWorker = null;
+
+  // Параметры берём с сервера, чтобы страница не разошлась с кодом экономики.
+  var ECO = { price: 0.2, usdPerTar: 20, fee: 0.05, e0: 50, halv: 365 };
+
+  // Тарифы конкурентов — официальные прайсы провайдеров (проверено 2026-10-21).
+  var COMPETITORS = [
+    { name: 'Google Gemini 2.0 Flash', in: 0.10, out: 0.40 },
+    { name: 'OpenAI GPT-4o mini', in: 0.15, out: 0.60 },
+    { name: 'OpenAI GPT-4o', in: 2.50, out: 10.00 }
+  ];
+
+  // Устройства: токенов в секунду и реальная доля суток под нагрузкой.
+  var DEVICES = [
+    { n: 'Смартфон (1.5B)', tok: 25, duty: 0.25 },
+    { n: 'Домашний ПК (7B, CPU)', tok: 12, duty: 0.30 },
+    { n: 'Видеокарта RTX 3060', tok: 50, duty: 0.40 },
+    { n: 'Видеокарта RTX 4070', tok: 80, duty: 0.40 },
+    { n: 'Видеокарта RTX 4090', tok: 120, duty: 0.50 },
+    { n: 'Две RTX 4090', tok: 240, duty: 0.50 }
+  ];
+
+  function usd(x) {
+    var n = Number(x) || 0;
+    if (n === 0) return '$0';
+    if (Math.abs(n) < 0.01) return '$' + n.toFixed(4);
+    return '$' + n.toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function fmt(x, d) {
+    var n = Number(x) || 0;
+    if (n === 0) return '0';
+    if (Math.abs(n) < 0.001) return n.toFixed(6);
+    return n.toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: d || 4 });
+  }
+
+  function showErr(msg) {
+    var e = $('err');
+    e.textContent = msg;
+    e.className = 'err on';
+  }
+  function clearErr() { $('err').className = 'err'; }
+
+  // На каждый запрос — свежий адрес. Иначе повторные нажатия делят один пул эмиссии,
+  // и суммы падают, что выглядит как ошибка, хотя это механика эпохи.
+  function ensureWorker() {
+    var hex = Date.now().toString(16) + Math.random().toString(16).slice(2, 10);
+    while (hex.length < 40) hex += '0';
+    var addr = ('0x' + hex).slice(0, 42).toLowerCase();
+    return fetch(B + '/node', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address: addr, stake: 50000, reputation: 0.9, isTeeAttested: false })
+    }).then(function (r) {
+      if (!r.ok) throw new Error('не удалось подключить компьютер к сети');
+      return addr;
+    });
+  }
+
+  $('go').addEventListener('click', function () {
+    var btn = this;
+    clearErr();
+    btn.disabled = true;
+    btn.textContent = 'Считаем…';
+
+    ensureWorker().then(function (addr) {
+      return fetch(B + '/work', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workerAddress: addr,
+          tokens: Number($('tokens').value),
+          tier: $('tier').value,
+          adapterId: 'base-model'
+        })
+      });
+    }).then(function (r) {
+      return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; });
+    }).then(function (j) {
+      var b = j.breakdown;
+      var total = b.rewardTar;
+      var feeGross = b.feeGrossTar;
+
+      $('rReward').textContent = fmt(b.feeRewardTar, 6);
+      $('rBlock').textContent = '+' + fmt(b.blockRewardTar, 6);
+      $('rWorker').textContent = fmt(total, 6);
+      $('rBurn').textContent = fmt(b.burnTar, 6);
+      $('rTreasury').textContent = fmt(b.treasuryTar, 6);
+
+      var hasRoyalty = Number(b.royaltyTar) > 0;
+      $('royaltyItem').style.display = hasRoyalty ? '' : 'none';
+      if (hasRoyalty) $('rRoyalty').textContent = fmt(b.royaltyTar, 6);
+
+      var tokens = Number($('tokens').value);
+      var tierName = { nano: 'слабого ноутбука', base: 'обычного компьютера', expert: 'мощной видеокарты' }[$('tier').value];
+      $('rCaption').textContent =
+        'За ' + fmt(tokens, 0) + ' токенов, посчитанных силами ' + tierName + '.';
+
+      // Фиат считаем от цены запроса, а не от TAR: это единственная сумма,
+      // которую реально платит заказчик. Доля пула — номинал, она не оплачена никем.
+      var cwu = Number(b.cwu) || (tokens * (b.kappa || 1));
+      var paidUsd = cwu * ECO.price / 1e6;
+      var workUsd = paidUsd * (1 - ECO.fee) - (Number(b.royaltyTar) || 0) * ECO.usdPerTar;
+      if (workUsd < 0) workUsd = 0;
+
+      $('rFiat').style.display = 'block';
+      $('rUsd').textContent = usd(workUsd);
+      $('rFiatNote').textContent =
+        'Заказчик заплатил ' + usd(paidUsd) + ' за ' + fmt(tokens, 0) + ' токенов ' +
+        '(по $' + ECO.price + ' за миллион). Из них ' + usd(workUsd) +
+        ' — исполнителю, остальное на комиссию и сжигание.';
+
+      $('rNote').textContent =
+        'Стоимость запроса — ' + fmt(feeGross, 6) + ' TAR. Из них ' + fmt(b.feeRewardTar, 6) +
+        ' уходит исполнителю, остальное сгорает и уходит в фонд. ' +
+        'Бонус из пула (' + fmt(b.blockRewardTar, 4) + ' TAR) — переменная часть: он тем меньше, ' +
+        'чем больше работы сделала вся сеть за сутки, и за него никто не платит деньгами.';
+
+      $('res').className = 'result on';
+      refresh();
+    }).catch(function (e) {
+      showErr('Не получилось: ' + e.message);
+    }).then(function () {
+      btn.disabled = false;
+      btn.textContent = 'Отправить запрос в сеть →';
+    });
+  });
+
+  function renderDevices() {
+    var rows = DEVICES.map(function (d) {
+      var mTok = d.tok * d.duty * 86400 * 30 / 1e6;   // млн токенов в месяц
+      var gross = mTok * ECO.price;                    // выручка до комиссии
+      var net = gross * (1 - ECO.fee);                 // что остаётся владельцу
+      return '<tr><td>' + d.n + '</td>' +
+        '<td>' + d.tok + '</td>' +
+        '<td>' + Math.round(d.duty * 100) + '%</td>' +
+        '<td>' + mTok.toFixed(1) + '</td>' +
+        '<td>' + usd(net) + '</td></tr>';
+    }).join('');
+
+    $('tblDev').innerHTML =
+      '<thead><tr><th>Устройство</th><th>ток/с</th><th>Загрузка</th><th>Млн/мес</th><th>Доход/мес</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody>';
+  }
+
+  function renderBreakeven() {
+    var E0 = ECO.e0 || 50;
+    var halv = ECO.halv || 365;
+    var perCard = 155.5; // млн токенов/мес у RTX 4090 при загрузке 50%
+
+    var rows = '';
+    for (var y = 1; y <= 5; y++) {
+      var e = E0 * Math.pow(2, -(y - 1));
+      var emisDay = e * ECO.usdPerTar;              // $ субсидии в сутки
+      var revDay = emisDay / (1 - ECO.fee);    // выручка, при которой 95% = субсидии
+      var revMonth = revDay * 30;
+      var tokMonth = revMonth / ECO.price;     // млн токенов/мес
+      var cards = Math.round(tokMonth / perCard);
+
+      rows += '<tr' + (y === 1 ? ' class="hi"' : '') + '>' +
+        '<td>Год ' + y + '</td>' +
+        '<td>' + (e >= 10 ? e.toFixed(0) : e.toFixed(1)) + '</td>' +
+        '<td>$' + Math.round(revMonth / 1000) + 'k</td>' +
+        '<td>' + cards.toLocaleString('ru-RU') + '</td></tr>';
+    }
+
+    $('tblBreak').innerHTML =
+      '<thead><tr><th>Период</th><th>Эмиссия TAR/сут</th><th>Нужно выручки/мес</th><th>Карт 4090</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody>';
+
+    $('bE0').textContent = E0;
+    $('bHalv').textContent = halv;
+  }
+
+  /* Замкнутый контур: сколько остаётся, если и произвёл, и потратил один и тот же объём.
+   * Считаем только комиссию — она точна и не зависит от доли эмиссии.
+   * Сам блок-бонус сюда не входит сознательно: он зависит от того, сколько
+   * ещё узлов работало в ту же эпоху, и обещать его как стабильную часть нельзя. */
+  function renderLoop() {
+    var N = 10e6;                                  // 10 млн токенов
+    var gross = N * ECO.price / 1e6 / ECO.usdPerTar; // TAR — цена запроса
+    var back = gross * (1 - ECO.fee);                // TAR — возврат как исполнителю
+    var loss = gross - back;
+
+    var rows =
+      '<tr><td>Считает 10 млн токенов для других</td>' +
+      '<td style="color:var(--ok)">+' + back.toFixed(4) + ' TAR</td>' +
+      '<td>95% оплаты возвращается исполнителю</td></tr>' +
+      '<tr><td>Задаёт свои 10 млн токенов</td>' +
+      '<td style="color:var(--danger)">−' + gross.toFixed(4) + ' TAR</td>' +
+      '<td>платит полную цену, как любой заказчик</td></tr>' +
+      '<tr class="hi"><td><b>Итого за круг</b></td>' +
+      '<td style="color:var(--warn)"><b>−' + loss.toFixed(4) + ' TAR</b></td>' +
+      '<td><b>это и есть комиссия сети ' + (ECO.fee * 100).toFixed(0) + '%</b></td></tr>';
+
+    $('tblLoop').innerHTML =
+      '<thead><tr><th>Действие</th><th>Движение токенов</th><th>Пояснение</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody>';
+
+    $('loopPrice').textContent = ECO.price;
+    $('loopRate').textContent = ECO.usdPerTar.toLocaleString('ru-RU', { maximumFractionDigits: 2 });
+    $('loopFeePct').textContent = (ECO.fee * 100).toFixed(0);
+  }
+
+  function loadConfig() {
+    return fetch(B + '/config').then(function (r) { return r.json(); }).then(function (c) {
+      if (c && c.price) {
+        ECO.price = Number(c.price.usdPer1MTokens) || ECO.price;
+        ECO.usdPerTar = Number(c.price.usdPerTar) || ECO.usdPerTar;
+      }
+      if (c && c.fee) ECO.fee = Number(c.fee.protocol) || ECO.fee;
+      if (c && c.emission) {
+        ECO.e0 = Number(c.emission.initialBlockReward) || 50;
+        ECO.halv = Number(c.emission.halvingPeriodEpochs) || 365;
+      }
+
+      $('cPrice').textContent = ECO.price;
+      $('cRate').textContent = ECO.usdPerTar.toLocaleString('ru-RU', { maximumFractionDigits: 2 });
+      if ($('cRate2')) $('cRate2').textContent = ECO.usdPerTar.toLocaleString('ru-RU', { maximumFractionDigits: 2 });
+      renderDevices();
+      renderBreakeven();
+      renderLoop();
+    }).catch(function () {
+      renderDevices();
+      renderBreakeven();
+      renderLoop();
+    });
+  }
+
+  function refresh() {
+    fetch(B + '/nodes').then(function (r) { return r.json(); }).then(function (n) {
+      $('sNodes').textContent = Array.isArray(n) ? n.length : '—';
+    }).catch(function () {});
+
+    fetch(B + '/summary').then(function (r) { return r.json(); }).then(function (s) {
+      $('sReward').textContent = fmt(s.totalRewardTar, 2);
+      $('sJobs').textContent = fmt(s.receipts, 0);
+      $('sBurn').textContent = fmt(s.totalBurnedTar, 2);
+
+      // Сколько реально заплатили заказчики: gross в TAR × курс.
+      var paidUsd = (Number(s.totalFeeGrossTar) || 0) * ECO.usdPerTar;
+      $('sUsd').textContent = usd(paidUsd);
+
+      // Доля оплаты работы и доля субсидии в общем начислении.
+      var fee = Number(s.totalFeeRewardTar) || 0;
+      var blk = Number(s.totalBlockRewardTar) || 0;
+      var tot = fee + blk;
+      if (tot > 0) {
+        var feePct = (fee / tot * 100).toFixed(0);
+        var blkPct = (100 - feePct);
+        $('mixNote').innerHTML =
+          'На этом стенде сейчас <b>' + feePct + '%</b> начислений — реальная оплата работы ' +
+          '(' + usd(fee * ECO.usdPerTar) + ' от заказчиков), и <b>' + blkPct + '%</b> — субсидия из пула ' +
+          '(' + usd(blk * ECO.usdPerTar) + ' условно). Именно поэтому нельзя называть весь доход ' +
+          'заработком: субсидия однажды закончится по халвингу, а оплата работы — нет.';
+
+        // Насколько стенд далёк от порога самоокупаемости.
+        var needMonth = (ECO.e0 || 50) * ECO.usdPerTar / (1 - ECO.fee) * 30;
+        var haveMonth = (Number(s.totalFeeGrossTar) || 0) * ECO.usdPerTar;
+        var pct = needMonth > 0 ? (haveMonth / needMonth * 100) : 0;
+        $('bNow').innerHTML =
+          '<b>Где мы сейчас:</b> за всё время заказчики заплатили ' + usd(haveMonth) + ', а для баланса ' +
+          'на первом году нужно ' + usd(needMonth) + ' в месяц. Это <b>' +
+          (pct < 1 ? 'меньше 1%' : pct.toFixed(1) + '%') + '</b> от порога. ' +
+          'Цифра маленькая не потому, что модель плохая, а потому, что стенд тестовый: заказов почти нет, ' +
+          'а эмиссия идёт по расписанию с первого дня.';
+      }
+    }).catch(function () {});
+
+    fetch(B + '/health').then(function (r) { return r.json(); }).then(function (h) {
+      var b = $('liveBadge');
+      if (h.status === 'ok') b.textContent = 'сеть работает · версия ' + h.version;
+    }).catch(function () {
+      $('liveBadge').textContent = 'сеть недоступна';
+    });
+  }
+
+  loadConfig().then(refresh);
+  setInterval(refresh, 5000);
+})();
+</script>
+</body>
+</html>

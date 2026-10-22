@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🐝 TarNet / Synapse — dPoUW Console</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
+    --muted: #8b949e; --accent: #58a6ff; --ok: #3fb950; --warn: #d29922; --danger: #f85149;
+    --purple: #bc8cff; --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 24px; }
+  h1 { font-size: 24px; margin-bottom: 4px; }
+  h2 { font-size: 15px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 14px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .metric { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .metric .k { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 6px; }
+  .metric .v { font-size: 22px; font-weight: 600; font-family: var(--mono); }
+  .metric .d { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  button { background: var(--accent); color: #04121f; border: none; padding: 9px 15px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+  button:hover { filter: brightness(1.12); }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--border); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  input, select { background: #0d1117; border: 1px solid var(--border); color: var(--text); padding: 8px 11px; border-radius: 6px; font-family: var(--mono); font-size: 12px; width: 100%; }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 10px 0 4px; }
+  pre { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: var(--mono); font-size: 11.5px; overflow-x: auto; max-height: 320px; white-space: pre-wrap; word-break: break-word; color: #a5d6ff; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; padding: 7px 8px; color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase; border-bottom: 1px solid var(--border); }
+  td { padding: 7px 8px; border-bottom: 1px solid #21262d; font-family: var(--mono); font-size: 11.5px; }
+  .pos { color: var(--ok); font-weight: 700; }
+  .neg { color: var(--danger); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 10px; font-weight: 700; font-family: var(--mono); }
+  .b-new { background: rgba(63,185,80,.15); color: var(--ok); }
+  .b-expert { background: rgba(188,140,255,.15); color: var(--purple); }
+  .b-nano { background: rgba(88,166,255,.15); color: var(--accent); }
+  .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .mono { font-family: var(--mono); font-size: 11.5px; }
+  .flex { flex: 1; min-width: 90px; }
+  .tag { font-size: 10px; color: var(--muted); }
+  .big { font-family: var(--mono); font-size: 30px; font-weight: 700; color: var(--ok); letter-spacing: -.5px; }
+  .delta { font-family: var(--mono); font-size: 20px; font-weight: 700; color: var(--ok); }
+  .pulse { animation: pulse .6s ease-out; }
+  @keyframes pulse { from { transform: scale(1.06); text-shadow: 0 0 14px rgba(63,185,80,.7); } to { transform: scale(1); } }
+</style>
+</head>
+<body>
+
+<h1>🐝 TarNet / Synapse — dPoUW Console</h1>
+<div class="sub">
+  Deterministic Proof-of-Useful-Work · начисления гарантированы и детерминированы
+  <span class="status" style="float:right"><span class="dot" id="dot"></span><span id="statusText">подключение…</span></span>
+</div>
+
+<div class="metrics">
+  <div class="metric"><div class="k">Начислено всего</div><div class="v" id="mReward">—</div><div class="d">totalRewardTar</div></div>
+  <div class="metric"><div class="k">Полезная работа</div><div class="v" id="mCwu">—</div><div class="d">CWU (Σ W)</div></div>
+  <div class="metric"><div class="k">Сожжено</div><div class="v" id="mBurn">—</div><div class="d">2.5% от fee</div></div>
+  <div class="metric"><div class="k">В казну</div><div class="v" id="mTreasury">—</div><div class="d">2.5% от fee</div></div>
+  <div class="metric"><div class="k">LoRA-роялти</div><div class="v" id="mLora">—</div><div class="d">5% от fee</div></div>
+  <div class="metric"><div class="k">Начислений</div><div class="v" id="mReceipts">—</div><div class="d">receipts</div></div>
+</div>
+
+<div class="grid">
+
+  <div class="panel">
+    <h2>⚡ Работа и начисление</h2>
+    <div class="row">
+      <div class="flex"><label>Воркер (адрес ноды)</label><input id="wAddr" placeholder="зарегистрируйте ноду ниже"></div>
+    </div>
+    <div class="row">
+      <div class="flex"><label>Токенов сгенерировано</label><input id="wTokens" value="2000000"></div>
+      <div class="flex"><label>Тариф κ</label>
+        <select id="wTier">
+          <option value="nano">nano ×0.1</option>
+          <option value="base" selected>base ×1.0</option>
+          <option value="expert">expert ×4.0</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <div class="flex"><label>Адаптер (LoRA)</label><input id="wAdapter" value="base-model"></div>
+    </div>
+    <div class="row">
+      <button onclick="submitWork()">Выполнить работу</button>
+      <button class="ghost" onclick="fillDemo()">Демо-нода</button>
+    </div>
+    <div class="tag">γ_verify=1 → начисление всегда. Провал проверки → начисления нет.</div>
+
+    <div id="workResult" style="display:none;margin-top:14px">
+      <div class="delta" id="workDelta">+0.000000 $TAR</div>
+      <div class="tag" id="workNote" style="margin-bottom:8px"></div>
+      <table><tbody id="workBreak"></tbody></table>
+    </div>
+    <pre id="workOut" style="margin-top:10px">—</pre>
+  </div>
+
+  <div class="panel">
+    <h2>👛 Баланс воркера (плавный рост)</h2>
+    <div class="big" id="balBig">0.000000</div>
+    <div class="tag">$TAR · обновляется без скачков</div>
+    <div class="row" style="margin-top:14px">
+      <div class="flex"><label>Адрес для баланса</label><input id="balAddr" placeholder="адрес ноды"></div>
+    </div>
+    <div class="row">
+      <button class="ghost" onclick="loadBalance()">Показать баланс</button>
+      <button onclick="withdraw()">Вывести on-chain</button>
+    </div>
+    <div class="tag" id="settleNote">On-chain пишется только итоговый накопительный чек.</div>
+    <pre id="balOut" style="margin-top:10px">—</pre>
+  </div>
+
+  <div class="panel">
+    <h2>⚙️ Регистрация ноды</h2>
+    <div class="row">
+      <div class="flex"><label>Адрес</label><input id="nAddr" placeholder="0x…"></div>
+      <div class="flex"><label>Stake</label><input id="nStake" value="50000"></div>
+    </div>
+    <div class="row">
+      <div class="flex"><label>Репутация</label><input id="nRep" value="0.9"></div>
+      <div class="flex"><label>TEE attested</label>
+        <select id="nTee"><option value="0">false</option><option value="1">true</option></select>
+      </div>
+    </div>
+    <div class="row"><button onclick="registerNode()">Зарегистрировать</button>
+      <button class="ghost" onclick="loadNodes()">Обновить</button></div>
+    <div class="tag">ω = √stake × reputation — анти-монополистический вес.</div>
+    <div style="max-height:200px;overflow:auto;margin-top:10px"><table id="nodesTbl"><thead><tr>
+      <th>Адрес</th><th>Stake</th><th>Rep</th><th>ω</th><th>TEE</th>
+    </tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="panel">
+    <h2>🧩 Адаптер и роялти</h2>
+    <div class="row">
+      <div class="flex"><label>adapterId</label><input id="aId" value="lora-alpha"></div>
+    </div>
+    <div class="row">
+      <div class="flex"><label>Адрес автора</label><input id="aAuthor" placeholder="0x… (40 hex)"></div>
+    </div>
+    <div class="row"><button onclick="registerAdapter()">Зарегистрировать</button>
+      <button class="ghost" onclick="loadAdapters()">Список</button></div>
+    <div class="tag">5% от Fee_Reward автору адаптера. Для base-model роялти не начисляется.</div>
+    <div style="max-height:170px;overflow:auto;margin-top:10px"><table id="adTbl"><thead><tr>
+      <th>Адаптер</th><th>Автор</th><th>Роялти</th>
+    </tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="panel">
+    <h2>🧠 Инференс (тот же путь начисления)</h2>
+    <div class="row"><div class="flex"><label>Промпт (только в теле POST)</label><input id="infPrompt" value="Напиши функцию быстрой сортировки"></div></div>
+    <div class="row"><div class="flex"><label>Тариф</label>
+      <select id="infTier"><option value="nano">nano</option><option value="base" selected>base</option><option value="expert">expert</option></select>
+    </div></div>
+    <div class="row"><button onclick="runInference()">Выполнить</button>
+      <button class="ghost" onclick="loadEpoch()">Эпоха</button></div>
+    <pre id="infOut">—</pre>
+  </div>
+
+  <div class="panel">
+    <h2>🧾 История начислений (чеки)</h2>
+    <div class="row">
+      <div class="flex"><label>Воркер</label><input id="histAddr" placeholder="адрес ноды"></div>
+      <button class="ghost" onclick="loadHistory()">Показать</button>
+    </div>
+    <div style="max-height:320px;overflow:auto"><table id="histTbl"><thead><tr>
+      <th>seq</th><th>CWU</th><th>Fee</th><th>Block</th><th>Итого</th><th>Cum</th><th>Burn</th>
+    </tr></thead><tbody></tbody></table></div>
+    <div class="tag">Каждая строка — подписанный Ed25519 чек с точной суммой.</div>
+  </div>
+
+  <div class="panel">
+    <h2>⛓️ On-chain выводы</h2>
+    <div class="row"><button class="ghost" onclick="loadSettlements()">Обновить</button></div>
+    <div style="max-height:220px;overflow:auto"><table id="setTbl"><thead><tr>
+      <th>Воркер</th><th>seq</th><th>Сумма</th><th>tx</th>
+    </tr></thead><tbody></tbody></table></div>
+    <div class="tag">Одна запись на воркера — итоговый чек, не каждое начисление.</div>
+  </div>
+
+  <div class="panel">
+    <h2>🏦 Балансы</h2>
+    <div class="row"><button class="ghost" onclick="loadBalances()">Обновить</button></div>
+    <div style="max-height:220px;overflow:auto"><table id="balTbl"><thead><tr>
+      <th>Адрес</th><th>Баланс</th><th>Стейк</th>
+    </tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="panel">
+    <h2>🔗 Движения (ledger)</h2>
+    <div class="row"><button class="ghost" onclick="loadLedger()">Обновить</button>
+      <button class="ghost" onclick="refreshAll()">Обновить всё</button></div>
+    <div style="max-height:220px;overflow:auto"><table id="ledTbl"><thead><tr>
+      <th>Тип</th><th>Кому</th><th>Сумма</th>
+    </tr></thead><tbody></tbody></table></div>
+  </div>
+
+</div>
+
+<script>
+const API = location.origin;
+const $ = id => document.getElementById(id);
+const fmt = n => (Number(n)||0).toLocaleString('en-US', {maximumFractionDigits:2});
+const tar = n => (Number(n)||0).toFixed(6);
+
+async function api(path, method='GET', body) {
+  const opt = { method, headers: {'Content-Type':'application/json'} };
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(API + path, opt);
+  const t = await r.text();
+  try { return JSON.parse(t); } catch { return { raw: t, status: r.status }; }
+}
+function out(id, data) { $(id).textContent = typeof data === 'string' ? data : JSON.stringify(data, null, 2); }
+
+/* Плавный счётчик: баланс не должен прыгать дискретными скачками.
+ * Анимируем от текущего показанного значения к новому за ~700 мс. */
+const shown = {};
+function animateNumber(el, to, decimals = 6) {
+  const key = el.id;
+  const from = shown[key] ?? 0;
+  const dur = 700, t0 = performance.now();
+  if (el._raf) cancelAnimationFrame(el._raf);
+  const step = (t) => {
+    const p = Math.min(1, (t - t0) / dur);
+    const e = 1 - Math.pow(1 - p, 3); // easeOutCubic
+    const v = from + (to - from) * e;
+    el.textContent = v.toFixed(decimals);
+    if (p < 1) el._raf = requestAnimationFrame(step);
+    else { shown[key] = to; el.classList.add('pulse'); setTimeout(()=>el.classList.remove('pulse'), 600); }
+  };
+  el._raf = requestAnimationFrame(step);
+}
+
+async function health() {
+  try {
+    const h = await api('/health');
+    $('dot').className = 'dot on';
+    $('statusText').textContent = 'v' + h.version + ' · ' + h.rewardMode + ' · ' + new Date(h.timestamp).toLocaleTimeString();
+    const e = h.epoch;
+    $('settleNote').textContent =
+      `Эпоха ${e.index}: выпущено ${e.emissionTar.toFixed(4)} TAR, открыто ${e.releasedTar.toFixed(4)}, роздано ${e.distributedTar.toFixed(4)}`;
+  } catch { $('dot').className = 'dot'; $('statusText').textContent = 'нет связи'; }
+}
+
+async function loadSummary() {
+  const s = await api('/summary');
+  $('mReward').textContent = fmt(s.totalRewardTar);
+  $('mCwu').textContent = s.totalCwu.toLocaleString('en-US');
+  $('mBurn').textContent = tar(s.totalBurnedTar);
+  $('mTreasury').textContent = tar(s.totalTreasuryTar);
+  $('mLora').textContent = tar(s.totalLoraRoyaltyTar);
+  $('mReceipts').textContent = s.receipts;
+  return s;
+}
+
+/* Главное действие: работа → гарантированное начисление. */
+async function submitWork() {
+  const worker = $('wAddr').value.trim();
+  if (!worker) { out('workOut', 'Укажите адрес воркера (сначала зарегистрируйте ноду)'); return; }
+  const r = await api('/work', 'POST', {
+    workerAddress: worker,
+    tokens: Number($('wTokens').value),
+    tier: $('wTier').value,
+    adapterId: $('wAdapter').value.trim() || 'base-model',
+    response: 'output generated by worker',
+  });
+  if (r.status >= 400 || r.error) { out('workOut', r); return; }
+
+  const b = r.breakdown;
+  $('workResult').style.display = 'block';
+  $('workDelta').textContent = '+' + tar(b.rewardTar) + ' $TAR';
+  $('workNote').textContent =
+    `CWU ${b.cwu.toLocaleString('en-US')} = ${b.tokens.toLocaleString('en-US')} × κ${b.kappa} × γ${b.gamma} · ${b.tier}`;
+  $('workBreak').innerHTML = `
+    <tr><td>Fee-поток</td><td class="pos">${tar(b.feeRewardTar)}</td><td class="tag">от ${tar(b.feeGrossTar)} gross</td></tr>
+    <tr><td>Block-поток</td><td class="pos">${tar(b.blockRewardTar)}</td><td class="tag">эмиссия эпохи</td></tr>
+    <tr><td>Burn 2.5%</td><td class="neg">−${tar(b.burnTar)}</td><td class="tag">изъято из оборота</td></tr>
+    <tr><td>Казна 2.5%</td><td>${tar(b.treasuryTar)}</td><td class="tag">протокол</td></tr>
+    <tr><td>LoRA-роялти</td><td>${tar(b.royaltyTar)}</td><td class="tag">автору адаптера</td></tr>
+    <tr><td><b>Итого воркеру</b></td><td class="pos"><b>${tar(b.rewardTar)}</b></td><td></td></tr>`;
+  out('workOut', { receipt: r.receipt, conservation: r.conservation });
+
+  // Баланс подставляем сразу и анимируем — видно плавный рост.
+  $('balAddr').value = worker;
+  $('histAddr').value = worker;
+  animateNumber($('balBig'), r.cumulative_receipt.cumulativeTotal, 6);
+  await Promise.all([loadSummary(), loadHistory(), loadBalances(), loadLedger()]);
+}
+
+async function fillDemo() {
+  const addr = '0x' + 'a1'.repeat(20);
+  const n = await api('/node', 'POST', { address: addr, stake: 60000, reputation: 0.92, isTeeAttested: true });
+  $('wAddr').value = addr;
+  $('balAddr').value = addr;
+  $('histAddr').value = addr;
+  out('workOut', n);
+  await loadNodes();
+}
+
+async function loadBalance() {
+  const a = $('balAddr').value.trim();
+  if (!a) return;
+  const b = await api('/balance/' + a);
+  if (b.balanceTar !== undefined) {
+    animateNumber($('balBig'), b.balanceTar, 6);
+    const r = await api('/receipt/' + a);
+    out('balOut', { balance: b.balanceTar, cumulativeReceipt: r.seq, cumulativeTotal: r.cumulativeTotal, signatureValid: r.verified });
+  } else out('balOut', b);
+}
+
+/* Кнопка «Вывести»: on-chain уходит ТОЛЬКО итоговый накопительный чек. */
+async function withdraw() {
+  const a = $('balAddr').value.trim();
+  if (!a) { out('balOut', 'Укажите адрес'); return; }
+  const s = await api('/settle', 'POST', { workerAddress: a });
+  out('balOut', s);
+  if (s.results && s.results[0] && s.results[0].amountTar !== undefined) {
+    $('settleNote').textContent =
+      `Выведено ${tar(s.results[0].amountTar)} TAR · чек #${s.results[0].receiptSeq}` +
+      (s.results[0].alreadySettled ? ' (уже был выведен — повторно не списывается)' : '');
+  }
+  await loadSettlements();
+}
+
+async function registerNode() {
+  const addr = $('nAddr').value.trim();
+  if (!addr) { out('balOut', 'Укажите адрес ноды'); return; }
+  const n = await api('/node', 'POST', {
+    address: addr,
+    stake: Number($('nStake').value),
+    reputation: Number($('nRep').value),
+    isTeeAttested: $('nTee').value === '1'
+  });
+  $('wAddr').value = addr; $('balAddr').value = addr; $('histAddr').value = addr;
+  out('balOut', n);
+  await loadNodes();
+}
+
+async function loadNodes() {
+  const nodes = await api('/nodes');
+  const tb = $('nodesTbl').querySelector('tbody');
+  tb.innerHTML = nodes.map(n => `<tr>
+    <td>${n.address.slice(0,12)}…</td><td>${fmt(n.stake)}</td><td>${Number(n.reputation).toFixed(2)}</td>
+    <td><b>${fmt(n.routingWeight)}</b></td>
+    <td>${n.isTeeAttested ? '<span class="badge b-expert">TEE</span>' : '—'}</td></tr>`).join('')
+    || '<tr><td colspan="5" style="color:var(--muted)">нет нод</td></tr>';
+}
+
+async function registerAdapter() {
+  const r = await api('/adapter', 'POST', { adapterId: $('aId').value.trim(), authorAddress: $('aAuthor').value.trim() });
+  out('balOut', r);
+  await loadAdapters();
+}
+
+async function loadAdapters() {
+  const a = await api('/adapters');
+  const tb = $('adTbl').querySelector('tbody');
+  tb.innerHTML = a.map(x => `<tr>
+    <td><span class="badge b-expert">${x.adapterId}</span></td>
+    <td>${String(x.authorAddress).slice(0,12)}…</td>
+    <td>${(Number(x.royaltyRate)*100).toFixed(0)}%</td></tr>`).join('')
+    || '<tr><td colspan="3" style="color:var(--muted)">адаптеров нет</td></tr>';
+}
+
+async function runInference() {
+  $('infOut').textContent = '⏳ выполняю…';
+  const r = await api('/inference', 'POST', { prompt: $('infPrompt').value, tier: $('infTier').value });
+  out('infOut', r.error ? r : {
+    source: r.source, emulated: r.emulated, tier: r.tier, tokensGenerated: r.tokensGenerated,
+    reward: r.breakdown ? r.breakdown.rewardTar : null,
+    breakdown: r.breakdown, receiptSeq: r.receipt ? r.receipt.seq : null,
+    signature: r.cumulative_receipt ? String(r.cumulative_receipt.signature).slice(0, 32) + '…' : null,
+  });
+  if (r.breakdown) {
+    $('wAddr').value = r.workerAddress; $('balAddr').value = r.workerAddress; $('histAddr').value = r.workerAddress;
+    animateNumber($('balBig'), r.cumulative_receipt.cumulativeTotal, 6);
+  }
+  await Promise.all([loadSummary(), loadHistory(), loadBalances(), loadLedger()]);
+}
+
+async function loadEpoch() {
+  const e = await api('/epoch');
+  out('infOut', e);
+}
+
+async function loadHistory() {
+  const a = $('histAddr').value.trim();
+  if (!a) return;
+  const h = await api('/receipts/' + a + '?limit=50');
+  const tb = $('histTbl').querySelector('tbody');
+  if (!Array.isArray(h) || !h.length) {
+    tb.innerHTML = '<tr><td colspan="7" style="color:var(--muted)">начислений нет</td></tr>';
+    return;
+  }
+  tb.innerHTML = h.map(r => `<tr>
+    <td>${r.seq}</td>
+    <td>${Number(r.cwu).toLocaleString('en-US')}</td>
+    <td>${tar(r.feeRewardTar)}</td>
+    <td>${tar(r.blockRewardTar)}</td>
+    <td class="pos">+${tar(r.rewardTar)}</td>
+    <td>${tar(r.cumulativeTotal)}</td>
+    <td class="neg">${tar(r.burnTar)}</td></tr>`).join('');
+}
+
+async function loadSettlements() {
+  const s = await api('/settlements');
+  const tb = $('setTbl').querySelector('tbody');
+  tb.innerHTML = s.map(x => `<tr>
+    <td>${String(x.workerAddress).slice(0,10)}…</td><td>${x.receiptSeq}</td>
+    <td class="pos">${tar(x.amountTar)}</td><td>${String(x.txHash).slice(0,10)}…</td></tr>`).join('')
+    || '<tr><td colspan="4" style="color:var(--muted)">выводов ещё не было</td></tr>';
+}
+
+async function loadBalances() {
+  const b = await api('/balances');
+  const tb = $('balTbl').querySelector('tbody');
+  tb.innerHTML = b.slice(0, 50).map(x => `<tr>
+    <td>${String(x.address).slice(0,14)}…</td>
+    <td>${tar(x.balanceTar)}</td><td>${fmt(x.stakedTar)}</td></tr>`).join('')
+    || '<tr><td colspan="3" style="color:var(--muted)">нет балансов</td></tr>';
+}
+
+async function loadLedger() {
+  const l = await api('/ledger?limit=50');
+  const tb = $('ledTbl').querySelector('tbody');
+  const cls = k => k === 'burn' ? 'neg' : k === 'payout' ? 'pos' : '';
+  tb.innerHTML = l.map(x => `<tr>
+    <td class="${cls(x.kind)}">${x.kind}</td>
+    <td>${String(x.toAddress || '—').slice(0,14)}…</td>
+    <td>${tar(x.amountTar)}</td></tr>`).join('')
+    || '<tr><td colspan="3" style="color:var(--muted)">движений нет</td></tr>';
+}
+
+async function refreshAll() {
+  await Promise.all([health(), loadSummary(), loadNodes(), loadAdapters(), loadBalances(), loadLedger(), loadSettlements()]);
+}
+
+refreshAll();
+// Живое обновление метрик и баланса — рост виден плавно, без перезагрузки.
+setInterval(async () => {
+  await health();
+  await loadSummary();
+  const a = $('balAddr').value.trim();
+  if (a) {
+    const b = await api('/balance/' + a);
+    if (b.balanceTar !== undefined) animateNumber($('balBig'), b.balanceTar, 6);
+  }
+}, 4000);
+</script>
+</body>
+</html>

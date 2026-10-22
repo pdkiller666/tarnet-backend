@@ -1,0 +1,33 @@
+# Зависимости
+node_modules/
+
+# Секреты: мастер-ключ и seed лотереи. Попадание в git = компрометация.
+.secrets/
+
+# Базы данных и их WAL/SHM
+tarnet.db
+tarnet.db-wal
+tarnet.db-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Резервные копии
+*.bak-*
+archive/backups/
+
+# Логи и временные файлы
+*.log
+/tmp/
+.DS_Store
+
+# Архивы БД (batcharchive / lottery / batching-бэкапы)
+tarnet.db.*.gz
+tarnet.db.*.bak*
+*.db.gz
+*.db.bak*
+*.sqlite
+*.sqlite3
+
+# Артефакты приёмки и временные БД
+/tmp/tarnet-test-*

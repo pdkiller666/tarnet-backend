@@ -1,0 +1,459 @@
+#!/usr/bin/env node
+"use strict";
+/*
+ * test-dpouw.js — приёмка dPoUW v2.1.
+ *
+ * Проверяет поведение, а не намерения: каждый блок соответствует критерию
+ * приёмки из задания. Запуск против изолированного сервера:
+ *
+ *   node test-dpouw.js http://localhost:3006
+ *
+ * Тест самодостаточен: регистрирует ноды и адаптер на чистой БД.
+ *
+ * Воспроизводимость на непустой БД: каждый прогон получает уникальный суффикс
+ * RUN и работает на собственных адресах воркеров и actionId. Поэтому результаты
+ * прогонов не смешиваются с прошлыми чеками и settlement-записями — повторный
+ * запуск против той же БД даёт тот же набор проверок.
+ */
+
+const crypto = require('crypto');
+const net = require('net');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+
+/* Флаг --test поднимает собственный изолированный сервер на временной БД и
+ * свободном порту. Позиционный аргумент (URL) сохраняется для прогона против
+ * уже запущенного стенда. */
+const TEST_MODE = process.argv.includes('--test');
+const positional = process.argv.slice(2).filter((a) => !a.startsWith('--'));
+
+let BASE = positional[0] || process.env.BASE || 'http://localhost:3006';
+
+let child = null;
+let tmpDir = null;
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const p = srv.address().port;
+      srv.close(() => resolve(p));
+    });
+  });
+}
+
+async function startIsolatedServer() {
+  const port = await freePort();
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-test-'));
+  const dbPath = path.join(tmpDir, 'test.db');
+  const secretsDir = path.join(tmpDir, 'secrets');
+
+  child = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
+    cwd: __dirname,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      TARNET_DB: dbPath,
+      TARNET_SECRETS_DIR: secretsDir,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let out = '';
+  child.stdout.on('data', (d) => { out += d.toString(); });
+  child.stderr.on('data', (d) => { out += d.toString(); });
+
+  const base = `http://127.0.0.1:${port}`;
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) {
+      throw new Error(`сервер упал при старте (код ${child.exitCode}):\n${out.slice(-800)}`);
+    }
+    try {
+      const r = await fetch(base + '/health');
+      if (r.ok) return base;
+    } catch (_e) { /* ещё не слушает */ }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  throw new Error(`сервер не поднялся за 20 с:\n${out.slice(-800)}`);
+}
+
+function stopIsolatedServer() {
+  if (child && child.exitCode === null) {
+    try { child.kill('SIGTERM'); } catch (_e) { /* уже мёртв */ }
+  }
+  child = null;
+  if (tmpDir) {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_e) { /* занято */ }
+    tmpDir = null;
+  }
+}
+
+process.on('exit', stopIsolatedServer);
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => { stopIsolatedServer(); process.exit(130); });
+}
+
+let pass = 0, fail = 0;
+const failures = [];
+
+function ok(name, cond, detail) {
+  if (cond) { pass++; console.log(`  ✅ ${name}`); }
+  else {
+    fail++; failures.push({ name, detail });
+    console.log(`  ❌ ${name}${detail !== undefined ? ` — ${JSON.stringify(detail)}` : ''}`);
+  }
+}
+function section(t) { console.log(`\n${t}`); }
+
+async function api(path, method = 'GET', body) {
+  const res = await fetch(BASE + path, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let json = null;
+  const text = await res.text();
+  try { json = text ? JSON.parse(text) : null; } catch (_e) { json = text; }
+  return { status: res.status, body: json };
+}
+
+/* Уникальный суффикс прогона: адреса и actionId не должны пересекаться с
+ * предыдущими запусками, иначе на непустой БД ломаются проверки, завязанные
+ * на «первый/единственный» чек воркера. */
+const RUN = Date.now().toString(16) + process.pid.toString(16).padStart(4, '0');
+const runId = (tag) => `${tag}-${RUN}`;
+const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
+
+(async () => {
+  if (TEST_MODE) {
+    console.log('Режим --test: поднимаю изолированный сервер на временной БД…');
+    BASE = await startIsolatedServer();
+    console.log(`Изоляция: ${tmpDir}`);
+  }
+  console.log(`Приёмка dPoUW v2.1 на ${BASE}`);
+  console.log(`Прогон RUN=${RUN}: адреса воркеров и actionId уникальны для этого запуска`);
+
+  const health = await api('/health');
+  ok('сервер отвечает', health.status === 200, health.status);
+  ok('версия схемы 2.1.0-dpouw', health.body.version === '2.1.0-dpouw', health.body.version);
+
+  // ---------- 1. Нет рандома в начислениях ----------
+  section('1. Детерминизм: одинаковый вход → одинаковое начисление');
+  // Две разные ноды с одинаковыми stake/reputation, одинаковый вход.
+  const wA = runAddress('a'), wB = runAddress('b');
+  for (const w of [wA, wB]) {
+    await api('/node', 'POST', { address: w, stake: 50000, reputation: 0.9, isTeeAttested: true });
+  }
+  const detA = await api('/work', 'POST', {
+    workerAddress: wA, tokens: 1000000, tier: 'base', response: 'same input',
+  });
+  const detB = await api('/work', 'POST', {
+    workerAddress: wB, tokens: 1000000, tier: 'base', response: 'same input',
+  });
+  ok('оба начисления приняты', detA.status === 201 && detB.status === 201,
+    [detA.status, detB.status]);
+  ok('fee одинаков при одинаковом входе',
+    Math.abs(detA.body.breakdown.feeRewardTar - detB.body.breakdown.feeRewardTar) < 1e-9,
+    [detA.body.breakdown.feeRewardTar, detB.body.breakdown.feeRewardTar]);
+  ok('CWU вычислен по формуле N×κ×γ',
+    detA.body.breakdown.cwu === 1000000 * 1.0 * 1, detA.body.breakdown.cwu);
+
+  // Повторный вызов с тем же actionId не должен начислять второй раз.
+  const sameAction = runId('fixed-action-id');
+  const r1 = await api('/work', 'POST', {
+    workerAddress: wA, tokens: 500000, tier: 'base', response: 'x', actionId: sameAction,
+  });
+  ok('работа с явным actionId принята', r1.status === 201, r1.status);
+
+  // ---------- 2. Каждая успешная задача = гарантированное начисление ----------
+  section('2. Гарантированное начисление (нет «если повезло»)');
+  const N = 30;
+  let zeroRewards = 0, positives = 0;
+  for (let i = 0; i < N; i++) {
+    const r = await api('/work', 'POST', {
+      workerAddress: wA, tokens: 100000 + i * 1000, tier: 'base',
+      response: `guaranteed ${i}`, actionId: runId(`guaranteed-${i}`),
+    });
+    if (r.status === 201 && r.body.receipt.rewardTar > 0) positives++;
+    else if (r.status === 201 && r.body.receipt.rewardTar === 0) zeroRewards++;
+  }
+  ok(`все ${N} работ начислены (γ=1)`, positives === N, { positives, zeroRewards });
+  ok('нет нулевых начислений при успешной работе', zeroRewards === 0, zeroRewards);
+
+  // ---------- 3. Баланс растёт плавно ----------
+  section('3. Плавный рост баланса');
+  const balBefore = await api(`/balance/${wA}`);
+  const r3 = await api('/work', 'POST', {
+    workerAddress: wA, tokens: 250000, tier: 'base', response: 'growth', actionId: runId('growth'),
+  });
+  const balAfter = await api(`/balance/${wA}`);
+  const delta = balAfter.body.balanceTar - balBefore.body.balanceTar;
+  ok('баланс вырос ровно на сумму начисления',
+    Math.abs(delta - r3.body.receipt.rewardTar) < 1e-6,
+    { delta, reward: r3.body.receipt.rewardTar });
+  ok('нарастающий итог монотонен',
+    r3.body.receipt.cumulativeTotal > balBefore.body.balanceTar - 1e-9,
+    { cumulative: r3.body.receipt.cumulativeTotal });
+  ok('начисление не округлено до целых', r3.body.receipt.rewardTar % 1 !== 0,
+    r3.body.receipt.rewardTar);
+
+  // ---------- 4. Burn 2.5% на КАЖДОМ начислении ----------
+  section('4. Burn на каждом начислении');
+  const burnBefore = await api(`/balance/${(await api('/config')).body ? '0x' + 'dead'.repeat(10) : ''}`);
+  const b1 = await api('/work', 'POST', {
+    workerAddress: wA, tokens: 4000000, tier: 'base', response: 'burn check', actionId: runId('burn'),
+  });
+  const burnAfter = await api(`/balance/${'0x' + 'dead'.repeat(10)}`);
+  ok('burn > 0 на начислении', b1.body.receipt.burnTar > 0, b1.body.receipt.burnTar);
+  ok('баланс адреса сжигания вырос',
+    burnAfter.body.balanceTar > burnBefore.body.balanceTar,
+    { before: burnBefore.body.balanceTar, after: burnAfter.body.balanceTar });
+  // burn = 2.5% от fee gross, а не от полного начисления (эмиссия не сжигается)
+  const feeGross = b1.body.breakdown.feeGrossTar;
+  ok('burn = 2.5% от fee gross',
+    Math.abs(b1.body.receipt.burnTar - feeGross * 0.025) < 1e-6,
+    { burn: b1.body.receipt.burnTar, expected: feeGross * 0.025 });
+
+  // ---------- 5. Dual-Stream ----------
+  section('5. Формула Dual-Stream (Fee + Block)');
+  const ds = await api('/work', 'POST', {
+    workerAddress: wA, tokens: 1000000, tier: 'expert', response: 'dual', actionId: runId('dual'),
+  });
+  ok('fee-поток присутствует', ds.body.breakdown.feeRewardTar >= 0);
+  ok('block-поток присутствует', ds.body.breakdown.blockRewardTar >= 0);
+  ok('reward = fee + block',
+    Math.abs(ds.body.breakdown.rewardTar
+      - (ds.body.breakdown.feeRewardTar + ds.body.breakdown.blockRewardTar)) < 1e-6,
+    ds.body.breakdown);
+  ok('CWU expert = N × 4',
+    ds.body.breakdown.cwu === 1000000 * 4, ds.body.breakdown.cwu);
+  ok('инвариант сохранения держится', ds.body.conservation.holds === true, ds.body.conservation);
+
+  // ---------- 6. On-chain только для итоговых чеков ----------
+  section('6. On-chain settlement только для итогового чека');
+  const receiptsBefore = await api(`/receipts/${wA}?limit=500`);
+  const settle = await api('/settle', 'POST', { workerAddress: wA });
+  ok('settle принят', settle.status === 200, settle.status);
+  ok('в on-chain ровно один чек на воркера',
+    settle.body.results[0].receiptSeq === receiptsBefore.body[0].seq,
+    { settled: settle.body.results[0].receiptSeq, lastReceipt: receiptsBefore.body[0].seq });
+  ok('сумма on-chain = нарастающий итог',
+    Math.abs(settle.body.results[0].amountTar - receiptsBefore.body[0].cumulativeTotal) < 1e-6,
+    { amount: settle.body.results[0].amountTar, cumulative: receiptsBefore.body[0].cumulativeTotal });
+  const settleAgain = await api('/settle', 'POST', { workerAddress: wA });
+  ok('повторный settle идемпотентен', settleAgain.body.results[0].alreadySettled === true);
+  const onchain = await api('/settlements');
+  ok('в /settlements одна запись на воркера',
+    onchain.body.filter(s => s.workerAddress === wA).length === 1,
+    onchain.body.filter(s => s.workerAddress === wA).length);
+
+  // ---------- 7. Ed25519 подписи проверяются локально ----------
+  section('7. Ed25519: подпись чека верифицируется независимо');
+  const receipt = await api(`/receipt/${wA}`);
+  ok('чек получен', receipt.status === 200, receipt.status);
+  ok('подпись помечена как ed25519', receipt.body.signatureAlg === 'ed25519');
+  const verify = await api('/receipt/verify', 'POST', receipt.body);
+  ok('подпись валидна', verify.body.signatureValid === true, verify.body);
+  ok('нарастающий итог арифметически верен', verify.body.cumulativeValid === true, verify.body);
+
+  // Подделка: изменить сумму — подпись должна отвалиться.
+  const forged = { ...receipt.body, rewardTar: receipt.body.rewardTar + 1000 };
+  const forgedVerify = await api('/receipt/verify', 'POST', forged);
+  ok('подделка суммы отвергается', forgedVerify.body.signatureValid === false);
+
+  // ---------- 8. Логи и детализация ----------
+  section('8. Детализация каждого начисления');
+  const hist = await api(`/receipts/${wA}?limit=5`);
+  ok('история начислений доступна', hist.status === 200 && Array.isArray(hist.body));
+  ok('в истории есть CWU, fee, block, burn',
+    hist.body.length > 0 && ['cwu', 'feeRewardTar', 'blockRewardTar', 'burnTar']
+      .every(k => hist.body[0][k] !== undefined), Object.keys(hist.body[0] || {}));
+  const seqs = hist.body.map(r => r.seq);
+  ok('seq монотонно убывает в истории',
+    seqs.every((v, i) => i === 0 || seqs[i - 1] > v), seqs);
+
+  // ---------- 8.5. LoRA-роялти: автор адаптера получает 5% от feeReward ----------
+  section('8.5. LoRA royalty: 5% от feeReward уходит автору адаптера');
+  /* Фикстуры адаптеров сеются сервером при старте (seedAdapterFixtures):
+   * lora-coder-v1 / lora-math-v1 / lora-medical-v1 с доменами. Проверяем,
+   * что они на месте, а не регистрируем свой адаптер на каждый прогон. */
+  const adapters = await api('/adapters');
+  const adapterId = 'lora-coder-v1';
+  const fixture = (adapters.body || []).find(a => a.adapterId === adapterId);
+  ok('фикстура адаптера засеяна', Boolean(fixture), adapters.body?.length);
+  ok('фикстура имеет домен', Boolean(fixture?.domain), fixture?.domain);
+  const authorAddress = fixture.authorAddress;
+
+  /* Три домена — три записи. Публичная регистрация адаптеров — Фаза 2,
+   * поэтому набор фиксирован и проверяется по именам. */
+  const fixtureIds = ['lora-coder-v1', 'lora-math-v1', 'lora-medical-v1'];
+  ok('в GET /adapters все 3 фикстуры',
+    fixtureIds.every(id => (adapters.body || []).some(a => a.adapterId === id)),
+    (adapters.body || []).map(a => a.adapterId));
+
+  const authorBefore = await api(`/balance/${authorAddress}`);
+  const royaltyWork = await api('/work', 'POST', {
+    workerAddress: wA, tokens: 1000000, tier: 'expert',
+    adapterId, response: 'lora royalty test', actionId: runId('royalty'),
+  });
+  ok('работа с adapterId принята', royaltyWork.status === 201, royaltyWork.status);
+
+  // royalty = 5% от net, где net = gross - burn - treasury.
+  const rb = royaltyWork.body.breakdown;
+  const rBurn = rb.feeGrossTar * 0.025;
+  const rTreas = rb.feeGrossTar * 0.025;
+  const rNet = rb.feeGrossTar - rBurn - rTreas;
+  ok('роялти начислено (ненулевое)', rb.royaltyTar > 0, rb.royaltyTar);
+  ok('роялти = 5% от feeReward после вычетов',
+    Math.abs(rb.royaltyTar - rNet * 0.05) < 1e-6,
+    { royalty: rb.royaltyTar, expected: rNet * 0.05 });
+  ok('воркеру остались 95% net',
+    Math.abs(rb.feeRewardTar - (rNet - rNet * 0.05)) < 1e-6,
+    { worker: rb.feeRewardTar, expected: rNet - rNet * 0.05 });
+
+  const authorAfter = await api(`/balance/${authorAddress}`);
+  ok('роялти реально зачислено автору',
+    Math.abs((authorAfter.body.balanceTar - authorBefore.body.balanceTar) - rb.royaltyTar) < 1e-6,
+    { before: authorBefore.body.balanceTar, after: authorAfter.body.balanceTar, royalty: rb.royaltyTar });
+
+  const sumRoyalty = await api('/summary');
+  ok('в /summary totalLoraRoyaltyTar > 0', sumRoyalty.body.totalLoraRoyaltyTar > 0,
+    sumRoyalty.body.totalLoraRoyaltyTar);
+  ok('инвариант сохранения держится при роялти',
+    royaltyWork.body.conservation.holds === true, royaltyWork.body.conservation);
+
+  // ---------- 8.6. client_signature проверяется по Ed25519 ----------
+  section('8.6. client_signature: подпись клиента обязана сходиться');
+  const client = await api('/wallet', 'POST');
+  const clientAddress = client.body.address;
+  const sigTier = 'base';
+  const sigTokens = 250000;
+  const sigAction = runId('sig');
+
+  /* Канонический payload фиксирован в server.js (clientSignPayload):
+   * clientAddress:workerAddress:tokens:tier:actionId */
+  const canonical = [clientAddress, wB, String(sigTokens), sigTier, sigAction].join(':');
+  const sig = crypto.sign(null, Buffer.from(canonical, 'utf8'),
+    crypto.createPrivateKey(client.body.privateKeyPem)).toString('base64');
+
+  const signed = await api('/work', 'POST', {
+    workerAddress: wB, clientAddress, tokens: sigTokens, tier: sigTier,
+    response: 'signed work', actionId: sigAction, client_signature: sig,
+  });
+  ok('валидная подпись клиента принята', signed.status === 201, signed.status);
+
+  const forgedSig = await api('/work', 'POST', {
+    workerAddress: wB, clientAddress, tokens: sigTokens + 1, tier: sigTier,
+    response: 'forged work', actionId: runId('sig-forged'), client_signature: sig,
+  });
+  ok('подпись с изменёнными данными отвергнута (400)', forgedSig.status === 400, forgedSig.status);
+  ok('причина отказа — несовпадение подписи',
+    /signature does not match/i.test(String(forgedSig.body?.reason || '')), forgedSig.body?.reason);
+
+  const noClient = await api('/work', 'POST', {
+    workerAddress: wB, tokens: sigTokens, tier: sigTier,
+    response: 'no client', actionId: runId('sig-noclient'), client_signature: sig,
+  });
+  ok('подпись без clientAddress отвергнута (400)', noClient.status === 400, noClient.status);
+
+  // ---------- 8.7. llm_mode и worker-очередь ----------
+  section('8.7. LLM-режим виден в /health, очередь воркеров доступна');
+  const hLlm = await api('/health');
+  ok('в /health есть llm_mode', typeof hLlm.body.llm_mode === 'string', hLlm.body.llm_mode);
+  ok('llm_mode — одно из трёх состояний',
+    ['worker', 'external_api', 'deterministic_fallback'].includes(hLlm.body.llm_mode),
+    hLlm.body.llm_mode);
+  ok('в /health есть active_workers и pii_blocked_today',
+    hLlm.body.active_workers !== undefined && hLlm.body.pii_blocked_today !== undefined,
+    { active_workers: hLlm.body.active_workers, pii_blocked_today: hLlm.body.pii_blocked_today });
+
+  const wStatus = await api('/worker/status');
+  ok('/worker/status отвечает', wStatus.status === 200 && wStatus.body.mode !== undefined, wStatus.body);
+  const wPoll = await api('/worker/poll');
+  ok('/worker/poll не падает на пустой очереди',
+    wPoll.status === 200 && wPoll.body.task === null, wPoll.body?.task);
+
+  // ---------- 8.8. Батчинг коротких работ ----------
+  section('8.8. Батчинг: короткие работы копятся до порога, а не теряются');
+  /* Отдельный воркер: накопление живёт в pending_work и не должно
+   * смешиваться с чеками других блоков теста. */
+  const wC = runAddress('c');
+  await api('/node', 'POST', { address: wC, stake: 40000, reputation: 0.85 });
+
+  const queuedRuns = [];
+  for (let i = 1; i <= 9; i++) {
+    const r = await api('/work', 'POST', {
+      workerAddress: wC, tokens: 5, tier: 'base',
+      response: `short ${i}`, actionId: runId(`short-${i}`),
+    });
+    queuedRuns.push(r);
+  }
+  ok('9 коротких работ приняты без чека (202)',
+    queuedRuns.every(r => r.status === 202 && r.body.queued === true),
+    queuedRuns.map(r => r.status));
+  ok('накопление растёт от 5 до 45',
+    queuedRuns.map(r => r.body.pending_work).join(',') === '5,10,15,20,25,30,35,40,45',
+    queuedRuns.map(r => r.body.pending_work));
+  ok('порог в ответе равен 50',
+    queuedRuns.every(r => r.body.threshold === 50), queuedRuns[0].body.threshold);
+  ok('в queued-ответе нет чека', queuedRuns.every(r => r.body.receipt === null));
+
+  const closing = await api('/work', 'POST', {
+    workerAddress: wC, tokens: 5, tier: 'base',
+    response: 'short 10', actionId: runId('short-10'),
+  });
+  ok('10-я работа выпустила чек (201)', closing.status === 201 && !closing.body.queued, closing.status);
+  ok('чек на суммарные 50 токенов', closing.body.breakdown.tokens === 50, closing.body.breakdown.tokens);
+  ok('в чеке 10 работ в batchedFrom',
+    Array.isArray(closing.body.batchedFrom) && closing.body.batchedFrom.length === 10,
+    closing.body.batchedFrom?.length);
+  ok('короткие работы не потеряны: начислено > 0', closing.body.breakdown.rewardTar > 0,
+    closing.body.breakdown.rewardTar);
+
+  const afterClose = await api('/work', 'POST', {
+    workerAddress: wC, tokens: 5, tier: 'base',
+    response: 'after close', actionId: runId('short-11'),
+  });
+  ok('после выпуска накопление сброшено',
+    afterClose.status === 202 && afterClose.body.pending_work === 5,
+    { status: afterClose.status, pending: afterClose.body.pending_work });
+
+  const wcHist = await api(`/receipts/${wC}`);
+  ok('у воркера ровно один чек за 10 коротких работ',
+    Array.isArray(wcHist.body) && wcHist.body.length === 1, wcHist.body?.length);
+
+  // ---------- Инварианты сети ----------
+  section('9. Глобальные инварианты');
+  const summary = await api('/summary');
+  ok('инвариант сохранения в /summary', summary.body.conservation.holds === true, summary.body.conservation);
+  ok('нет несогласованных чеков', health.body.conservation.inconsistentRows === 0);
+  const h2 = await api('/health');
+  ok('инвариант сохранения в /health', h2.body.conservation.holds === true, h2.body.conservation);
+
+  // Лотерейных маршрутов быть не должно.
+  section('10. Лотерея удалена');
+  for (const p of ['/lottery/commitment', '/ticket', '/draw/x']) {
+    const r = await api(p, p === '/ticket' ? 'POST' : 'GET', p === '/ticket' ? {} : undefined);
+    ok(`${p} отсутствует (404)`, r.status === 404, r.status);
+  }
+  const oldSummary = await api('/summary');
+  ok('в /summary нет ticketsIssued', oldSummary.body.ticketsIssued === undefined);
+  ok('в /summary нет winRate', oldSummary.body.winRate === undefined);
+
+  console.log('\n' + '─'.repeat(50));
+  console.log(`Итого: ${pass} ✅   ${fail} ❌`);
+  if (fail) {
+    console.log('\nПровалы:');
+    for (const f of failures) console.log(`  • ${f.name} — ${JSON.stringify(f.detail)}`);
+  }
+  console.log('─'.repeat(50));
+  process.exit(fail ? 1 : 0);
+})().catch(e => {
+  console.error('\nФатальная ошибка теста:', e.message);
+  process.exit(2);
+});
