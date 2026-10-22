@@ -961,6 +961,83 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   });
   ok('невалидный PEM отклоняется на регистрации (400)', regBadKey.status === 400, regBadKey.body);
 
+  // ---------- 8.15. POST /inference/onion: пакет собирается, промпт не оседает ----------
+  section('8.15. POST /inference/onion');
+  const onRoute = [];
+  for (const tag of ['onr1', 'onr2', 'onw']) {
+    const kp = onion.generateNodeRsaKeypair();
+    const addr = runAddress(tag);
+    const reg = await api('/node', 'POST', {
+      address: addr, stake: 120000, reputation: 0.93, rsaPublicKeyPem: kp.publicKeyPem,
+    });
+    onRoute.push({ addr, kp, reg });
+  }
+  ok('три узла с ключами зарегистрированы',
+    onRoute.every(n => n.reg.status === 200 && n.reg.body?.onionCapable === true),
+    onRoute.map(n => n.reg.status));
+
+  const ONION_PROMPT = `промпт-маркер-${RUN}-никогда-не-должен-лежать-на-диске`;
+  const inf = await api('/inference/onion', 'POST', {
+    routeNodes: onRoute.map(n => n.addr),
+    prompt: ONION_PROMPT,
+    clientAddress: runAddress('onclient'),
+    model: 'qwen2.5-coder-7b',
+  });
+  ok('/inference/onion отвечает 200 и сообщает число прыжков',
+    inf.status === 200 && inf.body?.hops === 3, { status: inf.status, hops: inf.body?.hops });
+  ok('эндпоинт честно говорит, что пакет не доставлен',
+    inf.body?.delivered === false, inf.body?.delivered);
+
+  /* Пакет разбирается настоящими приватными ключами узлов: если маршрут
+   * собран неверно, воркер не увидит промпт и проверка упадёт. */
+  let pkt = Buffer.from(inf.body.onionPacket, 'base64');
+  const hopViews = [];
+  let workerGot = null;
+  for (const n of onRoute) {
+    const { nextHop, payload } = onion.unwrapLayer(pkt, n.kp.privateKeyPem);
+    hopViews.push({ addr: n.addr.slice(0, 10), nextHop, seesPrompt: payload.toString('utf8').includes(ONION_PROMPT) });
+    if (nextHop === 'destination') { workerGot = JSON.parse(payload.toString('utf8')); break; }
+    pkt = payload;
+  }
+  ok('реле 1 и реле 2 не видят промпт',
+    hopViews[0]?.seesPrompt === false && hopViews[1]?.seesPrompt === false, hopViews);
+  ok('воркер получил промпт и модель',
+    workerGot?.prompt === ONION_PROMPT && workerGot?.model === 'qwen2.5-coder-7b',
+    { prompt: workerGot?.prompt === ONION_PROMPT, model: workerGot?.model });
+  ok('ключ ответа вернулся клиенту (32 байта)',
+    Buffer.from(inf.body.responseAesKey || '', 'base64').length === 32);
+
+  /* PROMISE из комментария к эндпоинту: промпт не пишется ни в БД, ни в лог.
+   * Читаю файл БД сырыми байтами: если промпт где-то осел, он там будет.
+   * Это проверка обещания, а не косвенная догадка. */
+  let promptOnDisk = null;
+  if (tmpDir) {
+    const dbPath = path.join(tmpDir, 'test.db');
+    if (fs.existsSync(dbPath)) {
+      promptOnDisk = fs.readFileSync(dbPath).includes(Buffer.from(ONION_PROMPT, 'utf8'));
+    }
+  }
+  ok('промпт не найден в файле БД', promptOnDisk === false, { found: promptOnDisk });
+
+  const noRoute = await api('/inference/onion', 'POST', { prompt: 'x' });
+  ok('без routeNodes — 400', noRoute.status === 400, noRoute.body);
+
+  const unknownNode = await api('/inference/onion', 'POST', {
+    routeNodes: ['0x' + 'd'.repeat(40)], prompt: 'x',
+  });
+  ok('незарегистрированный узел — 404', unknownNode.status === 404, unknownNode.body);
+
+  const bareNode = runAddress('onbare');
+  await api('/node', 'POST', { address: bareNode, stake: 1000, reputation: 0.5 });
+  const bareRoute = await api('/inference/onion', 'POST', { routeNodes: [bareNode], prompt: 'x' });
+  ok('узел без ключа — 409 и понятная причина',
+    bareRoute.status === 409 && /rsaPublicKeyPem/.test(bareRoute.body?.error || ''), bareRoute.body);
+
+  const tooLong = await api('/inference/onion', 'POST', {
+    routeNodes: [onRoute[0].addr], prompt: 'A'.repeat(65 * 1024),
+  });
+  ok('промпт больше 64 KiB — 413', tooLong.status === 413, tooLong.body);
+
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
   const summary = await api('/summary');

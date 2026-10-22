@@ -23,6 +23,7 @@ const { CWUCalculator, RewardEngine, verifyQuality, epochEmission, epochIndex, o
 const { CumulativeLedger, receiptPayload, epochState, releasedFor, bumpEpoch } = require('./ledger');
 const { getGenesisHash, receiptPayloadV2, computeReceiptHash, verifyWorkerDagChain } = require('./dag-chain');
 const LLM = require('./llm-adapter');
+const onion = require('./onion');
 
 // ===== Configuration =====
 const PORT = process.env.PORT || 3001;
@@ -1396,6 +1397,86 @@ function handleWork(req, res) {
     throw e;
   }
 }
+
+/* --- Onion Routing: сборка луковичного пакета (Фаза 2) ---
+ * Тело: { routeNodes: [адрес, ...], prompt, clientAddress, model? }
+ *
+ * ЧЕГО ЭТОТ ЭНДПОИНТ НЕ ДЕЛАЕТ: он НЕ доставляет пакет по сети. Ни один
+ * ретранслятор его не получает, промпт не уходит воркеру, ответа нет.
+ * Возвращается собранный пакет и одноразовый ключ клиента — этого достаточно,
+ * чтобы клиент сам прогнал пакет по цепи, но P2P-транспорт между реле это
+ * Фаза 3. Называть эндпоинт «работающим инференсом» было бы ложью.
+ *
+ * PROMISE: промпт не записывается ни в БД, ни в лог. Он живёт только в
+ * памяти на время сборки пакета и уходит вон зашифрованным. Иначе весь смысл
+ * луковой схемы теряется в первом же слое на сервере. */
+app.post('/inference/onion', (req, res) => {
+  const { routeNodes, prompt, clientAddress, model } = req.body || {};
+
+  if (!Array.isArray(routeNodes) || routeNodes.length === 0) {
+    return res.status(400).json({ error: 'routeNodes must be a non-empty array of node addresses' });
+  }
+  /* Три прыжка — разумный потолок для стенда: каждый слой добавляет
+   * RSA-блок и свой конверт, и цепь из десятков узлов не даёт ничего,
+   * кроме задержки. Больше пяти не разрешаем. */
+  if (routeNodes.length > 5) {
+    return res.status(400).json({ error: 'routeNodes supports at most 5 hops', got: routeNodes.length });
+  }
+  if (typeof prompt !== 'string' || prompt.length === 0) {
+    return res.status(400).json({ error: 'prompt must be a non-empty string' });
+  }
+  /* Промпт огромного размера в луковице раздувает каждый слой: RSA несёт
+   * только ключ, но AES-конверт растёт линейно. Ограничиваем явно. */
+  if (Buffer.byteLength(prompt, 'utf8') > 64 * 1024) {
+    return res.status(413).json({ error: 'prompt exceeds 64 KiB' });
+  }
+
+  const route = [];
+  for (const addr of routeNodes) {
+    if (typeof addr !== 'string' || !addr.length) {
+      return res.status(400).json({ error: 'routeNodes entries must be non-empty strings' });
+    }
+    const node = get('SELECT address, rsaPublicKeyPem FROM nodes WHERE address = ?', [addr]);
+    if (!node) {
+      return res.status(404).json({ error: 'route node not registered', address: addr });
+    }
+    if (!node.rsaPublicKeyPem) {
+      /* Отказ именно здесь: собрать слой без ключа нельзя, и лучше сказать
+       * это на входе, чем упасть на ONION_ROUTE_NODE_INCOMPLETE из глубины. */
+      return res.status(409).json({
+        error: 'route node has no rsaPublicKeyPem; register it via POST /node',
+        address: addr,
+      });
+    }
+    route.push({ address: node.address, rsaPublicKeyPem: node.rsaPublicKeyPem });
+  }
+
+  let built;
+  try {
+    built = onion.buildOnionRequest(
+      { prompt, model: model || null, clientAddress: clientAddress || null },
+      route,
+    );
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+
+  const packetBuf = Buffer.from(built.onionPacket, 'base64');
+  res.json({
+    ok: true,
+    hops: built.hops,
+    entryNode: built.entryNode,
+    route: route.map(n => n.address),
+    onionPacket: built.onionPacket,
+    packetBytes: packetBuf.length,
+    /* Ключ ответа возвращается только потому, что транспорт пока не готов:
+     * клиенту иначе нечем расшифровать ответ. В Фазе 3 он останется
+     * исключительно у клиента и из ответа API уйдёт. */
+    responseAesKey: built.responseAesKey.toString('base64'),
+    delivered: false,
+    note: 'пакет собран, но не отправлен: транспорт между реле — Фаза 3',
+  });
+});
 
 app.post('/work', handleWork);
 
