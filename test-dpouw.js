@@ -536,6 +536,148 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       && receiptsQ.length === 0,
     { rejected: rej.body, after: afterRej.body, receipts: receiptsQ.length });
 
+  /* ---------- 8.11. actionId — ключ идемпотентности ----------
+   * До этой проверки POST /work принимал actionId и молча выбрасывал: id
+   * выводился из содержимого, и ретрай создавал второй чек с тем же id.
+   * Контракт после починки:
+   *   • явный actionId  → повтор возвращает существующий чек (200) либо
+   *                       существующее накопление (202), нового начисления нет;
+   *   • тот же ключ на другого воркера → 409 (это не ретрай, а конфликт);
+   *   • actionId не передан → ключа нет, каждый запрос — новая работа, а
+   *                       выведенный из содержимого id остаётся отпечатком
+   *                       для spot-check, но не ключом дедупликации. */
+  section('8.11. actionId: повтор возвращает существующий чек, а не второй');
+  const wI = runAddress('i');
+  await api('/node', 'POST', { address: wI, stake: 45000, reputation: 0.88 });
+
+  const keyOne = runId('idem-one');
+  const idemBody = { workerAddress: wI, tokens: 750000, tier: 'base', response: 'idem payload' };
+  const first = await api('/work', 'POST', { ...idemBody, actionId: keyOne });
+  ok('явный actionId доходит до чека (поле больше не теряется)',
+    first.status === 201 && first.body.receipt?.actionId === keyOne,
+    { status: first.status, actionId: first.body.receipt?.actionId, sent: keyOne });
+
+  const beforeRetry = await api(`/receipts/${wI}?limit=500`);
+  const balRetryBefore = await api(`/balance/${wI}`);
+  const retry = await api('/work', 'POST', { ...idemBody, actionId: keyOne });
+  const afterRetry = await api(`/receipts/${wI}?limit=500`);
+  const balRetryAfter = await api(`/balance/${wI}`);
+  ok('повтор того же actionId: 200 + duplicate + existing=receipt',
+    retry.status === 200 && retry.body.duplicate === true && retry.body.existing === 'receipt',
+    { status: retry.status, duplicate: retry.body.duplicate, existing: retry.body.existing });
+  ok('повтор возвращает тот же чек (тот же seq)',
+    retry.body.receipt?.seq === first.body.receipt?.seq,
+    { retry: retry.body.receipt?.seq, first: first.body.receipt?.seq });
+  ok('повтор не создал второго чека',
+    afterRetry.body.length === beforeRetry.body.length,
+    { before: beforeRetry.body.length, after: afterRetry.body.length });
+  ok('повтор не изменил баланс воркера',
+    balRetryAfter.body.balanceTar === balRetryBefore.body.balanceTar,
+    { before: balRetryBefore.body.balanceTar, after: balRetryAfter.body.balanceTar });
+
+  /* Тот же ключ с другими полями — по-прежнему тот же чек. Ключ отвечает на
+   * вопрос «это та же работа?», поэтому расхождение полей новую работу не
+   * создаёт: иначе ключ ничего не защищал бы. */
+  const retryOther = await api('/work', 'POST', {
+    ...idemBody, tokens: 999999, response: 'другое тело', actionId: keyOne,
+  });
+  ok('тот же ключ с другим телом возвращает тот же чек (200, seq совпадает)',
+    retryOther.status === 200 && retryOther.body.receipt?.seq === first.body.receipt?.seq,
+    { status: retryOther.status, seq: retryOther.body.receipt?.seq });
+
+  /* Обратная сторона: разные ключи при одинаковом теле — разные работы.
+   * До починки id выводился из тела, и два таких запроса были неразличимы. */
+  const keyTwo = runId('idem-two');
+  const second = await api('/work', 'POST', { ...idemBody, actionId: keyTwo });
+  ok('другой actionId при тех же данных создаёт отдельный чек (201)',
+    second.status === 201 && second.body.receipt?.seq !== first.body.receipt?.seq,
+    { status: second.status, seq: second.body.receipt?.seq, first: first.body.receipt?.seq });
+  ok('во втором чеке лежит присланный id, а не выведенный',
+    second.body.receipt?.actionId === keyTwo, second.body.receipt?.actionId);
+
+  /* Ключ глобальный: тот же id на другого воркера — конфликт, а не ретрай.
+   * Иначе чужой чек можно было бы получить, угадав id. */
+  const wJ = runAddress('j');
+  await api('/node', 'POST', { address: wJ, stake: 45000, reputation: 0.88 });
+  const conflict = await api('/work', 'POST', { ...idemBody, workerAddress: wJ, actionId: keyOne });
+  const histJ = await api(`/receipts/${wJ}`);
+  ok('тот же actionId на другого воркера — 409', conflict.status === 409, conflict.status);
+  ok('конфликт не создал чек у второго воркера',
+    Array.isArray(histJ.body) && histJ.body.length === 0, histJ.body?.length);
+
+  /* actionId не передан: ключа нет. Одинаковые запросы — две работы, id
+   * выводится из содержимого и служит отпечатком для spot-check, а не
+   * ключом. Склеивать их нельзя: клиент мог честно выполнить ту же работу
+   * дважды, и молчаливая «одна оплата» списала бы его токены. */
+  const wK = runAddress('k');
+  await api('/node', 'POST', { address: wK, stake: 45000, reputation: 0.88 });
+  const noKeyBody = { workerAddress: wK, tokens: 600000, tier: 'base', response: 'same no key' };
+  const nk1 = await api('/work', 'POST', noKeyBody);
+  const nk2 = await api('/work', 'POST', noKeyBody);
+  ok('без actionId одинаковые запросы дают два чека (дедупликации нет)',
+    nk1.status === 201 && nk2.status === 201 && nk1.body.receipt.seq !== nk2.body.receipt.seq,
+    { s1: nk1.status, s2: nk2.status, seq1: nk1.body.receipt?.seq, seq2: nk2.body.receipt?.seq });
+  ok('без actionId id выводится из содержимого и воспроизводим',
+    nk1.body.receipt.actionId === nk2.body.receipt.actionId
+      && /^[0-9a-f]{32}$/.test(String(nk1.body.receipt.actionId)),
+    nk1.body.receipt.actionId);
+
+  /* Короткая работа: повтор ключа не должен копить токены дважды. */
+  const wP = runAddress('p');
+  await api('/node', 'POST', { address: wP, stake: 45000, reputation: 0.88 });
+  const pendKey = runId('idem-pending');
+  const pk1 = await api('/work', 'POST', {
+    workerAddress: wP, tokens: 5, tier: 'base', response: 'short idem', actionId: pendKey,
+  });
+  const pk2 = await api('/work', 'POST', {
+    workerAddress: wP, tokens: 5, tier: 'base', response: 'short idem', actionId: pendKey,
+  });
+  ok('повтор короткой работы — 202 already_pending, накопление не удвоилось',
+    pk1.status === 202 && pk2.status === 202 && pk2.body.duplicate === true
+      && pk2.body.reason === 'already_pending' && pk2.body.pending_work === 5,
+    { first: pk1.body, retry: pk2.body });
+
+  /* Накопление израсходовано при выпуске чека: ключ остаётся только в
+   * batchedFrom. Повтор обязан найти его там, иначе оплаченная короткая
+   * работа выпустила бы второй чек. */
+  const closeKey = runId('idem-close');
+  const closeP = await api('/work', 'POST', {
+    workerAddress: wP, tokens: 45, tier: 'base', response: 'close batch', actionId: closeKey,
+  });
+  const pk3 = await api('/work', 'POST', {
+    workerAddress: wP, tokens: 5, tier: 'base', response: 'short idem', actionId: pendKey,
+  });
+  const histP = await api(`/receipts/${wP}`);
+  ok('чек закрыл накопление (201) и содержит оба ключа в batchedFrom',
+    closeP.status === 201 && Array.isArray(closeP.body.batchedFrom)
+      && closeP.body.batchedFrom.includes(pendKey) && closeP.body.batchedFrom.includes(closeKey),
+    closeP.body.batchedFrom);
+  ok('повтор работы из batchedFrom возвращает тот чек, без нового начисления',
+    pk3.status === 200 && pk3.body.duplicate === true
+      && pk3.body.batchedInto === closeP.body.receipt.seq
+      && pk3.body.receipt?.seq === closeP.body.receipt.seq,
+    { status: pk3.status, batchedInto: pk3.body.batchedInto, closeSeq: closeP.body.receipt?.seq });
+  ok('у воркера по-прежнему один чек',
+    Array.isArray(histP.body) && histP.body.length === 1, histP.body?.length);
+
+  /* Повтор уже отвергнутой (γ=0) работы: работа не записана, значит ключ
+   * ничего не находит и проверка повторяется с тем же результатом. Это
+   * детерминизм, а не баг: чтобы получить новое решение, нужен новый ключ. */
+  if (respFail !== null) {
+    const rejRetry = await api('/work', 'POST', {
+      workerAddress: wQ, tokens: 100, tier: 'base', response: respFail, actionId: idFail,
+    });
+    ok('повтор отвергнутой работы снова 422, в накопление не попало',
+      rejRetry.status === 422 && rejRetry.body?.quality?.gamma === 0
+        && rejRetry.body?.receipt === null,
+      { status: rejRetry.status, quality: rejRetry.body?.quality });
+  }
+
+  const sumIdem = await api('/summary');
+  ok('инвариант сохранения держится после повторов',
+    sumIdem.body.conservation.delta === 0 && sumIdem.body.conservation.holds === true,
+    sumIdem.body.conservation);
+
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
   const summary = await api('/summary');

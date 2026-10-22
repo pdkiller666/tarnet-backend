@@ -613,6 +613,52 @@ function receiptThreshold(tier) {
   return Math.max(CONFIG.MIN_RECEIPT_TOKENS, tokensForNonzeroPayout(tier));
 }
 
+/* ===== Ключ идемпотентности =====
+ * actionId, присланный клиентом, — это ключ идемпотентности, а не подсказка:
+ * повтор с тем же ключом не создаёт второе начисление, а возвращает то
+ * состояние, в котором работа уже находится (чек либо накопление).
+ *
+ * Ищем в трёх местах, потому что работа проходит три стадии:
+ *   1) pending_work.actions — работа короткая и ещё копится;
+ *   2) work_receipts.actionId — работа закрыла чек;
+ *   3) work_receipts.batchedFrom — работа была слита в чек другого объёма.
+ * Без третьего шага повтор уже оплаченной короткой работы выпустил бы
+ * второй чек: после выпуска pending_work очищается, и ключ оставался бы
+ * только внутри batchedFrom.
+ *
+ * Списки проверяются через json_each (точное сравнение элемента), а не
+ * LIKE-подстрокой: id приходит от клиента, может содержать `%`, `_` или быть
+ * коротким, и подстрочный поиск давал бы и ложные совпадения, и — хуже —
+ * пропуски при ограниченном LIMIT, то есть двойную выплату. */
+function lookupActionId(id) {
+  const own = get('SELECT * FROM work_receipts WHERE actionId = ? ORDER BY seq DESC LIMIT 1', [id]);
+  if (own) return { kind: 'receipt', workerAddress: own.workerAddress, receipt: ledger.decorate(own) };
+
+  const batched = get(
+    `SELECT * FROM work_receipts r
+      WHERE r.batchedFrom IS NOT NULL
+        AND EXISTS (SELECT 1 FROM json_each(r.batchedFrom) WHERE json_each.value = ?)
+      ORDER BY r.seq DESC LIMIT 1`, [id],
+  );
+  if (batched) {
+    return { kind: 'receipt', workerAddress: batched.workerAddress,
+      receipt: ledger.decorate(batched), batched: true };
+  }
+
+  const pending = get(
+    `SELECT * FROM pending_work p
+      WHERE EXISTS (SELECT 1 FROM json_each(p.actions) WHERE json_each.value = ?)
+      LIMIT 1`, [id],
+  );
+  if (pending) {
+    return {
+      kind: 'pending', workerAddress: pending.workerAddress, tier: pending.tier,
+      adapterId: pending.adapterId, pending_work: Number(pending.tokens),
+    };
+  }
+  return null;
+}
+
 /* ===== Ядро начисления =====
  * Единственный путь, которым в системе появляются токены. Никаких условий
  * «если повезло»: при γ=1 начисление всегда, при γ=0 — никогда. */
@@ -631,16 +677,52 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
   }
 
   const adapter = adapterAuthor(adapterId);
+  /* Явный actionId — ключ идемпотентности. Пустая строка означает «не передан»:
+   * так же её понимает clientSignPayload, поэтому подпись не расходится. */
+  const explicitActionId = typeof actionId === 'string' && actionId.length > 0;
+  const id = explicitActionId ? actionId : crypto.createHash('sha256')
+    .update(`${workerAddress}:${clientAddress || ''}:${tokens}:${t}:${adapterId || ''}:${response || ''}`)
+    .digest('hex').slice(0, 32);
+
+  /* 0) Повтор с тем же ключом. Возвращаем существующее состояние, а не
+   * начисляем второй раз: ретрай клиента — это тот же запрос, а не новая
+   * работа. Ключ глобальный, поэтому тот же ключ на другого воркера — уже не
+   * ретрай, а конфликт: иначе чужой чек можно было бы вытащить перебором id. */
+  if (explicitActionId) {
+    const found = lookupActionId(id);
+    if (found) {
+      if (found.workerAddress !== workerAddress) {
+        const err = new Error(`actionId ${id} already used by another worker`);
+        err.code = 'ACTION_ID_CONFLICT';
+        throw err;
+      }
+      return {
+        duplicate: true,
+        existing: found.kind,
+        actionId: id,
+        workerAddress,
+        tier: t,
+        adapterId: adapterId || BASE_MODEL,
+        receipt: found.kind === 'receipt' ? found.receipt : null,
+        pending_work: found.kind === 'pending' ? found.pending_work : null,
+        threshold: receiptThreshold(t),
+        queued: found.kind === 'pending',
+        batchedInto: found.batched ? found.receipt.seq : null,
+      };
+    }
+  }
+
   /* Мягко удалённый адаптер закрыт для новых работ. Иначе soft delete был бы
-   * косметикой: роялти продолжали бы начисляться удалённому адаптеру. */
+   * косметикой: роялти продолжали бы начисляться удалённому адаптеру.
+   *
+   * Проверка стоит ПОСЛЕ поиска по ключу: работа уже принята и оплачена, и
+   * soft delete адаптера, случившийся позже, не отменяет её. Иначе ретрай
+   * оплаченной работы получал бы 409 на ровном месте, а не свой чек. */
   if (adapter && adapter.deletedAt) {
     const err = new Error(`Adapter ${adapterId} is deleted (soft) — new work rejected`);
     err.code = 'ADAPTER_DELETED';
     throw err;
   }
-  const id = actionId || crypto.createHash('sha256')
-    .update(`${workerAddress}:${clientAddress || ''}:${tokens}:${t}:${adapterId || ''}:${response || ''}`)
-    .digest('hex').slice(0, 32);
 
   // 1) Качество: γ_verify ∈ {0,1}. Провал проверки = нет начисления.
   const quality = verifyQuality({ actionId: id, tokens, response: response || 'ok', adapterId: adapterId || BASE_MODEL });
@@ -1042,6 +1124,13 @@ function handleWork(req, res) {
   if (!Number.isFinite(tokens) || tokens <= 0) {
     return res.status(400).json({ error: 'tokens must be a positive number', received: body.tokens ?? null });
   }
+  /* actionId — ключ идемпотентности. Не строка и не пустая строка значит
+   * «не передан»: иначе число 0 или null стали бы ключом и склеили бы
+   * разные работы в одну. */
+  if (body.actionId !== undefined && body.actionId !== null
+      && (typeof body.actionId !== 'string' || !body.actionId.length)) {
+    return res.status(400).json({ error: 'actionId must be a non-empty string when provided', actionId: body.actionId });
+  }
   /* Подпись клиента, если передана, обязана сойтись. Молча принимать
    * непроверенную подпись хуже, чем не принимать её вовсе. */
   const sig = checkClientSignature(body, {
@@ -1058,7 +1147,46 @@ function handleWork(req, res) {
       tier: body.tier ?? 'base',
       adapterId: body.adapterId,
       response: body.response,
+      /* Раньше поле терялось здесь, и повтор запроса получал НОВЫЙ чек (или
+       * досчитывался в накопление) с тем же выведенным id. Теперь ключ доходит
+       * до ядра: повтор того же actionId — идемпотентный возврат существующего
+       * состояния, а не второе начисление. */
+      actionId: body.actionId,
     });
+
+    /* Повтор с тем же ключом. 200, а не 201: нового ресурса не создано.
+     * Тело описывает то состояние, в котором работа уже находится — чек либо
+     * накопление. Флаг duplicate: true делает повтор отличимым от первого
+     * ответа, чтобы клиент не считал его свежим начислением. */
+    if (outcome.duplicate) {
+      const common = {
+        duplicate: true,
+        existing: outcome.existing,
+        actionId: outcome.actionId,
+        workerAddress: outcome.workerAddress,
+        tier: outcome.tier,
+        adapterId: outcome.adapterId,
+        threshold: outcome.threshold,
+      };
+      if (outcome.existing === 'pending') {
+        return res.status(202).json({
+          ...common,
+          queued: true,
+          reason: 'already_pending',
+          pending_work: outcome.pending_work,
+          receipt: null,
+        });
+      }
+      return res.status(200).json({
+        ...common,
+        queued: false,
+        // Работа уже оплачена: чек существующий, batchedInto — если она была
+        // слита в чек большего объёма и своего seq у неё нет.
+        batchedInto: outcome.batchedInto ?? null,
+        cumulative_receipt: ledger.getCumulativeReceipt(outcome.workerAddress),
+        receipt: outcome.receipt,
+      });
+    }
 
     /* Работа короче порога не даёт чека: она накоплена. Ответ 202, а не 201:
      * ресурс (чек) не создан, но запрос принят и не потерян. Отдавать 201 с
@@ -1123,6 +1251,10 @@ function handleWork(req, res) {
     if (e.code === 'BAD_TIER') return res.status(400).json({ error: e.message, tier: req.body?.tier ?? null });
     if (e.code === 'UNKNOWN_WORKER') return res.status(400).json({ error: e.message, workerAddress: req.body?.workerAddress });
     if (e.code === 'ADAPTER_DELETED') return res.status(409).json({ error: e.message, adapterId: req.body?.adapterId ?? null });
+    /* Тот же actionId уже принадлежит другому воркеру — это не ретрай, а
+     * конфликт ключей. Вернуть чужой чек значило бы отдать его первому, кто
+     * угадает id. */
+    if (e.code === 'ACTION_ID_CONFLICT') return res.status(409).json({ error: e.message, actionId: req.body?.actionId ?? null });
     throw e;
   }
 }
