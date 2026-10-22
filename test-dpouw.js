@@ -1322,6 +1322,136 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('в /summary нет ticketsIssued', oldSummary.body.ticketsIssued === undefined);
   ok('в /summary нет winRate', oldSummary.body.winRate === undefined);
 
+  // ---------- Фаза 2: TarNet ID ----------
+  section('11. TarNet ID (детерминированный аккаунт)');
+  const idCrypto = require('crypto');
+  const tarIdentity = require('./identity');
+  const chatMod = require('./chat-sync');
+  const entropy = idCrypto.randomBytes(32).toString('hex');
+
+  const reg1 = await api('/id/register', 'POST', { masterEntropy: entropy });
+  ok('/id/register создаёт аккаунт', reg1.status === 200 && reg1.body.created === true, reg1.status);
+  ok('pubkey — 32 байта hex', /^[0-9a-f]{64}$/.test(reg1.body.pubkey || ''), reg1.body.pubkey);
+  ok('ответ помечен serverDerived', reg1.body.serverDerived === true);
+  ok('есть предупреждение о выводе на сервере',
+    /derive keys on the device/i.test(reg1.body.warning || ''), reg1.body.warning);
+
+  /* Главная проверка вехи: seed-фраза должна воспроизводить тот же аккаунт.
+   * Недетерминированный generateKeyPairSync (подход v2.2.1) здесь бы провалился. */
+  const reg2 = await api('/id/register', 'POST', { masterEntropy: entropy });
+  ok('детерминизм: та же энтропия → тот же pubkey',
+    reg2.body.pubkey === reg1.body.pubkey, { a: reg1.body.pubkey, b: reg2.body.pubkey });
+  ok('детерминизм: тот же адрес', reg2.body.address === reg1.body.address);
+  ok('повторная регистрация не создаёт дубль', reg2.body.created === false);
+
+  const idPub = reg1.body.pubkey;
+  const idAddr = reg1.body.address;
+  const idBal = await api(`/id/${idPub}/balance`);
+  ok('GET /id/:pubkey/balance отвечает', idBal.status === 200, idBal.status);
+  ok('баланс нового ID — 0', idBal.body.balanceTar === 0, idBal.body.balanceTar);
+  ok('адрес в балансе совпадает с регистрацией', idBal.body.address === idAddr);
+  ok('deviceId выведен из энтропии', typeof idBal.body.deviceId === 'string' && idBal.body.deviceId.length > 0);
+
+  const regByPub = await api('/id/register', 'POST', { pubkey: idPub });
+  ok('регистрация по pubkey не требует секрета', regByPub.status === 200 && regByPub.body.serverDerived === false);
+  ok('адрес из pubkey совпадает', regByPub.body.address === idAddr);
+
+  /* Совместимость: адрес TarNet ID считается той же формулой, что у кошельков,
+   * поэтому старый эндпоинт баланса обязан его видеть без правок. */
+  const legacyBal = await api(`/balance/${idAddr}`);
+  ok('старый /balance/:address видит TarNet ID', legacyBal.status === 200 && legacyBal.body.address === idAddr);
+
+  const badPub = await api('/id/register', 'POST', { pubkey: 'abcd' });
+  ok('короткий pubkey отвергается (400)', badPub.status === 400, badPub.status);
+  const noBody = await api('/id/register', 'POST', {});
+  ok('пустое тело отвергается (400)', noBody.status === 400, noBody.status);
+  const unknownId = await api(`/id/${idCrypto.randomBytes(32).toString('hex')}/balance`);
+  ok('неизвестный pubkey — 404', unknownId.status === 404, unknownId.status);
+  const nonHex = await api('/id/zzz/balance');
+  ok('не-хекс pubkey — 400', nonHex.status === 400, nonHex.status);
+
+  // ---------- Фаза 2: P2P Sync ----------
+  section('12. P2P Sync (оффлайн-история)');
+  const syncKeys = tarIdentity.deriveTarNetKeys(idCrypto.randomBytes(32));
+  const syncKeyHex = Buffer.from(syncKeys.chatSyncKey).toString('hex');
+  const threadId = runId('th');
+  const encA = chatMod.encryptPayload(syncKeys.chatSyncKey, 'сообщение с ПК');
+  const encB = chatMod.encryptPayload(syncKeys.chatSyncKey, 'второе сообщение');
+  const syncMsg = (n, enc, dev) => ({
+    msg_id: `${threadId}-m${n}`, chat_thread_id: threadId, sender_device_id: dev,
+    logical_time: n, wall_clock_ms: 1000 * n, is_deleted: 0, ...enc,
+  });
+  const msgA = syncMsg(1, encA, 'devPC');
+  const msgB = syncMsg(2, encB, 'devPC');
+
+  const push1 = await api('/chat/sync', 'POST', {
+    chatSyncKey: syncKeyHex, knownIds: [], messages: [msgA, msgB],
+  });
+  ok('POST /chat/sync принимает дельту', push1.status === 200 && push1.body.applied.inserted === 2, push1.body.applied);
+  ok('в ответе отданы принятые сообщения', push1.body.outbound === 2, push1.body.outbound);
+
+  /* Идемпотентность — основа оффлайн-синхронизации: устройства встречаются
+   * многократно и пересылают одно и то же. */
+  const push2 = await api('/chat/sync', 'POST', {
+    chatSyncKey: syncKeyHex, knownIds: [msgA.msg_id, msgB.msg_id], messages: [msgA, msgB],
+  });
+  ok('повторная отправка не создаёт дублей', push2.body.applied.inserted === 0, push2.body.applied);
+  ok('повторные сообщения пропущены', push2.body.applied.skipped === 2, push2.body.applied);
+
+  const push3 = await api('/chat/sync', 'POST', {
+    chatSyncKey: syncKeyHex, knownIds: [msgA.msg_id], messages: [],
+  });
+  ok('сервер отдаёт только недостающее', push3.body.outbound === 1 && push3.body.messages[0].msg_id === msgB.msg_id,
+    push3.body.outbound);
+
+  /* Целостность: пакет с битым MAC отбрасывается до сравнения версий,
+   * иначе подделка могла бы выиграть по wall_clock_ms. */
+  const forgedSync = await api('/chat/sync', 'POST', {
+    chatSyncKey: syncKeyHex, knownIds: [],
+    messages: [{
+      msg_id: `${threadId}-forged`, chat_thread_id: threadId, sender_device_id: 'devX',
+      logical_time: 99, wall_clock_ms: 99, is_deleted: 0,
+      payload_enc: encA.payload_enc, iv: encA.iv,
+      mac_tag: Buffer.alloc(16).toString('base64'),
+    }],
+  });
+  ok('подделанный MAC отвергнут', forgedSync.body.applied.rejected === 1, forgedSync.body.applied);
+  ok('подделка не попала в исходящие', forgedSync.body.messages.every((m) => m.msg_id !== `${threadId}-forged`));
+
+  const shortKey = await api('/chat/sync', 'POST', { chatSyncKey: 'short', knownIds: [], messages: [] });
+  ok('ключ неверной длины — 400', shortKey.status === 400, shortKey.status);
+
+  // ---------- Фаза 2: Knowledge Loop ----------
+  section('13. Knowledge Loop (сжатие LoRA)');
+  const rows = 4, cols = 32;
+  const weights = Array.from({ length: rows * cols }, () => Math.random() - 0.5);
+  const lora1 = await api('/knowledge/submit-lora', 'POST', {
+    name: runId('delta'), rows, cols, data: weights, authorAddress: runAddress('auth'),
+  });
+  ok('POST /knowledge/submit-lora принимает дельту', lora1.status === 200, lora1.status);
+  ok('хеш адаптера 0x + 64 hex', /^0x[0-9a-f]{64}$/.test(lora1.body.adapterHash || ''), lora1.body.adapterHash);
+  ok('формат CSR + INT8', lora1.body.format === 'csr-int8', lora1.body.format);
+  ok('сжатие реально (меньше fp32)', lora1.body.compressionRatio < 1, lora1.body.compressionRatio);
+  ok('Trim оставил ~20% весов', Math.abs(lora1.body.density - 0.2) < 0.05, lora1.body.density);
+
+  /* Benchmark Gate не реализован. Тест закрепляет честное поведение:
+   * заглушка ОБЯЗАНА сообщать, что она заглушка, а не «одобрено». */
+  ok('Benchmark Gate помечен как нереализованный', lora1.body.gate.implemented === false, lora1.body.gate);
+  ok('адаптер НЕ одобрен заглушкой', lora1.body.gate.approved === false);
+
+  const loraDup = await api('/knowledge/submit-lora', 'POST', {
+    name: runId('delta'), rows, cols, data: weights,
+  });
+  ok('тот же адаптер распознан как дубль',
+    loraDup.body.duplicate === true && loraDup.body.adapterHash === lora1.body.adapterHash);
+
+  const loraBadLen = await api('/knowledge/submit-lora', 'POST', { name: 'x', rows: 2, cols: 2, data: [1, 2, 3] });
+  ok('несовпадение длины — 400', loraBadLen.status === 400, loraBadLen.status);
+  const loraBadType = await api('/knowledge/submit-lora', 'POST', { name: 'x', rows: 2, cols: 2, data: [1, 'a', 3, 4] });
+  ok('не-число в весах — 400', loraBadType.status === 400, loraBadType.status);
+  const loraNoData = await api('/knowledge/submit-lora', 'POST', { name: 'x', rows: 2, cols: 2, data: [] });
+  ok('пустые веса — 400', loraNoData.status === 400, loraNoData.status);
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌`);
   if (fail) {

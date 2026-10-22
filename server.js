@@ -25,6 +25,11 @@ const { getGenesisHash, receiptPayloadV2, computeReceiptHash, verifyWorkerDagCha
 const LLM = require('./llm-adapter');
 const onion = require('./onion');
 const { startDemoMesh, describeMesh } = require('./p2p-demo');
+/* Фаза 2: TarNet ID, оффлайн-синхронизация чатов, Knowledge Loop.
+ * Спека-источник — v2.2.2 (v2.2.1 отозвана: недетерминированные ключи + wrtc). */
+const tarIdentity = require('./identity');
+const chatSync = require('./chat-sync');
+const knowledgeLoop = require('./knowledge-loop');
 
 // ===== Configuration =====
 const PORT = process.env.PORT || 3001;
@@ -349,6 +354,44 @@ ensureColumn('wallets', 'privateKeyPem', 'privateKeyPem TEXT');
 ensureColumn('inferenceLogs', 'source', 'source TEXT');
 ensureColumn('inferenceLogs', 'emulated', 'emulated INTEGER DEFAULT 0');
 ensureColumn('ledger_txs', 'actionId', 'actionId TEXT');
+
+/* ===== Фаза 2: TarNet ID, оффлайн-чаты, LoRA-дельты =====
+ * Всё на IF NOT EXISTS, поэтому отдельная миграция на стенде не нужна:
+ * существующая база получает новые таблицы при первом же старте.
+ *
+ * Адрес TarNet ID считается той же формулой, что у кошельков
+ * (0x + sha256(SPKI-DER)[0..40]), поэтому аккаунт живёт в общей таблице
+ * balances и /balance/:address работает без правок старого кода. */
+db.exec(`
+CREATE TABLE IF NOT EXISTS tar_id (
+  address TEXT PRIMARY KEY,
+  pubkey TEXT NOT NULL,
+  device_id TEXT,
+  createdAt TEXT NOT NULL,
+  lastSeenAt TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tar_id_pubkey ON tar_id (pubkey);
+
+CREATE TABLE IF NOT EXISTS lora_submissions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  adapter_hash TEXT NOT NULL,
+  author_address TEXT,
+  name TEXT,
+  rows INTEGER,
+  cols INTEGER,
+  nnz INTEGER,
+  byte_size INTEGER,
+  density REAL,
+  payload TEXT,
+  gate_approved INTEGER DEFAULT 0,
+  gate_reason TEXT,
+  createdAt TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_lora_hash ON lora_submissions (adapter_hash);
+`);
+
+/* chat_messages + журнал синхронизации. Схема — по спеке v2.2.2 §4.1. */
+chatSync.initChatSchema(db);
 /* timestamp участвует в канонической строке подписи чека: без него
  * payload собирался с undefined и подпись не сходилась при проверке. */
 ensureColumn('work_receipts', 'timestamp', 'timestamp INTEGER');
@@ -1103,7 +1146,9 @@ const RATE_LIMITS = {
  * тем же классом: иначе открытие страницы съедало бы бюджет записи. */
 const RATE_READ_PATH =
   /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|p2p\/status)$/;
-const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$/;
+/* `/id/<pubkey>/balance` — чтение, а не запись: клиент опрашивает баланс так же
+ * часто, как /balance/<addr>. Без этой ветки он упирался бы в 10/мин. */
+const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$|^\/id\/[0-9a-fA-F]{0,64}\/balance$/;
 const RATE_READ_ASSET = /\.(html|css|js|svg|webmanifest|png|ico|woff2?)$/;
 /* Оболочки UI: `/` и `/app/` — это HTML-контейнеры без расширения, без этой
  * ветки открытие консоли списывалось бы с бюджета записи (10/мин).
@@ -1189,7 +1234,10 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     timestamp: Date.now(),
-    database: 'sqlite://tarnet.db',
+    /* Путь берётся из DB_PATH, а не литералом: на стенде TARNET_DB задаётся
+     * переменной окружения, и жёсткая строка 'sqlite://tarnet.db' вводила в
+     * заблуждение — отчёт показывал одну базу, работа шла с другой. */
+    database: `sqlite://${path.basename(DB_PATH)}`,
     version: SCHEMA_VERSION,
     rewardMode: CONFIG.REWARD_MODE,
     signatureAlg: 'ed25519',
@@ -1297,6 +1345,223 @@ app.get('/balance/:address', (req, res) => {
 app.get('/balances', (_req, res) => {
   res.json(all('SELECT address, balanceTar, stakedTar, updatedAt FROM balances ORDER BY balanceTar DESC LIMIT 200')
     .map(b => ({ ...b, balanceTar: Number(b.balanceTar.toFixed(6)) })));
+});
+
+/* ===== TarNet ID =====
+ * Два пути регистрации, и разница между ними принципиальна:
+ *
+ *  1. { pubkey }            — ПРАВИЛЬНЫЙ путь. Клиент выводит ключи у себя из
+ *                             seed-фразы и присылает только публичный ключ.
+ *                             Сервер никогда не видит мастер-энтропию.
+ *  2. { masterEntropy }     — путь стенда/отладки: вывод происходит на сервере.
+ *                             Ответ помечается serverDerived: true, чтобы это
+ *                             нельзя было принять за штатный режим. В бою
+ *                             энтропия на сервер уходить не должна.
+ */
+app.post('/id/register', (req, res) => {
+  const body = req.body || {};
+  const now = new Date().toISOString();
+
+  let rawPub;
+  let serverDerived = false;
+  let keys = null;
+
+  try {
+    if (typeof body.pubkey === 'string' && body.pubkey.length) {
+      rawPub = tarIdentity.normalizePubkey(body.pubkey);
+    } else if (typeof body.masterEntropy === 'string' && body.masterEntropy.length) {
+      keys = tarIdentity.deriveTarNetKeys(body.masterEntropy);
+      rawPub = keys.wallet.pub;
+      serverDerived = true;
+    } else {
+      return res.status(400).json({
+        error: 'pubkey or masterEntropy required',
+        hint: 'prefer pubkey: entropy must stay on the device',
+      });
+    }
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+
+  const pubkeyHex = Buffer.from(rawPub).toString('hex');
+  const address = tarIdentity.addressFromRawPubkey(rawPub);
+
+  const existing = get('SELECT address, pubkey, device_id, createdAt FROM tar_id WHERE pubkey = ?', [pubkeyHex]);
+  if (existing) {
+    run('UPDATE tar_id SET lastSeenAt = ? WHERE address = ?', [now, existing.address]);
+    return res.json({
+      ok: true,
+      created: false,
+      address: existing.address,
+      pubkey: pubkeyHex,
+      deviceId: existing.device_id,
+      serverDerived,
+    });
+  }
+
+  /* Кошелёк и счёт создаём через общие помощники: адрес посчитан той же
+   * формулой, поэтому приватный ключ ложится в wallets, а баланс — в balances.
+   * Публичный/приватный ключ в PEM нужен, чтобы старые эндпоинты (подпись
+   * чеков, client_signature) работали с TarNet ID без изменений. */
+  const publicKeyPem = tarIdentity.rawPubToPem(rawPub);
+  const privateKeyPem = keys ? tarIdentity.seedToPem(keys.wallet.priv) : null;
+
+  run('INSERT OR IGNORE INTO wallets (address, publicKeyPem, privateKeyPem) VALUES (?, ?, ?)',
+    [address, publicKeyPem, privateKeyPem ? encryptSecret(privateKeyPem) : null]);
+  run(`INSERT INTO balances (address, balanceTar, stakedTar, updatedAt) VALUES (?, 0, 0, ?)
+       ON CONFLICT(address) DO NOTHING`, [address, now]);
+
+  const deviceId = keys ? keys.deviceId : null;
+  run('INSERT INTO tar_id (address, pubkey, device_id, createdAt, lastSeenAt) VALUES (?, ?, ?, ?, ?)',
+    [address, pubkeyHex, deviceId, now, now]);
+
+  /* Приватные ключи на диск — только если вывод был серверным. При регистрации
+   * по pubkey секретов у сервера нет вовсе, и это правильно. */
+  if (keys) {
+    try {
+      tarIdentity.saveIdentity(address, keys, MASTER_KEY, SECRETS_DIR);
+    } catch (e) {
+      console.error('[id] не удалось сохранить ключи на диск:', e.message);
+    }
+  }
+
+  res.json({
+    ok: true,
+    created: true,
+    address,
+    pubkey: pubkeyHex,
+    deviceId,
+    serverDerived,
+    warning: serverDerived
+      ? 'entropy was sent to the server; derive keys on the device in production'
+      : undefined,
+  });
+});
+
+app.get('/id/:pubkey/balance', (req, res) => {
+  let raw;
+  try {
+    raw = tarIdentity.normalizePubkey(req.params.pubkey);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+  const address = tarIdentity.addressFromRawPubkey(raw);
+  const b = get('SELECT address, balanceTar, stakedTar, updatedAt FROM balances WHERE address = ?', [address]);
+  const idRow = get('SELECT address, device_id, createdAt FROM tar_id WHERE address = ?', [address]);
+
+  if (!b && !idRow) {
+    return res.status(404).json({ error: 'TarNet ID not found', address });
+  }
+  res.json({
+    address,
+    pubkey: req.params.pubkey.toLowerCase(),
+    deviceId: idRow ? idRow.device_id : null,
+    registeredAt: idRow ? idRow.createdAt : null,
+    balanceTar: b ? Number(b.balanceTar.toFixed(6)) : 0,
+    stakedTar: b ? Number(b.stakedTar.toFixed(6)) : 0,
+    updatedAt: b ? b.updatedAt : null,
+  });
+});
+
+/* ===== P2P Sync: обмен дельтами по HTTP =====
+ * Тот же алгоритм, что в chat-sync.js, доступный по сети. Вектор состояния —
+ * список известных msg_id (LWW-Element-Set), поэтому пропуски внутри
+ * последовательности не теряются. */
+app.post('/chat/sync', (req, res) => {
+  const body = req.body || {};
+  const chatSyncKey = body.chatSyncKey;
+  if (typeof chatSyncKey !== 'string' || !/^[0-9a-fA-F]{64}$/.test(chatSyncKey)) {
+    return res.status(400).json({ error: 'chatSyncKey must be 64 hex chars (32 bytes)' });
+  }
+  const key = Buffer.from(chatSyncKey, 'hex');
+  const knownIds = new Set(Array.isArray(body.knownIds) ? body.knownIds.map(String) : []);
+  const incoming = Array.isArray(body.messages) ? body.messages : [];
+
+  const stats = chatSync.mergeMessages(db, { chatSyncKey: key, incoming });
+  const delta = chatSync.deltaFor(db, knownIds);
+
+  res.json({
+    ok: true,
+    applied: stats,
+    outbound: delta.length,
+    messages: delta,
+  });
+});
+
+/* ===== Knowledge Loop =====
+ * Принимает сырые веса дельты, сжимает (Trim 80% → INT8 → CSR), считает хеш
+ * и сохраняет. Benchmark Gate НЕ пройден и не может быть пройден: он не
+ * реализован (Фаза 3), поэтому gate_approved = 0 всегда. */
+app.post('/knowledge/submit-lora', (req, res) => {
+  const body = req.body || {};
+  const { name, rows, cols, data } = body;
+
+  if (!Array.isArray(data) || !data.length) {
+    return res.status(400).json({ error: 'data must be a non-empty array of weights' });
+  }
+  if (!Number.isInteger(rows) || !Number.isInteger(cols) || rows <= 0 || cols <= 0) {
+    return res.status(400).json({ error: 'rows and cols must be positive integers' });
+  }
+  if (data.length !== rows * cols) {
+    return res.status(400).json({ error: `data length ${data.length} != rows*cols ${rows * cols}` });
+  }
+  for (const v of data) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      return res.status(400).json({ error: 'data must contain only finite numbers' });
+    }
+  }
+
+  let compressed;
+  try {
+    compressed = knowledgeLoop.compressLoRA({ name: name || 'unnamed', rows, cols, data });
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+
+  const hash = knowledgeLoop.adapterHash(compressed);
+  const gate = knowledgeLoop.verifyAdapter(hash, []);
+
+  const existing = get('SELECT adapter_hash FROM lora_submissions WHERE adapter_hash = ?', [hash]);
+  if (existing) {
+    return res.json({
+      ok: true,
+      duplicate: true,
+      adapterHash: hash,
+      gate: { approved: false, implemented: gate.implemented },
+    });
+  }
+
+  const now = new Date().toISOString();
+  const payload = JSON.stringify({
+    rowPtr: compressed.rowPtr,
+    indices: compressed.indices,
+    values: compressed.values,
+    scales: compressed.scales,
+  });
+
+  run(`INSERT INTO lora_submissions
+       (adapter_hash, author_address, name, rows, cols, nnz, byte_size, density,
+        payload, gate_approved, gate_reason, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+    [hash, body.authorAddress || null, compressed.name, rows, cols, compressed.nnz,
+      compressed.byteSize, compressed.density, payload, gate.reason, now]);
+
+  res.json({
+    ok: true,
+    adapterHash: hash,
+    format: compressed.format,
+    nnz: compressed.nnz,
+    density: compressed.density,
+    byteSize: compressed.byteSize,
+    fp32ByteSize: compressed.fp32ByteSize,
+    compressionRatio: Number((compressed.byteSize / compressed.fp32ByteSize).toFixed(4)),
+    gate: {
+      implemented: gate.implemented,
+      approved: gate.approved,
+      quorumRequired: gate.quorumRequired,
+      reason: gate.reason,
+    },
+  });
 });
 
 app.get('/ledger', (req, res) => {
