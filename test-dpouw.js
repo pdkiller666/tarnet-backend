@@ -678,6 +678,62 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     sumIdem.body.conservation.delta === 0 && sumIdem.body.conservation.holds === true,
     sumIdem.body.conservation);
 
+  /* ---------- 8.12. Клиентский actionId НЕ выбирает spot-check ---------- */
+  section('8.12. actionId — ключ дедупликации, а не seed аудита');
+
+  /* Ловушка, ради которой seed и ключ разведены. Выборка — bucket < 5, где
+   * bucket считается из seed. Если бы seed был клиентским actionId, клиент
+   * перебрал бы id с bucket >= 5 и проходил аудит без работы — то есть покупал
+   * себе γ=1 перебором строки. Тест доказывает, что это невозможно: берём
+   * работу, которая ЗАВЕДОМО проваливает проверку, и шлём её с «удобным»
+   * ключом (bucket >= 5). Вердикт обязан остаться прежним — 422.
+   *
+   * Без разведения seed и ключа этот тест краснеет: там 201 и оплаченный чек. */
+  const bucketOf = (s) => crypto.createHash('sha256').update(s).digest().readUInt32BE(0) % 100;
+  let safeKey = null;
+  for (let n = 0; n < 5000 && safeKey === null; n++) {
+    const cand = `bribe-${runId('s')}-${n}`;
+    if (bucketOf(cand) >= 5) safeKey = cand;
+  }
+
+  if (respFail !== null && safeKey !== null) {
+    /* Тот же воркер и та же работа, что провалилась в 8.10, но с ключом,
+     * чей собственный bucket «безопасен». */
+    const bribe = await api('/work', 'POST', {
+      workerAddress: wQ, tokens: 100, tier: 'base', response: respFail, actionId: safeKey,
+    });
+    console.log(`  … подкуп: ключ bucket=${bucketOf(safeKey)} (>=5, «чистый»), а работа sampled=${bribe.body?.quality?.sampled} bucket=${bribe.body?.quality?.bucket}`);
+    ok('«удобный» ключ не отменяет аудит: работа всё равно 422',
+      bribe.status === 422 && bribe.body?.quality?.gamma === 0
+        && bribe.body?.quality?.sampled === true && bribe.body?.receipt === null,
+      { status: bribe.status, quality: bribe.body?.quality });
+    ok('bucket аудита считается из содержимого, а не из ключа',
+      bribe.body?.quality?.bucket === bucketOf(idFail)
+        && bribe.body?.quality?.bucket !== bucketOf(safeKey),
+      { auditBucket: bribe.body?.quality?.bucket, contentBucket: bucketOf(idFail), keyBucket: bucketOf(safeKey) });
+  }
+
+  /* Обратная сторона: ключ всё-таки работает как ключ. Успешная работа с тем
+   * же actionId возвращает тот же чек — дедупликация не сломана разведением. */
+  if (safeKey !== null) {
+    const wR = runAddress('r');
+    await api('/node', 'POST', { address: wR, stake: 45000, reputation: 0.9 });
+    const okBody = { workerAddress: wR, tokens: 800000, tier: 'base', response: 'honest work', actionId: safeKey };
+    const r1 = await api('/work', 'POST', okBody);
+    const r2 = await api('/work', 'POST', okBody);
+    ok('тот же ключ на честной работе — 201 затем 200 с тем же чеком',
+      r1.status === 201 && r2.status === 200 && r2.body.duplicate === true
+        && r2.body.receipt?.seq === r1.body.receipt?.seq,
+      { s1: r1.status, s2: r2.status, seq1: r1.body.receipt?.seq, seq2: r2.body.receipt?.seq });
+    ok('чек сохраняет клиентский ключ как actionId',
+      r1.body.receipt?.actionId === safeKey, r1.body.receipt?.actionId);
+  }
+
+  const sumBribe = await api('/summary');
+  ok('сохранение держится после попытки подкупа',
+    sumBribe.body.conservation.delta === 0 && sumBribe.body.conservation.holds === true,
+    sumBribe.body.conservation);
+
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
   const summary = await api('/summary');

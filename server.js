@@ -677,12 +677,30 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
   }
 
   const adapter = adapterAuthor(adapterId);
+  /* Здесь два РАЗНЫХ идентификатора, и путать их нельзя:
+   *
+   *   id        — ключ дедупликации. Может прийти от клиента.
+   *   auditSeed — seed spot-check. ВСЕГДА выводится сервером из содержимого
+   *               работы и НИКОГДА из клиентского id.
+   *
+   * Почему seed не может быть клиентским: выборка — bucket = h % 100 < 5, и
+   * если клиент задаёт seed, он просто перебирает id, пока bucket не станет
+   * >= 5, то есть покупает себе проход аудита без работы. Это записанная
+   * ловушка (MEMORY.md, запись про body.actionId), и именно поэтому нельзя
+   * было «просто прокинуть» actionId в verifyQuality.
+   *
+   * Seed выводится из содержимого работы, а не из ключа, поэтому он
+   * воспроизводим — тот же труд даёт тот же вердикт, а другой труд — другой.
+   * Клиент влияет на него только меняя саму работу (tokens/response/тир), а не
+   * метку запроса. */
+  const auditSeed = crypto.createHash('sha256')
+    .update(`${workerAddress}:${clientAddress || ''}:${tokens}:${t}:${adapterId || ''}:${response || ''}`)
+    .digest('hex').slice(0, 32);
+
   /* Явный actionId — ключ идемпотентности. Пустая строка означает «не передан»:
    * так же её понимает clientSignPayload, поэтому подпись не расходится. */
   const explicitActionId = typeof actionId === 'string' && actionId.length > 0;
-  const id = explicitActionId ? actionId : crypto.createHash('sha256')
-    .update(`${workerAddress}:${clientAddress || ''}:${tokens}:${t}:${adapterId || ''}:${response || ''}`)
-    .digest('hex').slice(0, 32);
+  const id = explicitActionId ? actionId : auditSeed;
 
   /* 0) Повтор с тем же ключом. Возвращаем существующее состояние, а не
    * начисляем второй раз: ретрай клиента — это тот же запрос, а не новая
@@ -725,7 +743,9 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
   }
 
   // 1) Качество: γ_verify ∈ {0,1}. Провал проверки = нет начисления.
-  const quality = verifyQuality({ actionId: id, tokens, response: response || 'ok', adapterId: adapterId || BASE_MODEL });
+  // Seed берётся из содержимого (auditSeed), а не из id: иначе клиент
+  // подбирал бы себе bucket и проходил аудит без работы.
+  const quality = verifyQuality({ actionId: auditSeed, tokens, response: response || 'ok', adapterId: adapterId || BASE_MODEL });
 
   /* 1.5) Батчинг коротких работ. Работа дешевле порога не пропадает и не
    * превращается в чек на ноль: она копится в pending_work и суммируется со
