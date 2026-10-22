@@ -65,7 +65,7 @@ class CumulativeLedger {
     feeGrossTar = 0, feeRewardTar, blockRewardTar, rewardTar,
     burnTar, treasuryTar, royaltyTar,
     epoch, omega = 0, share = 0, adapterId = null, actionId = null,
-    batchedFrom = null,
+    batchedFrom = null, adapterDeletedAt = null,
   }) {
     if (!workerAddress) throw new Error('workerAddress is required');
     const prev = this.lastFor(workerAddress);
@@ -93,15 +93,16 @@ class CumulativeLedger {
          (seq, workerAddress, cwu, tier, feeGrossTar, feeRewardTar, blockRewardTar, rewardTar,
           burnTar, treasuryTar, royaltyTar, cumulativeTotal, epoch, omega, share,
           adapterId, actionId, timestamp, prevSignature, signature, signatureAlg, createdAt,
-          batchedFrom)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          batchedFrom, adapterDeletedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [seq, workerAddress, round(cwu), tier,
         round(feeGrossTar), round(feeRewardTar), round(blockRewardTar), round(rewardTar),
         round(burnTar), round(treasuryTar), round(royaltyTar), cumulativeTotal,
         epoch, Number(omega), Number(share),
         adapterId, actionId, timestamp, base.prevSignature, signature, 'ed25519',
         new Date(timestamp).toISOString(),
-        batchedFrom && batchedFrom.length ? JSON.stringify(batchedFrom) : null],
+        batchedFrom && batchedFrom.length ? JSON.stringify(batchedFrom) : null,
+        adapterDeletedAt],
     );
 
     return this.get(seq);
@@ -140,6 +141,10 @@ class CumulativeLedger {
        * входит: формат payload зафиксирован, а батчинг — метаданные о том,
        * из чего собран объём. Ценность чека от них не зависит. */
       batchedFrom: r.batchedFrom ? JSON.parse(r.batchedFrom) : [],
+      /* Момент soft-delete адаптера на момент выпуска чека (ISO-строка) либо
+       * null. Снимок, а не текущее состояние реестра: чек описывает прошлое,
+       * а адаптер могли удалить позже. Вне подписываемого payload. */
+      adapterDeletedAt: r.adapterDeletedAt || null,
     };
   }
 

@@ -362,6 +362,15 @@ ensureColumn('work_receipts', 'batchedFrom', 'batchedFrom TEXT');
 /* domain — домен адаптера (code/math/medical). Нужен для проверки роялти
  * по доменам; публичная регистрация адаптеров — Фаза 2. */
 ensureColumn('adapters', 'domain', 'domain TEXT');
+/* deleted_at — soft delete. Физического удаления адаптеров в коде нет и не
+ * должно быть: на адаптер ссылаются уже выплаченные чеки, и DELETE осиротил
+ * бы роялти. Удалённый адаптер перестаёт принимать новые работы, история
+ * остаётся целой. */
+ensureColumn('adapters', 'deleted_at', 'deleted_at TEXT');
+/* adapterDeletedAt — снимок deleted_at адаптера в момент выпуска чека. Нужен,
+ * чтобы чек оставался самодостаточным: состояние реестра может измениться
+ * позже. В подписываемый payload не входит. */
+ensureColumn('work_receipts', 'adapterDeletedAt', 'adapterDeletedAt TEXT');
 
 /* Счёт казны существует с самого старта, а не только после первого
  * начисления: иначе /balance/<treasury> отдаёт 404 на чистой базе. */
@@ -560,8 +569,15 @@ function pickWorker(tier) {
 // ===== Adapters =====
 function adapterAuthor(adapterId) {
   if (!adapterId || adapterId === BASE_MODEL) return null;
-  const row = get('SELECT authorAddress, royaltyRate FROM adapters WHERE adapterId = ?', [adapterId]);
-  return row ? { address: row.authorAddress, rate: Number(row.royaltyRate) } : null;
+  const row = get('SELECT authorAddress, royaltyRate, deleted_at FROM adapters WHERE adapterId = ?', [adapterId]);
+  if (!row) return null;
+  return {
+    address: row.authorAddress,
+    rate: Number(row.royaltyRate),
+    /* Soft delete: адаптер удалён, но строка и роялти остаются. Новые работы
+     * на него не принимаются, уже выплаченное не откатывается. */
+    deletedAt: row.deleted_at || null,
+  };
 }
 
 // ===== Ledger =====
@@ -615,6 +631,13 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
   }
 
   const adapter = adapterAuthor(adapterId);
+  /* Мягко удалённый адаптер закрыт для новых работ. Иначе soft delete был бы
+   * косметикой: роялти продолжали бы начисляться удалённому адаптеру. */
+  if (adapter && adapter.deletedAt) {
+    const err = new Error(`Adapter ${adapterId} is deleted (soft) — new work rejected`);
+    err.code = 'ADAPTER_DELETED';
+    throw err;
+  }
   const id = actionId || crypto.createHash('sha256')
     .update(`${workerAddress}:${clientAddress || ''}:${tokens}:${t}:${adapterId || ''}:${response || ''}`)
     .digest('hex').slice(0, 32);
@@ -714,6 +737,7 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
       adapterId: adapterId || BASE_MODEL,
       actionId: id,
       batchedFrom,
+      adapterDeletedAt: adapter ? adapter.deletedAt : null,
     });
 
     /* Накопление израсходовано: чек выпущен на суммарный объём. Удаление в
@@ -950,7 +974,24 @@ app.post('/adapter', (req, res) => {
   res.json({ adapterId, authorAddress, baseModel: baseModel || BASE_MODEL, domain: domain || null, royaltyRate: CONFIG.LORA_ROYALTY_RATE });
 });
 
-app.get('/adapters', (_req, res) => res.json(all('SELECT adapterId, authorAddress, baseModel, domain, royaltyRate FROM adapters ORDER BY adapterId')));
+app.get('/adapters', (_req, res) => res.json(all('SELECT adapterId, authorAddress, baseModel, domain, royaltyRate, deleted_at FROM adapters ORDER BY adapterId')));
+
+/* --- Soft delete адаптера ---
+ * Физического удаления нет: на адаптер ссылаются уже выплаченные чеки, и
+ * DELETE осиротил бы историю роялти. DELETE /adapter/:id только ставит
+ * deleted_at, после чего новые работы на адаптер отклоняются (409), а
+ * выплаченное и история остаются нетронутыми. Идемпотентно. */
+app.delete('/adapter/:adapterId', (req, res) => {
+  const { adapterId } = req.params;
+  const row = get('SELECT adapterId, deleted_at FROM adapters WHERE adapterId = ?', [adapterId]);
+  if (!row) return res.status(404).json({ error: 'adapter not found', adapterId });
+  if (row.deleted_at) {
+    return res.json({ adapterId, deleted_at: row.deleted_at, alreadyDeleted: true });
+  }
+  const deletedAt = new Date().toISOString();
+  run('UPDATE adapters SET deleted_at = ? WHERE adapterId = ?', [deletedAt, adapterId]);
+  res.json({ adapterId, deleted_at: deletedAt, alreadyDeleted: false });
+});
 
 /* --- Work: единственная точка начисления ---
  * Тело: { workerAddress, tokens, tier, adapterId?, response?, clientAddress?, actionId? }
@@ -1029,6 +1070,7 @@ function handleWork(req, res) {
   } catch (e) {
     if (e.code === 'BAD_TIER') return res.status(400).json({ error: e.message, tier: req.body?.tier ?? null });
     if (e.code === 'UNKNOWN_WORKER') return res.status(400).json({ error: e.message, workerAddress: req.body?.workerAddress });
+    if (e.code === 'ADAPTER_DELETED') return res.status(409).json({ error: e.message, adapterId: req.body?.adapterId ?? null });
     throw e;
   }
 }
