@@ -23,6 +23,7 @@ const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 const dag = require('./dag-chain');
+const onion = require('./onion');
 
 /* Флаг --test поднимает собственный изолированный сервер на временной БД и
  * свободном порту. Позиционный аргумент (URL) сохраняется для прогона против
@@ -860,6 +861,105 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   const unitGapRes = dag.verifyWorkerDagChain(unitGap, unitOpts);
   ok('юнит: пропуск workerSeq ловится',
     unitGapRes.valid === false && unitGapRes.error === 'SEQ_GAP', unitGapRes);
+
+  // ---------- 8.14. Onion Routing: 3 прыжка и закрытый обратный путь ----------
+  section('8.14. Onion Routing: Client → Relay 1 → Relay 2 → Worker');
+  const relay1 = onion.generateNodeRsaKeypair();
+  const relay2 = onion.generateNodeRsaKeypair();
+  const homeWorker = onion.generateNodeRsaKeypair();
+  const onionRoute = [
+    { address: runAddress('relay1'), ...relay1 },
+    { address: runAddress('relay2'), ...relay2 },
+    { address: runAddress('home'), ...homeWorker },
+  ];
+  const secretPrompt = 'секретный промпт, который реле видеть не должны';
+  const onionReq = onion.buildOnionRequest({ prompt: secretPrompt, model: 'qwen2.5-coder-7b' }, onionRoute);
+
+  ok('пакет собран из 3 слоёв',
+    onionReq.hops === 3 && Buffer.from(onionReq.onionPacket, 'base64').length > 0,
+    { hops: onionReq.hops, size: Buffer.from(onionReq.onionPacket, 'base64').length });
+
+  /* Главное свойство: реле снимает слой, но НЕ видит ни промпта, ни
+   * responseAesKey. Проверяем именно невидимость, а не только успех
+   * доставки: иначе тест зеленел бы и на схеме без шифрования. */
+  const relay1Peel = onion.unwrapLayer(Buffer.from(onionReq.onionPacket, 'base64'), relay1.privateKeyPem);
+  const relay1Sees = relay1Peel.payload.toString('utf8');
+  ok('реле 1 не видит промпт и не видит ключ ответа',
+    relay1Peel.nextHop === onionRoute[1].address
+      && !relay1Sees.includes(secretPrompt)
+      && !relay1Sees.includes('responseAesKey'),
+    { nextHop: relay1Peel.nextHop, leaked: relay1Sees.includes(secretPrompt) });
+
+  const relay2Peel = onion.unwrapLayer(relay1Peel.payload, relay2.privateKeyPem);
+  const relay2Sees = relay2Peel.payload.toString('utf8');
+  ok('реле 2 тоже не видит промпт',
+    relay2Peel.nextHop === onionRoute[2].address && !relay2Sees.includes(secretPrompt),
+    { nextHop: relay2Peel.nextHop, leaked: relay2Sees.includes(secretPrompt) });
+
+  const workerPeel = onion.unwrapLayer(relay2Peel.payload, homeWorker.privateKeyPem);
+  const innerReq = JSON.parse(workerPeel.payload.toString('utf8'));
+  ok('воркер получил промпт и одноразовый ключ ответа',
+    workerPeel.nextHop === 'destination'
+      && innerReq.prompt === secretPrompt
+      && typeof innerReq.responseAesKey === 'string'
+      && Buffer.from(innerReq.responseAesKey, 'base64').length === 32,
+    { nextHop: workerPeel.nextHop, hasKey: typeof innerReq.responseAesKey === 'string' });
+
+  /* Ответ шифруется ключом, которого у реле нет. Проверяем это попыткой
+   * расшифровать ответ чужим ключом: правильный ключ живёт только у клиента. */
+  const modelAnswer = 'ответ локальной модели qwen2.5-coder-7b';
+  const encResponse = onion.encryptWorkerResponse(modelAnswer, 'req-onion-1', innerReq.responseAesKey);
+  const decrypted = onion.decryptWorkerResponse(encResponse, onionReq.responseAesKey);
+  ok('клиент расшифровал ответ своим одноразовым ключом', decrypted === modelAnswer, decrypted);
+
+  let relayCantDecrypt = false;
+  try {
+    onion.decryptWorkerResponse(encResponse, crypto.randomBytes(32));
+  } catch (e) {
+    relayCantDecrypt = e.message === 'ONION_RESPONSE_AUTH_FAILED';
+  }
+  ok('посторонний ключ не расшифровывает ответ (тег не сходится)', relayCantDecrypt);
+
+  /* Подмена hop ломает аутентификацию: AAD привязан к адресу следующего
+   * прыжка, иначе ретранслятор мог бы перенаправить пакет безнаказанно. */
+  const env = JSON.parse(Buffer.from(onionReq.onionPacket, 'base64').toString('utf8'));
+  env.hop = runAddress('attacker');
+  let hopTamperCaught = false;
+  try {
+    onion.unwrapLayer(Buffer.from(JSON.stringify(env), 'utf8'), relay1.privateKeyPem);
+  } catch (e) {
+    hopTamperCaught = e.message === 'ONION_AUTH_TAG_MISMATCH';
+  }
+  ok('подмена nextHop в конверте ловится по authTag', hopTamperCaught);
+
+  const wrongRecipient = (() => {
+    try { onion.unwrapLayer(Buffer.from(onionReq.onionPacket, 'base64'), relay2.privateKeyPem); return null; }
+    catch (e) { return e.message; }
+  })();
+  ok('чужой узел не снимает не свой слой', wrongRecipient === 'ONION_WRONG_RECIPIENT', wrongRecipient);
+
+  /* Узел без ключа не может быть звеном цепи. Проверяем, что это отказ на
+   * сборке маршрута, а не падение где-то в середине передачи. */
+  const noKeyRefused = (() => {
+    try { onion.buildOnionRequest({ prompt: 'x' }, [{ address: runAddress('bare') }]); return null; }
+    catch (e) { return e.message; }
+  })();
+  ok('узел без RSA-ключа не годится в маршрут', noKeyRefused === 'ONION_ROUTE_NODE_INCOMPLETE', noKeyRefused);
+
+  /* Регистрация ключа через API: без этого поля onion.js остался бы
+   * библиотекой без входа. */
+  const onionNode = runAddress('onionnode');
+  const regWithKey = await api('/node', 'POST', {
+    address: onionNode, stake: 50000, reputation: 0.9,
+    rsaPublicKeyPem: relay1.publicKeyPem,
+  });
+  ok('POST /node принимает RSA-ключ и отмечает узел onion-capable',
+    regWithKey.status === 200 && regWithKey.body?.onionCapable === true, regWithKey.body);
+
+  const regBadKey = await api('/node', 'POST', {
+    address: runAddress('badkey'), stake: 1000, reputation: 0.5, rsaPublicKeyPem: 'not-a-pem',
+  });
+  ok('невалидный PEM отклоняется на регистрации (400)', regBadKey.status === 400, regBadKey.body);
 
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');

@@ -368,6 +368,12 @@ ensureColumn('adapters', 'domain', 'domain TEXT');
  * бы роялти. Удалённый адаптер перестаёт принимать новые работы, история
  * остаётся целой. */
 ensureColumn('adapters', 'deleted_at', 'deleted_at TEXT');
+/* rsaPublicKeyPem — публичный ключ узла для Onion Routing (Фаза 2).
+ * Опционален: без него узел не может быть ретранслятором или воркером
+ * луковой цепи, но обычная работа идёт по-прежнему. Колонка nullable
+ * сознательно: делать её NOT NULL значило бы объявить все уже
+ * зарегистрированные 43 узла неполноценными. */
+ensureColumn('nodes', 'rsaPublicKeyPem', 'rsaPublicKeyPem TEXT');
 /* adapterDeletedAt — снимок deleted_at адаптера в момент выпуска чека. Нужен,
  * чтобы чек оставался самодостаточным: состояние реестра может измениться
  * позже. В подписываемый payload не входит. */
@@ -1162,18 +1168,39 @@ app.get('/ledger', (req, res) => {
 
 /* --- Node --- */
 app.post('/node', (req, res) => {
-  const { address, stake, reputation, isTeeAttested } = req.body || {};
+  const { address, stake, reputation, isTeeAttested, rsaPublicKeyPem } = req.body || {};
   if (typeof address !== 'string' || !address.length) {
     return res.status(400).json({ error: 'address is required' });
   }
+  /* Ключ для Onion Routing проверяем до записи: невалидный PEM обнаружится
+   * только при попытке упаковки слоя, то есть далеко от регистрации, где его
+   * причину искать уже никто не будет. */
+  if (rsaPublicKeyPem !== undefined && rsaPublicKeyPem !== null) {
+    try {
+      const k = crypto.createPublicKey(String(rsaPublicKeyPem));
+      if (k.asymmetricKeyType !== 'rsa') {
+        return res.status(400).json({ error: 'rsaPublicKeyPem must be an RSA key', type: k.asymmetricKeyType });
+      }
+    } catch (_e) {
+      return res.status(400).json({ error: 'rsaPublicKeyPem is not a valid PEM public key' });
+    }
+  }
   const rw = routingWeight(stake, reputation);
-  run('INSERT OR REPLACE INTO nodes (address, stake, reputation, isTeeAttested, routingWeight) VALUES (?, ?, ?, ?, ?)',
-    [address, Number(stake) || 0, Number(reputation) || 0, isTeeAttested ? 1 : 0, rw]);
+  /* INSERT OR REPLACE затирает строку целиком. Ключ, не переданный в этом
+   * запросе, не должен терять ранее сохранённое значение: клиент может
+   * перерегистрировать узел, не повторяя ключ. Поэтому берём прежний. */
+  const existing = get('SELECT rsaPublicKeyPem FROM nodes WHERE address = ?', [address]);
+  const pubKey = rsaPublicKeyPem !== undefined
+    ? (rsaPublicKeyPem || null)
+    : (existing ? existing.rsaPublicKeyPem : null);
+  run('INSERT OR REPLACE INTO nodes (address, stake, reputation, isTeeAttested, routingWeight, rsaPublicKeyPem) VALUES (?, ?, ?, ?, ?, ?)',
+    [address, Number(stake) || 0, Number(reputation) || 0, isTeeAttested ? 1 : 0, rw, pubKey]);
   run(`INSERT INTO balances (address, balanceTar, stakedTar, updatedAt) VALUES (?, 0, ?, ?)
        ON CONFLICT(address) DO UPDATE SET stakedTar = excluded.stakedTar, updatedAt = excluded.updatedAt`,
     [address, Number(stake) || 0, new Date().toISOString()]);
   res.json({ address, stake: Number(stake) || 0, reputation: Number(reputation) || 0,
-    isTeeAttested: !!isTeeAttested, routingWeight: rw });
+    isTeeAttested: !!isTeeAttested, routingWeight: rw,
+    onionCapable: Boolean(pubKey) });
 });
 
 app.get('/nodes', (_req, res) => {
