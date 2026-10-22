@@ -27,6 +27,19 @@ const crypto = require('crypto');
 const PROTOCOL_VERSION = 'tarnet-onion-v1';
 const RESPONSE_VERSION = 'tarnet-res-v1';
 
+/* Время жизни конверта. Без него пакет, перехваченный реле, можно было бы
+ * проигрывать бесконечно: сборка детерминирована по содержимому, и старый
+ * конверт остаётся валидным, пока цел ключ. TTL ограничивает окно.
+ *
+ * Значение сознательно берётся с запасом: 60 секунд хватает на любой реальный
+ * маршрут из 5 прыжков, а часы двух узлов редко расходятся сильнее. Меньше
+ * минуты — и медленная сеть начнёт отбрасывать живые пакеты. */
+const DEFAULT_TTL_MS = 60 * 1000;
+
+/* Отдельно для ответа: воркер может думать над промптом дольше, чем живёт
+ * запрос, поэтому окно ответа задаётся своим TTL на уровне транспорта. */
+const MAX_TTL_MS = 10 * 60 * 1000;
+
 /* Предел открытого текста для RSA-OAEP-SHA256 при 2048 битах:
  * 256 - 2*32 - 2 = 190 байт. Проверяем явно, чтобы ошибка была внятной,
  * а не «data too large for key size» из недр OpenSSL. */
@@ -72,10 +85,12 @@ function aadForResponse(requestId) {
 }
 
 /* Один слой: AES-256-GCM над нагрузкой + RSA-OAEP над ключом AES. */
-function wrapLayer(payloadBuf, recipientPubPem, nextHop) {
+function wrapLayer(payloadBuf, recipientPubPem, nextHop, ttlMs = DEFAULT_TTL_MS) {
   if (!Buffer.isBuffer(payloadBuf)) throw new Error('ONION_PAYLOAD_MUST_BE_BUFFER');
   if (!recipientPubPem) throw new Error('ONION_MISSING_RECIPIENT_KEY');
   if (!nextHop) throw new Error('ONION_MISSING_NEXT_HOP');
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) throw new Error('ONION_BAD_TTL');
+  if (ttlMs > MAX_TTL_MS) throw new Error('ONION_TTL_TOO_LONG');
 
   const aesKey = crypto.randomBytes(32);
   const iv = crypto.randomBytes(12); // 96 бит — стандарт для GCM
@@ -97,6 +112,10 @@ function wrapLayer(payloadBuf, recipientPubPem, nextHop) {
   return Buffer.from(JSON.stringify({
     v: 1,
     hop: nextHop,
+    /* Абсолютный дедлайн, а не относительный TTL: реле не должно пересчитывать
+     * остаток по своим часам, иначе задержка в очереди узла продлевала бы
+     * жизнь пакета. */
+    exp: Date.now() + ttlMs,
     ek: encKey.toString('base64'),
     iv: iv.toString('base64'),
     tag: tag.toString('base64'),
@@ -121,6 +140,11 @@ function unwrapLayer(packetBuf, nodePrivPem) {
   if (!env.ek || !env.iv || !env.tag || typeof env.ct !== 'string') {
     throw new Error('ONION_INVALID_ENVELOPE');
   }
+
+  /* Проверка срока ДО расшифровки: просроченный слой не должен тратить RSA.
+   * Отдельный код ошибки, чтобы вызывающий отличал «протух» от «подделали». */
+  if (!Number.isFinite(env.exp)) throw new Error('ONION_INVALID_ENVELOPE');
+  if (Date.now() > env.exp) throw new Error('ONION_LAYER_EXPIRED');
 
   let aesKey;
   try {
@@ -156,7 +180,7 @@ function unwrapLayer(packetBuf, nodePrivPem) {
  * Упаковка идёт С КОНЦА: последний слой адресован воркеру, внешний — relay1.
  * responseAesKey кладётся в самый глубокий конверт и клиенту возвращается
  * отдельно: он остаётся только в памяти клиента и реле его не видят. */
-function buildOnionRequest(innerRequestObj, routeNodes) {
+function buildOnionRequest(innerRequestObj, routeNodes, opts = {}) {
   if (!Array.isArray(routeNodes) || routeNodes.length === 0) {
     throw new Error('ONION_EMPTY_ROUTE');
   }
@@ -167,6 +191,7 @@ function buildOnionRequest(innerRequestObj, routeNodes) {
   }
 
   const responseAesKey = crypto.randomBytes(32);
+  const ttlMs = opts.ttlMs === undefined ? DEFAULT_TTL_MS : opts.ttlMs;
   let currentPacket = Buffer.from(JSON.stringify({
     ...innerRequestObj,
     responseAesKey: responseAesKey.toString('base64'),
@@ -174,7 +199,7 @@ function buildOnionRequest(innerRequestObj, routeNodes) {
 
   let nextHop = 'destination';
   for (let i = routeNodes.length - 1; i >= 0; i--) {
-    currentPacket = wrapLayer(currentPacket, nodePublicKey(routeNodes[i]), nextHop);
+    currentPacket = wrapLayer(currentPacket, nodePublicKey(routeNodes[i]), nextHop, ttlMs);
     nextHop = routeNodes[i].address;
   }
 
@@ -183,6 +208,7 @@ function buildOnionRequest(innerRequestObj, routeNodes) {
     onionPacket: currentPacket.toString('base64'),
     responseAesKey,
     hops: routeNodes.length,
+    ttlMs,
   };
 }
 
@@ -249,6 +275,8 @@ module.exports = {
   PROTOCOL_VERSION,
   RESPONSE_VERSION,
   RSA_OAEP_MAX_PLAINTEXT,
+  DEFAULT_TTL_MS,
+  MAX_TTL_MS,
   generateNodeRsaKeypair,
   nodePublicKey,
   nodePrivateKey,

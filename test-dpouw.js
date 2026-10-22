@@ -950,6 +950,54 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   })();
   ok('узел без RSA-ключа не годится в маршрут', noKeyRefused === 'ONION_ROUTE_NODE_INCOMPLETE', noKeyRefused);
 
+  /* TTL конверта. Без срока годности перехваченный реле пакет можно было бы
+   * проигрывать бесконечно: сборка луковицы детерминирована по содержимому,
+   * и старый конверт остаётся валидным, пока цел ключ. */
+  const ttlEnv = JSON.parse(Buffer.from(onionReq.onionPacket, 'base64').toString('utf8'));
+  ok('слой несёт абсолютный дедлайн exp',
+    Number.isFinite(ttlEnv.exp) && ttlEnv.exp > Date.now(),
+    { exp: ttlEnv.exp, inMs: ttlEnv.exp - Date.now() });
+  ok('TTL по умолчанию — 60 секунд',
+    onionReq.ttlMs === onion.DEFAULT_TTL_MS && onion.DEFAULT_TTL_MS === 60_000,
+    { ttlMs: onionReq.ttlMs });
+
+  const expiredEnv = JSON.parse(Buffer.from(onionReq.onionPacket, 'base64').toString('utf8'));
+  expiredEnv.exp = Date.now() - 1;
+  const expiredErr = (() => {
+    try { onion.unwrapLayer(Buffer.from(JSON.stringify(expiredEnv), 'utf8'), relay1.privateKeyPem); return null; }
+    catch (e) { return e.message; }
+  })();
+  ok('просроченный слой отбрасывается до расшифровки',
+    expiredErr === 'ONION_LAYER_EXPIRED', expiredErr);
+
+  /* Отдельный код для протухания, а не общий ONION_INVALID_ENVELOPE: иначе
+   * вызывающий не отличит «пакет опоздал» от «пакет подделали». */
+  const noExpEnv = JSON.parse(Buffer.from(onionReq.onionPacket, 'base64').toString('utf8'));
+  delete noExpEnv.exp;
+  const noExpErr = (() => {
+    try { onion.unwrapLayer(Buffer.from(JSON.stringify(noExpEnv), 'utf8'), relay1.privateKeyPem); return null; }
+    catch (e) { return e.message; }
+  })();
+  ok('конверт без exp отвергается как невалидный',
+    noExpErr === 'ONION_INVALID_ENVELOPE', noExpErr);
+
+  const badTtl = (ttl) => {
+    try { onion.buildOnionRequest({ prompt: 'x' }, onionRoute, { ttlMs: ttl }); return null; }
+    catch (e) { return e.message; }
+  };
+  ok('нулевой и отрицательный TTL не принимаются',
+    badTtl(0) === 'ONION_BAD_TTL' && badTtl(-1) === 'ONION_BAD_TTL',
+    { zero: badTtl(0), neg: badTtl(-1) });
+  ok('слишком длинный TTL не принимается (предел 10 минут)',
+    badTtl(onion.MAX_TTL_MS + 1) === 'ONION_TTL_TOO_LONG',
+    { max: onion.MAX_TTL_MS, got: badTtl(onion.MAX_TTL_MS + 1) });
+
+  const customTtl = onion.buildOnionRequest({ prompt: 'y' }, onionRoute, { ttlMs: 5000 });
+  const customEnv = JSON.parse(Buffer.from(customTtl.onionPacket, 'base64').toString('utf8'));
+  ok('свой TTL доезжает до конверта',
+    customTtl.ttlMs === 5000 && customEnv.exp - Date.now() <= 5000,
+    { ttlMs: customTtl.ttlMs, leftMs: customEnv.exp - Date.now() });
+
   /* Регистрация ключа через API: без этого поля onion.js остался бы
    * библиотекой без входа. */
   const onionNode = runAddress('onionnode');
