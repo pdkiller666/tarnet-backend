@@ -1070,21 +1070,72 @@ app.get('/download/worker.js', (_req, res) => {
 });
 
 /* ===== Rate limiting (in-memory, без внешних пакетов) =====
- * 10 запросов в минуту с одного IP по умолчанию (RATE_LIMIT_MAX/WINDOW_MS).
+ * Считаем не «запросы вообще», а по классам: у живого UI и у воркера
+ * профили трафика принципиально разные.
+ *
+ *   read   — /health, /summary, /ledger, /nodes… Консоль дёргает их 7 раз
+ *            при загрузке и ещё 3 каждые 4 с, то есть ~45/мин на одного
+ *            зрителя. Общий лимит 10/мин закрывал консоль через 20 секунд:
+ *            страница грузилась, но все панели оставались пустыми.
+ *   worker — /worker/poll: воркер ходит раз в секунду, 60/мин на узел.
+ *   strict — запись и тяжёлое: /inference, /work, /node, /wallet, /settle.
+ *
+ * Ключ бакета — `ip|класс`, поэтому исчерпанный лимит записи не блокирует
+ * чтение метрик и наоборот.
+ *
  * Сервер стоит за Caddy, поэтому доверяем ТОЛЬКО loopback: реальный адрес
  * клиента Caddy дописывает в конец X-Forwarded-For, а присланный клиентом
  * оказывается в начале. При `trust proxy = true` Express взял бы левое
  * (подделываемое) значение, и лимит обходился бы одним заголовком. */
-const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 10);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 10);
+const RATE_LIMIT_READ_MAX = Number(process.env.RATE_LIMIT_READ_MAX || 300);
+const RATE_LIMIT_WORKER_MAX = Number(process.env.RATE_LIMIT_WORKER_MAX || 240);
+
+const RATE_LIMITS = {
+  read: { max: RATE_LIMIT_READ_MAX, label: 'чтение метрик' },
+  worker: { max: RATE_LIMIT_WORKER_MAX, label: 'опрос воркера' },
+  strict: { max: RATE_LIMIT_MAX, label: 'запись' },
+};
+
+/* Пути, которые UI опрашивает постоянно. Статика вроде console.html идёт
+ * тем же классом: иначе открытие страницы съедало бы бюджет записи. */
+const RATE_READ_PATH =
+  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config)$/;
+const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$/;
+const RATE_READ_ASSET = /\.(html|css|js|svg|webmanifest|png|ico|woff2?)$/;
+/* Оболочки UI: `/` и `/app/` — это HTML-контейнеры без расширения, без этой
+ * ветки открытие консоли списывалось бы с бюджета записи (10/мин).
+ * `.../audit` сюда НЕ попадает намеренно: он пересчитывает цепочку подписей
+ * на каждый вызов, поэтому остаётся в strict. */
+const RATE_READ_UI = /^\/($|index\.html$|app$|app\/|ui(\/|$))/;
+
+function rateClass(req) {
+  if (req.path === '/worker/poll') return 'worker';
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    if (RATE_READ_PATH.test(req.path) || RATE_READ_SUBPATH.test(req.path) ||
+        RATE_READ_ASSET.test(req.path) || RATE_READ_UI.test(req.path)) return 'read';
+  }
+  return 'strict';
+}
+
 app.set('trust proxy', 'loopback');
 
 const rateBuckets = new Map();
 
 function rateLimiter(req, res, next) {
+  /* Общий выключатель: RATE_LIMIT_MAX=0 глушит ВСЕ классы. На этом держится
+   * приёмка (test-dpouw.js), которая делает ~200 запросов с одного IP за
+   * секунды и иначе упиралась бы в лимит чтения. */
   if (!RATE_LIMIT_MAX || RATE_LIMIT_MAX <= 0) return next();
+
+  const cls = rateClass(req);
+  const { max, label } = RATE_LIMITS[cls];
+  if (!max || max <= 0) return next();
+
   const now = Date.now();
-  const key = req.ip || req.socket.remoteAddress || 'unknown';
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const key = `${ip}|${cls}`;
   let b = rateBuckets.get(key);
   if (!b || now >= b.resetAt) {
     b = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
@@ -1092,17 +1143,19 @@ function rateLimiter(req, res, next) {
   }
   b.count += 1;
   const retryAfterSec = Math.max(1, Math.ceil((b.resetAt - now) / 1000));
-  res.set('X-RateLimit-Limit', String(RATE_LIMIT_MAX));
-  res.set('X-RateLimit-Remaining', String(Math.max(0, RATE_LIMIT_MAX - b.count)));
+  res.set('X-RateLimit-Limit', String(max));
+  res.set('X-RateLimit-Remaining', String(Math.max(0, max - b.count)));
   res.set('X-RateLimit-Reset', String(Math.ceil(b.resetAt / 1000)));
-  if (b.count > RATE_LIMIT_MAX) {
+  res.set('X-RateLimit-Class', cls);
+  if (b.count > max) {
     res.set('Retry-After', String(retryAfterSec));
     return res.status(429).json({
       error: 'too_many_requests',
-      message: `Не больше ${RATE_LIMIT_MAX} запросов за ${Math.round(RATE_LIMIT_WINDOW_MS / 1000)} с с одного IP`,
-      limit: RATE_LIMIT_MAX,
+      message: `Слишком много запросов (${label}): не больше ${max} за ${Math.round(RATE_LIMIT_WINDOW_MS / 1000)} с с одного IP`,
+      limit: max,
       windowMs: RATE_LIMIT_WINDOW_MS,
       retryAfterSec,
+      class: cls,
     });
   }
   return next();

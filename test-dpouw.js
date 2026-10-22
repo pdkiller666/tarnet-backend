@@ -1043,36 +1043,110 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('промпт больше 64 KiB — 413', tooLong.status === 413, tooLong.body);
 
   // ---------- Rate limiting ----------
-  section('8.16. Rate limiting: 10 запросов в минуту с одного IP');
+  section('8.16. Rate limiting по классам: чтение / воркер / запись');
   {
-    /* Свой сервер с рабочим лимитом: основной идёт с RATE_LIMIT_MAX=0,
-     * иначе сто запросов приёмки упирались бы в 429. */
-    const rl = await spawnServer({ RATE_LIMIT_MAX: '10', RATE_LIMIT_WINDOW_MS: '60000' });
+    /* Свой сервер с маленькими лимитами: основной идёт с RATE_LIMIT_MAX=0,
+     * иначе запросы приёмки упирались бы в 429. */
+    const rl = await spawnServer({
+      RATE_LIMIT_MAX: '10',          // strict
+      RATE_LIMIT_READ_MAX: '50',     // read
+      RATE_LIMIT_WORKER_MAX: '20',   // worker
+      RATE_LIMIT_WINDOW_MS: '60000',
+    });
     try {
       /* Разные X-Forwarded-For дают разные бакеты: прямой пир — loopback,
        * а loopback в trust proxy доверенный, поэтому крайний правый адрес
        * становится req.ip. Так проверяем и лимит, и ключевание по IP. */
-      const hit = (ip, path = '/health') =>
-        fetch(rl.base + path, { headers: { 'X-Forwarded-For': ip } });
+      const hit = (ip, path = '/health', method = 'GET') =>
+        fetch(rl.base + path, { method, headers: { 'X-Forwarded-For': ip } });
 
-      const codes = [];
-      let last = null;
+      /* Класс strict: POST /wallet — запись, лимит 10. */
+      const strictCodes = [];
+      let strictLast = null;
       for (let i = 0; i < 11; i++) {
-        const r = await hit('203.0.113.7');
-        codes.push(r.status);
-        if (i === 0) ok('заголовок X-RateLimit-Limit = 10', r.headers.get('x-ratelimit-limit') === '10',
-          r.headers.get('x-ratelimit-limit'));
-        if (i === 10) last = { status: r.status, retryAfter: r.headers.get('retry-after'), body: await r.json().catch(() => null) };
+        const r = await hit('203.0.113.10', '/wallet', 'POST');
+        strictCodes.push(r.status);
+        if (i === 0) {
+          ok('strict: X-RateLimit-Limit = 10', r.headers.get('x-ratelimit-limit') === '10',
+            r.headers.get('x-ratelimit-limit'));
+          ok('strict: X-RateLimit-Class = strict', r.headers.get('x-ratelimit-class') === 'strict',
+            r.headers.get('x-ratelimit-class'));
+        }
+        if (i === 10) {
+          strictLast = {
+            status: r.status,
+            retryAfter: r.headers.get('retry-after'),
+            body: await r.json().catch(() => null),
+          };
+        }
       }
-      ok('первые 10 запросов — 200', codes.slice(0, 10).every((c) => c === 200), codes);
-      ok('11-й запрос — 429 Too Many Requests', last.status === 429, last.status);
-      ok('в теле 429 есть error: too_many_requests', last.body?.error === 'too_many_requests', last.body);
-      ok('в 429 есть Retry-After', Number(last.retryAfter) > 0, last.retryAfter);
+      ok('strict: первые 10 запросов — 200', strictCodes.slice(0, 10).every((c) => c === 200), strictCodes);
+      ok('strict: 11-й запрос — 429', strictLast.status === 429, strictLast.status);
+      ok('strict: в теле error: too_many_requests', strictLast.body?.error === 'too_many_requests', strictLast.body);
+      ok('strict: в теле class = strict', strictLast.body?.class === 'strict', strictLast.body);
+      ok('strict: есть Retry-After', Number(strictLast.retryAfter) > 0, strictLast.retryAfter);
 
-      const other = await hit('203.0.113.8');
+      /* Главное свойства разделения: исчерпанная запись НЕ закрывает метрики.
+       * Именно из-за отсутствия этого свойства консоль показывала пустые
+       * панели: она читает /health каждые 4 с и упиралась в общий лимит 10. */
+      const readAfterStrict = await hit('203.0.113.10', '/health');
+      ok('strict исчерпан — read с того же IP работает', readAfterStrict.status === 200,
+        readAfterStrict.status);
+
+      /* Класс read: /health имеет свой, более щедрый лимит (здесь 50). */
+      const readCodes = [];
+      let readLast = null;
+      for (let i = 0; i < 51; i++) {
+        const r = await hit('203.0.113.11', '/health');
+        readCodes.push(r.status);
+        if (i === 0) {
+          ok('read: X-RateLimit-Limit = 50', r.headers.get('x-ratelimit-limit') === '50',
+            r.headers.get('x-ratelimit-limit'));
+        }
+        if (i === 50) readLast = { status: r.status, body: await r.json().catch(() => null) };
+      }
+      ok('read: 50 запросов — 200', readCodes.slice(0, 50).every((c) => c === 200),
+        readCodes.filter((c) => c !== 200).length + ' отказов');
+      ok('read: 51-й — 429', readLast.status === 429, readLast.status);
+      ok('read: в теле class = read', readLast.body?.class === 'read', readLast.body);
+
+      /* Класс worker: /worker/poll живёт отдельно, воркер ходит раз в секунду. */
+      const wCodes = [];
+      let wLast = null;
+      for (let i = 0; i < 21; i++) {
+        const r = await hit('203.0.113.12', '/worker/poll');
+        wCodes.push(r.status);
+        if (i === 20) wLast = await r.json().catch(() => null);
+      }
+      ok('worker: 20 опросов — 200', wCodes.slice(0, 20).every((c) => c === 200),
+        wCodes.filter((c) => c !== 200).length + ' отказов');
+      ok('worker: 21-й — 429', wCodes[20] === 429, wCodes[20]);
+      ok('worker: в теле class = worker', wLast?.class === 'worker', wLast);
+
+      /* Регрессия на реальный баг: один зритель консоли делает 7 запросов при
+       * загрузке + 3 каждые 4 с, т.е. 46 за первую минуту. При старом общем
+       * лимите 10/мин страница умирала через 20 секунд.
+       *
+       * Считаем именно 429, а не «всё 200»: /balance по незарегистрированному
+       * адресу честно отвечает 404, и это не отказ лимита. */
+      const consolePaths = ['/health', '/summary', '/nodes', '/adapters',
+        '/balances', '/ledger', '/settlements'];
+      const consoleCodes = [];
+      for (const p of consolePaths) consoleCodes.push((await hit('203.0.113.13', p)).status);
+      for (let i = 0; i < 13; i++) {
+        for (const p of ['/health', '/summary']) consoleCodes.push((await hit('203.0.113.13', p)).status);
+        consoleCodes.push((await hit('203.0.113.13', `/balance/${wA}`)).status);
+      }
+      ok(`консоль: ${consoleCodes.length} запросов за минуту — ни одного 429`,
+        consoleCodes.every((c) => c !== 429),
+        consoleCodes.filter((c) => c === 429).length + ' отказов 429');
+
+      /* Ключевание по IP: чужой адрес не страдает от нашего лимита. */
+      const other = await hit('203.0.113.14', '/health');
       ok('другой IP не затронут лимитом', other.status === 200, other.status);
 
-      const spoof = await hit('203.0.113.7, 203.0.113.7');
+      /* Подмена X-Forwarded-For не создаёт новый бакет. */
+      const spoof = await hit('203.0.113.10, 203.0.113.10', '/wallet', 'POST');
       ok('подмена X-Forwarded-For не сбрасывает счётчик', spoof.status === 429, spoof.status);
     } finally {
       rl.stop();
