@@ -83,8 +83,9 @@ curl -s -X POST https://v1107336.hosted-by-vdsina.com/inference/onion \
   -d '{"routeNodes":["0x2491ab72f3cdfa132059df7e5cf08a0ea4c9fe25","0xabe139a759a3e77649eabc45fa5319e7085b2610","0x3281abaf01c3d746d09934b8e3a64344c0de3640"],"prompt":"demo"}'
 ```
 
-Ответ: `"delivered": true`, `"hops": 3`, `"packetBytes": 2415`. Доставка
-реальная, не заглушка.
+Ответ: `"delivered": true`, `"hops": 3`, `"packetBytes"` ≈ 2.4 КБ
+(число зависит от длины промпта — не называть точное значение вслух,
+если оно изменится). Доставка реальная, не заглушка.
 
 ## Шаг 5. Запустить `worker.js` на ПК — показать `llm_mode: worker`
 
@@ -152,5 +153,12 @@ TARNET_API_URL=https://v1107336.hosted-by-vdsina.com node worker.js
 | 2 | `GET /p2p/status` | 200, 3 узла |
 | 3 | `POST /id/register` | 200, `serverDerived: false` |
 | 4 | `GET /app/` | 200, 3997 байт |
-| 5 | `POST /inference/onion` | 200, `delivered: true`, 3 хопа, 2415 байт |
+| 5 | `POST /inference/onion` | 200, `delivered: true`, 3 хопа, ≈2.4 КБ |
 | 6 | `GET /adapters` | 200, 3 адаптера |
+
+## Где лежит этот файл
+
+`backend-api/DEMO-RUNBOOK.md` в репозитории `pdkiller666/tarnet-backend`, и
+рядом с кодом на VPS (`/opt/tarnet/backend-api/`). По HTTP не отдаётся —
+статика настроена только на `/app` и `ui`, а лишний публичный маршрут к
+документам на демо-стенде не нужен. Открывать из репозитория или с диска VPS.
