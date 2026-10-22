@@ -23,6 +23,11 @@ const { CWUCalculator, RewardEngine, verifyQuality, epochEmission, epochIndex, o
 const { CumulativeLedger, receiptPayload, epochState, releasedFor, bumpEpoch } = require('./ledger');
 const { getGenesisHash, receiptPayloadV2, computeReceiptHash, verifyWorkerDagChain } = require('./dag-chain');
 const LLM = require('./llm-adapter');
+/* Фаза 2.5: консервативный PII-классификатор (regex + ONNX NER для имён).
+ * Заменяет голый regex в llm-adapter на гибрид: замер показал, что NER-модель
+ * bert-base-NER не видит телефонов и email, поэтому regex остаётся обязательным. */
+const { PIIClassifier } = require('./pii-classifier');
+const benchmarkGate = require('./benchmark-gate');
 const onion = require('./onion');
 const { startDemoMesh, describeMesh } = require('./p2p-demo');
 /* Фаза 2: TarNet ID, оффлайн-синхронизация чатов, Knowledge Loop.
@@ -39,6 +44,22 @@ const TIERS = Object.keys(TIER_WEIGHTS);
 const BASE_MODEL = 'base-model';
 const TREASURY_ADDRESS = '0x' + 'f'.repeat(40);
 const SCHEMA_VERSION = '2.1.0-dpouw';
+
+/* Версия СБОРКИ — то, чего раньше не было и из-за чего деплой приходилось
+ * проверять только через `git rev-parse HEAD` на сервере.
+ *
+ * SCHEMA_VERSION выше — версия схемы dPoUW, она меняется при изменении
+ * формата чеков/полей и НЕ отражает, какой код задеплоен. Это разные вещи,
+ * и путать их — значит снова искать в /health несуществующее поле.
+ *
+ * Значение по умолчанию берётся из package.json (единственный источник),
+ * BUILD_VERSION позволяет переопределить при упаковке без правки файла. */
+const BUILD_VERSION = process.env.BUILD_VERSION
+  || (() => { try { return require('./package.json').version; } catch (_e) { return 'unknown'; } })();
+
+/* Один экземпляр на процесс: модель (если включена) загружается лениво один раз
+ * и переиспользуется всеми запросами. */
+const piiClassifier = new PIIClassifier();
 
 /* ===== Секреты и криптография =====
  * Мастер-ключ лежит в файле с правами 0600 — не в БД и не в git.
@@ -1068,6 +1089,9 @@ function llmStatus() {
   return {
     ...LLM.describeMode({ activeWorkers: active }),
     pii_blocked_today: LLM.piiBlockedToday(),
+    /* Состояние PII-фильтра видно снаружи: включён ли ONNX, загрузилась ли
+     * модель, какой порог. Иначе «почему заблокировало» превращается в гадание. */
+    pii_classifier: piiClassifier.status(),
   };
 }
 
@@ -1239,6 +1263,7 @@ app.get('/health', (_req, res) => {
      * заблуждение — отчёт показывал одну базу, работа шла с другой. */
     database: `sqlite://${path.basename(DB_PATH)}`,
     version: SCHEMA_VERSION,
+    buildVersion: BUILD_VERSION,
     rewardMode: CONFIG.REWARD_MODE,
     signatureAlg: 'ed25519',
     priceFloor: {
@@ -1519,7 +1544,30 @@ app.post('/knowledge/submit-lora', (req, res) => {
   }
 
   const hash = knowledgeLoop.adapterHash(compressed);
-  const gate = knowledgeLoop.verifyAdapter(hash, []);
+
+  /* Benchmark Gate (Фаза 3): комитет ВЫБИРАЕТСЯ по детерминированному жребию,
+   * но НЕ ГОЛОСУЕТ — verifyAdapter остаётся заглушкой и возвращает
+   * approved:false. Так видно, что ротация реализована, а проверка нет.
+   *
+   * epochHash = genesis + индекс эпохи: жребий привязан к эпохе, а не к
+   * произвольной строке, и пересчитывается любым участником.
+   *
+   * ВАЖНО: в таблице nodes нет колонки tier, поэтому «5 валидаторов из Tier 3»
+   * выразить нечем — кандидаты это все узлы с stake > 0 и reputation > 0.
+   * Это пробел схемы, а не решение: он зафиксирован в отчёте. */
+  let committeeResult = { committee: [], candidates: 0, note: 'not drawn' };
+  try {
+    const epoch = epochIndex();
+    const epochHash = crypto.createHash('sha256')
+      .update(`${getGenesisHash(TREASURY_ADDRESS)}:epoch:${epoch}`)
+      .digest('hex');
+    const nodes = all('SELECT address, stake, reputation FROM nodes');
+    committeeResult = benchmarkGate.selectCommittee(epochHash, nodes);
+  } catch (e) {
+    committeeResult = { committee: [], candidates: 0, note: `committee draw failed: ${e.message}` };
+  }
+
+  const gate = knowledgeLoop.verifyAdapter(hash, committeeResult.committee);
 
   const existing = get('SELECT adapter_hash FROM lora_submissions WHERE adapter_hash = ?', [hash]);
   if (existing) {
@@ -2452,14 +2500,19 @@ async function runInference(req, res) {
     // Режим B: внешний OpenAI-совместимый endpoint.
     // PII-фильтр обязателен ДО выхода в сеть: иначе фича молча нарушает
     // обещание манифеста «никто не читает ваши мысли».
-    const pii = LLM.piiCheck(prompt);
-    if (pii.blocked || pii.confidence < LLM.TIER6_MIN_CONFIDENCE) {
+    //
+    // Гибридная проверка (Фаза 2.5): структурный regex ловит телефон/email/карту,
+    // ONNX NER ловит имена. Итог — минимум из двух уверенностей.
+    const pii = await piiClassifier.classify(prompt);
+    if (pii.blocked) {
       piiBlocked = true;
       LLM.notePiiBlock();
       result = LLM.deterministicFallback(prompt, 'pii_blocked');
       result.pii_blocked = true;
       result.pii_matches = pii.matches;
-      result.pii_reason = 'pattern_match';
+      result.pii_entities = pii.entities;
+      result.pii_confidence = pii.confidence;
+      result.pii_reason = pii.reason;
     } else {
       try {
         const e = LLM.env();

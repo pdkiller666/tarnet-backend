@@ -24,6 +24,8 @@ const path = require('path');
 const { spawn } = require('child_process');
 const dag = require('./dag-chain');
 const onion = require('./onion');
+const benchmarkGate = require('./benchmark-gate');
+const piiModule = require('./pii-classifier');
 
 /* Флаг --test поднимает собственный изолированный сервер на временной БД и
  * свободном порту. Позиционный аргумент (URL) сохраняется для прогона против
@@ -1451,6 +1453,133 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('не-число в весах — 400', loraBadType.status === 400, loraBadType.status);
   const loraNoData = await api('/knowledge/submit-lora', 'POST', { name: 'x', rows: 2, cols: 2, data: [] });
   ok('пустые веса — 400', loraNoData.status === 400, loraNoData.status);
+
+  // ---------- Фаза 2.5: buildVersion ----------
+  section('14. Версия сборки в /health');
+  const healthBv = await api('/health');
+  ok('/health отдаёт buildVersion', typeof healthBv.body.buildVersion === 'string' && healthBv.body.buildVersion.length > 0,
+    healthBv.body.buildVersion);
+  ok('buildVersion совпадает с package.json',
+    healthBv.body.buildVersion === require('./package.json').version,
+    { health: healthBv.body.buildVersion, pkg: require('./package.json').version });
+  /* version и buildVersion — разные вещи. Тест закрепляет разделение,
+   * иначе кто-то снова станет искать версию релиза в первом поле. */
+  ok('version остаётся версией схемы (не релиза)',
+    healthBv.body.version === '2.1.0-dpouw' && healthBv.body.buildVersion !== healthBv.body.version,
+    { version: healthBv.body.version, buildVersion: healthBv.body.buildVersion });
+  ok('/health отдаёт статус PII-классификатора', healthBv.body.pii_classifier !== undefined,
+    healthBv.body.pii_classifier && healthBv.body.pii_classifier.note);
+
+  // ---------- Фаза 2.5: PII Classifier ----------
+  section('15. PII Classifier (regex + ONNX NER)');
+  /* Тестируем regex-ветку напрямую: она работает без модели и обязана ловить
+   * структурный PII. ONNX-ветка проверяется отдельно и только если модель
+   * реально загружена — иначе тест был бы проверкой намерения, а не факта. */
+  const piiRegex = new piiModule.PIIClassifier({ onnx: false });
+
+  const cleanCase = await piiRegex.classify('Explain how TCP handshake works in three steps.');
+  ok('чистый текст: confidence 1.0', cleanCase.confidence === 1, cleanCase.confidence);
+  ok('чистый текст не блокируется', cleanCase.blocked === false, cleanCase);
+  ok('чистый текст: нет совпадений', cleanCase.matches.length === 0, cleanCase.matches);
+
+  const phoneCase = await piiRegex.classify('Call me at +7 916 555 12 34 tomorrow.');
+  ok('телефон: confidence 0 (не уверены, что чисто)', phoneCase.confidence === 0, phoneCase.confidence);
+  ok('телефон блокируется', phoneCase.blocked === true, phoneCase.blocked);
+  ok('телефон: класс phone найден', phoneCase.matches.includes('phone'), phoneCase.matches);
+
+  const emailCase = await piiRegex.classify('Send the report to ivan.petrov@example.com please.');
+  ok('email: confidence 0', emailCase.confidence === 0, emailCase.confidence);
+  ok('email блокируется', emailCase.blocked === true, emailCase.blocked);
+  ok('email: класс email найден', emailCase.matches.includes('email'), emailCase.matches);
+
+  /* Тот самый ложноположительный случай, из-за которого фильтр по «1 - max
+   * softmax» из спеки ломал обычные запросы: TCP ловится как B-ORG. Здесь
+   * проверяется, что технический текст НЕ блокируется. */
+  const techCase = await piiRegex.classify('Deploy nginx on port 8080 behind the TLS proxy and restart systemd unit.');
+  ok('технический текст не блокируется', techCase.blocked === false, techCase);
+
+  ok('пустой запрос: confidence 1', (await piiRegex.classify('')).confidence === 1);
+  ok('номер карты ловится', (await piiRegex.classify('Card 4111 1111 1111 1111 expires soon')).matches.includes('card'));
+  ok('SSN ловится', (await piiRegex.classify('SSN 123-45-6789 on file')).matches.includes('ssn'));
+
+  /* Проверка агрегации субтокенов: B-PER + I-PER должны стать одной
+   * сущностью, а не двумя. Это чистая функция, модель не нужна. */
+  const agg = piiModule.aggregateEntities([
+    { entity: 'B-PER', word: 'Ivan', score: 0.9 },
+    { entity: 'I-PER', word: 'Petrov', score: 0.8 },
+    { entity: 'O', word: 'works', score: 0.99 },
+  ]);
+  ok('субтокены персоны склеены в одну сущность', agg.length === 1 && agg[0].type === 'PER', agg);
+  ok('score сущности = максимум по субтокенам', agg[0].score === 0.9, agg[0].score);
+
+  /* ONNX-ветка: тест не требует, чтобы модель была загружена (на 1.6 ГБ RAM
+   * это может быть запрещено), но если загружена — имя обязано ловиться. */
+  const piiOnnx = new piiModule.PIIClassifier();
+  const onnxReady = await piiOnnx.init();
+  if (onnxReady) {
+    const nameCase = await piiOnnx.classify('My name is Ivan Petrov and I live in Moscow.');
+    ok('ONNX: имя персоны снижает confidence', nameCase.confidence < 1, nameCase.confidence);
+    ok('ONNX: имя персоны блокирует', nameCase.blocked === true, nameCase);
+  } else {
+    console.log('  ⏭  ONNX NER не загружен — проверка имён пропущена (regex-ветка покрыта выше)');
+  }
+  /* Проверяем "не упал и честно доложил", а не наличие текста ошибки:
+   * при TARNET_PII_ONNX != 1 классификатор выключен и loadError остаётся null —
+   * это штатное состояние, а не поломка. Первая версия этого теста требовала
+   * строку и падала на выключенном фильтре. */
+  const onnxStatus = piiOnnx.status();
+  ok('ONNX-ветка не роняет процесс при недоступной модели',
+    onnxStatus && (onnxStatus.loadError === null || typeof onnxStatus.loadError === 'string'),
+    onnxStatus && onnxStatus.loadError);
+  ok('статус классификатора честно говорит, чем он работает',
+    typeof onnxStatus.note === 'string' && onnxStatus.note.length > 0, onnxStatus && onnxStatus.note);
+
+  // ---------- Фаза 3: Benchmark Gate ----------
+  section('16. Benchmark Gate (выбор комитета)');
+  const vNodes = Array.from({ length: 9 }, (_, i) => ({
+    address: '0x' + (i + 1).toString(16).padStart(40, '0'),
+    stakeTar: (i + 1) * 10,
+    reputation: 1,
+  }));
+  const epochA = crypto.createHash('sha256').update('epoch-A').digest('hex');
+  const epochB = crypto.createHash('sha256').update('epoch-B').digest('hex');
+
+  const cmA = benchmarkGate.selectCommittee(epochA, vNodes);
+  ok('комитет из 5 валидаторов', cmA.committee.length === benchmarkGate.COMMITTEE_SIZE, cmA.committee.length);
+  ok('все адреса комитета уникальны', new Set(cmA.committee).size === cmA.committee.length, cmA.committee);
+  ok('выбор детерминирован (тот же epochHash)',
+    JSON.stringify(benchmarkGate.selectCommittee(epochA, vNodes).committee) === JSON.stringify(cmA.committee));
+  ok('другой epochHash даёт другой комитет',
+    JSON.stringify(benchmarkGate.selectCommittee(epochB, vNodes).committee) !== JSON.stringify(cmA.committee));
+  ok('порядок входного массива не влияет на жребий',
+    JSON.stringify(benchmarkGate.selectCommittee(epochA, [...vNodes].reverse()).committee) === JSON.stringify(cmA.committee));
+
+  /* Нулевой стейк не должен давать голос: иначе слэшить нечего. */
+  const noStake = benchmarkGate.selectCommittee(epochA, [{ address: '0xabc', stakeTar: 0, reputation: 1 }]);
+  ok('узел без стейка не попадает в комитет', noStake.committee.length === 0, noStake.committee);
+  ok('без стейка seats не заполнены — note объясняет', /of 5 seats/.test(noStake.note), noStake.note);
+
+  ok('пустой epochHash — недетерминированно, комитет пуст',
+    benchmarkGate.selectCommittee('', vNodes).committee.length === 0);
+  ok('нехватка кандидатов не добивается дублями',
+    new Set(benchmarkGate.selectCommittee(epochA, vNodes.slice(0, 3)).committee).size === 3);
+
+  const gateStub = benchmarkGate.verifyAdapter('0xdead', cmA.committee);
+  ok('verifyAdapter — заглушка (implemented:false)', gateStub.implemented === false);
+  ok('verifyAdapter никогда не одобряет', gateStub.approved === false);
+  ok('verifyAdapter видит размер комитета', gateStub.committeeSize === 5, gateStub.committeeSize);
+  ok('verifyAdapter перечисляет непроверенное', Array.isArray(gateStub.uncheckedSpec) && gateStub.uncheckedSpec.length > 0);
+
+  /* Интеграция: /knowledge/submit-lora обязан выбрать комитет из леджера,
+   * но по-прежнему НЕ одобрять адаптер. */
+  const loraWithCommittee = await api('/knowledge/submit-lora', 'POST', {
+    name: runId('committee'), rows: 2, cols: 8,
+    data: [0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8, 0.9, -1.0, 1.1, -1.2, 1.3, -1.4, 1.5, -1.6],
+  });
+  ok('submit-lora по-прежнему принимается', loraWithCommittee.status === 200, loraWithCommittee.status);
+  ok('submit-lora всё ещё НЕ одобряет адаптер', loraWithCommittee.body.gate.approved === false);
+  ok('submit-lora возвращает quorumRequired=4', loraWithCommittee.body.gate.quorumRequired === 4,
+    loraWithCommittee.body.gate.quorumRequired);
 
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌`);
