@@ -734,6 +734,30 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     sumBribe.body.conservation.delta === 0 && sumBribe.body.conservation.holds === true,
     sumBribe.body.conservation);
 
+  /* ---------- 8.11. Демо-батч переживает идемпотентность ----------
+   * Регресс, который приёмка ловила только руками: /batch-test слал
+   * actionId `batch-${i}` — детерминированный. После того как POST /work
+   * начал дедуплицировать по ключу, ВТОРОЕ нажатие демо-кнопки находило все
+   * ключи занятыми и падало в 500 (out.quality === undefined на повторе).
+   * Поэтому проверяем именно два прогона подряд: одиночный прогон зелёный и
+   * на сломанном коде. */
+  section('8.11. /batch-test: повторный запуск не ломается об идемпотентность');
+  const bt1 = await api('/batch-test', 'POST', { numWorkers: 1, iterations: 3 });
+  const bt2 = await api('/batch-test', 'POST', { numWorkers: 1, iterations: 3 });
+  const seqs1 = (bt1.body?.results || []).map(r => r.seq);
+  const seqs2 = (bt2.body?.results || []).map(r => r.seq);
+  const overlap = seqs1.filter(s => seqs2.includes(s));
+  console.log(`  … батч 1: HTTP ${bt1.status} seq=${seqs1.join(',')} | батч 2: HTTP ${bt2.status} seq=${seqs2.join(',')}`);
+  ok('два прогона /batch-test подряд: оба 200, чеки новые, не повтор',
+    bt1.status === 200 && bt2.status === 200
+      && bt1.body?.completed === 3 && bt2.body?.completed === 3
+      && seqs1.length === 3 && seqs2.length === 3
+      && overlap.length === 0
+      && (bt1.body?.results || []).every(r => r.gamma === 1),
+    { bt1: { status: bt1.status, seqs: seqs1, error: bt1.body?.error, details: bt1.body?.details },
+      bt2: { status: bt2.status, seqs: seqs2, error: bt2.body?.error, details: bt2.body?.details },
+      overlap });
+
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
   const summary = await api('/summary');

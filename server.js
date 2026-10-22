@@ -726,6 +726,11 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
         threshold: receiptThreshold(t),
         queued: found.kind === 'pending',
         batchedInto: found.batched ? found.receipt.seq : null,
+        /* Повтор не заново проверяет качество, поэтому quality: null, а не
+         * выдуманный γ=1. Вызывающий обязан отличать «вердикт известен» от
+         * «вердикта нет»: чтение outcome.quality.gamma без проверки на null
+         * роняло /batch-test в 500 на втором клике. */
+        quality: null,
       };
     }
   }
@@ -1765,6 +1770,12 @@ const BATCH_CHUNK = 100;
 
 app.post('/batch-test', async (req, res) => {
   const body = req.body || {};
+  /* Ключи батча обязаны быть уникальны для каждого запуска. Раньше здесь
+   * стоял `batch-${i}` — детерминированный, и после того как POST /work
+   * начал дедуплицировать по actionId, второй клик по демо-кнопке находил
+   * все ключи уже использованными и падал. Суффикс запуска возвращает
+   * прежнее поведение: каждое нажатие — это новая работа, а не ретрай. */
+  const batchRun = crypto.randomBytes(8).toString('hex');
   const numWorkers = Math.min(Math.max(Math.trunc(Number(body.numWorkers)) || 3, 1), BATCH_MAX_WORKERS);
   const iterations = Math.min(Math.max(Math.trunc(Number(body.iterations)) || 10, 1), BATCH_MAX_ITERATIONS);
 
@@ -1800,7 +1811,7 @@ app.post('/batch-test', async (req, res) => {
 
           const out = recordWork({
             workerAddress: worker.address, tokens, tier, adapterId,
-            response: `batch work ${i}`, actionId: `batch-${i}`,
+            response: `batch work ${i}`, actionId: `batch-${batchRun}-${i}`,
           });
           results.push({
             iteration: i, tier, adapterId,
@@ -1815,7 +1826,9 @@ app.post('/batch-test', async (req, res) => {
             cumulativeTotal: out.receipt ? out.receipt.cumulativeTotal : 0,
             burnTar: out.receipt ? out.receipt.burnTar : 0,
             seq: out.receipt ? out.receipt.seq : null,
-            gamma: out.quality.gamma,
+            /* gamma может отсутствовать: повтор с тем же ключом не проходит
+             * проверку заново. Без ?. второй клик по демо-кнопке падал в 500. */
+            gamma: out.quality ? out.quality.gamma : null,
           });
         }
       });
