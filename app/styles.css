@@ -226,6 +226,22 @@ code {
   border-radius: 4px;
 }
 
+/* Команда запуска воркера: длинная строка должна переноситься, а не
+   растягивать карточку на телефоне. */
+pre.cmd {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  margin: 0 0 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-x: auto;
+}
+
 /* Телефон: кнопки на всю ширину, таблетки не ломаются */
 @media (max-width: 520px) {
   .composer { flex-direction: column; align-items: stretch; }

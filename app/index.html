@@ -89,8 +89,26 @@
 
     <div class="card" id="workerCard">
       <h2>Воркер для ПК</h2>
-      <p class="dim">Скрипт забирает задачи, считает моделью и возвращает результат. Нужен для режима <code>worker</code>.</p>
+      <p class="dim">Скрипт забирает задачи, считает моделью на вашем ПК и возвращает результат. Нужен для режима <code>worker</code>.</p>
       <a class="btn" href="/download/worker.js" download>⬇ Скачать worker.js</a>
+
+      <!-- Адрес показываем здесь, а не только в «Балансе»: именно его надо
+           скопировать в команду запуска. Без него воркер создаст свой
+           кошелёк, и начисления не попадут в этот баланс. -->
+      <p class="dim" style="margin-top:16px">Шаг 1. Ваш адрес — тот же, что под балансом:</p>
+      <p class="mono" id="workerAddr">—</p>
+      <button id="copyAddr" class="ghost small">📋 Скопировать адрес</button>
+      <p class="hint" id="copyHint"></p>
+
+      <p class="dim" style="margin-top:14px">Шаг 2. Запустите воркер в терминале рядом со скачанным файлом — <strong>подставьте адрес из шага 1</strong>:</p>
+
+      <p class="dim" style="margin:0 0 4px">Linux / macOS:</p>
+      <pre class="cmd" id="runCmdPosix">—</pre>
+
+      <p class="dim" style="margin:0 0 4px">Windows (cmd):</p>
+      <pre class="cmd" id="runCmdWin">—</pre>
+
+      <p class="dim">Без <code>WORKER_ADDRESS</code> воркер сгенерирует свой кошелёк: работа будет считаться, но деньги придут не сюда, и баланс останется нулевым.</p>
     </div>
 
     <div class="card">

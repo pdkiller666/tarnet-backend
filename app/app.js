@@ -546,6 +546,71 @@ $('installBtn').addEventListener('click', async () => {
   $('installBtn').hidden = true;
 });
 
+/* ---------- Помощь по запуску воркера ----------
+ * Главная UX-проблема, которую это решает: на телефоне PWA и на ПК воркер
+ * генерировали КАЖДЫЙ свой адрес, поэтому баланс в PWA оставался нулевым,
+ * хотя работа считалась. Теперь адрес виден и копируется одним нажатием,
+ * а команда запуска уже содержит его. */
+function renderWorkerHelp() {
+  const addrEl = $('workerAddr');
+  if (!addrEl) return;
+  addrEl.textContent = ADDR;
+
+  /* Тот же origin, с которого открыта PWA: так команда работает и на
+   * продовом домене, и на туннеле, и на localhost — без правки руками. */
+  const api = location.origin;
+
+  const posix = $('runCmdPosix');
+  if (posix) {
+    posix.textContent =
+      `WORKER_ADDRESS=${ADDR} \\\n` +
+      `TARNET_API_URL=${api} \\\n` +
+      `node tarnet-worker.js`;
+  }
+
+  const win = $('runCmdWin');
+  if (win) {
+    win.textContent =
+      `set WORKER_ADDRESS=${ADDR}\n` +
+      `set TARNET_API_URL=${api}\n` +
+      `node tarnet-worker.js`;
+  }
+}
+
+/* Копирование адреса.
+ * navigator.clipboard существует только в secure context (https или
+ * localhost). По http на IP телефона он undefined — поэтому нужен запасной
+ * путь через скрытый textarea, иначе кнопка молча не работает. */
+async function copyWorkerAddress() {
+  const hint = $('copyHint');
+  const say = (t) => { if (hint) hint.textContent = t; };
+
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(ADDR);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = ADDR;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      if (!ok) throw new Error('execCommand copy failed');
+    }
+    say('✅ Адрес скопирован — вставьте его в команду ниже');
+  } catch (_e) {
+    /* Копирование запрещено браузером — не делаем вид, что сработало.
+     * Адрес виден выше, человек выделит руками. */
+    say('Не удалось скопировать автоматически — выделите адрес выше');
+  }
+  setTimeout(() => say(''), 6000);
+}
+
+$('copyAddr')?.addEventListener('click', copyWorkerAddress);
+
 /* ---------- Старт ---------- */
 (async () => {
   /* Регистрация service worker: без неё Chrome на Android не считает PWA
@@ -565,6 +630,7 @@ $('installBtn').addEventListener('click', async () => {
   }
 
   $('walletAddr').textContent = `кошелёк: ${ADDR}`;
+  renderWorkerHelp();
   startBannerPolling();
   await loadAdapters();
   refreshBalance();

@@ -40,21 +40,57 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /* ---------- Постоянный адрес воркера ----------
  * Адрес — это идентификатор для начислений. Если менять его при каждом
  * запуске, баланс и история будут размазаны по разным кошелькам, а
- * накопленная работа (pending_work) осиротеет. Поэтому храним в файле. */
+ * накопленная работа (pending_work) осиротеет. Поэтому храним в файле.
+ *
+ * ОДИН АДРЕС НА ВСЕ УСТРОЙСТВА: раньше телефон (PWA) и ПК (воркер)
+ * генерировали каждый свой адрес, и баланс в PWA не имел отношения к тому,
+ * что заработал воркер. Теперь адрес можно передать снаружи — ровно тот,
+ * который PWA показывает под балансом. */
+const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+/* Три имени — одно значение. WORKER_ADDRESS и TARNET_ID добавлены по
+ * директиве как человеко-понятные; TARNET_WORKER_ADDRESS уже разошёлся по
+ * документации и ломать его нельзя. Приоритет — в порядке перечисления. */
+function envAddress() {
+  const raw = process.env.WORKER_ADDRESS
+    || process.env.TARNET_ID
+    || process.env.TARNET_WORKER_ADDRESS;
+  if (!raw || String(raw).trim() === '') return null;
+
+  const v = String(raw).trim();
+  if (!ADDRESS_RE.test(v)) {
+    /* Молча подставить сгенерированный адрес нельзя: человек будет смотреть
+     * на чужой баланс и не понимать, почему начислений нет. Лучше упасть
+     * сразу и показать, где взять правильный. */
+    console.error('');
+    console.error('  ОШИБКА: адрес воркера задан неверно.');
+    console.error(`  получено:  "${v}"`);
+    console.error('  ожидается: 0x и ровно 40 шестнадцатеричных символов, например');
+    console.error('             0x1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d');
+    console.error('  свой адрес смотрите в PWA под балансом — строка «кошелёк: 0x…»');
+    console.error('');
+    process.exit(1);
+  }
+  /* Нижний регистр обязателен: сервер адрес не нормализует, и для него
+   * 0xAB… и 0xab… — ДВА РАЗНЫХ кошелька. В базе все адреса нижним регистром,
+   * поэтому адрес, скопированный в верхнем, создал бы пустой кошелёк. */
+  return v.toLowerCase();
+}
+
 function workerAddress() {
-  if (process.env.TARNET_WORKER_ADDRESS) return process.env.TARNET_WORKER_ADDRESS;
+  const fromEnv = envAddress();
+  if (fromEnv) return fromEnv;
 
   const dir = path.join(os.homedir(), '.tarnet');
   const file = path.join(dir, 'worker.json');
   try {
     if (fs.existsSync(file)) {
       const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (/^0x[0-9a-f]{40}$/.test(saved.address || '')) return saved.address;
+      if (ADDRESS_RE.test(saved.address || '')) return String(saved.address).toLowerCase();
     }
   } catch (_e) { /* файл битый — создадим новый */ }
 
-  const crypto = require('crypto');
-  const addr = '0x' + crypto.randomBytes(20).toString('hex');
+  const addr = '0x' + nodeCrypto.randomBytes(20).toString('hex');
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(file, JSON.stringify({ address: addr, createdAt: new Date().toISOString() }, null, 2));
@@ -319,6 +355,12 @@ async function pollOnce() {
   console.log('  TarNet worker');
   console.log(`  сервер:  ${API}`);
   console.log(`  адрес:   ${WORKER}`);
+  /* Источник адреса виден сразу: при пустом балансе в PWA первый вопрос —
+   * «тот ли это кошелёк». Без этой строки искать причину приходится в
+   * переменных окружения, которые не видны. */
+  const addrSource = envAddress() ? 'из переменной окружения'
+    : (fs.existsSync(path.join(os.homedir(), '.tarnet', 'worker.json')) ? 'из ~/.tarnet/worker.json' : 'сгенерирован сейчас');
+  console.log(`  источник: ${addrSource}`);
   console.log(`  модель:  ${MODEL}`);
   const backend = GROQ_KEY ? 'groq' : (OPENROUTER_KEY ? 'openrouter' : 'ollama (или fallback)');
   console.log(`  бэкенд:  ${backend}`);

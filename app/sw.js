@@ -8,7 +8,7 @@
  * а старый кэш удаляется в activate. Без смены CACHE старая оболочка жила бы
  * вечно — classic stale-shell.
  */
-const CACHE = 'tarnet-app-v1';
+const CACHE = 'tarnet-app-v2';
 
 const ASSETS = [
   '/app/',

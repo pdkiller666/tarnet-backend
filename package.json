@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.7.1-manifest-fix",
+  "version": "2.7.2-worker-address",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {
