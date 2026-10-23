@@ -307,6 +307,17 @@ CREATE TABLE IF NOT EXISTS balances (
   address TEXT PRIMARY KEY,
   balanceTar REAL NOT NULL DEFAULT 0,
   stakedTar REAL NOT NULL DEFAULT 0,
+  reservedTar REAL NOT NULL DEFAULT 0,
+  updatedAt TEXT
+);
+/* Состояние казны и оракула курса. Одна строка (id = 1): значения
+ * дописываются, а не плодятся. reserveUsdc и оракул — задел под оплату
+ * в фиате [SPEC Phase 2.5]; текущая экономика их не использует. */
+CREATE TABLE IF NOT EXISTS treasury_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  reserveUsdc REAL NOT NULL DEFAULT 0,
+  lastOracleRate REAL,
+  lastOracleUpdate INTEGER,
   updatedAt TEXT
 );
 CREATE TABLE IF NOT EXISTS ledger_txs (
@@ -375,6 +386,13 @@ ensureColumn('wallets', 'privateKeyPem', 'privateKeyPem TEXT');
 ensureColumn('inferenceLogs', 'source', 'source TEXT');
 ensureColumn('inferenceLogs', 'emulated', 'emulated INTEGER DEFAULT 0');
 ensureColumn('ledger_txs', 'actionId', 'actionId TEXT');
+/* Заблокировано под ожидающие запросы Tier 6 [SPEC Phase 3]: в текущей
+ * экономике всегда 0, но колонка обязана существовать до первой записи,
+ * иначе резервирование пришлось бы делать миграцией на живой базе. */
+ensureColumn('balances', 'reservedTar', 'reservedTar REAL NOT NULL DEFAULT 0');
+/* Строка состояния казны должна существовать сразу: /health читает её
+ * на каждом запросе, и null вместо нуля выглядел бы как отсутствие данных. */
+db.prepare('INSERT OR IGNORE INTO treasury_state (id) VALUES (1)').run();
 
 /* ===== Фаза 2: TarNet ID, оффлайн-чаты, LoRA-дельты =====
  * Всё на IF NOT EXISTS, поэтому отдельная миграция на стенде не нужна:
@@ -1273,6 +1291,10 @@ app.get('/health', (_req, res) => {
   const gross = Number(totals.feeGross) + Number(totals.block);
   const distributed = Number(totals.burn) + Number(totals.treasury) + Number(totals.royalty) + Number(totals.reward);
   const treas = get('SELECT balanceTar FROM balances WHERE address = ?', [TREASURY_ADDRESS]);
+  /* Состояние оракула курса. В текущей экономике не заполняется: оплата
+   * идёт в $TAR, а фиат — задел [SPEC Phase 2.5]. Поля отдаются всё равно,
+   * чтобы клиент не гадал, есть они или нет. */
+  const tstate = get('SELECT reserveUsdc, lastOracleRate, lastOracleUpdate FROM treasury_state WHERE id = 1');
   const epoch = epochIndex();
   const emissionTar = epochEmission(epoch);
   const st = epochState(dbx, epoch, emissionTar);
@@ -1310,6 +1332,12 @@ app.get('/health', (_req, res) => {
       inconsistentRows: bad,
     },
     treasuryBalanceTar: Number((treas?.balanceTar ?? 0).toFixed(6)),
+    treasury: {
+      balanceTar: Number((treas?.balanceTar ?? 0).toFixed(6)),
+      reserveUsdc: Number((tstate?.reserveUsdc ?? 0).toFixed(6)),
+      lastOracleRate: tstate?.lastOracleRate ?? null,
+      lastOracleUpdate: tstate?.lastOracleUpdate ?? null,
+    },
     epoch: {
       index: epoch,
       emissionTar: Number(emissionTar.toFixed(6)),
@@ -2480,6 +2508,25 @@ async function runInference(req, res) {
   const tier = String(body.tier ?? 'base').toLowerCase();
   if (!normalizeTier(tier)) {
     return res.status(400).json({ error: `tier must be one of ${TIERS.join('|')}`, received: tier });
+  }
+
+  /* Способ оплаты. $TAR — единственный работающий: им платит текущая
+   * экономика, и он же остаётся значением по умолчанию, чтобы старые
+   * клиенты ничего не заметили. FIAT объявлен, но не реализован: отвечаем
+   * 501 до выбора воркера, а не списываем деньги по неизвестному курсу. */
+  const paymentMethod = typeof body.paymentMethod === 'string' && body.paymentMethod.length
+    ? body.paymentMethod.toUpperCase()
+    : 'TAR';
+  if (paymentMethod !== 'TAR' && paymentMethod !== 'FIAT') {
+    return res.status(400).json({ error: 'paymentMethod must be TAR or FIAT', received: body.paymentMethod });
+  }
+  if (paymentMethod === 'FIAT') {
+    return res.status(501).json({
+      error: 'FIAT payments: [SPEC Phase 2.5]',
+      note: 'Оплата в фиате не реализована. Используйте paymentMethod "TAR".',
+      paymentMethod,
+      implemented: false,
+    });
   }
 
   // 1) Воркер: явный адрес или детерминированный взвешенный выбор.
