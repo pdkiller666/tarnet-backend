@@ -323,9 +323,20 @@ $('chatForm').addEventListener('submit', async (ev) => {
       res.response || '(пустой ответ)';
     thinking.appendChild(receiptBlock(res));
 
-    if (res.source === 'deterministic_fallback') {
-      $('chatHint').textContent =
-        'Ответ собран демо-обработчиком: модель не подключена (llm_mode = deterministic_fallback).';
+    if (res.source === 'deterministic_fallback' || res.fallback_reason) {
+      /* Причина приходит с сервера готовым кодом. Переводим только известные
+       * значения: неизвестный код показываем как есть, а не прячем за
+       * вежливой фразой — иначе новая причина станет невидимой. */
+      const reasons = {
+        no_workers: 'воркеров нет в сети — подключите свой ПК',
+        worker_timeout: 'воркер не ответил за отведённое время — возможно, ПК спит',
+        model_unavailable: 'воркер подключён, но модель на его ПК не загружена',
+        worker_error: 'воркер вернул ошибку — смотрите его лог',
+        external_api_error: 'внешний API не ответил — проверьте ключ и модель',
+      };
+      const code = res.fallback_reason;
+      const why = code ? (reasons[code] || code) : 'модель не подключена (llm_mode = deterministic_fallback)';
+      $('chatHint').textContent = `⚠️ Причина: ${code || 'deterministic_fallback'} (${why})`;
     }
   } catch (e) {
     thinking.querySelector('.bubble').textContent = `Ошибка: ${e.message}`;

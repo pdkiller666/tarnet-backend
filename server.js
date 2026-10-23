@@ -386,6 +386,10 @@ ensureColumn('wallets', 'privateKeyPem', 'privateKeyPem TEXT');
 ensureColumn('inferenceLogs', 'source', 'source TEXT');
 ensureColumn('inferenceLogs', 'emulated', 'emulated INTEGER DEFAULT 0');
 ensureColumn('ledger_txs', 'actionId', 'actionId TEXT');
+/* Чем ответил воркер: настоящей моделью или своим шаблоном. Без этой колонки
+ * /inference не может отличить model_unavailable от честного live-ответа и
+ * выдаёт шаблон воркера за работу модели. */
+ensureColumn('worker_tasks', 'source', 'source TEXT');
 /* Заблокировано под ожидающие запросы Tier 6 [SPEC Phase 3]: в текущей
  * экономике всегда 0, но колонка обязана существовать до первой записи,
  * иначе резервирование пришлось бы делать миграцией на живой базе. */
@@ -1154,6 +1158,9 @@ function llmStatus() {
      * думать дольше дефолтных 30 с, и задача истекала бы раньше ответа.
      * Значение видно снаружи, иначе причину таймаута приходится искать в коде. */
     worker_task_ttl_ms: WORKER_TASK_TTL_MS,
+    /* Окно присутствия видно снаружи: без него «баннер врал 2 минуты» или
+     * «воркер пропал во время ответа» ищется только в коде. */
+    worker_active_window_ms: WORKER_ACTIVE_WINDOW_MS,
   };
 }
 
@@ -2333,7 +2340,12 @@ app.get('/summary', (_req, res) => {
  * Это Вариант А по важности, а не запасной: первый настоящий узел сети
  * должен быть виден, поэтому /health показывает активных воркеров. */
 const WORKER_TASK_TTL_MS = Number(process.env.WORKER_TASK_TTL_MS || 30000);
-const WORKER_ACTIVE_WINDOW_MS = Number(process.env.WORKER_ACTIVE_WINDOW_MS || 120000);
+/* Окно присутствия: сколько воркер считается живым после последнего опроса.
+ * 15 с при опросе раз в секунду дают запас 15x, а уснувший ПК виден как
+ * отсутствующий уже через 15 с, а не через две минуты. Держится только
+ * вместе с пульсом во время генерации: 7B на CPU думает дольше 15 с, и без
+ * пульса живой воркер выглядел бы офлайн ровно в момент работы. */
+const WORKER_ACTIVE_WINDOW_MS = Number(process.env.WORKER_ACTIVE_WINDOW_MS || 15000);
 const WORKER_MIN_SUBMIT_MS = 500; // защита от мгновенного «ответа без работы»
 
 /* Есть ли воркер, который недавно забирал задачи. Если нет — /inference
@@ -2372,6 +2384,7 @@ function enqueueWorkerTask({ prompt, model, tier }) {
           tokensGenerated: row.tokensGenerated,
           usage,
           model: row.model,
+          source: row.source,
           workerAddress: row.workerAddress,
         });
       }
@@ -2424,6 +2437,19 @@ app.get('/worker/poll', (req, res) => {
          polls = worker_presence.polls + 1`,
       [workerAddress, model, now],
     );
+  }
+
+  /* Пульс без выдачи задачи. Нужен воркеру, пока он считает: иначе присутствие
+   * истекает за WORKER_ACTIVE_WINDOW_MS прямо во время генерации, и /inference
+   * принимает работающий воркер за отсутствующий. Задачу не забирает, поэтому
+   * пульс не может «украсть» работу у другого опроса. */
+  if (String(req.query.heartbeat || '') === '1') {
+    return res.json({
+      ok: true,
+      heartbeat: true,
+      present: Boolean(workerAddress),
+      active_window_ms: WORKER_ACTIVE_WINDOW_MS,
+    });
   }
 
   const task = get(
@@ -2484,10 +2510,14 @@ app.post('/worker/submit', (req, res) => {
   }
 
   const tokens = Math.max(1, Math.floor(Number(body.usage?.completion_tokens || body.tokensGenerated) || 0));
+  /* Источник объявляет воркер. Необязателен: старая версия worker.js его не
+   * присылает, и такой ответ считается настоящим — иначе уже работающие
+   * воркеры разом попали бы в model_unavailable. */
+  const declaredSource = typeof body.source === 'string' && body.source.length ? body.source : null;
   run(
     `UPDATE worker_tasks SET status = 'done', response = ?, tokensGenerated = ?,
-       usageJson = ?, model = ?, finishedAt = ? WHERE taskId = ?`,
-    [response, tokens, JSON.stringify(body.usage || null), body.model, Date.now(), taskId],
+       usageJson = ?, model = ?, source = ?, finishedAt = ? WHERE taskId = ?`,
+    [response, tokens, JSON.stringify(body.usage || null), body.model, declaredSource, Date.now(), taskId],
   );
 
   res.json({ taskId, accepted: true, tokensGenerated: tokens, workerAddress });
@@ -2555,7 +2585,10 @@ async function runInference(req, res) {
   let routing = { mode: 'explicit' };
   if (!workerAddress) {
     const picked = pickWorker(tier);
-    if (!picked) return res.status(503).json({ error: 'No worker nodes available — register a node first' });
+    if (!picked) return res.status(503).json({
+      error: 'No worker nodes available — register a node first',
+      fallback_reason: 'no_workers',
+    });
     workerAddress = picked.address;
     routing = { mode: 'weighted', routingWeight: picked.routingWeight, teeOnly: tier === 'expert', teeFallback: picked.teeFallback };
   } else {
@@ -2586,6 +2619,9 @@ async function runInference(req, res) {
    *    Disk footprint нулевой: .gguf не скачиваются, зависимостей нет. */
   let result;
   let piiBlocked = false;
+  /* Причина отката на шаблон, видимая клиенту. Без неё "ответ есть, но
+   * модель молчит" неотличим от честной работы: source одинаковый. */
+  let fallbackReason = null;
 
   if (hasActiveWorker()) {
     // Режим A: домашний узел забирает задачу и присылает результат.
@@ -2603,7 +2639,18 @@ async function runInference(req, res) {
       };
       // Оплата уходит тому воркеру, который реально считал.
       if (w.workerAddress) workerAddress = w.workerAddress;
+      /* Воркер подключён, но модель на его ПК не загружена: он честно прислал
+       * свой шаблон. Считать это работой модели нельзя, и молчать об этом
+       * тоже — иначе пользователь видит "живой воркер" с пустым смыслом. */
+      if (w.source === 'deterministic_fallback') {
+        fallbackReason = 'model_unavailable';
+        result.emulated = true;
+        result.warning = 'Воркер подключён, но модель на его ПК не загружена — ответ собран шаблоном воркера';
+      }
     } catch (e) {
+      /* Таймаут отделён от прочих сбоёв: "модель думала слишком долго" и
+       * "воркер отказал" лечатся разными действиями. */
+      fallbackReason = /worker timeout/i.test(e.message) ? 'worker_timeout' : 'worker_error';
       result = LLM.deterministicFallback(prompt, `worker: ${e.message}`);
     }
   } else if (LLM.externalConfigured()) {
@@ -2628,11 +2675,13 @@ async function runInference(req, res) {
         const e = LLM.env();
         result = await LLM.callExternal({ prompt, url: e.url, apiKey: e.key, model: body.model || e.model });
       } catch (err) {
+        fallbackReason = 'external_api_error';
         result = LLM.deterministicFallback(prompt, `external_api: ${err.message}`);
       }
     }
   } else {
     // Режим C: детерминированный ответ. Честно помечен, не «умная эмуляция».
+    fallbackReason = 'no_workers';
     result = LLM.deterministicFallback(prompt, null);
   }
 
@@ -2665,6 +2714,8 @@ async function runInference(req, res) {
 
   res.json({
     ...result,
+    /* Почему ответ не от модели. null = ответ дала живая модель. */
+    fallback_reason: fallbackReason,
     worker: workerAddress,
     workerAddress,
     routing,

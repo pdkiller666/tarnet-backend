@@ -413,6 +413,71 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('/worker/poll не падает на пустой очереди',
     wPoll.status === 200 && wPoll.body.task === null, wPoll.body?.task);
 
+  // ---------- 8.7a. Окно присутствия и пульс ----------
+  section('8.7a. Окно присутствия 15 с и пульс во время генерации');
+  const hWin = await api('/health');
+  ok('/health отдаёт worker_active_window_ms = 15000',
+    hWin.body.worker_active_window_ms === 15000, hWin.body.worker_active_window_ms);
+
+  /* Ноль присутствия — состояние на этот момент приёмки. Проверка идёт ДО
+   * пульса: после него active_workers станет 1 и причина сменится. */
+  const noW = await api('/inference', 'POST', { prompt: 'проверка причины no_workers' });
+  ok('fallback_reason no_workers без воркеров в presence',
+    noW.body.fallback_reason === 'no_workers', noW.body.fallback_reason);
+
+  const wHb = runAddress('hb');
+  await api('/node', 'POST', { address: wHb, stake: 30000, reputation: 0.8 });
+  const hb = await api(`/worker/poll?workerAddress=${wHb}&model=test-model&heartbeat=1`);
+  ok('пульс отвечает без выдачи задачи',
+    hb.status === 200 && hb.body.heartbeat === true && hb.body.task === undefined,
+    { heartbeat: hb.body.heartbeat, task: hb.body.task });
+  const hAfter = await api('/health');
+  ok('пульс включает воркера в active_workers',
+    Number(hAfter.body.active_workers) >= 1, hAfter.body.active_workers);
+
+  // ---------- 8.7b. fallback_reason: model_unavailable ----------
+  section('8.7b. fallback_reason различает шаблон воркера и работу модели');
+  const inflight = api('/inference', 'POST', {
+    prompt: 'проверка причины model_unavailable', workerAddress: wHb, model: 'test-model',
+  });
+  let mTask = null;
+  for (let i = 0; i < 60 && !mTask; i++) {
+    const p = await api(`/worker/poll?workerAddress=${wHb}&model=test-model`);
+    if (p.body?.task) mTask = p.body.task;
+    else await new Promise((r) => setTimeout(r, 100));
+  }
+  ok('задача для воркера опубликована', Boolean(mTask), mTask?.taskId);
+  /* Воркер честно объявляет, что модель у него не загружена. */
+  const subM = await api('/worker/submit', 'POST', {
+    taskId: mTask.taskId, workerAddress: wHb, response: 'шаблон воркера',
+    source: 'deterministic_fallback', model: 'test-model', usage: { completion_tokens: 5 },
+  });
+  ok('/worker/submit принимает source', subM.status === 200, subM.body);
+  const ansM = await inflight;
+  ok('шаблон воркера → fallback_reason model_unavailable',
+    ansM.body.fallback_reason === 'model_unavailable', ansM.body.fallback_reason);
+
+  // ---------- 8.7c. fallback_reason: worker_timeout ----------
+  section('8.7c. fallback_reason различает таймаут воркера');
+  /* Собственный сервер с коротким TTL: ждать 150 с в приёмке нельзя. */
+  const shortTtl = await spawnServer({ WORKER_TASK_TTL_MS: '2000' });
+  try {
+    const wTo = '0x' + ('tot' + RUN).padEnd(40, '0');
+    await apiAt(shortTtl.base, '/node', 'POST', { address: wTo, stake: 30000, reputation: 0.8 });
+    await apiAt(shortTtl.base, `/worker/poll?workerAddress=${wTo}&model=m&heartbeat=1`);
+    /* Задачу забирает — и молчит: ровно то, что делает уснувший ПК. */
+    const pollTo = await apiAt(shortTtl.base, `/worker/poll?workerAddress=${wTo}&model=m`);
+    const rTo = await apiAt(shortTtl.base, '/inference', 'POST', {
+      prompt: 'проверка таймаута', workerAddress: wTo, model: 'm',
+    });
+    ok('воркер молчит → fallback_reason worker_timeout',
+      rTo.body.fallback_reason === 'worker_timeout', rTo.body.fallback_reason);
+    ok('таймаут оставляет воркера в presence, а не «удаляет» его',
+      pollTo.status === 200, pollTo.status);
+  } finally {
+    shortTtl.stop();
+  }
+
   // ---------- 8.8. Батчинг коротких работ ----------
   section('8.8. Батчинг: короткие работы копятся до порога, а не теряются');
   /* Отдельный воркер: накопление живёт в pending_work и не должно

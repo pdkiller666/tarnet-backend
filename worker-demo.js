@@ -215,6 +215,16 @@ async function generate(prompt) {
 let submitted = 0;
 let running = true;
 
+/* Пульс присутствия. Воркер считает дольше окна присутствия (7B на CPU —
+ * минуты), а опрашивать в это время он не может: цикл занят генерацией.
+ * Без пульса живой воркер выглядел бы офлайн ровно в момент работы, и
+ * /inference ушёл бы в шаблон, пока модель ещё думает. */
+async function heartbeat() {
+  try {
+    await api('GET', `/worker/poll?workerAddress=${encodeURIComponent(WORKER)}&model=${encodeURIComponent(MODEL)}&heartbeat=1`);
+  } catch (_e) { /* пульс не критичен: провал не должен ломать генерацию */ }
+}
+
 async function pollOnce() {
   const r = await api('GET', `/worker/poll?workerAddress=${encodeURIComponent(WORKER)}&model=${encodeURIComponent(MODEL)}`);
   if (!r.ok || !r.data?.task) return;
@@ -223,7 +233,15 @@ async function pollOnce() {
   log(`задача ${task.taskId}: «${String(task.prompt).slice(0, 60)}»`);
 
   const started = Date.now();
-  const gen = await generate(task.prompt);
+  /* Пульс идёт вдвое чаще окна присутствия: один пропущенный запрос не
+   * должен гасить воркера. Клиренс — в finally, иначе таймер пережил бы задачу. */
+  const pulse = setInterval(heartbeat, 7000);
+  let gen;
+  try {
+    gen = await generate(task.prompt);
+  } finally {
+    clearInterval(pulse);
+  }
   const took = Date.now() - started;
 
   const sub = await api('POST', '/worker/submit', {
@@ -231,6 +249,9 @@ async function pollOnce() {
     workerAddress: WORKER,
     response: gen.response,
     usage: gen.usage,
+    /* Источник объявляется честно: сервер по нему отличает настоящий ответ
+     * модели от шаблона этого же воркера (model_unavailable). */
+    source: gen.source,
     // model обязателен: сервер отклоняет результат без него.
     model: gen.source === 'ollama' ? MODEL : (gen.source === 'groq' ? (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile') : MODEL),
   });
