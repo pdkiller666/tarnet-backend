@@ -114,6 +114,87 @@ TARNET_API_URL=https://v1107336.hosted-by-vdsina.com node worker.js
 
 ---
 
+## Demo Flush — чек ниже порога, показать сейчас
+
+Обычный путь: работа копится в `pending_work`, и чек выпускается только при
+переходе порога (`receiptThreshold()` = `max(MIN_RECEIPT_TOKENS, формула)`,
+`MIN_RECEIPT_TOKENS = 50`): nano — 500, base — 50, expert — 50. У expert
+формула даёт 13, но низкий пол в 50 токенов поднимает порог до 50 — цифру
+13 в демо не называть.
+На демо ждать порога нельзя: показать выплату нужно в первую минуту.
+
+`POST /demo/flush-work` выпускает чек **ровно на накопленное**, минуя порог.
+Экономика та же: идёт через `recordWork()` — fee, block, burn, treasury и
+`conservation: delta 0` считаются общим кодом, а не отдельной веткой.
+Принудительный чек помечается `demo: true` **в базе**, не только в ответе:
+иначе после перезагрузки страницы он выглядел бы обычным.
+
+### Как включить
+
+Флаг живёт в **окружении сервера**, не в теле запроса — иначе порог обошёл бы
+кто угодно.
+
+```bash
+ssh root@195.63.131.172
+sed -i '/^Environment=PORT=/a Environment=DEMO_MODE=1' /etc/systemd/system/tarnet.service
+systemctl daemon-reload && systemctl restart tarnet
+systemctl show tarnet -p Environment | tr ' ' '\n' | grep DEMO_MODE   # → DEMO_MODE=1
+```
+
+Без флага эндпоинт отвечает `403 {"error":"demo mode is off"}` — это норма.
+**Выключить после показа:** удалить строку `DEMO_MODE=1`, `daemon-reload`,
+`restart`.
+
+### Как вызвать
+
+```bash
+curl -s -X POST https://v1107336.hosted-by-vdsina.com/demo/flush-work \
+  -H 'Content-Type: application/json' \
+  -d '{"workerAddress":"0x..."}' | python3 -m json.tool
+```
+
+`workerAddress` обязателен. Необязательные: `tier` (`base`/`expert`/`nano`),
+`adapterId`, `clientAddress`, `response`.
+
+Успех — `201`:
+
+```json
+{
+  "demo": true, "flushed": true,
+  "pending_work_before": 6,
+  "threshold": 50,
+  "threshold_bypassed": true,
+  "remaining_pending_rows": 0,
+  "receipt": { "seq": 1, "rewardTar": 4.83, "demo": true },
+  "conservation": { "delta": 0, "holds": true }
+}
+```
+
+| Ответ | Когда |
+|---|---|
+| `403` | `DEMO_MODE` не равен `1` |
+| `400` | нет `workerAddress` |
+| `404` | `pending_work` пуст либо фильтр `tier`/`adapterId` не совпал |
+| `409` | накопление нулевое или чек не выпущен (нулевая эмиссия эпохи) |
+| `201` | чек выпущен |
+
+### Одна строка, а не все сразу
+
+Ключ накопления — `(workerAddress, tier, adapterId)`, поэтому у воркера может
+быть несколько строк. Без явного `tier`/`adapterId` берётся **самая крупная**
+строка: суммировать тиры нельзя, потому что CWU = `tokens × κ`, и общий чек на
+45 nano + 5 expert занизил бы выплату в κ раз. Выбор детерминирован и виден в
+ответе; остальные строки **не удаляются**, их число — в
+`remaining_pending_rows`. Режим «слить всё» (`all: true`) не реализован.
+
+> **Не показывать инвестору сумму чека с пустой БД.** На чистой базе доля пула
+> эмиссии огромна: блок-награда — доля пула, а не объём работы, поэтому flush
+> на 6 токенов со свежей базы даёт ≈ `4.83 TAR`. На боевой БД (CWU ~5×10⁸) та
+> же работа даст микродоли. Сумму с пустой базы нельзя подавать как «доход
+> воркера» — только как «механика начисления работает».
+
+---
+
 ## Если что-то упало во время демо
 
 | Симптом | Что делать |
