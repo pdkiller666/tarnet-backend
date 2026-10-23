@@ -37,6 +37,11 @@ const HKDF_INFO = {
   wallet: 'tarnet-wallet-v1',
   chat: 'tarnet-chat-v1',
   device: 'tarnet-device-v1',
+  /* Метка для ключа агента. Задана здесь, чтобы клиент и сервер не разошлись
+   * в строке (иначе один и тот же аккаунт даст два разных agentId), но
+   * ВЫВОД по ней остаётся на устройстве: deriveTarNetKeys её не читает и
+   * приватный ключ агента на сервере не появляется. */
+  agent: 'tarnet-agent-v1',
 };
 
 /**
@@ -70,6 +75,23 @@ function deriveTarNetKeys(masterEntropy) {
     deviceSeed,
     deviceId,
   };
+}
+
+/** Ключ агента из мастер-энтропии — только для стенда.
+ * Возвращает seed и публичный ключ; agentId в системе = hex этого pubkey
+ * (64 символа), как в директиве.
+ *
+ * Штатный путь — клиент выводит ключ сам и присылает только pubkey.
+ * Эта функция существует, чтобы отладочный режим не расходился с клиентским
+ * по info-метке; она НЕ вызывается в штатной регистрации. */
+function deriveAgentKey(masterEntropy) {
+  const ikm = toBuffer(masterEntropy, 'masterEntropy');
+  if (ikm.length < 16) {
+    throw new Error('masterEntropy too short: need >= 16 bytes, got ' + ikm.length);
+  }
+  const seed = hkdf(ikm, HKDF_INFO.agent);
+  const pub = Buffer.from(ed.getPublicKey(seed));
+  return { seed, pub, agentId: pub.toString('hex') };
 }
 
 function hkdf(ikm, info) {
@@ -195,6 +217,7 @@ function loadIdentity(address, masterKey, secretsDir) {
 
 module.exports = {
   deriveTarNetKeys,
+  deriveAgentKey,
   addressFromRawPubkey,
   rawPubToPem,
   seedToPem,

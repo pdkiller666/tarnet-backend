@@ -527,7 +527,82 @@ CREATE TABLE IF NOT EXISTS user_consent (
   is_opt_in INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+/* ===== Agent Foundation (Волна 3) =====
+ *
+ * Почему TEXT, а не VARCHAR(64) из директивы: в SQLite длина в VARCHAR не
+ * проверяется вовсе — колонка примет 1000 символов так же охотно, как 64.
+ * Заявленная длина без CHECK — это документация, которая не работает.
+ * Поэтому формат agentId закреплён CHECK'ом: ровно 64 символа, только
+ * нижний hex. Проверка на "нет символов вне 0-9a-f" заодно отсекает
+ * заглавные буквы — иначе один ключ жил бы в двух видах и «тот же агент»
+ * находился бы через раз.
+ *
+ * Почему ссылка на tar_id: агент принадлежит аккаунту TarNet ID, а не сырому
+ * адресу. FK не даст создать агента для незарегистрированного владельца —
+ * иначе в реестре появятся сироты, которых некому запускать.
+ */
+CREATE TABLE IF NOT EXISTS agent_registry (
+  agentId TEXT PRIMARY KEY
+    CHECK (length(agentId) = 64 AND agentId NOT GLOB '*[^0-9a-f]*'),
+  userId TEXT NOT NULL REFERENCES tar_id(address),
+  role TEXT NOT NULL DEFAULT 'general'
+    CHECK (role IN ('coder', 'researcher', 'general')),
+  allowedTools TEXT,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'revoked')),
+  createdAt TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_registry_user ON agent_registry (userId);
+
+/* Лимиты трат живут отдельной таблицей, а не колонками в реестре: политика
+ * меняется чаще, чем личность агента, и её правка не должна переписывать
+ * строку реестра (и трогать createdAt).
+ *
+ * REAL, а не DECIMAL(10,6): DECIMAL в SQLite — это NUMERIC-сродство, то есть
+ * те же числа с плавающей точкой. Обещать «6 знаков» типом нельзя; вся
+ * денежная модель стенда уже на REAL, и вводить один «правильный» тип в одной
+ * таблице — создавать иллюзию точности. Ограничение «не меньше нуля» — CHECK,
+ * он хотя бы реально проверяется. */
+CREATE TABLE IF NOT EXISTS agent_wallets (
+  agentId TEXT PRIMARY KEY REFERENCES agent_registry(agentId) ON DELETE CASCADE,
+  maxPerTaskTar REAL NOT NULL DEFAULT 1.0 CHECK (maxPerTaskTar >= 0),
+  dailyLimitTar REAL NOT NULL DEFAULT 10.0 CHECK (dailyLimitTar >= 0),
+  humanApprovalThresholdTar REAL NOT NULL DEFAULT 5.0
+    CHECK (humanApprovalThresholdTar >= 0),
+  allowlistTools TEXT,
+  updatedAt TEXT NOT NULL
+);
+
+/* Каталог инструментов. costPerCallTar = 0 значит «бесплатный вызов»,
+ * а не «цена не определена»: calculator честно ничего не стоит. */
+CREATE TABLE IF NOT EXISTS tool_registry (
+  toolId TEXT PRIMARY KEY CHECK (length(toolId) BETWEEN 1 AND 64),
+  name TEXT NOT NULL,
+  description TEXT,
+  costPerCallTar REAL NOT NULL DEFAULT 0 CHECK (costPerCallTar >= 0),
+  schema TEXT,
+  isAvailable INTEGER NOT NULL DEFAULT 1 CHECK (isAvailable IN (0, 1)),
+  createdAt TEXT NOT NULL
+);
 `);
+
+/* Сид каталога инструментов.
+ * INSERT OR IGNORE по той же причине, что и у моделей: оператор может вручную
+ * выключить инструмент (isAvailable=0), и старт сервера не должен возвращать
+ * его в строй. Цены — из директивы; проверяются тестом, а не на глаз. */
+(function seedToolRegistry() {
+  const now = new Date().toISOString();
+  const rows = [
+    ['web_search', 'Веб-поиск', 'Поиск в интернете, возвращает сниппеты с источниками', 0.01, null],
+    ['python_executor', 'Python', 'Запуск кода на изолированном клиенте воркера', 0.005, null],
+    ['calculator', 'Калькулятор', 'Арифметика без выхода в сеть', 0.0, null],
+  ];
+  const stmt = db.prepare(`INSERT OR IGNORE INTO tool_registry
+    (toolId, name, description, costPerCallTar, schema, isAvailable, createdAt)
+    VALUES (?, ?, ?, ?, ?, 1, ?)`);
+  for (const [id, name, desc, cost, sch] of rows) stmt.run(id, name, desc, cost, sch, now);
+})();
 
 /* Сид каталога. INSERT OR IGNORE, а не REPLACE: если запись уже есть,
  * ручная правка оператора (например, isAvailable=0 после проверки лицензии)
@@ -1359,7 +1434,7 @@ const RATE_LIMITS = {
 /* Пути, которые UI опрашивает постоянно. Статика вроде console.html идёт
  * тем же классом: иначе открытие страницы съедало бы бюджет записи. */
 const RATE_READ_PATH =
-  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|p2p\/status|worker\/status)$/;
+  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|p2p\/status|worker\/status|agents|tools)$/;
 /* `/id/<pubkey>/balance` — чтение, а не запись: клиент опрашивает баланс так же
  * часто, как /balance/<addr>. Без этой ветки он упирался бы в 10/мин. */
 const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$|^\/id\/[0-9a-fA-F]{0,64}\/balance$/;
@@ -1751,6 +1826,208 @@ app.get('/id/:pubkey/balance', (req, res) => {
     balanceTar: b ? Number(b.balanceTar.toFixed(6)) : 0,
     stakedTar: b ? Number(b.stakedTar.toFixed(6)) : 0,
     updatedAt: b ? b.updatedAt : null,
+  });
+});
+
+/* ===== Agent Foundation (Волна 3) — только каркас =====
+ *
+ * Здесь нет исполнения агентов: нет цикла Think→Act→Observe, нет списаний за
+ * вызовы инструментов. Только реестры и чтение/создание записи. Директива
+ * просит именно это, и подменять каркас «почти работающими» вызовами нельзя:
+ * лимиты, которые никто не проверяет, выглядят как защита, но не защищают.
+ *
+ * Что уже работает по-настоящему: формат agentId (CHECK в схеме), остаток
+ * userId в tar_id (FK), цены инструментов в справочнике и валидация
+ * входа. Что не работает совсем: траты. */
+
+app.get('/tools', (_req, res) => {
+  const tools = all(`SELECT toolId, name, description, costPerCallTar, isAvailable
+                       FROM tool_registry ORDER BY costPerCallTar ASC, toolId ASC`);
+  res.json({
+    tools: tools.map(t => ({
+      ...t,
+      /* SQLite отдаёт 0/1; клиент должен получать настоящий boolean, а не
+       * truthy-единицу (та же причина, что в /models). */
+      isAvailable: t.isAvailable === 1 || t.isAvailable === true,
+    })),
+    count: tools.length,
+  });
+});
+
+/* Список агентов конкретного владельца.
+ * Без userId возвращается 400, а не весь реестр: список всех агентов
+ * раскрывал бы чужие agentId и роли, а это структура аккаунтов. */
+app.get('/agents', (req, res) => {
+  const raw = typeof req.query.userId === 'string' ? req.query.userId.trim().toLowerCase() : '';
+  if (!raw) {
+    return res.status(400).json({
+      error: 'userId is required',
+      hint: 'GET /agents?userId=0x… — адрес владельца (TarNet ID)',
+    });
+  }
+  if (!/^0x[0-9a-f]{40}$/.test(raw)) {
+    return res.status(400).json({ error: 'userId must be 0x + 40 hex chars', got: raw });
+  }
+
+  const rows = all(`SELECT a.agentId, a.userId, a.role, a.allowedTools, a.status, a.createdAt,
+                           w.maxPerTaskTar, w.dailyLimitTar, w.humanApprovalThresholdTar,
+                           w.allowlistTools, w.updatedAt AS walletUpdatedAt
+                      FROM agent_registry a
+                      LEFT JOIN agent_wallets w ON w.agentId = a.agentId
+                     WHERE a.userId = ?
+                     ORDER BY a.createdAt DESC`, [raw]);
+
+  res.json({
+    userId: raw,
+    agents: rows.map(a => ({
+      agentId: a.agentId,
+      userId: a.userId,
+      role: a.role,
+      status: a.status,
+      allowedTools: parseJsonList(a.allowedTools),
+      createdAt: a.createdAt,
+      wallet: a.maxPerTaskTar === null ? null : {
+        maxPerTaskTar: a.maxPerTaskTar,
+        dailyLimitTar: a.dailyLimitTar,
+        humanApprovalThresholdTar: a.humanApprovalThresholdTar,
+        allowlistTools: parseJsonList(a.allowlistTools),
+        updatedAt: a.walletUpdatedAt,
+      },
+    })),
+    count: rows.length,
+  });
+});
+
+/* JSON-список из TEXT-колонки. NULL → пустой массив, а не null: клиенту
+ * проще всегда получать массив, а «поле не задано» и «список пуст» здесь
+ * означают одно и то же. */
+function parseJsonList(v) {
+  if (v === null || v === undefined || v === '') return [];
+  try {
+    const p = JSON.parse(v);
+    return Array.isArray(p) ? p : [];
+  } catch (_e) {
+    return [];
+  }
+}
+
+const AGENT_ROLES = new Set(['coder', 'researcher', 'general']);
+
+app.post('/agents', (req, res) => {
+  const body = req.body || {};
+
+  const userId = typeof body.userId === 'string' ? body.userId.trim().toLowerCase() : '';
+  if (!/^0x[0-9a-f]{40}$/.test(userId)) {
+    return res.status(400).json({
+      error: 'userId must be 0x + 40 hex chars (lowercase)',
+      got: userId || null,
+      hint: 'это адрес владельца — тот, что под балансом в PWA',
+    });
+  }
+  /* Причина проверки до INSERT: FK вернёт ошибку «FOREIGN KEY constraint
+   * failed», из которой не видно, ЧЕГО не хватает. Клиенту нужно сказать
+   * «сначала зарегистрируй TarNet ID», а не отдавать 500. */
+  const owner = get('SELECT address FROM tar_id WHERE address = ?', [userId]);
+  if (!owner) {
+    return res.status(400).json({
+      error: 'TarNet ID not registered for this userId',
+      userId,
+      hint: 'сначала POST /id/register с pubkey этого аккаунта',
+    });
+  }
+
+  const role = body.role === undefined ? 'general' : String(body.role);
+  if (!AGENT_ROLES.has(role)) {
+    return res.status(400).json({
+      error: 'role must be one of: coder, researcher, general',
+      got: role,
+    });
+  }
+
+  /* Инструменты: массив toolId. Проверяем существование каждого — иначе в
+   * allowlist попадут опечатки, и агент молча не сможет вызвать ничего. */
+  let allowedTools = [];
+  if (body.allowedTools !== undefined) {
+    if (!Array.isArray(body.allowedTools)) {
+      return res.status(400).json({ error: 'allowedTools must be an array of toolId' });
+    }
+    allowedTools = body.allowedTools.map(String);
+    const known = new Set(all('SELECT toolId FROM tool_registry').map(t => t.toolId));
+    const unknown = allowedTools.filter(t => !known.has(t));
+    if (unknown.length) {
+      return res.status(400).json({
+        error: 'unknown toolId in allowedTools',
+        unknown,
+        known: [...known].sort(),
+      });
+    }
+  }
+
+  /* Два пути, как у /id/register, и разница та же:
+   *   pubkey        — штатный: ключ выведен на устройстве, сервер видит
+   *                   только публичную часть.
+   *   masterEntropy — стенд: вывод на сервере, ответ помечается
+   *                   serverDerived: true, чтобы это не сошло за норму. */
+  let agentId;
+  let serverDerived = false;
+  try {
+    if (typeof body.pubkey === 'string' && body.pubkey.length) {
+      const rawPub = tarIdentity.normalizePubkey(body.pubkey);
+      agentId = Buffer.from(rawPub).toString('hex');
+    } else if (typeof body.masterEntropy === 'string' && body.masterEntropy.length) {
+      agentId = tarIdentity.deriveAgentKey(body.masterEntropy).agentId;
+      serverDerived = true;
+    } else {
+      return res.status(400).json({
+        error: 'pubkey or masterEntropy required',
+        hint: 'prefer pubkey: agent key must be derived on the device',
+      });
+    }
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+
+  const existing = get('SELECT agentId, userId, role, status, createdAt FROM agent_registry WHERE agentId = ?', [agentId]);
+  if (existing) {
+    /* Повторный POST с тем же ключом не пересоздаёт агента и не меняет
+     * политику: идемпотентность важнее «пусть обновит». Иначе случайный
+     * повтор запроса сбросил бы лимиты, выставленные вручную. */
+    return res.json({
+      ok: true,
+      created: false,
+      agentId: existing.agentId,
+      userId: existing.userId,
+      role: existing.role,
+      status: existing.status,
+      serverDerived,
+    });
+  }
+
+  const now = new Date().toISOString();
+  run(`INSERT INTO agent_registry (agentId, userId, role, allowedTools, status, createdAt)
+       VALUES (?, ?, ?, ?, 'active', ?)`,
+    [agentId, userId, role, JSON.stringify(allowedTools), now]);
+
+  /* Кошелёк создаём сразу с дефолтами из директивы: агент без строки
+   * agent_wallets остался бы без лимитов, а «нет лимита» читается как
+   * «трать сколько хочешь» — опасное умолчание. */
+  run(`INSERT INTO agent_wallets
+         (agentId, maxPerTaskTar, dailyLimitTar, humanApprovalThresholdTar, allowlistTools, updatedAt)
+       VALUES (?, 1.0, 10.0, 5.0, ?, ?)`,
+    [agentId, JSON.stringify(allowedTools), now]);
+
+  res.status(201).json({
+    ok: true,
+    created: true,
+    agentId,
+    userId,
+    role,
+    status: 'active',
+    allowedTools,
+    serverDerived,
+    warning: serverDerived
+      ? 'entropy was sent to the server; derive the agent key on the device in production'
+      : undefined,
   });
 });
 

@@ -2181,6 +2181,144 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     cfEnd.conservation.delta === 0 && cfEnd.conservation.holds === true,
     { delta: cfEnd.conservation.delta, holds: cfEnd.conservation.holds });
 
+  section('20. Волна 3: Agent Foundation (каркас)');
+
+  /* ---------- Каталог инструментов ---------- */
+  const toolsRes = await api('/tools');
+  ok('GET /tools отвечает 200', toolsRes.status === 200, toolsRes.status);
+  const tools = toolsRes.body?.tools;
+  ok('/tools отдаёт массив', Array.isArray(tools), typeof tools);
+  ok('/tools отдаёт ровно 3 инструмента', tools?.length === 3, tools?.length);
+
+  const byId = new Map((tools ?? []).map(t => [t.toolId, t]));
+  ok('цены совпадают с директивой',
+    byId.get('web_search')?.costPerCallTar === 0.01
+    && byId.get('python_executor')?.costPerCallTar === 0.005
+    && byId.get('calculator')?.costPerCallTar === 0.0,
+    [...byId.values()].map(t => [t.toolId, t.costPerCallTar]));
+
+  /* SQLite отдаёт 0/1. Если сервер не привёл тип, клиент получит число —
+   * проверяем именно boolean, как в секции 18 для моделей. */
+  ok('/tools: isAvailable — настоящий boolean',
+    (tools ?? []).every(t => typeof t.isAvailable === 'boolean'),
+    (tools ?? []).map(t => typeof t.isAvailable));
+
+  /* ---------- Доступ к списку агентов ---------- */
+  const agentsNoUser = await api('/agents');
+  ok('GET /agents без userId → 400', agentsNoUser.status === 400, agentsNoUser.status);
+  ok('без userId отдаётся подсказка, а не пустой список',
+    typeof agentsNoUser.body?.hint === 'string' && agentsNoUser.body.hint.includes('userId'),
+    agentsNoUser.body?.hint);
+
+  /* ---------- Создание агента: отказы ---------- */
+  /* Владелец должен существовать в tar_id. Проверяем, что отказ — это 400
+   * с объяснением, а не 500 от FOREIGN KEY: клиенту нужно знать, что
+   * сначала регистрируется аккаунт. */
+  const ghostUser = '0x' + RUN.padEnd(40, '0').slice(0, 40);
+  const ghostAgent = await api('/agents', 'POST', { userId: ghostUser });
+  ok('агент для незарегистрированного userId → 400', ghostAgent.status === 400, ghostAgent.status);
+  ok('отказ объясняет про /id/register',
+    /TarNet ID not registered/i.test(ghostAgent.body?.error || ''),
+    ghostAgent.body?.error);
+
+  /* ---------- Создание агента: успешный путь ---------- */
+  const agentOwnerEntropy = idCrypto.randomBytes(32).toString('hex');
+  const ownerReg = await api('/id/register', 'POST', { masterEntropy: agentOwnerEntropy });
+  const ownerAddr = ownerReg.body?.address;
+  ok('владелец агента зарегистрирован как TarNet ID',
+    ownerReg.status === 200 && /^0x[0-9a-f]{40}$/.test(ownerAddr || ''), ownerAddr);
+
+  /* Ключ агента выводим на стороне теста — так проверяется штатный путь
+   * (pubkey), при котором сервер не видит seed. */
+  const agentKey = crypto.generateKeyPairSync('ed25519');
+  const agentPubHex = Buffer.from(
+    agentKey.publicKey.export({ format: 'jwk' }).x, 'base64url').toString('hex');
+
+  const created = await api('/agents', 'POST', {
+    userId: ownerAddr,
+    pubkey: agentPubHex,
+    role: 'coder',
+    allowedTools: ['python_executor', 'calculator'],
+  });
+  ok('POST /agents создаёт агента (201)', created.status === 201, created.status);
+  ok('agentId = hex публичного ключа', created.body?.agentId === agentPubHex,
+    { got: created.body?.agentId?.slice(0, 16), want: agentPubHex.slice(0, 16) });
+  ok('agentId — ровно 64 hex-символа',
+    /^[0-9a-f]{64}$/.test(created.body?.agentId || ''), created.body?.agentId?.length);
+  ok('штатный путь не помечен serverDerived', created.body?.serverDerived === false);
+
+  /* ---------- Чтение и лимиты ---------- */
+  const listRes = await api(`/agents?userId=${ownerAddr}`);
+  ok('GET /agents возвращает созданного агента',
+    listRes.status === 200 && listRes.body?.count === 1, listRes.body?.count);
+  const createdRow = listRes.body?.agents?.[0];
+  ok('role и status сохранены',
+    createdRow?.role === 'coder' && createdRow?.status === 'active',
+    { role: createdRow?.role, status: createdRow?.status });
+
+  /* Умолчания из директивы: 1 / 10 / 5. Агент без лимитов читался бы как
+   * «трать сколько хочешь» — проверяем, что строка кошелька создана сразу. */
+  ok('кошелёк агента создан с дефолтными лимитами',
+    createdRow?.wallet?.maxPerTaskTar === 1
+    && createdRow?.wallet?.dailyLimitTar === 10
+    && createdRow?.wallet?.humanApprovalThresholdTar === 5,
+    createdRow?.wallet);
+  ok('allowedTools сохранён и разобран в массив',
+    Array.isArray(createdRow?.allowedTools)
+    && createdRow.allowedTools.join(',') === 'python_executor,calculator',
+    createdRow?.allowedTools);
+
+  /* ---------- Идемпотентность ---------- */
+  /* Повторный POST с тем же ключом НЕ должен пересоздавать агента и
+   * сбрасывать вручную выставленные лимиты. */
+  const againAgent = await api('/agents', 'POST', {
+    userId: ownerAddr, pubkey: agentPubHex, role: 'researcher',
+  });
+  ok('повторный POST → 200, created: false',
+    againAgent.status === 200 && againAgent.body?.created === false,
+    { status: againAgent.status, created: againAgent.body?.created });
+  ok('повторный POST не меняет роль', againAgent.body?.role === 'coder', againAgent.body?.role);
+
+  const afterAgain = await api(`/agents?userId=${ownerAddr}`);
+  ok('повторный POST не плодит агентов', afterAgain.body?.count === 1, afterAgain.body?.count);
+
+  /* ---------- Валидация инструментов и ролей ---------- */
+  const otherKey = crypto.generateKeyPairSync('ed25519');
+  const otherPub = Buffer.from(
+    otherKey.publicKey.export({ format: 'jwk' }).x, 'base64url').toString('hex');
+  const badTool = await api('/agents', 'POST', {
+    userId: ownerAddr, pubkey: otherPub, allowedTools: ['shell_exec'],
+  });
+  ok('неизвестный toolId → 400 со списком известных',
+    badTool.status === 400 && Array.isArray(badTool.body?.known)
+    && badTool.body.known.includes('web_search'),
+    { status: badTool.status, known: badTool.body?.known });
+
+  const badRole = await api('/agents', 'POST', {
+    userId: ownerAddr, pubkey: otherPub, role: 'admin',
+  });
+  ok('недопустимая роль → 400', badRole.status === 400, badRole.status);
+
+  /* ---------- Детерминизм ключа агента ---------- */
+  /* Стендовый путь: одна энтропия — тот же agentId. Это единственное, что
+   * связывает агента с аккаунтом без хранения seed на сервере. */
+  const detEntropy = idCrypto.randomBytes(32).toString('hex');
+  const a1 = tarIdentity.deriveAgentKey(detEntropy);
+  const a2 = tarIdentity.deriveAgentKey(detEntropy);
+  ok('ключ агента детерминирован при той же энтропии',
+    a1.agentId === a2.agentId && a1.agentId.length === 64, a1.agentId.slice(0, 16));
+  /* И не совпадает с ключом кошелька: разделение контуров по info-метке. */
+  const walletKeys = tarIdentity.deriveTarNetKeys(detEntropy);
+  ok('ключ агента отличается от ключа кошелька',
+    a1.agentId !== Buffer.from(walletKeys.wallet.pub).toString('hex'),
+    'agent и wallet выведены из разных info-меток');
+
+  /* Вся серия не должна была сдвинуть деньги. */
+  const cfAgent = (await api('/health')).body;
+  ok('Волна 3 не сломала conservation (delta 0)',
+    cfAgent.conservation.delta === 0 && cfAgent.conservation.holds === true,
+    { delta: cfAgent.conservation.delta, holds: cfAgent.conservation.holds });
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌`);
   if (fail) {
