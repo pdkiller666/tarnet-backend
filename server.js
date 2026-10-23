@@ -1231,7 +1231,7 @@ const RATE_LIMITS = {
 /* Пути, которые UI опрашивает постоянно. Статика вроде console.html идёт
  * тем же классом: иначе открытие страницы съедало бы бюджет записи. */
 const RATE_READ_PATH =
-  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|p2p\/status)$/;
+  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|p2p\/status|worker\/status)$/;
 /* `/id/<pubkey>/balance` — чтение, а не запись: клиент опрашивает баланс так же
  * часто, как /balance/<addr>. Без этой ветки он упирался бы в 10/мин. */
 const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$|^\/id\/[0-9a-fA-F]{0,64}\/balance$/;

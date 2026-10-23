@@ -29,6 +29,14 @@
   <button id="installBtn" class="ghost" hidden>Установить</button>
 </header>
 
+<!-- Статус воркера: виден до первого вопроса. Если ПК спит, ответы тихо
+     уходят в deterministic_fallback — пользователь должен знать это заранее,
+     а не догадываться по качеству ответа. -->
+<div id="workerBanner" class="banner" hidden role="status" aria-live="polite">
+  <span id="workerBannerText"></span>
+  <button id="workerHowto" class="link" hidden>Инструкция по подключению</button>
+</div>
+
 <nav class="tabs" role="tablist">
   <button class="tab active" role="tab" data-tab="chat" aria-selected="true">💬 Synapse Chat</button>
   <button class="tab" role="tab" data-tab="devices" aria-selected="false">📱 Мои устройства</button>
@@ -70,7 +78,7 @@
       <button id="refreshBal" class="ghost small">Обновить</button>
     </div>
 
-    <div class="card">
+    <div class="card" id="workerCard">
       <h2>Воркер для ПК</h2>
       <p class="dim">Скрипт забирает задачи, считает моделью и возвращает результат. Нужен для режима <code>worker</code>.</p>
       <a class="btn" href="/download/worker.js" download>⬇ Скачать worker.js</a>

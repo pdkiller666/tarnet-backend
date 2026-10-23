@@ -237,3 +237,53 @@ code {
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* ===== Баннер статуса воркера =====
+ * Стоит между шапкой и табами и виден без прокрутки: смысл баннера в том,
+ * чтобы пользователь узнал про спящий ПК ДО того, как задаст вопрос.
+ * Цвет несёт состояние, но не единственный носитель смысла — текст и иконка
+ * читаются и при дальтонизме. */
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 0 12px 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+/* ПК не в сети: ответы идут от демо-обработчика, это предупреждение, а не факт */
+.banner.offline {
+  border-left-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, var(--panel));
+}
+.banner.offline #workerBannerText { color: var(--warn); }
+
+/* ПК в сети: всё штатно */
+.banner.online {
+  border-left-color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 10%, var(--panel));
+}
+.banner.online #workerBannerText { color: var(--ok); }
+
+/* Сервер недоступен: отдельное состояние. Показывать «в сети» или «не в сети»
+ * при недоступном /health было бы выдумкой. */
+.banner.unknown { border-left-color: var(--danger); }
+.banner.unknown #workerBannerText { color: var(--danger); }
+
+.banner .link {
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}

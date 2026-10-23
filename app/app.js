@@ -80,9 +80,19 @@ document.querySelectorAll('.tab').forEach((tab) => {
   });
 });
 
-/* ---------- Режим сети в шапке ----------
- * Показываем llm_mode как есть. Честная подпись важнее красоты: если модель
- * не подключена, пользователь должен это видеть до того, как спросит.
+/* ---------- Баннер статуса воркера ----------
+ * Задача баннера: предупредить ДО первого вопроса, что ответ даст
+ * демо-обработчик. Пока ПК спит, /inference молча уходит в
+ * deterministic_fallback — по ответу это почти незаметно.
+ *
+ * Источник правды тот же, что у /inference: llm_mode и active_workers из
+ * /health. /worker/status нужен только за именем модели: в /health его нет.
+ *
+ * Про «Ваш ПК»: браузер не может доказать связь с ПК. Адрес PWA — локальный
+ * случайный кошелёк, а воркер на ПК регистрируется своим адресом из своего
+ * кошелька, и presence пишет только /worker/poll. Поэтому «ваш» пишем лишь
+ * когда наш адрес реально в списке присутствия; иначе честно говорим про
+ * сеть и число воркеров, а не выдаём чужой ПК за свой.
  */
 const MODES = {
   worker: '🖥 домашний воркер подключён',
@@ -90,15 +100,91 @@ const MODES = {
   deterministic_fallback: '🧪 демо-режим: модель не подключена',
 };
 
-async function refreshMode() {
+let bannerTimer = null;
+
+async function refreshWorkerBanner() {
+  const box = $('workerBanner');
+  const text = $('workerBannerText');
+  const howto = $('workerHowto');
+
+  let health;
   try {
-    const h = await call('/health');
-    const m = h.llm_mode || 'unknown';
-    $('modeLine').textContent = `${MODES[m] || m} · воркеров: ${h.active_workers ?? 0}`;
+    health = await call('/health');
   } catch (e) {
-    $('modeLine').textContent = e.code === 'RATE_LIMIT' ? 'лимит запросов, ждём…' : 'сервер недоступен';
+    /* Сервер молчит — это не «ПК не в сети». Врать в обе стороны нельзя. */
+    box.hidden = false;
+    box.className = 'banner unknown';
+    howto.hidden = true;
+    text.textContent = e.code === 'RATE_LIMIT'
+      ? '⏳ Лимит запросов — статус воркера обновится через минуту'
+      : '⚠️ Сервер недоступен — статус воркера неизвестен';
+    return;
+  }
+
+  const active = Number(health.active_workers ?? 0);
+  const mode = health.llm_mode || 'unknown';
+  $('modeLine').textContent = `${MODES[mode] || mode} · воркеров: ${active}`;
+
+  if (mode === 'deterministic_fallback' || active === 0) {
+    box.hidden = false;
+    box.className = 'banner offline';
+    howto.hidden = false;
+    text.textContent = '⚠️ Ваш ПК не в сети. Ответы генерируются демо-обработчиком.';
+    return;
+  }
+
+  /* Имя модели и «это точно мой ПК?» — только из присутствия воркеров. */
+  let model = null;
+  let mine = false;
+  try {
+    const ws = await call('/worker/status');
+    const list = Array.isArray(ws.workers) ? ws.workers : [];
+    const me = ADDR.toLowerCase();
+    mine = list.some((w) => String(w.workerAddress).toLowerCase() === me);
+    model = (list.find((w) => w.model) || {}).model || null;
+  } catch (e) {
+    /* Имя модели не критично: статус важнее. Баннер уже знает, что сеть жива. */
+  }
+
+  box.hidden = false;
+  box.className = 'banner online';
+  howto.hidden = true;
+
+  const modelPart = model ? ` Модель: ${model}.` : '';
+  if (mine) {
+    text.textContent = `✅ Ваш ПК в сети.${modelPart}`;
+  } else {
+    /* Живая модель есть, но это не ПК пользователя: сказать «ваш ПК в сети»
+     * значило бы соврать, а сказать «не в сети» — скрыть, что демо-обработчик
+     * не работает. Поэтому называем вещи по отдельности. */
+    text.textContent = `✅ Сеть активна.${modelPart} Воркеров: ${active} — ваш ПК не среди них, `
+      + 'но ответы даёт живая модель, а не демо-обработчик.';
   }
 }
+
+/* Опрос раз в 5 секунд. Скрытая вкладка не опрашивает: 12 запросов в минуту
+ * на каждую забытую вкладку — это чужой лимит, который потом сработает 429
+ * у активной. При возврате на вкладку обновляем сразу, не ждём тика. */
+function startBannerPolling() {
+  refreshWorkerBanner();
+  bannerTimer = setInterval(() => {
+    if (document.hidden) return;
+    refreshWorkerBanner();
+  }, 5000);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && bannerTimer) refreshWorkerBanner();
+});
+
+/* «Инструкция по подключению» ведёт к карточке воркера в «Моих устройствах»:
+ * отдельной страницы инструкции нет, и делать её ради кнопки — лишний экран. */
+$('workerHowto').addEventListener('click', () => {
+  const tab = document.querySelector('.tab[data-tab="devices"]');
+  if (tab) tab.click();
+  const card = $('workerCard');
+  if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+});
 
 /* ---------- Адаптеры ---------- */
 async function loadAdapters() {
@@ -397,7 +483,7 @@ $('installBtn').addEventListener('click', async () => {
 /* ---------- Старт ---------- */
 (async () => {
   $('walletAddr').textContent = `кошелёк: ${ADDR}`;
-  await refreshMode();
+  startBannerPolling();
   await loadAdapters();
   refreshBalance();
 })();

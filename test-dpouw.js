@@ -1173,6 +1173,21 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       ok('worker: 21-й — 429', wCodes[20] === 429, wCodes[20]);
       ok('worker: в теле class = worker', wLast?.class === 'worker', wLast);
 
+      /* /worker/status обязан быть классом read, а не strict.
+       * Баннер статуса воркера опрашивает его раз в 5 с = 12/мин, а strict
+       * даёт 10/мин: баннер упирался бы в 429 через 50 секунд и навсегда
+       * застревал бы в состоянии «лимит запросов». */
+      const wsFirst = await hit('203.0.113.15', '/worker/status');
+      ok('worker/status: класс read, а не strict',
+        wsFirst.headers.get('x-ratelimit-class') === 'read',
+        wsFirst.headers.get('x-ratelimit-class'));
+      const wsCodes = [];
+      for (let i = 0; i < 12; i++) {
+        wsCodes.push((await hit('203.0.113.15', '/worker/status')).status);
+      }
+      ok('worker/status: 12 опросов подряд (баннер раз в 5 с) — ни одного 429',
+        wsCodes.every((c) => c === 200), wsCodes);
+
       /* Регрессия на реальный баг: один зритель консоли делает 7 запросов при
        * загрузке + 3 каждые 4 с, т.е. 46 за первую минуту. При старом общем
        * лимите 10/мин страница умирала через 20 секунд.
@@ -1397,6 +1412,68 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   } finally {
     noDemo.stop();
   }
+
+  /* ---------- 8.19. Баннер статуса воркера в PWA ----------
+   * Проверяются отдаваемые файлы, а не исходники на диске: PWA раздаётся
+   * статикой, и «в репозитории есть» не значит «браузер это получил».
+   * Разметку и стили можно проверить текстом; реакцию на состояние —
+   * только данными, поэтому здесь же фиксируем контракт полей, на которые
+   * баннер опирается, иначе он молча покажет «не в сети» при живом воркере. */
+  section('8.19. Баннер статуса воркера: разметка, стили и контракт данных');
+
+  const pwaHtml = await fetch(`${BASE}/app/`);
+  const htmlText = await pwaHtml.text();
+  ok('/app/ отдаётся 200', pwaHtml.status === 200, pwaHtml.status);
+  ok('в разметке есть контейнер баннера #workerBanner',
+    htmlText.includes('id="workerBanner"'), htmlText.includes('workerBanner'));
+  ok('баннер скрыт до первого ответа сервера (hidden)',
+    /id="workerBanner"[^>]*hidden/.test(htmlText));
+  ok('у баннера есть aria-live — смена статуса озвучивается',
+    htmlText.includes('aria-live="polite"'));
+  ok('есть кнопка «Инструкция по подключению»',
+    htmlText.includes('workerHowto') && htmlText.includes('Инструкция по подключению'));
+  ok('есть якорь workerCard, к которому ведёт инструкция',
+    htmlText.includes('id="workerCard"'));
+
+  const pwaJs = await (await fetch(`${BASE}/app/app.js`)).text();
+  ok('баннер обновляется раз в 5 секунд',
+    /setInterval\([^)]*5000\)/.test(pwaJs) || pwaJs.includes(', 5000)'), 'нет интервала 5000');
+  ok('баннер берёт данные из /health и /worker/status',
+    pwaJs.includes("call('/health')") && pwaJs.includes("call('/worker/status')"));
+  ok('состояние «ПК не в сети» отличается от «сервер недоступен»',
+    pwaJs.includes('демо-обработчиком') && pwaJs.includes('Сервер недоступен'));
+
+  const pwaCss = await (await fetch(`${BASE}/app/styles.css`)).text();
+  for (const cls of ['.banner', '.banner.offline', '.banner.online', '.banner.unknown']) {
+    ok(`стиль ${cls} отдаётся браузеру`, pwaCss.includes(cls), cls);
+  }
+
+  /* Контракт данных: без этих полей баннер не может отличить состояния.
+   * active_workers — счётчик всей сети; model есть только в /worker/status. */
+  const bnStatus = await api('/worker/status');
+  ok('/worker/status отдаёт active_workers числом',
+    typeof bnStatus.body?.active_workers === 'number', bnStatus.body?.active_workers);
+  ok('/worker/status отдаёт mode — тот же llm_mode, что и /health',
+    bnStatus.body?.mode === (await api('/health')).body?.llm_mode,
+    { status_mode: bnStatus.body?.mode });
+  ok('/worker/status отдаёт массив workers для имени модели',
+    Array.isArray(bnStatus.body?.workers), typeof bnStatus.body?.workers);
+
+  /* Живой воркер должен поднимать режим из fallback: иначе баннер всегда
+   * показывал бы «демо», и предупреждение обесценилось бы. */
+  const wBanner = runAddress('bn');
+  await api('/node', 'POST', { address: wBanner, stake: 40000, reputation: 0.9 });
+  const baseBefore = (await api('/worker/status')).body;
+  await fetch(`${BASE}/worker/poll?workerAddress=${wBanner}&model=qwen2.5-coder%3A1.5b`);
+  const afterPoll = (await api('/worker/status')).body;
+  ok('опрос воркера увеличивает active_workers',
+    afterPoll.active_workers > baseBefore.active_workers,
+    { before: baseBefore.active_workers, after: afterPoll.active_workers });
+  ok('в списке видна модель — её покажет баннер',
+    afterPoll.workers.some((w) => w.model === 'qwen2.5-coder:1.5b'),
+    afterPoll.workers.map((w) => w.model));
+  ok('режим сети переключился на worker',
+    (await api('/health')).body?.llm_mode === 'worker');
 
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
