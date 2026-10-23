@@ -1,7 +1,7 @@
 # DEMO-RUNBOOK — показ TarNet инвестору
 
-**Версия:** `2.7.0-wave2-prep` · **Стенд:** `https://v1107336.hosted-by-vdsina.com`
-**Приёмка:** 363/363 ✅ (`test-dpouw.js`) + 25/25 (`test-mesh.js`)
+**Версия:** `2.7.1-manifest-fix` · **Стенд:** `https://v1107336.hosted-by-vdsina.com`
+**Приёмка:** 369/369 ✅ (`test-dpouw.js`) + 25/25 (`test-mesh.js`) = **394 проверки**
 **Сверено:** 2026-10-23. Хеш сборки здесь намеренно не указан — он меняется
 каждый деплой, и такая строка устаревает быстрее, чем её успевают прочитать.
 Актуальный хеш смотреть так: `ssh VPS 'cd /opt/tarnet/backend-api && git rev-parse --short HEAD'`, или `./scripts/verify.sh`.
@@ -42,7 +42,7 @@
 ```bash
 curl -s https://v1107336.hosted-by-vdsina.com/health \
   | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).buildVersion))"
-# ожидаем: 2.7.0-wave2-prep  (и cloudflared_processes: 0)
+# ожидаем: 2.7.1-manifest-fix  (и cloudflared_processes: 0)
 ```
 
 Если `buildVersion` пустой или `cloudflared_processes > 0` — открыт dev-стенд,
@@ -345,13 +345,25 @@ curl -s -X POST https://v1107336.hosted-by-vdsina.com/demo/flush-work \
 Формулировка для инвестора: «ядро экономики работает и сходится; валидация
 адаптеров и VRF — следующие два спринта, спека готова, кода нет».
 
+### `reserveStatus: critical` — это не авария
+
+`reserveStatus: critical` — это не авария, а честное «резерва нет».
+Не пугаться при показе. Платные модели недостижимы (402 только на фикстуре).
+
+При `RESERVE_OPEX_USD=517` и `reserveUsdc=0` статус `critical` — **правильный**
+расчёт (0 < 517/2), а не сбой. Ветка `402 reserve_insufficient` на боевом
+стенде **недостижима**: в каталоге все модели тира ≤ 3 бесплатные (`local`).
+Проверяется только фикстурой `test/paid-tier3` в изолированной БД — **не
+подавать как работающую функцию**. Если спросят «почему critical» — ответ:
+«резерв не пополняли, порог $517/мес, статус считается честно».
+
 ---
 
 ## Проверено перед демо (2026-10-22 18:30 MSK)
 
 | # | Проверка | Результат |
 |---|---|---|
-| 1 | `GET /health` | 200, `delta: 0`, `buildVersion: 2.7.0-wave2-prep` |
+| 1 | `GET /health` | 200, `delta: 0`, `buildVersion: 2.7.1-manifest-fix` |
 | 2 | `GET /p2p/status` | 200, 3 узла |
 | 3 | `POST /id/register` | 200, `serverDerived: false` |
 | 4 | `GET /app/` | 200, 4950 байт |
