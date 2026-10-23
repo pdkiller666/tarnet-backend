@@ -272,6 +272,16 @@ code {
 }
 .banner.online #workerBannerText { color: var(--ok); }
 
+/* Сеть активна, но это не ПК пользователя: четвёртое состояние.
+ * Смешивать с .online нельзя — там зелёный означает «ваш ПК работает»,
+ * а здесь работает чужая машина, и подставлять это как успех было бы враньём.
+ * Цвет accent (синий), а не ok (зелёный): нейтральное «сеть жива». */
+.banner.online-other {
+  border-left-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+}
+.banner.online-other #workerBannerText { color: var(--accent); }
+
 /* Сервер недоступен: отдельное состояние. Показывать «в сети» или «не в сети»
  * при недоступном /health было бы выдумкой. */
 .banner.unknown { border-left-color: var(--danger); }

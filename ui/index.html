@@ -138,6 +138,18 @@
   table.money tr.hi td { color: var(--ok); font-weight: 600; }
   .tablewrap { overflow-x: auto; margin-top: 8px; }
   .card h3 { margin: 0 0 10px; font-size: 16px; }
+
+  /* ---------- CTA: два адреса, по которым инвестору идти дальше ---------- */
+  .cta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+  .cta a {
+    display: inline-block; padding: 11px 18px; border-radius: 10px;
+    font-size: 14.5px; font-weight: 600; text-decoration: none;
+    border: 1px solid var(--border); color: var(--text); background: var(--panel2);
+    transition: border-color .15s, background .15s, color .15s;
+  }
+  .cta a:hover { border-color: var(--accent); }
+  .cta a.primary { background: var(--accent); border-color: var(--accent); color: #06231f; }
+  .cta a.primary:hover { background: var(--accent2); border-color: var(--accent2); color: #06121f; }
   .split2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 10px; }
   .mini { background: #0b1017; border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px; }
   .mini .t { font-weight: 600; font-size: 14px; margin-bottom: 6px; }
@@ -168,6 +180,10 @@
       компьютер считает запросы других людей — и получает за каждый ответ деньги.
       Без серверных залов, без посредников.
     </p>
+    <div class="cta">
+      <a class="primary" href="/app/">Открыть приложение →</a>
+      <a href="/health">Проверить статус сети</a>
+    </div>
   </header>
 
   <section>

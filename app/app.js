@@ -147,7 +147,7 @@ async function refreshWorkerBanner() {
   }
 
   box.hidden = false;
-  box.className = 'banner online';
+  box.className = mine ? 'banner online' : 'banner online-other';
   howto.hidden = true;
 
   const modelPart = model ? ` Модель: ${model}.` : '';
@@ -233,9 +233,10 @@ function receiptBlock(res) {
 
   if (!r) {
     const pend = res.pending_work ?? res.breakdown?.cwu ?? null;
-    /* Порог приходит с сервера: он зависит от тира (base 50, expert 13, nano
-     * 500), поэтому подставлять константу 50 в подпись нельзя — для nano она
-     * соврёт в 10 раз. Без ответа сервера показываем только накопленное. */
+    /* Порог приходит с сервера: он зависит от тира (base — 50, expert — 50
+     * при границе округления 13, nano — 500), поэтому подставлять константу 50
+     * в подпись нельзя — для nano она соврёт в 10 раз. Без ответа сервера
+     * показываем только накопленное. */
     const thr = res.threshold ?? null;
     const progress = pend !== null && thr !== null
       ? `Накоплено: ${esc(pend)}/${esc(thr)} токенов до чека`
