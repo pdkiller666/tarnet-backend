@@ -1,10 +1,36 @@
 # DEMO-RUNBOOK — показ TarNet инвестору
 
-**Версия:** `v2.4.1-production-ready` (`7a2878c`) · **Стенд:** `https://v1107336.hosted-by-vdsina.com`
-**Приёмка:** 255/255 ✅ · **Тег:** `f7cd088b` (`b2ec7d35…`)
+**Версия:** `2.6.0-tier6-prep` (`11d7af8`) · **Стенд:** `https://v1107336.hosted-by-vdsina.com`
+**Приёмка:** 339/339 ✅ (`test-dpouw.js`) + 25/25 (`test-mesh.js`)
 
 Пять шагов, ~6 минут. Что говорить — в колонке «смысл»: инвестору важен не
 экран, а почему это нельзя подделать.
+
+---
+
+## ⚠ Для демо инвестору — ТОЛЬКО боевой URL
+
+```
+✅ https://v1107336.hosted-by-vdsina.com      ← только это
+❌ https://*.trycloudflare.com               ← НЕЛЬЗЯ для показа
+```
+
+`trycloudflare` — это **dev-стенд агента**, а не боевой сервер. У него своя
+база (в момент записи 688 чеков против 693 боевых) и свой процесс Node;
+после деплоя на VPS он продолжает отдавать **старый код**, пока его не
+перезапустят — а имя туннеля каждый раз новое и ссылка перестаёт работать
+после перезапуска. Для демонстрации инвестору — только домен `vdsina`.
+
+Проверка перед показом, что открыт именно боевой стенд:
+
+```bash
+curl -s https://v1107336.hosted-by-vdsina.com/health \
+  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).buildVersion))"
+# ожидаем: 2.6.0-tier6-prep  (и cloudflared_processes: 0)
+```
+
+Если `buildVersion` пустой или `cloudflared_processes > 0` — открыт dev-стенд,
+а не боевой.
 
 ---
 
@@ -307,7 +333,7 @@ curl -s -X POST https://v1107336.hosted-by-vdsina.com/demo/flush-work \
 
 | # | Проверка | Результат |
 |---|---|---|
-| 1 | `GET /health` | 200, `delta: 0`, `buildVersion: 2.4.1-tier-fix` |
+| 1 | `GET /health` | 200, `delta: 0`, `buildVersion: 2.6.0-tier6-prep` |
 | 2 | `GET /p2p/status` | 200, 3 узла |
 | 3 | `POST /id/register` | 200, `serverDerived: false` |
 | 4 | `GET /app/` | 200, 3997 байт |
