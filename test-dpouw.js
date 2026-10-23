@@ -1907,6 +1907,104 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('счётчик settlement-ов рядом с флагом и это число',
     typeof healthOnchain.onchain.settlements === 'number', healthOnchain.onchain.settlements);
 
+  /* ============================================================
+   * 18. Волна 1: каталог моделей и opt-in на дистилляцию
+   * ============================================================ */
+  section('18. Model Registry и User Consent (Волна 1)');
+
+  const modelsRes = await api('/models');
+  ok('GET /models отвечает 200', modelsRes.status === 200, modelsRes.status);
+  const models = modelsRes.body?.models;
+  ok('/models отдаёт массив', Array.isArray(models), typeof models);
+  ok('/models отдаёт ровно 4 модели', models?.length === 4, models?.length);
+  ok('count совпадает с длиной массива',
+    modelsRes.body?.count === models?.length, modelsRes.body?.count);
+
+  /* Порядок — по tier, затем по modelId: клиент не должен сам сортировать,
+   * иначе две вкладки покажут разные списки в разном порядке. */
+  const tiers = (models ?? []).map(m => m.tier);
+  const sortedTiers = [...tiers].sort((a, b) => a - b);
+  ok('/models отсортирован по tier', JSON.stringify(tiers) === JSON.stringify(sortedTiers), tiers);
+
+  ok('у каждой модели есть modelId, provider, license',
+    (models ?? []).every(m => m.modelId && m.provider && m.license), null);
+
+  /* SQLite отдаёт INTEGER 0/1, а не boolean. Если сервер не привёл типы,
+   * клиент получит 0 — falsy, но `m.isFree === false` даст false, и любой
+   * строгий чекх сломается. Проверяем именно тип. */
+  ok('BOOLEAN-поля приведены к настоящим boolean',
+    (models ?? []).every(m => typeof m.isFree === 'boolean'
+      && typeof m.isAvailable === 'boolean'
+      && typeof m.allowsTraining === 'boolean'),
+    (models ?? []).map(m => typeof m.allowsTraining));
+
+  const gpt4o = (models ?? []).find(m => m.modelId === 'openai/gpt-4o');
+  ok('gpt-4o присутствует и в tier 6', gpt4o?.tier === 6, gpt4o?.tier);
+  ok('gpt-4o: proprietary и training запрещён',
+    gpt4o?.license === 'proprietary' && gpt4o?.allowsTraining === false,
+    { license: gpt4o?.license, train: gpt4o?.allowsTraining });
+  ok('gpt-4o: платная, есть reserveRequiredUsd',
+    gpt4o?.costPer1M === 0.125 && gpt4o?.reserveRequiredUsd === 2.5,
+    { cost: gpt4o?.costPer1M, reserve: gpt4o?.reserveRequiredUsd });
+
+  const dsModel = (models ?? []).find(m => m.modelId === 'deepseek-r1-distill-1.5b');
+  ok('deepseek-дистилл: tier 1, mit, training разрешён',
+    dsModel?.tier === 1 && dsModel?.license === 'mit' && dsModel?.allowsTraining === true,
+    { tier: dsModel?.tier, license: dsModel?.license, train: dsModel?.allowsTraining });
+  ok('локальные модели бесплатны (costPer1M = 0)',
+    (models ?? []).filter(m => m.provider === 'local').every(m => m.costPer1M === 0), null);
+
+  /* Секретов в ответе быть не должно: каталог публичный и кешируется
+   * клиентом. Проверяем и по именам полей, и по содержимому. */
+  const rawModels = JSON.stringify(modelsRes.body);
+  ok('в /models нет полей с ключами/токенами',
+    !/(api[_-]?key|secret|token|password|bearer)/i.test(rawModels),
+    rawModels.match(/(api[_-]?key|secret|token|password)/i)?.[0] ?? 'чисто');
+
+  /* --- consent --- */
+  const consentUser = runId('consent-user');
+  const cUnknown = await api(`/consent/${consentUser}`);
+  ok('GET /consent незнакомого пользователя — 200, а не 404',
+    cUnknown.status === 200, cUnknown.status);
+  /* Отсутствие строки трактуется как отказ. Если бы это было true по
+   * умолчанию, дистилляция собирала бы данные без согласия. */
+  ok('без записи согласие = false (молчание не согласие)',
+    cUnknown.body?.isOptIn === false, cUnknown.body);
+
+  const postOn = await api('/consent', 'POST', { userId: consentUser, isOptIn: true });
+  ok('POST /consent с isOptIn=true отвечает 200', postOn.status === 200, postOn.status);
+  const readOn = await api(`/consent/${consentUser}`);
+  ok('согласие сохранилось и читается как true', readOn.body?.isOptIn === true, readOn.body);
+
+  const postOff = await api('/consent', 'POST', { userId: consentUser, isOptIn: false });
+  const readOff = await api(`/consent/${consentUser}`);
+  ok('повторный POST перезаписывает согласие на false',
+    postOff.status === 200 && readOff.body?.isOptIn === false, readOff.body);
+
+  /* Идемпотентность: та же галочка дважды не должна плодить строки или
+   * падать на PRIMARY KEY. */
+  const again = await api('/consent', 'POST', { userId: consentUser, isOptIn: true });
+  const againRead = await api(`/consent/${consentUser}`);
+  ok('повторное согласие идемпотентно (не дубль, не ошибка)',
+    again.status === 200 && againRead.body?.isOptIn === true, again.status);
+
+  const noUser = await api('/consent', 'POST', { isOptIn: true });
+  ok('POST /consent без userId — 400', noUser.status === 400, noUser.status);
+  const badType = await api('/consent', 'POST', { userId: consentUser, isOptIn: 'yes' });
+  /* Строка 'yes' вместо boolean — популярная ошибка клиента. Принять её
+   * значило бы гадать о намерении там, где речь о согласии. */
+  ok('POST /consent с не-boolean isOptIn — 400', badType.status === 400, badType.status);
+
+  /* --- cloudflared в /health --- */
+  const cf = (await api('/health')).body;
+  ok('/health отдаёт cloudflared_processes числом',
+    typeof cf.cloudflared_processes === 'number', typeof cf.cloudflared_processes);
+
+  /* Новые таблицы не должны были тронуть экономику. */
+  ok('consent/models не сломали conservation (delta 0)',
+    cf.conservation.delta === 0 && cf.conservation.holds === true,
+    { delta: cf.conservation.delta, holds: cf.conservation.holds });
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌`);
   if (fail) {

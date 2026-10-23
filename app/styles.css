@@ -287,3 +287,25 @@ code {
   text-decoration: underline;
   cursor: pointer;
 }
+
+/* Чекбокс согласия: кликабельна вся строка, а не только квадратик —
+ * на телефоне попасть в 13px чекбокс почти невозможно. */
+.consent {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 0 10px;
+  font-size: 13px;
+  line-height: 1.45;
+  cursor: pointer;
+}
+.consent input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.consent input[type="checkbox"]:disabled { cursor: progress; }
+.consent span { color: var(--text); }

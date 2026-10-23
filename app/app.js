@@ -374,6 +374,60 @@ async function refreshBalance() {
 
 $('refreshBal').addEventListener('click', refreshBalance);
 
+/* ---------- Согласие на дистилляцию ----------
+ * Чекбокс отражает состояние НА СЕРВЕРЕ, а не в localStorage: согласие —
+ * юридический факт, и оно должно переживать смену устройства и чистку
+ * браузера. Поэтому при открытии вкладки читаем GET /consent/:userId, а
+ * localStorage не используем вовсе.
+ *
+ * По умолчанию ВЫКЛЮЧЕНО. Пока ответ не пришёл, чекбокс disabled: иначе
+ * пользователь успел бы щёлкнуть по чекбоксу, отражающему ещё не
+ * загруженное состояние, и записал бы противоположное своему намерению. */
+async function loadConsent() {
+  const box = $('consentBox');
+  const state = $('consentState');
+  if (!box) return;
+  box.disabled = true;
+  try {
+    const c = await call(`/consent/${encodeURIComponent(ADDR)}`);
+    box.checked = c.isOptIn === true;
+    state.textContent = c.updatedAt
+      ? `обновлено: ${new Date(c.updatedAt).toLocaleString('ru-RU')}`
+      : 'согласие не выдавалось';
+  } catch (e) {
+    box.checked = false;
+    state.textContent = e.code === 'RATE_LIMIT'
+      ? 'не удалось загрузить: лимит запросов, повторите через минуту'
+      : 'не удалось загрузить согласие';
+  } finally {
+    box.disabled = false;
+  }
+}
+
+async function saveConsent(next) {
+  const box = $('consentBox');
+  const state = $('consentState');
+  if (!box) return;
+  box.disabled = true;
+  try {
+    const r = await call('/consent', { method: 'POST', body: { userId: ADDR, isOptIn: next } });
+    box.checked = r.isOptIn === true;
+    state.textContent = `сохранено: ${new Date(r.updatedAt).toLocaleString('ru-RU')}`;
+  } catch (e) {
+    /* Откат к прежнему значению — обязателен: иначе галочка останется
+     * стоять, хотя на сервере согласия нет, и пользователь будет думать,
+     * что разрешил то, чего не разрешал. */
+    box.checked = !next;
+    state.textContent = e.code === 'RATE_LIMIT'
+      ? 'не сохранено: лимит запросов, повторите через минуту'
+      : `не сохранено: ${e.message}`;
+  } finally {
+    box.disabled = false;
+  }
+}
+
+$('consentBox').addEventListener('change', (ev) => saveConsent(ev.target.checked));
+
 /* ---------- Nano-node ----------
  * Раз в 10 секунд отправляет короткую работу. Токенов меньше порога nano
  * (500), поэтому они копятся в pending_work, а чек выпускается, когда
@@ -497,4 +551,5 @@ $('installBtn').addEventListener('click', async () => {
   startBannerPolling();
   await loadAdapters();
   refreshBalance();
+  loadConsent();
 })();

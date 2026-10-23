@@ -437,7 +437,57 @@ CREATE TABLE IF NOT EXISTS lora_submissions (
   createdAt TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_lora_hash ON lora_submissions (adapter_hash);
+
+/* Каталог моделей — фундамент Auto-Router (Волна 2) и Tier 6.
+ * Пока это ТОЛЬКО справочник: /inference его не читает, маршрутизация
+ * по-прежнему идёт через llm-adapter. Таблица описывает, ЧТО существует
+ * в сети и на каких условиях, чтобы роутер было к чему прицепить. */
+CREATE TABLE IF NOT EXISTS model_registry (
+  modelId TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  tier INTEGER NOT NULL CHECK(tier BETWEEN 1 AND 6),
+  contextWindow INTEGER NOT NULL,
+  costPer1M REAL DEFAULT 0.0,
+  reserveRequiredUsd REAL DEFAULT 0.0,
+  rpmLimit INTEGER DEFAULT -1,
+  rpdLimit INTEGER DEFAULT -1,
+  strengths TEXT,
+  minRamGb INTEGER DEFAULT 0,
+  isFree INTEGER DEFAULT 0,
+  isAvailable INTEGER DEFAULT 1,
+  license TEXT NOT NULL,
+  allowsTraining INTEGER DEFAULT 0,
+  tosUrl TEXT,
+  lastChecked TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+/* opt-in на использование запросов для дистилляции.
+ * По умолчанию ВЫКЛЮЧЕНО: строка появляется только когда пользователь
+ * явно поставил галочку. Отсутствие строки трактуется как отказ. */
+CREATE TABLE IF NOT EXISTS user_consent (
+  userId TEXT PRIMARY KEY,
+  is_opt_in INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 `);
+
+/* Сид каталога. INSERT OR IGNORE, а не REPLACE: если запись уже есть,
+ * ручная правка оператора (например, isAvailable=0 после проверки лицензии)
+ * не должна затираться при каждом старте. */
+(function seedModelRegistry() {
+  const rows = [
+    ['deepseek-r1-distill-1.5b', 'local', 1, 32768, 0, 0, -1, -1, 'reasoning,distill', 2, 1, 1, 'mit', 1, null],
+    ['qwen2.5-coder-7b', 'local', 2, 32768, 0, 0, -1, -1, 'code,agentic', 8, 1, 1, 'apache-2.0', 1, null],
+    ['openrouter/qwen3-coder', 'openrouter', 6, 262144, 0, 0, 20, 200, 'code,long-context', 0, 1, 1, 'apache-2.0', 1, 'https://openrouter.ai/models'],
+    ['openai/gpt-4o', 'openai', 6, 128000, 0.125, 2.5, 30, 500, 'general,vision', 0, 0, 1, 'proprietary', 0, 'https://openai.com/policies/terms-of-use'],
+  ];
+  const stmt = db.prepare(`INSERT OR IGNORE INTO model_registry
+    (modelId, provider, tier, contextWindow, costPer1M, reserveRequiredUsd,
+     rpmLimit, rpdLimit, strengths, minRamGb, isFree, isAvailable, license,
+     allowsTraining, tosUrl)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  for (const r of rows) stmt.run(...r);
+})();
 
 /* chat_messages + журнал синхронизации. Схема — по спеке v2.2.2 §4.1. */
 chatSync.initChatSchema(db);
@@ -1315,6 +1365,37 @@ setInterval(() => {
 }, 60000).unref();
 
 /* --- Health --- */
+/* Число живых процессов cloudflared (для мониторинга утечек).
+ * Считается чтением /proc, а не `ps`: спавн процесса на каждый /health
+ * был бы дороже самого опроса, а /health дёргают часто (мониторинг,
+ * watch-скрипты, verify.sh). Результат кэшируется на 10 секунд —
+ * чаще он всё равно не меняется.
+ * Учитывается только собственный процесс туннеля: строки, где cloudflared
+ * встречается в аргументах чужих команд (grep, pgrep, этот скрипт),
+ * пропускаются по argv[0]. */
+let cfCache = { at: 0, n: 0 };
+function countCloudflaredProcesses() {
+  const now = Date.now();
+  if (now - cfCache.at < 10000) return cfCache.n;
+  let n = 0;
+  let pids = [];
+  try { pids = fs.readdirSync('/proc'); } catch (_e) { pids = []; }
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid)) continue;
+    let raw;
+    try { raw = fs.readFileSync(`/proc/${pid}/cmdline`); } catch (_e) { continue; }
+    if (!raw.length) continue;
+    const argv = raw.toString('utf8').split('\0').filter(Boolean);
+    if (!argv.length) continue;
+    /* Именно бинарник cloudflared запущен, а не упомянут в чужой строке. */
+    const exe = path.basename(argv[0]);
+    if (!exe.startsWith('cloudflared')) continue;
+    n += 1;
+  }
+  cfCache = { at: now, n };
+  return n;
+}
+
 app.get('/health', (_req, res) => {
   const totals = ledger.totals();
   const bad = get(`SELECT COUNT(*) AS c FROM work_receipts
@@ -1378,6 +1459,10 @@ app.get('/health', (_req, res) => {
       note: 'No blockchain integration',
       settlements: settledCount,
     },
+    /* Сколько процессов cloudflared живёт на хосте. На боевом VPS
+     * ожидается 0: публичный доступ идёт через Caddy, а туннель —
+     * артефакт dev-стенда. Ненулевое значение здесь — сигнал утечки. */
+    cloudflared_processes: countCloudflaredProcesses(),
     treasury: {
       balanceTar: Number((treas?.balanceTar ?? 0).toFixed(6)),
       reserveUsdc: Number((tstate?.reserveUsdc ?? 0).toFixed(6)),
@@ -1797,6 +1882,56 @@ app.post('/adapter', (req, res) => {
        ON CONFLICT(adapterId) DO UPDATE SET authorAddress = excluded.authorAddress, baseModel = excluded.baseModel, domain = excluded.domain`,
     [adapterId, authorAddress, baseModel || BASE_MODEL, domain || null, CONFIG.LORA_ROYALTY_RATE]);
   res.json({ adapterId, authorAddress, baseModel: baseModel || BASE_MODEL, domain: domain || null, royaltyRate: CONFIG.LORA_ROYALTY_RATE });
+});
+
+/* --- Каталог моделей (Волна 1: справочник для будущего Auto-Router) ---
+ * Отдаётся без секретов: ни ключей, ни URL с токенами. Только то, что
+ * нужно клиенту и роутеру для выбора модели. */
+app.get('/models', (_req, res) => {
+  const rows = all(`SELECT modelId, provider, tier, contextWindow, costPer1M,
+      reserveRequiredUsd, rpmLimit, rpdLimit, strengths, minRamGb, isFree,
+      isAvailable, license, allowsTraining, tosUrl, lastChecked
+    FROM model_registry ORDER BY tier, modelId`);
+  /* SQLite хранит BOOLEAN как 0/1, а клиент ждёт настоящий boolean:
+   * 0 в JSON — truthy-ловушка для любого, кто пишет `if (m.isFree)`. */
+  const models = rows.map(m => ({
+    ...m,
+    isFree: m.isFree === 1,
+    isAvailable: m.isAvailable === 1,
+    allowsTraining: m.allowsTraining === 1,
+  }));
+  res.json({ count: models.length, models });
+});
+
+/* --- Opt-in на дистилляцию ---
+ * Согласие хранится по userId. Отсутствие строки = отказ: молчание не
+ * считается согласием, иначе первая же дистилляция соберёт чужие данные
+ * без права на это. */
+app.post('/consent', (req, res) => {
+  const { userId, isOptIn } = req.body || {};
+  if (typeof userId !== 'string' || !userId.trim()) {
+    return res.status(400).json({ error: 'userId required', got: typeof userId });
+  }
+  if (typeof isOptIn !== 'boolean') {
+    return res.status(400).json({ error: 'isOptIn must be boolean', got: typeof isOptIn });
+  }
+  const id = userId.trim();
+  const now = new Date().toISOString();
+  run(`INSERT INTO user_consent (userId, is_opt_in, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(userId) DO UPDATE SET is_opt_in = excluded.is_opt_in,
+       updated_at = excluded.updated_at`,
+    [id, isOptIn ? 1 : 0, now]);
+  res.json({ userId: id, isOptIn, updatedAt: now });
+});
+
+app.get('/consent/:userId', (req, res) => {
+  const id = String(req.params.userId || '').trim();
+  if (!id) return res.status(400).json({ error: 'userId required' });
+  const row = get('SELECT is_opt_in, updated_at FROM user_consent WHERE userId = ?', [id]);
+  /* Нет строки — нет согласия. Отдаём 200, а не 404: для клиента это
+   * валидный ответ «не разрешено», а не ошибка запроса. */
+  if (!row) return res.json({ userId: id, isOptIn: false, updatedAt: null });
+  res.json({ userId: id, isOptIn: row.is_opt_in === 1, updatedAt: row.updated_at });
 });
 
 app.get('/adapters', (_req, res) => res.json(all('SELECT adapterId, authorAddress, baseModel, domain, royaltyRate, deleted_at FROM adapters ORDER BY adapterId')));
