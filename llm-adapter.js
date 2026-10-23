@@ -32,18 +32,12 @@ const crypto = require('crypto');
  * regex-фильтр работает по принципу «нашли совпадение = не уверены». */
 const TIER6_MIN_CONFIDENCE = 0.95;
 
-/* ---------- PII-фильтр ---------- */
-/* Паттерны намеренно широкие: лучше заблокировать лишний запрос и отдать
- * детерминированный ответ, чем выпустить телефон клиента в чужой API. */
-const PII_PATTERNS = [
-  { id: 'email', re: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/ },
-  { id: 'card', re: /\b(?:\d[ -]?){13,19}\b/ },
-  { id: 'iban', re: /\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b/ },
-  { id: 'ssn', re: /\b\d{3}-\d{2}-\d{4}\b/ },
-  { id: 'phone', re: /(?:\+\d[\d\s\-()]{8,17}\d)/ },
-  { id: 'long_hex', re: /\b[0-9a-fA-F]{32,}\b/ },
-  { id: 'long_base64', re: /\b[A-Za-z0-9+/]{40,}={0,2}\b/ },
-];
+/* ---------- PII-фильтр ----------
+/* Паттерны берутся из pii-classifier: держать второй такой же список здесь
+ * значило бы чинить баги дважды. Именно так и вышло с IPv4 — адрес надо было
+ * добавить в оба места, и одно из них легко забыть. Теперь источник один:
+ * STRUCTURED_PATTERNS в pii-classifier.js. */
+const { STRUCTURED_PATTERNS: PII_PATTERNS } = require('./pii-classifier');
 
 function piiCheck(text) {
   const s = String(text ?? '');

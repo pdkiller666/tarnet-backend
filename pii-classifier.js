@@ -59,6 +59,17 @@ const STRUCTURED_PATTERNS = [
   { id: 'card', re: /\b(?:\d[ -]?){13,19}\b/ },
   { id: 'iban', re: /\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b/ },
   { id: 'ssn', re: /\b\d{3}-\d{2}-\d{4}\b/ },
+/* IPv4. Строгие октеты 0–255, а не `\d{1,3}`: иначе «номер 999.1.1.1»
+ * считался бы адресом. Lookaround вместо `\b`: `\b` не видит границу
+ * между кириллицей и цифрой как «слово→слово», и адрес сразу после
+ * русской буквы («адрес192.168.0.1») остался бы незамеченным.
+ *
+ * guard отделяет адрес от ТЕКСТОВОЙ ВЕРСИИ: «версия 1.2.3.4 сборки» и
+ * «build 1.2.3.4» — не PII, а номер релиза. Синтаксически они неотличимы
+ * от IPv4, поэтому смотрим на слово перед числом, а не на само число.
+ * Сознательно консервативно: без явного слова-маркера считаем адресом. */
+  { id: 'ipv4', re: /(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/,
+    guard: (prefix) => !/version|build|сборк\p{L}*|верси\p{L}*\s*[:№]?\s*$/iu.test(prefix) },
   { id: 'phone', re: /(?:\+\d[\d\s\-()]{8,17}\d)/ },
   { id: 'long_hex', re: /\b[0-9a-fA-F]{32,}\b/ },
   { id: 'long_base64', re: /\b[A-Za-z0-9+/]{40,}={0,2}\b/ },
@@ -69,7 +80,25 @@ function checkStructured(text) {
   if (!s) return { matches: [], clean: true };
   const matches = [];
   for (const p of STRUCTURED_PATTERNS) {
-    if (p.re.test(s)) matches.push(p.id);
+    let hit = false;
+    if (!p.guard) {
+      hit = p.re.test(s);
+    } else {
+      /* Ищем не первое совпадение, а первое, которое guard не отклонил:
+       * в «версия 1.2.3.4, адрес 10.0.0.1» отклонённая версия не должна
+       * скрывать настоящий адрес. Глобальную копию делаем на каждый вызов,
+       * чтобы lastIndex не тёк между запросами. */
+      const re = new RegExp(p.re.source, p.re.flags.includes('g') ? p.re.flags : p.re.flags + 'g');
+      let m;
+      while ((m = re.exec(s)) !== null) {
+        /* guard возвращает true = «это действительно PII, не отклоняй».
+         * Было написано `!p.guard(...)`, то есть ровно наоборот: отклонялись
+         * настоящие адреса, а версии проходили. */
+        if (p.guard(s.slice(0, m.index))) { hit = true; break; }
+        if (m.index === re.lastIndex) re.lastIndex += 1;
+      }
+    }
+    if (hit) matches.push(p.id);
   }
   return { matches, clean: matches.length === 0 };
 }

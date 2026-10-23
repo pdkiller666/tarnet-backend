@@ -26,6 +26,9 @@ const dag = require('./dag-chain');
 const onion = require('./onion');
 const benchmarkGate = require('./benchmark-gate');
 const piiModule = require('./pii-classifier');
+/* Нужен, чтобы закрепить единство паттернов: llm-adapter берёт их из
+ * pii-classifier, и тест ловит момент, когда кто-то снова скопирует список. */
+const LLM = require('./llm-adapter');
 const p2pTransport = require('./p2p-transport');
 
 /* Флаг --test поднимает собственный изолированный сервер на временной БД и
@@ -1736,6 +1739,25 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('пустой запрос: confidence 1', (await piiRegex.classify('')).confidence === 1);
   ok('номер карты ловится', (await piiRegex.classify('Card 4111 1111 1111 1111 expires soon')).matches.includes('card'));
   ok('SSN ловится', (await piiRegex.classify('SSN 123-45-6789 on file')).matches.includes('ssn'));
+
+  /* IPv4 добавлен 2026-10-23 (К4): до этого адрес не ловился вообще.
+   * Проверяем обе стороны: адрес ловится, но НОМЕР ВЕРСИИ — нет.
+   * Синтаксически «1.2.3.4» — валидный IPv4, отличить можно только по слову. */
+  ok('IPv4 ловится', (await piiRegex.classify('Наш шлюз 192.168.10.25 в подсети')).matches.includes('ipv4'));
+  ok('IPv4 сразу после кириллицы ловится',
+    (await piiRegex.classify('адрес192.168.0.1 слитно')).matches.includes('ipv4'));
+  ok('номер версии 1.2.3.4 не считается адресом',
+    (await piiRegex.classify('Обнови версию 1.2.3.4 сборки')).matches.length === 0,
+    (await piiRegex.classify('Обнови версию 1.2.3.4 сборки')).matches);
+  ok('версия не скрывает настоящий IPv4 в том же тексте',
+    (await piiRegex.classify('версия 1.2.3.4, а адрес 10.0.0.1')).matches.includes('ipv4'));
+  ok('невалидный октет 999.1.1.1 не PII',
+    (await piiRegex.classify('999.1.1.1 не адрес')).matches.length === 0);
+  /* Один источник паттернов: llm-adapter берёт их из pii-classifier.
+   * Раньше списки были скопированы, и IPv4 пришлось бы править дважды. */
+  ok('llm-adapter и pii-classifier видят IPv4 одинаково',
+    LLM.piiCheck('шлюз 192.168.0.1').matches.includes('ipv4')
+    && piiModule.checkStructured('шлюз 192.168.0.1').matches.includes('ipv4'));
 
   /* Проверка агрегации субтокенов: B-PER + I-PER должны стать одной
    * сущностью, а не двумя. Это чистая функция, модель не нужна. */
