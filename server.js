@@ -444,6 +444,11 @@ ensureColumn('work_receipts', 'feeGrossTar', 'feeGrossTar REAL NOT NULL DEFAULT 
 /* batchedFrom — какие короткие работы слиты в этот чек. В подписываемый
  * payload не входит (формат зафиксирован), это метаданные объёма. */
 ensureColumn('work_receipts', 'batchedFrom', 'batchedFrom TEXT');
+/* demo — чек выпущен принудительно через /demo/flush-work, минуя порог.
+ * Признак живёт в БД, а не только в ответе: иначе после перезагрузки страницы
+ * такой чек выглядел бы обычным, и на демо снова стало бы непонятно,
+ * откуда взялась выплата ниже порога. */
+ensureColumn('work_receipts', 'demo', 'demo INTEGER NOT NULL DEFAULT 0');
 /* domain — домен адаптера (code/math/medical). Нужен для проверки роялти
  * по доменам; публичная регистрация адаптеров — Фаза 2. */
 ensureColumn('adapters', 'domain', 'domain TEXT');
@@ -861,7 +866,7 @@ function lookupActionId(id) {
 /* ===== Ядро начисления =====
  * Единственный путь, которым в системе появляются токены. Никаких условий
  * «если повезло»: при γ=1 начисление всегда, при γ=0 — никогда. */
-function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, response, actionId }) {
+function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, response, actionId, flush = false, demo = false }) {
   const t = normalizeTier(tier);
   if (!t) {
     const err = new Error(`tier must be one of ${TIERS.join('|')}`);
@@ -949,7 +954,12 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
   // 1) Качество: γ_verify ∈ {0,1}. Провал проверки = нет начисления.
   // Seed берётся из содержимого (auditSeed), а не из id: иначе клиент
   // подбирал бы себе bucket и проходил аудит без работы.
-  const quality = verifyQuality({ actionId: auditSeed, tokens, response: response || 'ok', adapterId: adapterId || BASE_MODEL });
+  const quality = flush
+    /* Принудительный выпуск (только демо): работа уже прошла проверку
+     * качества, когда копилась. enqueue() вызывается лишь при gamma > 0,
+     * поэтому проваленной работы в pending_work нет и перепроверять нечего. */
+    ? { gamma: 1, sampled: false, bucket: null, checks: {}, passed: true, reason: 'demo_flush' }
+    : verifyQuality({ actionId: auditSeed, tokens, response: response || 'ok', adapterId: adapterId || BASE_MODEL });
 
   /* 1.5) Батчинг коротких работ. Работа дешевле порога не пропадает и не
    * превращается в чек на ноль: она копится в pending_work и суммируется со
@@ -967,7 +977,9 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
   try { pendingActions = pend ? JSON.parse(pend.actions) : []; } catch (_e) { pendingActions = []; }
 
   const threshold = receiptThreshold(t);
-  const tokensUsed = round(pendingTokens + Number(tokens));
+  /* flush выпускает чек ровно на накопленное, без добавления новой работы:
+   * иначе переданный объём сложился бы с pending и оплатил его дважды. */
+  const tokensUsed = flush ? round(pendingTokens) : round(pendingTokens + Number(tokens));
 
   /* Накопление работы в pending_work. Вынесено в функцию, потому что
    * причин не выпускать чек две: объём ниже порога и нулевое начисление
@@ -976,7 +988,9 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
   const enqueue = (reason) => tx(() => {
     /* Список ограничен: pending — это счётчик, а не журнал. 200 хватает,
      * чтобы показать состав чека и не растить строку бесконечно. */
-    const actions = [...pendingActions, id].slice(-200);
+    /* flush не добавляет работы: id принудительного выпуска не должен
+     * попасть в список действий, иначе он выглядел бы несделанной работой. */
+    const actions = (flush ? pendingActions : [...pendingActions, id]).slice(-200);
     run(`INSERT INTO pending_work (workerAddress, tier, adapterId, tokens, actions, updatedAt)
          VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(workerAddress, tier, adapterId) DO UPDATE SET
@@ -999,14 +1013,16 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
   /* Провал качества не копим: γ=0 означает «работы не было», а накопление
    * подразумевает, что она была. Иначе мусорный actionId раздувал бы
    * следующий чек. */
-  if (quality.gamma > 0 && tokensUsed < threshold) {
+  if (!flush && quality.gamma > 0 && tokensUsed < threshold) {
     return enqueue('below_threshold');
   }
 
   /* Работа достигла порога: поглощаем накопленное и выпускаем один чек на
    * суммарный объём. batchedFrom — actionId слитых работ: у них не было
    * своего чека, поэтому seq у них не существует. */
-  const batchedFrom = pendingTokens > 0 ? [...pendingActions, id] : [];
+  const batchedFrom = flush
+    ? [...pendingActions]
+    : (pendingTokens > 0 ? [...pendingActions, id] : []);
 
   // 2) CWU и эмиссия текущей эпохи.
   const now = Date.now();
@@ -1081,6 +1097,7 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
       actionId: id,
       batchedFrom,
       adapterDeletedAt: adapter ? adapter.deletedAt : null,
+      demo,
     });
 
     /* Накопление израсходовано: чек выпущен на суммарный объём. Удаление в
@@ -2676,6 +2693,132 @@ async function runInference(req, res) {
     conservation: outcome.conservation ?? null,
   });
 }
+
+/* ===== Demo-flush: принудительный чек из pending_work =====
+ *
+ * Зачем: короткий запрос не выпускает чек, потому что копится в pending_work
+ * до порога (50 токенов для base). На демо это выглядит как «экономика не
+ * работает»: ответ есть, денег нет. Эндпоинт закрывает разрыв — выпускает чек
+ * на накопленное, не дожидаясь порога.
+ *
+ * Только демо. Условие — DEMO_MODE=1 в окружении процесса, а не флаг в теле
+ * запроса: клиентский флаг обошёл бы порог кто угодно, и «демо-режим» стал бы
+ * дырой в экономике. При выключенном флаге эндпоинт отвечает 403 и не читает
+ * тело вовсе, поэтому его наличие в коде ничего не разрешает.
+ *
+ * Поток не дублирует экономику: он идёт через тот же recordWork(), поэтому
+ * сохранение (delta=0), дебет клиента, эпоха и подпись чека остаются теми же,
+ * что у обычного начисления. Отличаются ровно три вещи: порог обходится,
+ * quality не перепроверяется (работа уже была принята при накоплении),
+ * и чек помечается demo=true. */
+app.post('/demo/flush-work', (req, res) => {
+  if (process.env.DEMO_MODE !== '1') {
+    return res.status(403).json({
+      error: 'demo mode is off',
+      note: 'Принудительный выпуск чека доступен только при DEMO_MODE=1 в окружении сервера.',
+      demoMode: false,
+    });
+  }
+
+  const body = req.body || {};
+  const workerAddress = typeof body.workerAddress === 'string' ? body.workerAddress.trim() : '';
+  if (!workerAddress) {
+    return res.status(400).json({ error: 'workerAddress is required' });
+  }
+
+  /* Накопление лежит с ключом (workerAddress, tier, adapterId), поэтому у
+   * одного воркера может быть несколько строк. Тиры не смешиваются: CWU =
+   * tokens × κ, и общий чек на 45 nano + 5 expert занизил бы выплату в κ раз.
+   * Поэтому без явного фильтра берётся САМАЯ КРУПНАЯ строка, а не сумма:
+   * выбор детерминирован и виден в ответе. Остальные строки не удаляются,
+   * их число возвращается как remaining_pending_rows. */
+  const rows = all(
+    'SELECT tier, adapterId, tokens FROM pending_work WHERE workerAddress = ? ORDER BY tokens DESC',
+    [workerAddress],
+  );
+  if (!rows.length) {
+    return res.status(404).json({
+      error: 'nothing to flush',
+      note: 'У этого воркера нет накопленной работы: pending_work пуст.',
+      workerAddress,
+      pending_work: 0,
+    });
+  }
+
+  const wantTier = typeof body.tier === 'string' && body.tier ? normalizeTier(body.tier) : null;
+  const wantAdapter = typeof body.adapterId === 'string' ? body.adapterId : null;
+  const target = rows.find((r) =>
+    (!wantTier || r.tier === wantTier) &&
+    (wantAdapter === null || (r.adapterId || '') === wantAdapter),
+  );
+  if (!target) {
+    return res.status(404).json({
+      error: 'nothing to flush for given tier/adapterId',
+      workerAddress,
+      available: rows.map((r) => ({
+        tier: r.tier, adapterId: r.adapterId || BASE_MODEL, tokens: Number(r.tokens),
+      })),
+    });
+  }
+
+  const pendTokens = Number(target.tokens);
+  if (!(pendTokens > 0)) {
+    return res.status(409).json({
+      error: 'pending work is empty',
+      note: 'Записей нет либо объём нулевой — чека не из чего выпускать.',
+      workerAddress, pending_work: pendTokens,
+    });
+  }
+
+  try {
+    /* actionId уникален для принудительного выпуска: повтор с тем же ключом
+     * вернул бы существующий чек (дедупликация), а нужен новый выпуск. */
+    const actionId = `demo-flush-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+    const outcome = recordWork({
+      workerAddress,
+      clientAddress: typeof body.clientAddress === 'string' ? body.clientAddress : null,
+      /* flush игнорирует переданный объём и берёт ровно накопленное. */
+      tokens: pendTokens,
+      tier: target.tier,
+      adapterId: target.adapterId || null,
+      response: typeof body.response === 'string' ? body.response : 'demo flush',
+      actionId,
+      flush: true,
+      demo: true,
+    });
+
+    if (!outcome.receipt) {
+      /* Сюда можно попасть при нулевой эмиссии эпохи: чек на ноль не
+       * выпускается даже в демо. Отвечаем честно, а не пустым чеком. */
+      return res.status(409).json({
+        error: 'receipt not issued',
+        reason: outcome.reason || 'unknown',
+        pending_work: outcome.pending_work ?? pendTokens,
+        workerAddress,
+        receipt: null,
+      });
+    }
+
+    return res.status(201).json({
+      demo: true,
+      flushed: true,
+      workerAddress,
+      tier: target.tier,
+      adapterId: target.adapterId || BASE_MODEL,
+      pending_work_before: pendTokens,
+      threshold: receiptThreshold(target.tier),
+      threshold_bypassed: pendTokens < receiptThreshold(target.tier),
+      remaining_pending_rows: rows.length - 1,
+      actionId,
+      receipt: outcome.receipt,
+      conservation: outcome.conservation ?? null,
+    });
+  } catch (e) {
+    const code = e.code || 'FLUSH_FAILED';
+    const status = code === 'UNKNOWN_WORKER' ? 404 : code === 'BAD_TIER' ? 400 : 500;
+    return res.status(status).json({ error: e.message, code });
+  }
+});
 
 app.post('/inference', runInference);
 app.get('/inference', (_req, res) => res.status(405).json({

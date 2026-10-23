@@ -147,18 +147,32 @@ function receiptBlock(res) {
 
   if (!r) {
     const pend = res.pending_work ?? res.breakdown?.cwu ?? null;
+    /* Порог приходит с сервера: он зависит от тира (base 50, expert 13, nano
+     * 500), поэтому подставлять константу 50 в подпись нельзя — для nano она
+     * соврёт в 10 раз. Без ответа сервера показываем только накопленное. */
+    const thr = res.threshold ?? null;
+    const progress = pend !== null && thr !== null
+      ? `Накоплено: ${esc(pend)}/${esc(thr)} токенов до чека`
+      : pend !== null
+        ? `Накоплено: ${esc(pend)} токенов до чека`
+        : null;
     el.innerHTML =
       `<div class="row"><span>чек</span><b class="queued">не выпущен</b></div>` +
+      (progress ? `<div class="row pending-line"><b>${progress}</b></div>` : '') +
       `<div class="row"><span>причина</span><b>${esc(res.reason || 'below_threshold')}</b></div>` +
       (pend !== null ? `<div class="row"><span>накоплено токенов</span><b>${esc(pend)}</b></div>` : '') +
-      (res.threshold ? `<div class="row"><span>порог чека</span><b>${esc(res.threshold)}</b></div>` : '') +
+      (thr ? `<div class="row"><span>порог чека</span><b>${esc(thr)}</b></div>` : '') +
       `<div class="row"><span>оплата</span><b>0 TAR (пока)</b></div>`;
     return el;
   }
 
   const b = res.breakdown || {};
   const sig = r.signature ? String(r.signature) : '';
+  /* Чек, выпущенный demo-flush, помечен на сервере. Без пометки зритель видит
+   * обычный чек на объём ниже порога и делает вывод, что порог не работает. */
+  const demoBadge = r.demo ? `<div class="row"><span>источник</span><b class="queued">демо: порог обойдён</b></div>` : '';
   el.innerHTML =
+    demoBadge +
     `<div class="row"><span>seq</span><b>#${esc(r.seq)}</b></div>` +
     `<div class="row"><span>CWU</span><b>${esc(b.cwu ?? r.cwu)}</b></div>` +
     `<div class="row"><span>Fee</span><b>${fmt(b.feeRewardTar ?? r.feeRewardTar)} TAR</b></div>` +

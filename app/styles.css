@@ -156,6 +156,11 @@ select:focus-visible, textarea:focus-visible, button:focus-visible {
 .receipt .sig-ok { color: var(--ok); }
 .receipt .sig-bad { color: var(--danger); }
 .receipt .queued { color: var(--warn); }
+/* Строка прогресса до чека. Отдельный стиль, а не .queued: это не причина
+   отказа, а объяснение, почему чека пока нет — глаз должен цепляться за неё
+   первой, поэтому текст на всю ширину и чуть ярче обычных строк. */
+.receipt .pending-line { justify-content: flex-start; }
+.receipt .pending-line b { color: var(--warn); font-weight: 600; }
 
 .composer { display: flex; gap: 8px; align-items: flex-end; }
 textarea {

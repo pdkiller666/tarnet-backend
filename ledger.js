@@ -66,7 +66,7 @@ class CumulativeLedger {
     feeGrossTar = 0, feeRewardTar, blockRewardTar, rewardTar,
     burnTar, treasuryTar, royaltyTar,
     epoch, omega = 0, share = 0, adapterId = null, actionId = null,
-    batchedFrom = null, adapterDeletedAt = null,
+    batchedFrom = null, adapterDeletedAt = null, demo = false,
   }) {
     if (!workerAddress) throw new Error('workerAddress is required');
     const prev = this.lastFor(workerAddress);
@@ -118,8 +118,9 @@ class CumulativeLedger {
           burnTar, treasuryTar, royaltyTar, cumulativeTotal, epoch, omega, share,
           adapterId, actionId, timestamp, prevSignature, signature, signatureAlg, createdAt,
           batchedFrom, adapterDeletedAt,
-          workerSeq, prevReceiptHash, cumulativeCwu, cumulativeTar, receiptHash, payloadVersion)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          workerSeq, prevReceiptHash, cumulativeCwu, cumulativeTar, receiptHash, payloadVersion,
+          demo)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [seq, workerAddress, round(cwu), tier,
         round(feeGrossTar), round(feeRewardTar), round(blockRewardTar), round(rewardTar),
         round(burnTar), round(treasuryTar), round(royaltyTar), cumulativeTotal,
@@ -128,7 +129,8 @@ class CumulativeLedger {
         new Date(timestamp).toISOString(),
         batchedFrom && batchedFrom.length ? JSON.stringify(batchedFrom) : null,
         adapterDeletedAt,
-        workerSeq, prevReceiptHash, cumulativeCwu, cumulativeTar, receiptHash, 2],
+        workerSeq, prevReceiptHash, cumulativeCwu, cumulativeTar, receiptHash, 2,
+        demo ? 1 : 0],
     );
 
     return this.get(seq);
@@ -180,6 +182,12 @@ class CumulativeLedger {
        * null. Снимок, а не текущее состояние реестра: чек описывает прошлое,
        * а адаптер могли удалить позже. Вне подписываемого payload. */
       adapterDeletedAt: r.adapterDeletedAt || null,
+      /* Чек выпущен принудительно, вне обычного порога (только демо).
+       * В подписываемый payload не входит намеренно: подпись подтверждает
+       * суммы и цепочку, а не причину выпуска. Но клиенту и аудитору нужно
+       * видеть, что порог был обойдён, иначе такой чек неотличим от
+       * обычного чека, накопленного честным батчингом. */
+      demo: Boolean(r.demo),
     };
   }
 

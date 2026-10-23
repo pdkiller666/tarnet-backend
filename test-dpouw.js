@@ -1306,6 +1306,98 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('проверки регистрации не ослабли: неизвестный узел — 404',
     stillUnknown.status === 404, stillUnknown.status);
 
+  /* ---------- 8.18. Demo-flush: принудительный чек из pending_work ----------
+   * Два сервера, потому что проверяется именно флаг окружения: при DEMO_MODE=1
+   * эндпоинт выпускает чек, без флага — 403. Проверять 403 на основном сервере
+   * нельзя: он наследует окружение процесса и результат зависел бы от того,
+   * как запущен тест. */
+  section('8.18. Demo-flush: чек из pending_work, только при DEMO_MODE=1');
+
+  const demo = await spawnServer({ DEMO_MODE: '1' });
+  try {
+    const wD = runAddress('df');
+    await apiAt(demo.base, '/node', 'POST', { address: wD, stake: 50000, reputation: 0.9 });
+
+    /* 6 токенов — заведомо ниже порога 50: без flush чека не было бы, работа
+     * просто копилась бы. Это и есть сценарий «экономика не работает». */
+    const small = await apiAt(demo.base, '/work', 'POST', {
+      workerAddress: wD, tokens: 6, tier: 'base', response: 'demo short work',
+    });
+    ok('короткая работа накоплена, чека нет',
+      small.status === 202 && small.body.pending_work === 6 && small.body.receipt === null,
+      { status: small.status, pending: small.body?.pending_work });
+
+    const flush = await apiAt(demo.base, '/demo/flush-work', 'POST', { workerAddress: wD });
+
+    ok('flush выпускает чек на накопленные токены (201)',
+      flush.status === 201 && flush.body.receipt !== null
+        && flush.body.pending_work_before === 6,
+      { status: flush.status, body: flush.body });
+
+    ok('чек помечен demo:true и порог обойдён',
+      flush.body.receipt?.demo === true
+        && flush.body.threshold_bypassed === true && flush.body.threshold === 50,
+      { demo: flush.body.receipt?.demo, bypassed: flush.body.threshold_bypassed });
+
+    ok('чек ниже порога, но выплата ненулевая',
+      flush.body.receipt?.rewardTar > 0 && flush.body.receipt?.seq > 0,
+      { reward: flush.body.receipt?.rewardTar, seq: flush.body.receipt?.seq });
+
+    /* Пометка должна пережить запись в БД, а не жить только в ответе: иначе
+     * после перезагрузки страницы чек выглядел бы обычным. */
+    const histD = await apiAt(demo.base, `/receipts/${wD}`);
+    ok('demo:true виден в истории чеков воркера',
+      Array.isArray(histD.body) && histD.body.length === 1 && histD.body[0].demo === true,
+      { count: histD.body?.length, demo: histD.body?.[0]?.demo });
+
+    ok('flush не ломает сохранение: delta = 0, holds = true',
+      (await apiAt(demo.base, '/summary')).body?.conservation?.delta === 0,
+      (await apiAt(demo.base, '/summary')).body?.conservation);
+
+    /* Накопление израсходовано: следующая короткая работа начинает счёт заново.
+     * Если бы pending_work не очистился, токены оплатились бы дважды. */
+    const afterClear = await apiAt(demo.base, '/work', 'POST', {
+      workerAddress: wD, tokens: 5, tier: 'base', response: 'after flush work',
+    });
+    ok('после flush накопление сброшено',
+      afterClear.status === 202 && afterClear.body.pending_work === 5,
+      { status: afterClear.status, pending: afterClear.body?.pending_work });
+
+    /* Пустой pending_work — не чек на ноль и не 500, а внятный 404.
+     * Проверяется на ОТДЕЛЬНОМ воркере: у wD выше осталась накопленная
+     * работа на 5 токенов, и flush по нему выпустил бы законный чек.
+     * Ожидание 404 на wD было дефектом теста, а не кода. */
+    const wEmpty = runAddress('de');
+    await apiAt(demo.base, '/node', 'POST', { address: wEmpty, stake: 50000, reputation: 0.9 });
+    const empty = await apiAt(demo.base, '/demo/flush-work', 'POST', { workerAddress: wEmpty });
+    ok('flush пустого накопления — 404, а не чек на ноль',
+      empty.status === 404 && empty.body.receipt === undefined && empty.body.pending_work === 0,
+      { status: empty.status, body: empty.body });
+  } finally {
+    demo.stop();
+  }
+
+  const noDemo = await spawnServer({ DEMO_MODE: '0' });
+  try {
+    const wN = runAddress('dn');
+    await apiAt(noDemo.base, '/node', 'POST', { address: wN, stake: 50000, reputation: 0.9 });
+    await apiAt(noDemo.base, '/work', 'POST', {
+      workerAddress: wN, tokens: 6, tier: 'base', response: 'no demo work',
+    });
+    const denied = await apiAt(noDemo.base, '/demo/flush-work', 'POST', { workerAddress: wN });
+
+    ok('без DEMO_MODE=1 — 403, чек не выпущен',
+      denied.status === 403 && denied.body.demoMode === false,
+      { status: denied.status, body: denied.body });
+
+    const stillPending = await apiAt(noDemo.base, `/receipts/${wN}`);
+    ok('отказ не тронул накопление: чеков у воркера нет',
+      Array.isArray(stillPending.body) && stillPending.body.length === 0,
+      { count: stillPending.body?.length });
+  } finally {
+    noDemo.stop();
+  }
+
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
   const summary = await api('/summary');
