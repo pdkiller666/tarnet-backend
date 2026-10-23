@@ -224,6 +224,10 @@ const GATEWAY = deriveGatewayKey();
 // ===== Database =====
 const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA journal_mode = WAL;');
+/* Затираем удалённые данные нулями, а не оставляем их в свободных страницах.
+ * Без этого очистка колонки (response = NULL) не убирает текст с диска: старая
+ * версия страницы остаётся в файле и находится поиском по строкам. */
+db.exec('PRAGMA secure_delete = ON;');
 db.exec('PRAGMA foreign_keys = ON;');
 
 db.exec(`
@@ -345,9 +349,13 @@ CREATE TABLE IF NOT EXISTS inferenceLogs (
  * Статусы: pending -> claimed -> done | failed | expired.
  * Задача живёт WORKER_TASK_TTL_MS; иначе /inference висел бы вечно
  * в ожидании воркера, которого нет. */
+/* Промпт НЕ хранится открытым текстом: в очереди лежит только
+ * encryptedPayload, ключ живёт в памяти процесса (taskKeys) и умирает
+ * вместе с задачей. Колонки prompt здесь нет намеренно — иначе её
+ * когда-нибудь снова начнут заполнять. */
 CREATE TABLE IF NOT EXISTS worker_tasks (
   taskId TEXT PRIMARY KEY,
-  prompt TEXT NOT NULL,
+  encryptedPayload TEXT,
   model TEXT,
   tier TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
@@ -391,6 +399,55 @@ ensureColumn('ledger_txs', 'actionId', 'actionId TEXT');
  * /inference не может отличить model_unavailable от честного live-ответа и
  * выдаёт шаблон воркера за работу модели. */
 ensureColumn('worker_tasks', 'source', 'source TEXT');
+
+/* ===== Миграция очереди воркера на шифрование промптов =====
+ * Старая схема лежала с колонкой prompt NOT NULL: переименованием колонки
+ * её не убрать, поэтому таблица пересобирается один раз. Сначала из всех
+ * строк стирается открытый текст (это работает даже если пересборка
+ * почему-то не пройдёт), потом колонка физически исчезает. */
+function migrateWorkerTasksEncryption() {
+  const cols = db.prepare('PRAGMA table_info(worker_tasks)').all().map(c => c.name);
+  if (!cols.length) return;
+  const hadPrompt = cols.includes('prompt');
+  if (hadPrompt) {
+    /* Сначала затираем plaintext: если следующий шаг упадёт, открытых
+     * промптов на диске уже не будет. */
+    db.exec("UPDATE worker_tasks SET prompt = '' WHERE prompt IS NOT NULL AND prompt <> ''");
+  }
+  if (!cols.includes('encryptedPayload')) {
+    db.exec('ALTER TABLE worker_tasks ADD COLUMN encryptedPayload TEXT');
+  }
+  if (!hadPrompt) return;
+  db.exec(`
+    BEGIN;
+    CREATE TABLE worker_tasks_rebuilt (
+      taskId TEXT PRIMARY KEY,
+      encryptedPayload TEXT,
+      model TEXT,
+      tier TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      workerAddress TEXT,
+      response TEXT,
+      tokensGenerated INTEGER,
+      usageJson TEXT,
+      source TEXT,
+      claimedAt INTEGER,
+      finishedAt INTEGER,
+      createdAt INTEGER NOT NULL,
+      expiresAt INTEGER NOT NULL
+    );
+    INSERT INTO worker_tasks_rebuilt
+      (taskId, encryptedPayload, model, tier, status, workerAddress, response,
+       tokensGenerated, usageJson, source, claimedAt, finishedAt, createdAt, expiresAt)
+      SELECT taskId, encryptedPayload, model, tier, status, workerAddress, response,
+             tokensGenerated, usageJson, source, claimedAt, finishedAt, createdAt, expiresAt
+      FROM worker_tasks;
+    DROP TABLE worker_tasks;
+    ALTER TABLE worker_tasks_rebuilt RENAME TO worker_tasks;
+    CREATE INDEX IF NOT EXISTS idx_worker_tasks_status ON worker_tasks (status, createdAt);
+    COMMIT;`);
+}
+migrateWorkerTasksEncryption();
 /* Заблокировано под ожидающие запросы Tier 6 [SPEC Phase 3]: в текущей
  * экономике всегда 0, но колонка обязана существовать до первой записи,
  * иначе резервирование пришлось бы делать миграцией на живой базе. */
@@ -1246,6 +1303,13 @@ app.use('/app', express.static(APP_DIR, {
   setHeaders: (res, filePath) => {
     if (filePath.endsWith('manifest.webmanifest')) {
       res.setHeader('Content-Type', 'application/manifest+json');
+    }
+    /* sw.js обязан не кешироваться: с maxAge 1h браузер сутки-в-час держал бы
+     * старую версию воркера и не замечал, что оболочка обновилась. Именно
+     * поэтому файл исключён из общего часового кеша. */
+    if (filePath.endsWith('sw.js')) {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Service-Worker-Allowed', '/app/');
     }
   },
 }));
@@ -2525,15 +2589,44 @@ function hasActiveWorker() {
   return Number(row?.c || 0) > 0;
 }
 
+/* ===== Шифрование промптов в очереди =====
+ * Ключ на задачу живёт ТОЛЬКО в памяти процесса: он не пишется ни в БД, ни в
+ * лог. Смысл в том, что дамп базы (бэкап, утёкший файл) больше не содержит
+ * текстов пользователей. Сервер не может расшифровать задачу после рестарта —
+ * и это правильное поведение: незавершённые задачи истекут, а не оживут. */
+const workerTaskKeys = new Map();
+
+function encryptWithKey(plaintext, key) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ct = Buffer.concat([cipher.update(String(plaintext), 'utf8'), cipher.final()]);
+  return `enc:v1:${iv.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${ct.toString('base64')}`;
+}
+
+function decryptWithKey(blob, key) {
+  if (typeof blob !== 'string' || !blob.startsWith('enc:v1:')) return null;
+  const parts = blob.split(':');
+  if (parts.length !== 5) return null;
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(parts[2], 'base64'));
+    decipher.setAuthTag(Buffer.from(parts[3], 'base64'));
+    return Buffer.concat([decipher.update(Buffer.from(parts[4], 'base64')), decipher.final()]).toString('utf8');
+  } catch (_e) {
+    return null;
+  }
+}
+
 /* Публикация задачи и ожидание результата. Крутим setTimeout, а не блокирующий
  * цикл: пока /inference ждёт, сервер обязан обслуживать /worker/poll. */
 function enqueueWorkerTask({ prompt, model, tier }) {
   const taskId = 'wt_' + crypto.randomBytes(12).toString('hex');
   const now = Date.now();
+  const sessionKey = crypto.randomBytes(32);
+  workerTaskKeys.set(taskId, sessionKey);
   run(
-    `INSERT INTO worker_tasks (taskId, prompt, model, tier, status, createdAt, expiresAt)
+    `INSERT INTO worker_tasks (taskId, encryptedPayload, model, tier, status, createdAt, expiresAt)
      VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
-    [taskId, String(prompt), model || null, tier || null, now, now + WORKER_TASK_TTL_MS],
+    [taskId, encryptWithKey(prompt, sessionKey), model || null, tier || null, now, now + WORKER_TASK_TTL_MS],
   );
 
   return new Promise((resolve, reject) => {
@@ -2544,9 +2637,22 @@ function enqueueWorkerTask({ prompt, model, tier }) {
       if (row.status === 'done') {
         let usage = null;
         try { usage = row.usageJson ? JSON.parse(row.usageJson) : null; } catch (_e) { usage = null; }
+        /* В БД лежит шифротекст ответа (или plaintext от старого воркера).
+         * Расшифровываем ключом сессии, пока он ещё в памяти. */
+        const key = workerTaskKeys.get(taskId);
+        let plain = row.response;
+        if (key && typeof row.response === 'string' && row.response.startsWith('enc:v1:')) {
+          const dec = decryptWithKey(row.response, key);
+          if (dec === null) return reject(new Error('worker response failed to decrypt'));
+          plain = dec;
+        }
+        /* Сразу чистим и текст, и ключ: ответ уже в переменной и уйдёт клиенту,
+         * а шаблон стенда повторяет промпт в ответе — хранить его дальше нельзя. */
+        run(`UPDATE worker_tasks SET response = NULL WHERE taskId = ?`, [taskId]);
+        workerTaskKeys.delete(taskId);
         return resolve({
           taskId,
-          response: row.response,
+          response: plain,
           tokensGenerated: row.tokensGenerated,
           usage,
           model: row.model,
@@ -2619,7 +2725,7 @@ app.get('/worker/poll', (req, res) => {
   }
 
   const task = get(
-    `SELECT taskId, prompt, model, tier, createdAt, expiresAt
+    `SELECT taskId, encryptedPayload, model, tier, createdAt, expiresAt
      FROM worker_tasks WHERE status = 'pending' AND expiresAt > ?
      ORDER BY createdAt ASC LIMIT 1`,
     [now],
@@ -2632,14 +2738,31 @@ app.get('/worker/poll', (req, res) => {
     });
   }
 
+  /* Ключ живёт в памяти. После рестарта процесса его нет — выдать задачу,
+   * которую некому расшифровать, значило бы отдать воркеру мусор и держать
+   * /inference в ожидании до таймаута. Такая задача истекает сразу. */
+  const sessionKey = workerTaskKeys.get(task.taskId);
+  if (!sessionKey) {
+    run(`UPDATE worker_tasks SET status = 'expired' WHERE taskId = ?`, [task.taskId]);
+    return res.json({
+      task: null,
+      note: 'Задача истекла: ключ сессии потерян при перезапуске сервера.',
+      present: Boolean(workerAddress),
+    });
+  }
+
   run(`UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?
        WHERE taskId = ? AND status = 'pending'`,
     [now, workerAddress, task.taskId]);
 
+  /* Промпт уходит шифротекстом: канал может быть TLS, но задача обязана быть
+   * нечитаемой и в логах прокси, и в памяти посредника. */
   res.json({
     task: {
       taskId: task.taskId,
-      prompt: task.prompt,
+      encryptedPayload: task.encryptedPayload,
+      sessionKey: sessionKey.toString('base64'),
+      encryption: 'aes-256-gcm',
       model: task.model,
       tier: task.tier,
       deadlineMs: Math.max(0, task.expiresAt - now),
@@ -2653,11 +2776,14 @@ app.post('/worker/submit', (req, res) => {
   const body = req.body || {};
   const taskId = typeof body.taskId === 'string' ? body.taskId : null;
   const workerAddress = typeof body.workerAddress === 'string' ? body.workerAddress : null;
-  const response = typeof body.response === 'string' ? body.response : null;
+  const plainResponse = typeof body.response === 'string' ? body.response : null;
+  const encryptedResponse = typeof body.encryptedResponse === 'string' ? body.encryptedResponse : null;
 
   if (!taskId) return res.status(400).json({ error: 'taskId is required' });
   if (!workerAddress) return res.status(400).json({ error: 'workerAddress is required' });
-  if (!response || !response.length) return res.status(400).json({ error: 'response is required' });
+  if (!plainResponse && !encryptedResponse) {
+    return res.status(400).json({ error: 'response is required' });
+  }
   if (submitRateLimited(workerAddress)) {
     return res.status(429).json({ error: 'Too many submissions — limit is 10 per minute' });
   }
@@ -2675,16 +2801,40 @@ app.post('/worker/submit', (req, res) => {
     return res.status(400).json({ error: 'model is required — worker must declare the model it ran' });
   }
 
+  /* Расшифровка ответа. Если воркер прислал шифротекст — он обязан сойтись:
+   * битый authTag означает, что ответ подменён или собран не той сессией,
+   * и такой результат нельзя засчитывать как работу. */
+  let storedResponse = plainResponse;
+  if (encryptedResponse) {
+    const key = workerTaskKeys.get(taskId);
+    if (!key) {
+      return res.status(409).json({ error: 'Session key expired — task must be requeued', taskId });
+    }
+    const decrypted = decryptWithKey(encryptedResponse, key);
+    if (!decrypted || !decrypted.length) {
+      return res.status(400).json({ error: 'encryptedResponse failed to decrypt', taskId });
+    }
+    /* В БД кладём ШИФРОТЕКСТ, а не расшифрованный текст: иначе промпт
+     * вернулся бы на диск открытым через ответ. Расшифрует его читатель
+     * (enqueueWorkerTask), у которого ключ ещё в памяти. */
+    storedResponse = encryptedResponse;
+  }
+
   const tokens = Math.max(1, Math.floor(Number(body.usage?.completion_tokens || body.tokensGenerated) || 0));
   /* Источник объявляет воркер. Необязателен: старая версия worker.js его не
    * присылает, и такой ответ считается настоящим — иначе уже работающие
    * воркеры разом попали бы в model_unavailable. */
   const declaredSource = typeof body.source === 'string' && body.source.length ? body.source : null;
+  /* encryptedPayload стирается сразу по получении результата: задача
+   * завершена, хранить шифротекст больше не для чего. */
   run(
     `UPDATE worker_tasks SET status = 'done', response = ?, tokensGenerated = ?,
-       usageJson = ?, model = ?, source = ?, finishedAt = ? WHERE taskId = ?`,
-    [response, tokens, JSON.stringify(body.usage || null), body.model, declaredSource, Date.now(), taskId],
+       usageJson = ?, model = ?, source = ?, finishedAt = ?, encryptedPayload = NULL
+     WHERE taskId = ?`,
+    [storedResponse, tokens, JSON.stringify(body.usage || null), body.model, declaredSource, Date.now(), taskId],
   );
+  /* Ключ НЕ удаляем здесь: его ещё нужен читателю, чтобы расшифровать ответ
+   * при выдаче клиенту. Удаление — в enqueueWorkerTask после расшифровки. */
 
   res.json({ taskId, accepted: true, tokensGenerated: tokens, workerAddress });
 });
@@ -2859,9 +3009,18 @@ async function runInference(req, res) {
     tier, adapterId, response: result.response || `[emulated:${tokensGenerated} tokens]`,
   });
 
+  /* В лог НЕ пишется текст ответа. Он содержит эхо промпта (шаблон стенда
+   * повторяет запрос), и именно так закрытая в очереди строка утекала бы в
+   * журнал. Для аудита достаточно хеша и длины: они доказывают, что ответ был
+   * и что он не менялся, но не раскрывают содержание. */
+  const loggedResult = { ...result, response: undefined };
+  delete loggedResult.response;
+  loggedResult.responseSha256 = crypto.createHash('sha256')
+    .update(String(result.response ?? ''), 'utf8').digest('hex');
+  loggedResult.responseChars = String(result.response ?? '').length;
   run('INSERT INTO inferenceLogs (workerAddress, tokensGenerated, adapterId, source, emulated, resultJson) VALUES (?, ?, ?, ?, ?, ?)',
     [workerAddress, tokensGenerated, adapterId, result.source, result.emulated ? 1 : 0,
-      JSON.stringify({ ...result, receiptSeq: outcome.receipt ? outcome.receipt.seq : null,
+      JSON.stringify({ ...loggedResult, receiptSeq: outcome.receipt ? outcome.receipt.seq : null,
         queued: Boolean(outcome.queued), rejected: Boolean(outcome.rejected),
         reason: outcome.reason ?? null,
         pendingWork: outcome.pending_work ?? null })]);

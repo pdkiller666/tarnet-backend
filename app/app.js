@@ -547,6 +547,22 @@ $('installBtn').addEventListener('click', async () => {
 
 /* ---------- Старт ---------- */
 (async () => {
+  /* Регистрация service worker: без неё Chrome на Android не считает PWA
+   * устанавливаемым приложением, а только ярлыком в браузере. Регистрируем
+   * после загрузки, чтобы установка SW не задерживала первый рендер.
+   *
+   * Так как start_url и scope — /app/, SW тоже живёт в /app/sw.js: файл в
+   * корне перехватывал бы все запросы приложения, включая /inference. */
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/app/sw.js', { scope: '/app/' }).catch((e) => {
+        /* Офлайн-режим отключается, но чат работает: молча терять причину
+         * нельзя, поэтому пишем в консоль. */
+        console.warn('service worker не зарегистрирован:', e.message);
+      });
+    });
+  }
+
   $('walletAddr').textContent = `кошелёк: ${ADDR}`;
   startBannerPolling();
   await loadAdapters();

@@ -20,6 +20,7 @@
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const nodeCrypto = require('crypto');
 
 /* ---------- Конфигурация ---------- */
 const API = (process.env.TARNET_API_URL || 'http://localhost:3001').replace(/\/+$/, '');
@@ -211,6 +212,37 @@ async function generate(prompt) {
   return askFallback(prompt);
 }
 
+/* ---------- Шифрование задачи ----------
+ * Сервер больше не присылает промпт открытым текстом: он отдаёт шифротекст и
+ * одноразовый ключ сессии. Ключ приходит по TLS и живёт только в памяти этого
+ * процесса — на диск не попадает. Ответ шифруется тем же ключом, чтобы в
+ * обратном направлении текст тоже не шёл открытым.
+ *
+ * Если ключа нет (старый сервер) — работаем по plaintext: воркер обязан быть
+ * совместим с обеими версиями, иначе обновление сервера разом отключит ферму. */
+function decryptTask(encryptedPayload, sessionKeyB64) {
+  const parts = String(encryptedPayload).split(':');
+  if (parts.length !== 5 || parts[0] !== 'enc' || parts[1] !== 'v1') {
+    throw new Error('encryptedPayload: неизвестный формат');
+  }
+  const key = Buffer.from(sessionKeyB64, 'base64');
+  if (key.length !== 32) throw new Error(`sessionKey: ожидалось 32 байта, пришло ${key.length}`);
+  const decipher = nodeCrypto.createDecipheriv('aes-256-gcm', key, Buffer.from(parts[2], 'base64'));
+  decipher.setAuthTag(Buffer.from(parts[3], 'base64'));
+  return Buffer.concat([
+    decipher.update(Buffer.from(parts[4], 'base64')),
+    decipher.final(),
+  ]).toString('utf8');
+}
+
+function encryptResult(plaintext, sessionKeyB64) {
+  const key = Buffer.from(sessionKeyB64, 'base64');
+  const iv = nodeCrypto.randomBytes(12);
+  const cipher = nodeCrypto.createCipheriv('aes-256-gcm', key, iv);
+  const ct = Buffer.concat([cipher.update(String(plaintext), 'utf8'), cipher.final()]);
+  return `enc:v1:${iv.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${ct.toString('base64')}`;
+}
+
 /* ---------- Основной цикл ---------- */
 let submitted = 0;
 let running = true;
@@ -230,7 +262,21 @@ async function pollOnce() {
   if (!r.ok || !r.data?.task) return;
 
   const task = r.data.task;
-  log(`задача ${task.taskId}: «${String(task.prompt).slice(0, 60)}»`);
+
+  /* Расшифровка на локальной машине. Промпт не покидает этот процесс в
+   * открытом виде: он пришёл зашифрованным и расшифрован здесь. */
+  let prompt;
+  try {
+    prompt = task.encryptedPayload && task.sessionKey
+      ? decryptTask(task.encryptedPayload, task.sessionKey)
+      : String(task.prompt || '');
+  } catch (e) {
+    log(`задача ${task.taskId} не расшифрована (${e.message}) — пропускаю`);
+    /* Задачу не отправляем: без промпта результат был бы выдуман. Сервер
+     * сам пометит её истёкшей по таймауту. */
+    return;
+  }
+  log(`задача ${task.taskId}: «${prompt.slice(0, 60)}»`);
 
   const started = Date.now();
   /* Пульс идёт вдвое чаще окна присутствия: один пропущенный запрос не
@@ -238,7 +284,7 @@ async function pollOnce() {
   const pulse = setInterval(heartbeat, 7000);
   let gen;
   try {
-    gen = await generate(task.prompt);
+    gen = await generate(prompt);
   } finally {
     clearInterval(pulse);
   }
@@ -247,7 +293,11 @@ async function pollOnce() {
   const sub = await api('POST', '/worker/submit', {
     taskId: task.taskId,
     workerAddress: WORKER,
-    response: gen.response,
+    /* Ответ уходит шифротекстом, когда есть ключ сессии. Поле response
+     * остаётся для совместимости со старым сервером. */
+    ...(task.sessionKey
+      ? { encryptedResponse: encryptResult(gen.response, task.sessionKey) }
+      : { response: gen.response }),
     usage: gen.usage,
     /* Источник объявляется честно: сервер по нему отличает настоящий ответ
      * модели от шаблона этого же воркера (model_unavailable). */
