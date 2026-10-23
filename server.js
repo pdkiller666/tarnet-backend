@@ -19,6 +19,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 
 const { CONFIG, TIER_WEIGHTS, normalizeTier, round } = require('./config');
+const { classifyDomain, selectModel } = require('./model-router');
 const { CWUCalculator, RewardEngine, verifyQuality, epochEmission, epochIndex, omega } = require('./economics');
 const { CumulativeLedger, receiptPayload, epochState, releasedFor, bumpEpoch } = require('./ledger');
 const { getGenesisHash, receiptPayloadV2, computeReceiptHash, verifyWorkerDagChain } = require('./dag-chain');
@@ -1438,6 +1439,19 @@ setInterval(() => {
  * встречается в аргументах чужих команд (grep, pgrep, этот скрипт),
  * пропускаются по argv[0]. */
 let cfCache = { at: 0, n: 0 };
+/* Состояние фиатного резерва для /health. Три порога, а не два: "low" —
+ * резерв есть, но меньше месячного OPEX; "critical" — пустой или ниже
+ * половины месячного OPEX. Если месячный OPEX не задан (0), статус
+ * "unknown", а не "ok": незаданный порог — это не "всё в порядке". */
+function reserveStatusOf(reserveUsdc) {
+  const have = Number(reserveUsdc) || 0;
+  const opex = Number(CONFIG.RESERVE_OPEX_USD) || 0;
+  if (opex <= 0) return 'unknown';
+  if (have < opex * 0.5) return 'critical';
+  if (have < opex) return 'low';
+  return 'ok';
+}
+
 function countCloudflaredProcesses() {
   const now = Date.now();
   if (now - cfCache.at < 10000) return cfCache.n;
@@ -1532,6 +1546,12 @@ app.get('/health', (_req, res) => {
       reserveUsdc: Number((tstate?.reserveUsdc ?? 0).toFixed(6)),
       lastOracleRate: tstate?.lastOracleRate ?? null,
       lastOracleUpdate: tstate?.lastOracleUpdate ?? null,
+      /* Состояние резерва для мониторинга. Порог берётся из
+       * CONFIG.RESERVE_OPEX_USD; пока он 0 — "monthly_opex_usd" 0 и статус
+       * всегда "unknown", а не "ok". Врать «всё хорошо» при незаданном OPEX
+       * нельзя: именно это скрыло бы, что проверка ещё не настроена. */
+      monthlyOpexUsd: round(CONFIG.RESERVE_OPEX_USD),
+      reserveStatus: reserveStatusOf(tstate?.reserveUsdc),
     },
     epoch: {
       index: epoch,
@@ -2884,8 +2904,8 @@ async function runInference(req, res) {
   const paymentMethod = typeof body.paymentMethod === 'string' && body.paymentMethod.length
     ? body.paymentMethod.toUpperCase()
     : 'TAR';
-  if (paymentMethod !== 'TAR' && paymentMethod !== 'FIAT') {
-    return res.status(400).json({ error: 'paymentMethod must be TAR or FIAT', received: body.paymentMethod });
+  if (paymentMethod !== 'TAR' && paymentMethod !== 'FIAT' && paymentMethod !== 'BYOK') {
+    return res.status(400).json({ error: 'paymentMethod must be TAR, FIAT or BYOK', received: body.paymentMethod });
   }
   if (paymentMethod === 'FIAT') {
     return res.status(501).json({
@@ -2894,6 +2914,90 @@ async function runInference(req, res) {
       paymentMethod,
       implemented: false,
     });
+  }
+  /* BYOK распознан, но не реализован: ключ пользователя должен приходить в
+   * заголовке и не попадать в логи, а этого контура ещё нет. Отвечаем 501
+   * ДО выбора модели, чтобы клиент не решил, что ключ куда-то ушёл. */
+  if (paymentMethod === 'BYOK') {
+    return res.status(501).json({
+      error: 'BYOK payments: [SPEC Phase 2.5]',
+      note: 'Свой ключ провайдера не принимается: контура для него нет. Используйте paymentMethod "TAR".',
+      paymentMethod,
+      implemented: false,
+    });
+  }
+
+  /* --- Явный выбор модели из каталога (Волна 2) ---
+   * modelId не заменяет tier: tier задаёт κ (сколько заплачено за работу),
+   * а modelId — какая модель её сделала. Это разные оси, и склеивать их
+   * нельзя: при склейке одна и та же работа на разной модели платилась бы
+   * по-разному, и формула перестала бы быть проверяемой. */
+  const modelId = typeof body.modelId === 'string' && body.modelId.trim() ? body.modelId.trim() : null;
+  let modelRow = null;
+  if (modelId) {
+    modelRow = get(`SELECT modelId, provider, tier, costPer1M, reserveRequiredUsd,
+        isFree, isAvailable, allowsTraining, license, strengths
+      FROM model_registry WHERE modelId = ?`, [modelId]);
+    if (!modelRow) {
+      return res.status(400).json({
+        error: 'unknown_model',
+        note: 'Модели нет в каталоге. Список: GET /models',
+        modelId,
+      });
+    }
+    /* Отказ, а не подмена на первую доступную: клиент назвал модель, и
+     * молча подсунуть другую — это обман, который всплывёт только по
+     * качеству ответа. */
+    if (Number(modelRow.isAvailable) !== 1) {
+      return res.status(409).json({
+        error: 'model_not_available',
+        note: 'Модель есть в каталоге, но помечена недоступной',
+        modelId,
+      });
+    }
+    /* Порядок ворот: существование (400) → доступность (409) → тир (501) →
+     * резерв (402). Тир раньше резерва не случайно: 402 значит «пополни
+     * казну — и заработает», а для тира 4-6 это неправда, там нет кода
+     * вообще. Сказать «нет денег» про несуществующую функцию — ввести
+     * клиента в заблуждение дороже, чем само отсутствие фичи. */
+    const tierBlocked = Number(modelRow.tier) > 3;
+    if (tierBlocked) {
+      return res.status(501).json({
+        error: 'Tier 6: [SPEC Phase 2.5] — use paymentMethod: BYOK',
+        note: 'Внешние модели (тир 4-6) не подключены. Локальные модели тира 1-3 работают.',
+        modelId,
+        tier: Number(modelRow.tier),
+        /* Флаг отдаётся и здесь: решение модели о тренировке не зависит от
+         * того, подключена она или нет. Без этого клиент не смог бы
+         * отличить «нельзя тренировать» от «модель недоступна». */
+        training_allowed: Number(modelRow.allowsTraining) === 1,
+        implemented: false,
+      });
+    }
+
+    /* Резерв: платная модель не должна вызываться на пустой казне. Проверка
+     * до вызова, а не после: списать по факту нельзя, а отказать после
+     * ответа значит либо недоплатить, либо раздать чужое.
+     *
+     * Известное ограничение: в текущем каталоге все модели тира ≤ 3
+     * бесплатные (local), поэтому на боевом стенде эта ветка не срабатывает
+     * ни разу — она ждёт первой платной локальной или гибридной модели.
+     * Тест проверяет её на фикстуре в собственной БД, а не на проде. */
+    const needUsd = Math.max(Number(modelRow.reserveRequiredUsd) || 0, CONFIG.RESERVE_OPEX_USD);
+    if (Number(modelRow.costPer1M) > 0 && needUsd > 0) {
+      const haveUsd = Number(get('SELECT reserveUsdc FROM treasury_state WHERE id = 1')?.reserveUsdc ?? 0);
+      if (haveUsd < needUsd) {
+        return res.status(402).json({
+          error: 'reserve_insufficient',
+          note: 'Фиатный резерв пуст: платная модель не может быть оплачена [SPEC Phase 2.5]',
+          modelId,
+          requiredUsd: round(needUsd),
+          availableUsd: round(haveUsd),
+          tier: Number(modelRow.tier),
+          training_allowed: Number(modelRow.allowsTraining) === 1,
+        });
+      }
+    }
   }
 
   // 1) Воркер: явный адрес или детерминированный взвешенный выбор.
@@ -2942,7 +3046,10 @@ async function runInference(req, res) {
   if (hasActiveWorker()) {
     // Режим A: домашний узел забирает задачу и присылает результат.
     try {
-      const w = await enqueueWorkerTask({ prompt, model: body.model || null, tier });
+      /* modelId имеет приоритет над body.model: клиент назвал модель из
+       * каталога, и воркер должен получить именно её имя, а не свободную
+       * строку. Иначе выбор из реестра ничего бы не значил. */
+      const w = await enqueueWorkerTask({ prompt, model: body.model || modelId || null, tier });
       result = {
         source: 'live_llm',
         provider: 'home_worker',
@@ -3037,10 +3144,37 @@ async function runInference(req, res) {
     ? { rejected: true, reason: outcome.reason, quality: outcome.quality }
     : {};
 
+  /* Флаг обучения — решение, а не справка. Источник: model_registry.allowsTraining
+   * выбранной модели. Три состояния, а не два:
+   *   true  — модель разрешает обучение на своих выходах
+   *   false — модель запрещает (proprietary), даже при opt-in пользователя
+   *   null  — модель не выбрана явно, то есть какая модель ответила — неизвестно;
+   *           считать это согласием было бы выдумкой.
+   * Сам по себе флаг ничего не собирает и не копирует: дистилляция — Фаза 2.5. */
+  const trainingAllowed = modelRow ? Number(modelRow.allowsTraining) === 1 : null;
+
+  /* Подсказка домена и модели. ВЫЧИСЛЯЕТСЯ, НО НЕ МЕНЯЕТ ВЫБОР воркера:
+   * локальный воркер объявляет одну модель в /worker/status, поэтому выбор
+   * по реестру ничего бы не изменил — задача всё равно ушла бы тому же ПК
+   * с той же моделью. Подсказка полезна клиенту и понадобится, когда воркер
+   * научится объявлять список моделей. Пока — только ответ, не поведение. */
+  const domain = classifyDomain(prompt);
+  const suggested = modelId ? null : selectModel(
+    all('SELECT modelId, provider, tier, isFree, isAvailable, strengths FROM model_registry'),
+    domain,
+  );
+
   res.json({
     ...result,
     /* Почему ответ не от модели. null = ответ дала живая модель. */
     fallback_reason: fallbackReason,
+    /* Выбор модели из каталога (Волна 2). model_id = null означает, что
+     * клиент модель не называл и какая именно ответила — неизвестно. */
+    model_id: modelId,
+    model_tier: modelRow ? Number(modelRow.tier) : null,
+    training_allowed: trainingAllowed,
+    domain,
+    suggested_model: suggested ? suggested.modelId : null,
     worker: workerAddress,
     workerAddress,
     routing,

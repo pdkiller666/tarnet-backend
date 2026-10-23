@@ -2005,6 +2005,160 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     cf.conservation.delta === 0 && cf.conservation.holds === true,
     { delta: cf.conservation.delta, holds: cf.conservation.holds });
 
+  // ---------- 19. Волна 2: modelId, training_allowed, 402 ----------
+  section('19. Волна 2: modelId, training_allowed, резерв, classifyDomain');
+
+  /* Классификатор — чистая функция, поэтому проверяется напрямую, а не
+   * через HTTP: так видно, что именно он вернул, без обвязки сервера. */
+  const { classifyDomain } = require('./model-router');
+  ok('classifyDomain: промпт про функцию → code',
+    classifyDomain('Напиши функцию на Python для сортировки списка') === 'code',
+    classifyDomain('Напиши функцию на Python для сортировки списка'));
+  ok('classifyDomain: уравнение → math',
+    classifyDomain('Реши уравнение 2x + 5 = 15') === 'math',
+    classifyDomain('Реши уравнение 2x + 5 = 15'));
+  ok('classifyDomain: «почему» → reasoning',
+    classifyDomain('Почему небо синее') === 'reasoning',
+    classifyDomain('Почему небо синее'));
+  ok('classifyDomain: пустой промпт → general',
+    classifyDomain('') === 'general', classifyDomain(''));
+  /* Главная ловушка эвристики: «напиши» есть и в creative, и в code.
+   * code должен победить, иначе запрос про код уедет в creative-модель. */
+  ok('classifyDomain: «напиши функцию» — code, а не creative',
+    classifyDomain('Напиши функцию на JavaScript') === 'code',
+    classifyDomain('Напиши функцию на JavaScript'));
+
+  /* Воркер для успешного пути: без присутствия /inference ответил бы 503. */
+  const wV2 = runAddress('v2');
+  await api('/node', 'POST', { address: wV2, stake: 30000, reputation: 0.8 });
+  await api(`/worker/poll?workerAddress=${wV2}&model=qwen2.5-coder-7b&heartbeat=1`);
+
+  /* --- modelId валидной локальной модели → 200 ---
+   * Задача забирается и сдаётся так же, как в 8.7b: иначе /inference висел бы
+   * до таймаута воркера. */
+  const inflV2 = api('/inference', 'POST', {
+    prompt: 'Напиши функцию на JavaScript для сложения двух чисел',
+    modelId: 'qwen2.5-coder-7b',
+    workerAddress: wV2,
+  });
+  let taskV2 = null;
+  for (let i = 0; i < 60 && !taskV2; i++) {
+    const p = await api(`/worker/poll?workerAddress=${wV2}&model=qwen2.5-coder-7b`);
+    if (p.body?.task) taskV2 = p.body.task;
+    else await new Promise((r) => setTimeout(r, 100));
+  }
+  ok('modelId: задача для воркера опубликована', Boolean(taskV2), taskV2?.taskId);
+  /* Воркер получает именно ту модель, которую выбрал клиент из каталога,
+   * а не свободную строку body.model. */
+  ok('modelId доехал до воркера как model задачи',
+    taskV2?.model === 'qwen2.5-coder-7b', taskV2?.model);
+  if (taskV2) {
+    await api('/worker/submit', 'POST', {
+      taskId: taskV2.taskId, workerAddress: wV2, response: 'function add(a,b){return a+b}',
+      source: 'live_llm', model: 'qwen2.5-coder-7b', usage: { completion_tokens: 12 },
+    });
+  }
+  const ansV2 = await inflV2;
+  ok('modelId локальной модели → 200', ansV2.status === 200, ansV2.status);
+  ok('ответ несёт model_id выбранной модели',
+    ansV2.body?.model_id === 'qwen2.5-coder-7b', ansV2.body?.model_id);
+  /* Локальная модель с лицензией apache-2.0 разрешает обучение. */
+  ok('training_allowed: true для локальной apache-2.0',
+    ansV2.body?.training_allowed === true, ansV2.body?.training_allowed);
+  ok('domain определён как code', ansV2.body?.domain === 'code', ansV2.body?.domain);
+
+  /* --- неизвестная модель: 400, а не тихий откат на base --- */
+  const unknownM = await api('/inference', 'POST', {
+    prompt: 'unknown model probe', modelId: 'no/such-model',
+  });
+  ok('неизвестный modelId → 400 unknown_model',
+    unknownM.status === 400 && unknownM.body?.error === 'unknown_model',
+    { status: unknownM.status, error: unknownM.body?.error });
+
+  /* --- платная внешняя модель: 501 и training_allowed: false ---
+   * 501, а не 402: для тира 6 нет кода вообще, и «пополни казну — и
+   * заработает» было бы ложью. */
+  const paidM = await api('/inference', 'POST', {
+    prompt: 'proprietary model probe', modelId: 'openai/gpt-4o',
+  });
+  ok('платный modelId тира 6 → 501', paidM.status === 501, paidM.status);
+  ok('501 про тир 6 называет BYOK',
+    /Tier 6/.test(String(paidM.body?.error ?? '')) && /BYOK/.test(String(paidM.body?.error ?? '')),
+    paidM.body?.error);
+  /* Решение модели об обучении не зависит от того, подключена она или нет. */
+  ok('training_allowed: false для proprietary gpt-4o',
+    paidM.body?.training_allowed === false, paidM.body?.training_allowed);
+
+  /* --- 402 reserve_insufficient ---
+   * Нужна платная модель тира ≤ 3, которой в боевом каталоге нет. Фикстура
+   * пишется только в изолированную БД: трогать боевой реестр ради теста
+   * нельзя, иначе на стенде появится выдуманная модель. */
+  if (TEST_MODE && tmpDir) {
+    const { DatabaseSync } = require('node:sqlite');
+    const fdb = new DatabaseSync(path.join(tmpDir, 'test.db'));
+    fdb.exec('PRAGMA busy_timeout = 3000;');
+    fdb.exec(`INSERT OR REPLACE INTO model_registry
+      (modelId, provider, tier, contextWindow, costPer1M, reserveRequiredUsd,
+       rpmLimit, rpdLimit, strengths, minRamGb, isFree, isAvailable, license,
+       allowsTraining, tosUrl)
+      VALUES ('test/paid-tier3','test',3,8192,0.5,10,-1,-1,'general',0,0,1,'proprietary',0,null)`);
+    fdb.close();
+
+    const bufM = await api('/inference', 'POST', {
+      prompt: 'paid local probe', modelId: 'test/paid-tier3',
+    });
+    ok('платная модель при reserveUsdc = 0 → 402', bufM.status === 402, bufM.status);
+    ok('402 называет reserve_insufficient',
+      bufM.body?.error === 'reserve_insufficient', bufM.body?.error);
+    ok('402 сообщает requiredUsd и availableUsd',
+      bufM.body?.requiredUsd === 10 && bufM.body?.availableUsd === 0,
+      { required: bufM.body?.requiredUsd, available: bufM.body?.availableUsd });
+  } else {
+    console.log('  ⏭  402 требует платной модели тира ≤ 3 — проверяется только в --test');
+  }
+
+  /* --- регресс: без modelId поведение Волны 1 не изменилось ---
+   * Это самая важная проверка секции: она доказывает, что новые ворота не
+   * задели старый путь. */
+  const legInfl = api('/inference', 'POST', {
+    prompt: 'регресс без modelId', workerAddress: wV2,
+  });
+  let legTask = null;
+  for (let i = 0; i < 60 && !legTask; i++) {
+    const p = await api(`/worker/poll?workerAddress=${wV2}&model=qwen2.5-coder-7b`);
+    if (p.body?.task) legTask = p.body.task;
+    else await new Promise((r) => setTimeout(r, 100));
+  }
+  if (legTask) {
+    await api('/worker/submit', 'POST', {
+      taskId: legTask.taskId, workerAddress: wV2, response: 'старый путь работает',
+      source: 'live_llm', model: 'qwen2.5-coder-7b', usage: { completion_tokens: 5 },
+    });
+  }
+  const legAns = await legInfl;
+  ok('без modelId запрос проходит как раньше (200)', legAns.status === 200, legAns.status);
+  /* null, а не false: какая модель ответила — неизвестно, и выдавать это
+   * за «обучать нельзя» значило бы гадать. */
+  ok('без modelId training_allowed = null (модель неизвестна)',
+    legAns.body?.training_allowed === null, legAns.body?.training_allowed);
+  ok('без modelId model_id = null',
+    legAns.body?.model_id === null, legAns.body?.model_id);
+
+  /* --- /health: состояние резерва --- */
+  const hRes = (await api('/health')).body;
+  ok('/health отдаёт reserveStatus строкой',
+    typeof hRes.treasury?.reserveStatus === 'string', typeof hRes.treasury?.reserveStatus);
+  /* При незаданном OPEX статус обязан быть unknown, а не ok: «всё хорошо»
+   * при ненастроенном пороге скрыло бы, что проверка ещё не работает. */
+  ok('при OPEX = 0 статус резерва = unknown',
+    hRes.treasury?.reserveStatus === 'unknown', hRes.treasury?.reserveStatus);
+
+  /* Вся серия не должна была сдвинуть деньги. */
+  const cfEnd = (await api('/health')).body;
+  ok('Волна 2 не сломала conservation (delta 0)',
+    cfEnd.conservation.delta === 0 && cfEnd.conservation.holds === true,
+    { delta: cfEnd.conservation.delta, holds: cfEnd.conservation.holds });
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌`);
   if (fail) {

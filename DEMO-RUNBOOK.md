@@ -1,7 +1,7 @@
 # DEMO-RUNBOOK — показ TarNet инвестору
 
-**Версия:** `2.6.0-tier6-prep` · **Стенд:** `https://v1107336.hosted-by-vdsina.com`
-**Приёмка:** 339/339 ✅ (`test-dpouw.js`) + 25/25 (`test-mesh.js`)
+**Версия:** `2.7.0-wave2-prep` · **Стенд:** `https://v1107336.hosted-by-vdsina.com`
+**Приёмка:** 363/363 ✅ (`test-dpouw.js`) + 25/25 (`test-mesh.js`)
 **Сверено:** 2026-10-23. Хеш сборки здесь намеренно не указан — он меняется
 каждый деплой, и такая строка устаревает быстрее, чем её успевают прочитать.
 Актуальный хеш смотреть так: `ssh VPS 'cd /opt/tarnet/backend-api && git rev-parse --short HEAD'`, или `./scripts/verify.sh`.
@@ -42,7 +42,7 @@
 ```bash
 curl -s https://v1107336.hosted-by-vdsina.com/health \
   | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).buildVersion))"
-# ожидаем: 2.6.0-tier6-prep  (и cloudflared_processes: 0)
+# ожидаем: 2.7.0-wave2-prep  (и cloudflared_processes: 0)
 ```
 
 Если `buildVersion` пустой или `cloudflared_processes > 0` — открыт dev-стенд,
@@ -351,7 +351,7 @@ curl -s -X POST https://v1107336.hosted-by-vdsina.com/demo/flush-work \
 
 | # | Проверка | Результат |
 |---|---|---|
-| 1 | `GET /health` | 200, `delta: 0`, `buildVersion: 2.6.0-tier6-prep` |
+| 1 | `GET /health` | 200, `delta: 0`, `buildVersion: 2.7.0-wave2-prep` |
 | 2 | `GET /p2p/status` | 200, 3 узла |
 | 3 | `POST /id/register` | 200, `serverDerived: false` |
 | 4 | `GET /app/` | 200, 4950 байт |
