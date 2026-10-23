@@ -2191,9 +2191,12 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('/tools отдаёт ровно 3 инструмента', tools?.length === 3, tools?.length);
 
   const byId = new Map((tools ?? []).map(t => [t.toolId, t]));
+  /* Цены после Волны 4: снижены в 20 раз, потому что писались из расчёта
+   * $1 за TAR, а USD_PER_TAR = 20. При старой цене 0.01 TAR один поиск
+   * стоил 50 000 токенов инференса — ровно дневной лимит агента. */
   ok('цены совпадают с директивой',
-    byId.get('web_search')?.costPerCallTar === 0.01
-    && byId.get('python_executor')?.costPerCallTar === 0.005
+    byId.get('web_search')?.costPerCallTar === 0.0005
+    && byId.get('python_executor')?.costPerCallTar === 0.00025
     && byId.get('calculator')?.costPerCallTar === 0.0,
     [...byId.values()].map(t => [t.toolId, t.costPerCallTar]));
 
@@ -2256,13 +2259,21 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     createdRow?.role === 'coder' && createdRow?.status === 'active',
     { role: createdRow?.role, status: createdRow?.status });
 
-  /* Умолчания из директивы: 1 / 10 / 5. Агент без лимитов читался бы как
-   * «трать сколько хочешь» — проверяем, что строка кошелька создана сразу. */
-  ok('кошелёк агента создан с дефолтными лимитами',
-    createdRow?.wallet?.maxPerTaskTar === 1
-    && createdRow?.wallet?.dailyLimitTar === 10
-    && createdRow?.wallet?.humanApprovalThresholdTar === 5,
+  /* Умолчания из директивы Волны 4 — в токенах: 5000 / 50000 / 2000.
+   * Агент без лимитов читался бы как «трать сколько хочешь», поэтому
+   * проверяем, что строка кошелька создана сразу и с токеновыми полями. */
+  ok('кошелёк агента создан с дефолтными лимитами (в токенах)',
+    createdRow?.wallet?.maxPerTaskTokens === 5000
+    && createdRow?.wallet?.dailyLimitTokens === 50000
+    && createdRow?.wallet?.humanApprovalThresholdTokens === 2000,
     createdRow?.wallet);
+  /* Старые TAR-поля не должны вернуться: если они где-то остались, клиент
+   * прочтёт их и покажет лимиты, которые сервер не проверяет. */
+  ok('старые TAR-поля лимитов больше не отдаются',
+    createdRow?.wallet?.maxPerTaskTar === undefined
+    && createdRow?.wallet?.dailyLimitTar === undefined
+    && createdRow?.wallet?.humanApprovalThresholdTar === undefined,
+    Object.keys(createdRow?.wallet ?? {}));
   ok('allowedTools сохранён и разобран в массив',
     Array.isArray(createdRow?.allowedTools)
     && createdRow.allowedTools.join(',') === 'python_executor,calculator',
@@ -2318,6 +2329,320 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('Волна 3 не сломала conservation (delta 0)',
     cfAgent.conservation.delta === 0 && cfAgent.conservation.holds === true,
     { delta: cfAgent.conservation.delta, holds: cfAgent.conservation.holds });
+
+  /* ================= Волна 4: Agent Runtime ================= */
+  section('21. Волна 4: Agent Runtime (лимиты в токенах, резерв, HITL)');
+
+  /* ---------- Модуль лимитов, без сервера ----------
+   * Считаем локально: эти проверки — арифметика, и гонять их через HTTP
+   * значило бы проверять транспорт, а не логику границ. */
+  const agentRuntime = require('./agent-runtime');
+  const limitsWallet = {
+    maxPerTaskTokens: 5000,
+    dailyLimitTokens: 50000,
+    humanApprovalThresholdTokens: 2000,
+  };
+
+  ok('модуль считает TAR из токенов на текущих константах',
+    agentRuntime.TAR_PER_CWU === 1e-8
+    && agentRuntime.tokensToTar(5000) === 0.00005,
+    { perCwu: agentRuntime.TAR_PER_CWU, tar: agentRuntime.tokensToTar(5000) });
+
+  ok('21.1 лимит на задачу: 6000 > 5000 → отказ',
+    agentRuntime.checkTaskLimits({ wallet: limitsWallet, maxTokens: 6000 }).reason
+      === 'per_task_limit_exceeded',
+    agentRuntime.checkTaskLimits({ wallet: limitsWallet, maxTokens: 6000 }));
+
+  ok('21.1 ровно 5000 проходит (граница включительна)',
+    agentRuntime.checkTaskLimits({ wallet: limitsWallet, maxTokens: 5000 }).ok === true,
+    agentRuntime.checkTaskLimits({ wallet: limitsWallet, maxTokens: 5000 }));
+
+  ok('21.2 дневной лимит: 5000 при 47000 израсходованных → отказ',
+    agentRuntime.checkTaskLimits({
+      wallet: limitsWallet, maxTokens: 5000, spentTokensToday: 47000,
+    }).reason === 'daily_limit_exceeded',
+    agentRuntime.checkTaskLimits({ wallet: limitsWallet, maxTokens: 5000, spentTokensToday: 47000 }));
+
+  /* Главный смысл heldTokens: без него пять параллельных задач по 5000
+   * прошли бы дневной лимит каждая по отдельности. */
+  ok('21.2 занятые задачи уменьшают доступный лимит',
+    agentRuntime.checkTaskLimits({
+      wallet: limitsWallet, maxTokens: 5000, heldTokens: 46000,
+    }).reason === 'daily_limit_exceeded',
+    agentRuntime.checkTaskLimits({ wallet: limitsWallet, maxTokens: 5000, heldTokens: 46000 }));
+
+  /* ---------- HITL порог ---------- */
+  const belowThreshold = agentRuntime.checkTaskLimits({ wallet: limitsWallet, maxTokens: 1500 });
+  const aboveThreshold = agentRuntime.checkTaskLimits({ wallet: limitsWallet, maxTokens: 2500 });
+  ok('21.5 ниже порога (1500 ≤ 2000) подтверждение не нужно',
+    belowThreshold.ok === true && belowThreshold.needsApproval === false,
+    belowThreshold);
+  ok('21.5 выше порога (2500 > 2000) нужен человек',
+    aboveThreshold.ok === true && aboveThreshold.needsApproval === true,
+    aboveThreshold);
+
+  /* ---------- Инструменты ---------- */
+  const toolCatalog = [
+    { toolId: 'web_search', costPerCallTar: 0.0005, isAvailable: 1 },
+    { toolId: 'python_executor', costPerCallTar: 0.00025, isAvailable: 1 },
+    { toolId: 'calculator', costPerCallTar: 0, isAvailable: 1 },
+  ];
+  ok('21.7 инструмент вне allowlist → отказ',
+    agentRuntime.checkToolCall({
+      toolId: 'web_search', allowedTools: ['calculator'], tools: toolCatalog,
+    }).reason === 'tool_not_allowed',
+    agentRuntime.checkToolCall({ toolId: 'web_search', allowedTools: ['calculator'], tools: toolCatalog }));
+
+  ok('21.6 неизвестный toolId → отказ',
+    agentRuntime.checkToolCall({
+      toolId: 'nope', allowedTools: ['nope'], tools: toolCatalog,
+    }).reason === 'unknown_tool',
+    agentRuntime.checkToolCall({ toolId: 'nope', allowedTools: ['nope'], tools: toolCatalog }));
+
+  ok('21.7 выключенный инструмент → отказ',
+    agentRuntime.checkToolCall({
+      toolId: 'web_search', allowedTools: ['web_search'],
+      tools: [{ toolId: 'web_search', costPerCallTar: 0.0005, isAvailable: 0 }],
+    }).reason === 'tool_unavailable');
+
+  /* Цена инструмента теперь в 20 раз ниже: один web_search стоил 50 000
+   * токенов, то есть весь дневной лимит агента целиком. */
+  const searchCost = agentRuntime.checkToolCall({
+    toolId: 'web_search', allowedTools: ['web_search'], tools: toolCatalog,
+  });
+  ok('цена web_search = 50 000 ток-эквивалента, не 1 000 000',
+    searchCost.ok === true && searchCost.costTokens === 50000,
+    searchCost);
+
+  ok('21.6 сумма вызовов складывается из каталога',
+    agentRuntime.toolCallsCost([
+      { costTar: 0 }, { costTar: 0.00025 }, { costTar: 0.00025 },
+    ]) === 0.0005,
+    agentRuntime.toolCallsCost([{ costTar: 0 }, { costTar: 0.00025 }, { costTar: 0.00025 }]));
+
+  /* ---------- Цикл Think→Act→Observe ---------- */
+  /* Подставной infer вместо живой модели: тест про границы цикла, а не
+   * про транспорт. Живой воркер на стенде не обязателен. */
+  let inferCalls = 0;
+  const oneShot = await agentRuntime.runAgent({
+    agentId: 'a'.repeat(64),
+    prompt: 'одна итерация',
+    maxTokens: 100,
+    infer: async () => {
+      inferCalls++;
+      return { response: 'готово', tokens: 10, toolCalls: [] };
+    },
+  });
+  ok('цикл завершается за одну итерацию без инструментов',
+    inferCalls === 1 && oneShot.stopReason === 'completed' && oneShot.iterations === 1,
+    { calls: inferCalls, stop: oneShot.stopReason, iters: oneShot.iterations });
+
+  let loopCalls = 0;
+  const looped = await agentRuntime.runAgent({
+    agentId: 'a'.repeat(64),
+    prompt: 'всегда вызывает инструмент',
+    maxTokens: 1000,
+    maxIterations: 3,
+    infer: async () => {
+      loopCalls++;
+      return { response: 'ещё шаг', tokens: 10, toolCalls: [{ toolId: 'calculator' }] };
+    },
+  });
+  ok('цикл упирается в maxIterations, а не крутится вечно',
+    loopCalls === 3 && looped.stopReason === 'iteration_limit',
+    { calls: loopCalls, stop: looped.stopReason });
+
+  /* ---------- Резерв и conservation через HTTP ---------- */
+  const wave4OwnerEntropy = idCrypto.randomBytes(32).toString('hex');
+  const wave4Owner = await api('/id/register', 'POST', { pubkey: (() => {
+    // Ключ владельца выводим локально: сервер не должен видеть энтропию.
+    const k = tarIdentity.deriveTarNetKeys(wave4OwnerEntropy);
+    return Buffer.from(k.wallet.pub).toString('hex');
+  })() });
+  const wave4OwnerAddr = wave4Owner.body?.address;
+  ok('владелец для Волны 4 зарегистрирован',
+    /^0x[0-9a-f]{40}$/.test(wave4OwnerAddr || ''), wave4OwnerAddr);
+
+  /* Нода нужна, чтобы /inference прошёл путь recordWork. */
+  const wave4Worker = runAddress('w4');
+  await api('/node', 'POST', { address: wave4Worker, stake: 60000, reputation: 0.9 });
+
+  const wave4AgentKey = crypto.generateKeyPairSync('ed25519');
+  const wave4AgentPub = Buffer.from(
+    wave4AgentKey.publicKey.export({ format: 'jwk' }).x, 'base64url').toString('hex');
+  const wave4Agent = await api('/agents', 'POST', {
+    userId: wave4OwnerAddr,
+    pubkey: wave4AgentPub,
+    role: 'general',
+    allowedTools: ['calculator', 'python_executor'],
+  });
+  ok('агент Волны 4 создан', wave4Agent.status === 201, wave4Agent.status);
+  const wave4AgentId = wave4Agent.body?.agentId;
+
+  /* ---------- 21.5: HITL на живом сервере ---------- */
+  const overThreshold = await api('/inference', 'POST', {
+    prompt: 'дорогая задача',
+    agentId: wave4AgentId,
+    clientAddress: wave4OwnerAddr,
+    maxTokens: 2500,
+    tier: 'base',
+    workerAddress: wave4Worker,
+    actionId: runId('approval'),
+  });
+  ok('21.5 трата выше порога → 202 и запрос подтверждения',
+    overThreshold.status === 202 && overThreshold.body?.error === 'approval_required',
+    { status: overThreshold.status, error: overThreshold.body?.error });
+  ok('21.5 отданы approvalId и сумма',
+    typeof overThreshold.body?.approvalId === 'string'
+    && overThreshold.body.requestedTokens === 2500,
+    { id: overThreshold.body?.approvalId, tokens: overThreshold.body?.requestedTokens });
+
+  const approvalId = overThreshold.body?.approvalId;
+  /* Ничего не списано: траты ещё не было. Это главная проверка того, что
+   * порог — не «списали и ждём подтверждения». */
+  const balanceAfterApprovalRequest = (await api(`/balance/${wave4OwnerAddr}`)).body;
+  ok('21.5 запрос подтверждения ничего не зарезервировал',
+    Number(balanceAfterApprovalRequest?.reservedTar ?? 0) === 0,
+    balanceAfterApprovalRequest?.reservedTar);
+
+  /* Подпись чужим ключом обязана быть отвергнута: иначе HITL — фикция. */
+  const wrongKey = crypto.generateKeyPairSync('ed25519');
+  const wrongSig = (() => {
+    const p = overThreshold.body?.payloadHash;
+    const payload = ['approve', 'v1', approvalId, wave4AgentId, p, '2500'].join(':');
+    return Buffer.from(crypto.sign(null, Buffer.from(payload, 'utf8'), wrongKey.privateKey)).toString('base64');
+  })();
+  const badApprove = await api('/agents/approve', 'POST', {
+    approvalId, decision: 'approve', signature: wrongSig,
+  });
+  ok('21.5 подпись чужим ключом отвергнута (400)',
+    badApprove.status === 400 && badApprove.body?.error === 'signature_rejected',
+    { status: badApprove.status, error: badApprove.body?.error });
+
+  /* Правильная подпись: ключом владельца, над строкой, собранной сервером. */
+  const ownerKeys = tarIdentity.deriveTarNetKeys(wave4OwnerEntropy);
+  const goodPayload = ['approve', 'v1', approvalId, wave4AgentId,
+    overThreshold.body?.payloadHash, '2500'].join(':');
+  const goodSig = tarIdentity.signWithSeed(ownerKeys.wallet.priv, goodPayload);
+  const goodApprove = await api('/agents/approve', 'POST', {
+    approvalId, decision: 'approve', signature: goodSig,
+  });
+  ok('21.5 подпись владельца принята',
+    goodApprove.status === 200 && goodApprove.body?.status === 'approved',
+    { status: goodApprove.status, st: goodApprove.body?.status });
+  ok('21.5 одобрение не списало деньги само по себе',
+    goodApprove.body?.charged === false, goodApprove.body?.charged);
+
+  /* Повторное использование подписи не должно пройти: одна подпись — один
+   * расход, иначе одобрение дешёвой задачи открывало бы серию дорогих. */
+  const replayApprove = await api('/agents/approve', 'POST', {
+    approvalId, decision: 'approve', signature: goodSig,
+  });
+  ok('21.5 повторное решение по тому же подтверждению → 409',
+    replayApprove.status === 409, replayApprove.status);
+
+  /* ---------- 21.1 на живом сервере: лимит на задачу ---------- */
+  const overPerTask = await api('/inference', 'POST', {
+    prompt: 'слишком дорого',
+    agentId: wave4AgentId,
+    clientAddress: wave4OwnerAddr,
+    maxTokens: 6000,
+    tier: 'base',
+    workerAddress: wave4Worker,
+    actionId: runId('perTask'),
+  });
+  ok('21.1 задача дороже лимита → 402',
+    overPerTask.status === 402 && overPerTask.body?.error === 'per_task_limit_exceeded',
+    { status: overPerTask.status, error: overPerTask.body?.error });
+
+  /* ---------- чужой clientAddress ---------- */
+  const otherWallet = await api('/wallet', 'POST');
+  const foreignBudget = await api('/inference', 'POST', {
+    prompt: 'чужой бюджет',
+    agentId: wave4AgentId,
+    clientAddress: otherWallet.body?.address,
+    maxTokens: 100,
+    tier: 'base',
+    workerAddress: wave4Worker,
+    actionId: runId('foreign'),
+  });
+  ok('21.4 агент тратит только бюджет владельца (403)',
+    foreignBudget.status === 403 && foreignBudget.body?.error === 'agent_owner_mismatch',
+    { status: foreignBudget.status, error: foreignBudget.body?.error });
+
+  /* ---------- 21.6: инструмент вне allowlist ---------- */
+  const badToolCall = await api('/inference', 'POST', {
+    prompt: 'вызови запрещённое',
+    agentId: wave4AgentId,
+    clientAddress: wave4OwnerAddr,
+    maxTokens: 100,
+    tier: 'base',
+    workerAddress: wave4Worker,
+    actionId: runId('badtool'),
+    toolCalls: [{ toolId: 'web_search' }],
+  });
+  ok('21.6 запрещённый инструмент → 400',
+    badToolCall.status === 400 && badToolCall.body?.error === 'tool_not_allowed',
+    { status: badToolCall.status, error: badToolCall.body?.error });
+  ok('21.6 отказ по инструменту ничего не зарезервировал',
+    Number((await api(`/balance/${wave4OwnerAddr}`)).body?.reservedTar ?? 0) === 0,
+    'резерв должен вернуться в 0');
+
+  /* ---------- 21.3: успешная задача снимает резерв ---------- */
+  const okRun = await api('/inference', 'POST', {
+    prompt: 'обычная задача в пределах лимита',
+    agentId: wave4AgentId,
+    clientAddress: wave4OwnerAddr,
+    maxTokens: 100,
+    tier: 'base',
+    workerAddress: wave4Worker,
+    actionId: runId('okrun'),
+    toolCalls: [{ toolId: 'calculator' }],
+  });
+  ok('21.3 задача в пределах лимита выполняется (200)',
+    okRun.status === 200, { status: okRun.status, error: okRun.body?.error });
+  ok('21.3 в ответе есть блок агента',
+    okRun.body?.agent?.agentId === wave4AgentId, okRun.body?.agent);
+  const balanceAfterRun = (await api(`/balance/${wave4OwnerAddr}`)).body;
+  ok('21.3 резерв снят после выполнения (0)',
+    Number(balanceAfterRun?.reservedTar ?? 0) === 0, balanceAfterRun?.reservedTar);
+
+  /* Один и тот же actionId не должен удваивать расход: ключ идемпотентности
+   * клиента обязан работать и в учёте агента. */
+  const spendBeforeReplay = (await api('/inference', 'POST', {
+    prompt: 'обычная задача в пределах лимита',
+    agentId: wave4AgentId,
+    clientAddress: wave4OwnerAddr,
+    maxTokens: 100,
+    tier: 'base',
+    workerAddress: wave4Worker,
+    actionId: runId('okrun'),
+  })).body?.agent?.spendToday?.spentTokens;
+  ok('21.4 повтор с тем же actionId не удваивает расход',
+    Number(spendBeforeReplay ?? 0) === Number(okRun.body?.agent?.spendToday?.spentTokens ?? 0),
+    { replay: spendBeforeReplay, first: okRun.body?.agent?.spendToday?.spentTokens });
+
+  /* ---------- 21.2: reservedTar в conservation ---------- */
+  const cfWave4 = (await api('/health')).body;
+  ok('21.2 /health.conservation отдаёт reservedTar',
+    typeof cfWave4?.conservation?.reservedTar === 'number', cfWave4?.conservation);
+  ok('21.2 reservedTar не входит в delta (delta остаётся 0)',
+    cfWave4.conservation.delta === 0 && cfWave4.conservation.holds === true,
+    { delta: cfWave4.conservation.delta, holds: cfWave4.conservation.holds });
+
+  /* ---------- История подтверждений ---------- */
+  const listApprovals = await api(`/agents/approvals?userId=${wave4OwnerAddr}`);
+  ok('21.5 GET /agents/approvals отдаёт историю владельца',
+    listApprovals.status === 200 && Array.isArray(listApprovals.body?.approvals),
+    { status: listApprovals.status, count: listApprovals.body?.count });
+  ok('21.5 без userId список подтверждений → 400',
+    (await api('/agents/approvals')).status === 400);
+
+  /* Вся серия не должна была сдвинуть деньги. */
+  const cfFinal = (await api('/health')).body;
+  ok('Волна 4 не сломала conservation (delta 0)',
+    cfFinal.conservation.delta === 0 && cfFinal.conservation.holds === true,
+    { delta: cfFinal.conservation.delta, holds: cfFinal.conservation.holds });
 
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌`);

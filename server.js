@@ -36,6 +36,10 @@ const { startDemoMesh, describeMesh } = require('./p2p-demo');
 const tarIdentity = require('./identity');
 const chatSync = require('./chat-sync');
 const knowledgeLoop = require('./knowledge-loop');
+/* Волна 4: лимиты агента, резерв и цикл Think→Act→Observe.
+ * Модуль чистый (без БД): сервер передаёт ему снимок лимитов и каталог
+ * инструментов, а запись денег остаётся здесь, рядом с debit/credit. */
+const agentRuntime = require('./agent-runtime');
 
 // ===== Configuration =====
 const PORT = process.env.PORT || 3001;
@@ -566,10 +570,10 @@ CREATE INDEX IF NOT EXISTS idx_agent_registry_user ON agent_registry (userId);
  * он хотя бы реально проверяется. */
 CREATE TABLE IF NOT EXISTS agent_wallets (
   agentId TEXT PRIMARY KEY REFERENCES agent_registry(agentId) ON DELETE CASCADE,
-  maxPerTaskTar REAL NOT NULL DEFAULT 1.0 CHECK (maxPerTaskTar >= 0),
-  dailyLimitTar REAL NOT NULL DEFAULT 10.0 CHECK (dailyLimitTar >= 0),
-  humanApprovalThresholdTar REAL NOT NULL DEFAULT 5.0
-    CHECK (humanApprovalThresholdTar >= 0),
+  maxPerTaskTokens INTEGER NOT NULL DEFAULT 5000 CHECK (maxPerTaskTokens >= 0),
+  dailyLimitTokens INTEGER NOT NULL DEFAULT 50000 CHECK (dailyLimitTokens >= 0),
+  humanApprovalThresholdTokens INTEGER NOT NULL DEFAULT 2000
+    CHECK (humanApprovalThresholdTokens >= 0),
   allowlistTools TEXT,
   updatedAt TEXT NOT NULL
 );
@@ -585,6 +589,65 @@ CREATE TABLE IF NOT EXISTS tool_registry (
   isAvailable INTEGER NOT NULL DEFAULT 1 CHECK (isAvailable IN (0, 1)),
   createdAt TEXT NOT NULL
 );
+
+/* ===== Волна 4: учёт расхода агента =====
+ *
+ * ПОЧЕМУ ОТДЕЛЬНАЯ ТАБЛИЦА, А НЕ СУММА ПО ledger_txs:
+ *   1. В ledger_txs нет agentId — атрибутировать расход агенту через actionId
+ *      нельзя, это клиентский ключ дедупликации, его присылает кто угодно;
+ *   2. запись в ledger_txs появляется ТОЛЬКО на выпуске чека, а чек — только
+ *      при переходе pending_work через порог (nano ≈ 1000 токенов). Мелкие
+ *      вызовы не видны вообще, и подсчёт по леджеру занижал бы расход.
+ * Счётчик по дню хранится явно: SELECT по этой таблице дешевле сканирования
+ * леджера на каждый /inference, и он не зависит от порогов чека. */
+CREATE TABLE IF NOT EXISTS agent_spend (
+  agentId TEXT NOT NULL REFERENCES agent_registry(agentId) ON DELETE CASCADE,
+  day TEXT NOT NULL,
+  spentTokens INTEGER NOT NULL DEFAULT 0 CHECK (spentTokens >= 0),
+  spentTar REAL NOT NULL DEFAULT 0 CHECK (spentTar >= 0),
+  calls INTEGER NOT NULL DEFAULT 0 CHECK (calls >= 0),
+  toolCalls INTEGER NOT NULL DEFAULT 0 CHECK (toolCalls >= 0),
+  PRIMARY KEY (agentId, day)
+);
+
+/* Резерв под незавершённую задачу.
+ * Зачем: между постановкой задачи и выпуском чека проходит время, и без
+ * резерва пять параллельных задач по maxTokens прошли бы дневной лимит
+ * каждая по отдельности. state='held' — деньги заняты, 'settled' — списаны,
+ * 'released' — работа не была выполнена (γ=0), деньги не двигались.
+ * UNIQUE (agentId, actionId) — повтор с тем же ключом не резервирует дважды. */
+CREATE TABLE IF NOT EXISTS agent_reservations (
+  reservationId TEXT PRIMARY KEY,
+  agentId TEXT NOT NULL REFERENCES agent_registry(agentId) ON DELETE CASCADE,
+  actionId TEXT NOT NULL,
+  reservedTokens INTEGER NOT NULL CHECK (reservedTokens >= 0),
+  reservedTar REAL NOT NULL CHECK (reservedTar >= 0),
+  state TEXT NOT NULL DEFAULT 'held' CHECK (state IN ('held', 'settled', 'released')),
+  createdAt TEXT NOT NULL,
+  resolvedAt TEXT,
+  UNIQUE (agentId, actionId)
+);
+
+/* Подтверждение человеком (HITL).
+ * payloadHash обязателен: без него можно одобрить дешёвый промпт, а
+ * отправить дорогой — сумма привязана к содержимому, а не к намерению.
+ * decidedBy — адрес владельца из tar_id, а не agentId: агент не должен
+ * одобрять сам себя, иначе HITL — формальность. */
+CREATE TABLE IF NOT EXISTS approvals (
+  approvalId TEXT PRIMARY KEY,
+  agentId TEXT NOT NULL REFERENCES agent_registry(agentId) ON DELETE CASCADE,
+  ownerAddress TEXT NOT NULL,
+  actionId TEXT NOT NULL,
+  payloadHash TEXT NOT NULL,
+  requestedTokens INTEGER NOT NULL CHECK (requestedTokens >= 0),
+  projectedTar REAL NOT NULL CHECK (projectedTar >= 0),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+  createdAt TEXT NOT NULL,
+  expiresAt INTEGER NOT NULL,
+  decidedAt TEXT,
+  decidedBy TEXT
+);
 `);
 
 /* Сид каталога инструментов.
@@ -594,14 +657,89 @@ CREATE TABLE IF NOT EXISTS tool_registry (
 (function seedToolRegistry() {
   const now = new Date().toISOString();
   const rows = [
-    ['web_search', 'Веб-поиск', 'Поиск в интернете, возвращает сниппеты с источниками', 0.01, null],
-    ['python_executor', 'Python', 'Запуск кода на изолированном клиенте воркера', 0.005, null],
+    ['web_search', 'Веб-поиск', 'Поиск в интернете, возвращает сниппеты с источниками', 0.0005, null],
+    ['python_executor', 'Python', 'Запуск кода на изолированном клиенте воркера', 0.00025, null],
     ['calculator', 'Калькулятор', 'Арифметика без выхода в сеть', 0.0, null],
   ];
   const stmt = db.prepare(`INSERT OR IGNORE INTO tool_registry
     (toolId, name, description, costPerCallTar, schema, isAvailable, createdAt)
     VALUES (?, ?, ?, ?, ?, 1, ?)`);
   for (const [id, name, desc, cost, sch] of rows) stmt.run(id, name, desc, cost, sch, now);
+})();
+
+/* ===== Волна 4: цены инструментов в 20 раз ниже =====
+ * Сид выше работает только на пустой базе (INSERT OR IGNORE). На боевой БД
+ * строки уже есть со старыми ценами 0.01 / 0.005, и без этой миграции
+ * GET /tools продолжил бы отдавать переоценённые числа: один web_search
+ * стоил 50 000 токенов инференса.
+ *
+ * UPDATE с условием «цена ещё старая» — нарочно: если оператор выставил
+ * свою цену, миграция её не тронет. Повторный запуск тоже ничего не меняет. */
+(function migrateToolPricesWave4() {
+  const updates = [
+    ['web_search', 0.01, 0.0005],
+    ['python_executor', 0.005, 0.00025],
+  ];
+  const stmt = db.prepare(
+    'UPDATE tool_registry SET costPerCallTar = ? WHERE toolId = ? AND costPerCallTar = ?');
+  for (const [id, oldPrice, newPrice] of updates) stmt.run(newPrice, id, oldPrice);
+})();
+
+/* ===== Волна 4: лимиты агента из TAR в токены =====
+ * CREATE TABLE IF NOT EXISTS выше на существующей базе не делает ничего,
+ * поэтому старые колонки *_Tar остались бы на месте вместе с REAL-типом.
+ *
+ * ПОЧЕМУ ПЕРЕСБОРКА, А НЕ RENAME COLUMN: у старых колонок есть CHECK
+ * (>= 0), а имя ограничения в SQLite не переименовывается. После RENAME
+ * ограничение продолжило бы ссылаться на несуществующую колонку — база
+ * стала бы невалидной.
+ *
+ * КАК ПЕРЕСЧИТЫВАЮТСЯ СТАРЫЕ ЗНАЧЕНИЯ. 1 TAR = 1e8 cwu, поэтому старый
+ * дефолт 1 TAR означал 100 000 000 токенов — то есть не ограничивал ничего.
+ * Пересчитывать его 1:1 значило бы законсервировать ту же декоративность:
+ *   • значение, равное старому дефолту (1 / 10 / 5), заменяется новым
+ *     токеновым дефолтом из директивы (5000 / 50000 / 2000);
+ *   • осознанно выставленное значение переводится в токеновый эквивалент,
+ *     чтобы его денежный смысл не потерялся. */
+(function migrateAgentWalletsToTokens() {
+  const cols = db.prepare('PRAGMA table_info(agent_wallets)').all().map(c => c.name);
+  if (!cols.length) return;                      // таблицы ещё нет — её создал CREATE выше
+  if (!cols.includes('maxPerTaskTar')) return;   // уже в токенах, миграция не нужна
+
+  const perCwu = CONFIG.PRICE_USD_PER_1M_TOKENS / 1e6 / CONFIG.USD_PER_TAR;
+
+  /* SQL считает пересчёт сам: тянуть строки в JS и писать обратно — это
+   * лишний шанс потерять updatedAt и order по агентам. */
+  const caseFor = (oldCol, oldDefault, newDefault) =>
+    `CASE WHEN ABS(COALESCE(${oldCol}, 0) - ${oldDefault}) < 1e-9` +
+    ` THEN ${newDefault} ELSE CAST(ROUND(COALESCE(${oldCol}, 0) / ${perCwu}) AS INTEGER) END`;
+
+  db.exec(`
+    BEGIN;
+    CREATE TABLE agent_wallets_wave4 (
+      agentId TEXT PRIMARY KEY REFERENCES agent_registry(agentId) ON DELETE CASCADE,
+      maxPerTaskTokens INTEGER NOT NULL DEFAULT ${CONFIG.AGENT_MAX_PER_TASK_TOKENS}
+        CHECK (maxPerTaskTokens >= 0),
+      dailyLimitTokens INTEGER NOT NULL DEFAULT ${CONFIG.AGENT_DAILY_LIMIT_TOKENS}
+        CHECK (dailyLimitTokens >= 0),
+      humanApprovalThresholdTokens INTEGER NOT NULL
+        DEFAULT ${CONFIG.AGENT_APPROVAL_THRESHOLD_TOKENS}
+        CHECK (humanApprovalThresholdTokens >= 0),
+      allowlistTools TEXT,
+      updatedAt TEXT NOT NULL
+    );
+    INSERT INTO agent_wallets_wave4
+      (agentId, maxPerTaskTokens, dailyLimitTokens,
+       humanApprovalThresholdTokens, allowlistTools, updatedAt)
+    SELECT agentId,
+           ${caseFor('maxPerTaskTar', 1.0, CONFIG.AGENT_MAX_PER_TASK_TOKENS)},
+           ${caseFor('dailyLimitTar', 10.0, CONFIG.AGENT_DAILY_LIMIT_TOKENS)},
+           ${caseFor('humanApprovalThresholdTar', 5.0, CONFIG.AGENT_APPROVAL_THRESHOLD_TOKENS)},
+           allowlistTools, updatedAt
+      FROM agent_wallets;
+    DROP TABLE agent_wallets;
+    ALTER TABLE agent_wallets_wave4 RENAME TO agent_wallets;
+    COMMIT;`);
 })();
 
 /* Сид каталога. INSERT OR IGNORE, а не REPLACE: если запись уже есть,
@@ -848,6 +986,155 @@ function all(sql, params = []) {
 function get(sql, params = []) {
   const stmt = db.prepare(sql);
   return params.length ? stmt.get(...params) : stmt.get();
+}
+
+/* Сумма всех резервов по счетам.
+ *
+ * ПОЧЕМУ ОТДЕЛЬНЫЙ ЗАПРОС, А НЕ ПОЛЕ В balances: резерв — это не баланс.
+ * balanceTar — деньги, доступные к списанию; reservedTar — уже обещанные под
+ * конкретные задачи. Складывать их в одно число нельзя: консервация тогда
+ * посчитала бы забронированное дважды.
+ *
+ * ПОЧЕМУ SUM, А НЕ СЧЁТЧИК В ПАМЯТИ: счётчик в памяти разошёлся бы с базой
+ * после рестарта или отката транзакции, и /health показывал бы не то, что
+ * реально записано в БД. Один SELECT по индексу на запрос /health дешевле,
+ * чем расхождение в аудиторском инварианте. */
+function reservedTarTotal() {
+  return Number(get('SELECT COALESCE(SUM(reservedTar), 0) AS s FROM balances')?.s ?? 0);
+}
+
+/* ===== Волна 4: учёт бюджета агента =====
+ * День в UTC, а не в локальной зоне: лимит «в сутки» должен быть одинаковым
+ * для всех узлов, иначе переезд сервера в другой пояс молча меняет окно. */
+function agentDayKey(ts = Date.now()) {
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
+function agentSpendOf(agentId, day = agentDayKey()) {
+  const r = get(`SELECT spentTokens, spentTar, calls, toolCalls
+                   FROM agent_spend WHERE agentId = ? AND day = ?`, [agentId, day]);
+  return r || { spentTokens: 0, spentTar: 0, calls: 0, toolCalls: 0 };
+}
+
+/* Сколько токенов уже занято незавершёнными задачами.
+ * Без этой суммы пять параллельных задач по 5000 токенов прошли бы дневной
+ * лимит 50 000 каждая по отдельности — лимит проверялся бы против нуля. */
+function agentHeldTokens(agentId) {
+  const r = get(`SELECT COALESCE(SUM(reservedTokens), 0) AS s
+                   FROM agent_reservations
+                  WHERE agentId = ? AND state = 'held'`, [agentId]);
+  return Number(r?.s ?? 0);
+}
+
+/* Повтор с тем же actionId не должен удваивать резерв: ключ идемпотентности
+ * клиента обязан работать и здесь, иначе ретрай сжигал бы лимит дважды. */
+function reserveAgentTokens({ agentId, actionId, tokens, tar }) {
+  const existing = get(`SELECT reservationId, reservedTokens, reservedTar, state
+                          FROM agent_reservations
+                         WHERE agentId = ? AND actionId = ?`, [agentId, actionId]);
+  /* created: false — это ретрай. Важно для вызывающего: повторное начисление
+   * на balances.reservedTar создало бы двойной резерв, который снимется
+   * только один раз, и занятые деньги висели бы вечно. */
+  if (existing) return { ...existing, created: false };
+
+  const reservationId = 'rsv_' + crypto.randomBytes(12).toString('hex');
+  run(`INSERT INTO agent_reservations
+         (reservationId, agentId, actionId, reservedTokens, reservedTar, state, createdAt)
+       VALUES (?, ?, ?, ?, ?, 'held', ?)`,
+    [reservationId, agentId, actionId, tokens, tar, new Date().toISOString()]);
+  return { reservationId, reservedTokens: tokens, reservedTar: tar, state: 'held', created: true };
+}
+
+/* Закрытие резерва и учёт расхода.
+ *
+ * ДВА РАЗНЫХ СЧЁТЧИКА, И ЭТО НЕ ДУБЛИРОВАНИЕ:
+ *   • spentTokens — сколько токенов агент ИЗРАСХОДОВАЛ. Считается всегда,
+ *     когда работа была, даже если чек ещё не выпущен (работа копится в
+ *     pending_work до порога). Иначе дневной лимит обходился бы множеством
+ *     мелких вызовов: каждый по отдельности ниже порога, а сумма — любая.
+ *   • spentTar — сколько денег реально списано. Растёт только на settle:
+ *     до выпуска чека денег ещё не списали, и прибавлять их к расходу
+ *     значило бы показать списание, которого не было.
+ *
+ * γ=0 (работы не было) не считается ни там, ни там: провал качества не
+ * должен отнимать лимит. */
+function settleAgentReservation(reservationId, { agentId, tokens, tar, settled, worked = true }) {
+  const now = new Date().toISOString();
+  const state = settled ? 'settled' : 'released';
+
+  /* Идемпотентность считается по факту перехода, а не по намерению:
+   * повторный вызов с тем же actionId находит уже закрытый резерв и НЕ
+   * добавляет расход второй раз. Без этой проверки ретрай клиента удваивал
+   * бы счётчик, и агент «заканчивался» бы вдвое быстрее, чем тратил. */
+  const moved = run(`UPDATE agent_reservations SET state = ?, resolvedAt = ?
+                      WHERE reservationId = ? AND state = 'held'`, [state, now, reservationId]);
+  const transitioned = Number(moved?.changes ?? 0) > 0;
+
+  if (!transitioned) return { state, counted: false, reason: 'already_resolved' };
+  if (!worked) return { state, counted: false };
+
+  const day = agentDayKey();
+  run(`INSERT INTO agent_spend (agentId, day, spentTokens, spentTar, calls, toolCalls)
+       VALUES (?, ?, ?, ?, 1, 0)
+       ON CONFLICT(agentId, day) DO UPDATE SET
+         spentTokens = spentTokens + excluded.spentTokens,
+         spentTar    = spentTar + excluded.spentTar,
+         calls       = calls + 1`,
+    [agentId, day,
+      Math.max(0, Math.round(Number(tokens) || 0)),
+      settled ? round(Number(tar) || 0) : 0]);
+
+  return { state, counted: true, spend: agentSpendOf(agentId, day) };
+}
+
+/* Учёт вызовов инструментов. Отдельно от инференса: у них своя единица
+ * (штуки, а не токены), и тест 21.6 проверяет именно число вызовов. */
+function recordToolSpend({ agentId, calls, tar }) {
+  if (!calls) return null;
+  const day = agentDayKey();
+  run(`INSERT INTO agent_spend (agentId, day, spentTokens, spentTar, calls, toolCalls)
+       VALUES (?, ?, 0, ?, 0, ?)
+       ON CONFLICT(agentId, day) DO UPDATE SET
+         spentTar  = spentTar + excluded.spentTar,
+         toolCalls = toolCalls + excluded.toolCalls`,
+    [agentId, day, round(Number(tar) || 0), Math.max(0, Math.round(Number(calls) || 0))]);
+  return agentSpendOf(agentId, day);
+}
+
+/* Каноническая строка, которую подписывает ВЛАДЕЛЕЦ.
+ * Промпт в неё не входит — только его хеш: подписывать килобайты текста
+ * дорого, а payloadHash всё равно привязывает одобрение к содержимому. */
+function approvalPayload({ approvalId, agentId, payloadHash, requestedTokens }) {
+  return ['approve', 'v1', approvalId, agentId, payloadHash, String(requestedTokens)].join(':');
+}
+
+/* Создание запроса на подтверждение. Токенов не резервируем: пока человек не
+ * ответил, траты не существует, и держать резерв значило бы блокировать
+ * дневной лимит чужой нерешительностью. */
+function createApproval({ agentId, ownerAddress, actionId, payloadHash, requestedTokens, projectedTar }) {
+  const approvalId = 'apr_' + crypto.randomBytes(12).toString('hex');
+  const now = new Date().toISOString();
+  run(`INSERT INTO approvals
+         (approvalId, agentId, ownerAddress, actionId, payloadHash,
+          requestedTokens, projectedTar, status, createdAt, expiresAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+    [approvalId, agentId, ownerAddress, actionId, payloadHash,
+      requestedTokens, projectedTar, now, Date.now() + CONFIG.AGENT_APPROVAL_TTL_MS]);
+  return { approvalId, requestedTokens, projectedTar, expiresAt: Date.now() + CONFIG.AGENT_APPROVAL_TTL_MS };
+}
+
+/* Истечение срока. Вызывается при попытке использовать подтверждение и при
+ * чтении списка: отдельный таймер на каждое подтверждение — лишний ресурс,
+ * а просроченное одобрение не должно срабатывать спустя сутки. */
+function expireApprovalIfNeeded(row) {
+  if (!row) return row;
+  if (row.status === 'pending' && Date.now() > Number(row.expiresAt)) {
+    run(`UPDATE approvals SET status = 'expired', decidedAt = ?
+          WHERE approvalId = ? AND status = 'pending'`,
+      [new Date().toISOString(), row.approvalId]);
+    return { ...row, status: 'expired' };
+  }
+  return row;
 }
 /* Реентерабельная транзакция.
  * Вложенный BEGIN в SQLite запрещён, а батч хочет одну транзакцию на пачку,
@@ -1600,6 +1887,11 @@ app.get('/health', (_req, res) => {
       distributed: Number(distributed.toFixed(6)),
       delta: Number((distributed - gross).toFixed(6)),
       holds: Math.abs(distributed - gross) < 1e-6 && bad === 0,
+      /* Забронировано под ожидающие задачи. НЕ входит в delta: резерв —
+       * это ещё не распределённые деньги, а «в процессе». Если добавить его
+       * к distributed, инвариант сломался бы на каждом резерве — ровно то,
+       * из-за чего поле раньше не использовали вовсе. */
+      reservedTar: Number(reservedTarTotal().toFixed(6)),
       inconsistentRows: bad,
     },
     treasuryBalanceTar: Number((treas?.balanceTar ?? 0).toFixed(6)),
@@ -1703,9 +1995,19 @@ function loadPrivateKey(address) {
 }
 
 app.get('/balance/:address', (req, res) => {
-  const b = get('SELECT address, balanceTar, stakedTar, updatedAt FROM balances WHERE address = ?', [req.params.address]);
+  const b = get('SELECT address, balanceTar, stakedTar, reservedTar, updatedAt FROM balances WHERE address = ?', [req.params.address]);
   if (!b) return res.status(404).json({ error: 'Balance not found', address: req.params.address });
-  res.json({ ...b, balanceTar: Number(b.balanceTar.toFixed(6)), stakedTar: Number(b.stakedTar.toFixed(6)) });
+  res.json({
+    ...b,
+    balanceTar: Number(b.balanceTar.toFixed(6)),
+    stakedTar: Number(b.stakedTar.toFixed(6)),
+    /* Занято незавершёнными задачами. Отдаётся рядом с балансом, но НЕ
+     * вычитается из него: balanceTar — это всё ещё деньги на счету, а
+     * reservedTar — обещание под конкретную задачу. Смешать их значит либо
+     * показать ложное списание, либо спрятать реальный остаток. */
+    reservedTar: Number((b.reservedTar ?? 0).toFixed(6)),
+    availableTar: Number(((b.balanceTar ?? 0) - (b.reservedTar ?? 0)).toFixed(6)),
+  });
 });
 
 app.get('/balances', (_req, res) => {
@@ -1870,7 +2172,7 @@ app.get('/agents', (req, res) => {
   }
 
   const rows = all(`SELECT a.agentId, a.userId, a.role, a.allowedTools, a.status, a.createdAt,
-                           w.maxPerTaskTar, w.dailyLimitTar, w.humanApprovalThresholdTar,
+                           w.maxPerTaskTokens, w.dailyLimitTokens, w.humanApprovalThresholdTokens,
                            w.allowlistTools, w.updatedAt AS walletUpdatedAt
                       FROM agent_registry a
                       LEFT JOIN agent_wallets w ON w.agentId = a.agentId
@@ -1886,10 +2188,14 @@ app.get('/agents', (req, res) => {
       status: a.status,
       allowedTools: parseJsonList(a.allowedTools),
       createdAt: a.createdAt,
-      wallet: a.maxPerTaskTar === null ? null : {
-        maxPerTaskTar: a.maxPerTaskTar,
-        dailyLimitTar: a.dailyLimitTar,
-        humanApprovalThresholdTar: a.humanApprovalThresholdTar,
+      wallet: a.maxPerTaskTokens === null ? null : {
+        /* Лимиты в токенах — основная единица (Волна 4). TAR-эквиваленты
+         * отдаются рядом для отображения, но НЕ хранятся: если бы они
+         * лежали в БД, они бы протухли при смене USD_PER_TAR или κ, и
+         * клиент показывал бы одно, а сервер проверял другое. */
+        maxPerTaskTokens: a.maxPerTaskTokens,
+        dailyLimitTokens: a.dailyLimitTokens,
+        humanApprovalThresholdTokens: a.humanApprovalThresholdTokens,
         allowlistTools: parseJsonList(a.allowlistTools),
         updatedAt: a.walletUpdatedAt,
       },
@@ -2012,9 +2318,11 @@ app.post('/agents', (req, res) => {
    * agent_wallets остался бы без лимитов, а «нет лимита» читается как
    * «трать сколько хочешь» — опасное умолчание. */
   run(`INSERT INTO agent_wallets
-         (agentId, maxPerTaskTar, dailyLimitTar, humanApprovalThresholdTar, allowlistTools, updatedAt)
-       VALUES (?, 1.0, 10.0, 5.0, ?, ?)`,
-    [agentId, JSON.stringify(allowedTools), now]);
+         (agentId, maxPerTaskTokens, dailyLimitTokens, humanApprovalThresholdTokens,
+          allowlistTools, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    [agentId, CONFIG.AGENT_MAX_PER_TASK_TOKENS, CONFIG.AGENT_DAILY_LIMIT_TOKENS,
+      CONFIG.AGENT_APPROVAL_THRESHOLD_TOKENS, JSON.stringify(allowedTools), now]);
 
   res.status(201).json({
     ok: true,
@@ -2028,6 +2336,145 @@ app.post('/agents', (req, res) => {
     warning: serverDerived
       ? 'entropy was sent to the server; derive the agent key on the device in production'
       : undefined,
+  });
+});
+
+/* ===== HITL: подтверждение траты владельцем =====
+ *
+ * Зачем вообще: агент тратит деньги владельца, и выше порога решение
+ * принимает человек, а не эвристика. Подпись проверяется ключом ВЛАДЕЛЬЦА
+ * (tar_id.pubkey), а не ключом агента: иначе агент одобрил бы сам себя, и
+ * весь механизм стал бы формальностью.
+ *
+ * Почему подписывается не промпт, а его хеш: подписывать килобайты текста
+ * дорого и не нужно — payloadHash всё равно привязывает одобрение к
+ * содержимому. Без него можно было бы одобрить дешёвый промпт, а отправить
+ * дорогой, и сумма в подтверждении ничего бы не значила. */
+app.get('/agents/approvals', (req, res) => {
+  const raw = typeof req.query.userId === 'string' ? req.query.userId.trim().toLowerCase() : '';
+  if (!/^0x[0-9a-f]{40}$/.test(raw)) {
+    return res.status(400).json({
+      error: 'userId must be 0x + 40 hex chars',
+      hint: 'GET /agents/approvals?userId=0x… — адрес владельца',
+    });
+  }
+
+  const rows = all(`SELECT approvalId, agentId, ownerAddress, actionId, payloadHash,
+                           requestedTokens, projectedTar, status, createdAt, expiresAt,
+                           decidedAt, decidedBy
+                      FROM approvals
+                     WHERE ownerAddress = ?
+                     ORDER BY createdAt DESC LIMIT 100`, [raw]);
+
+  const list = rows.map(expireApprovalIfNeeded).map(a => ({
+    ...a,
+    /* Строка, которую владелец подписывает. Отдаётся клиенту готовой:
+     * собирать её в браузере по кускам — верный способ разойтись с
+     * сервером в формате и получить «подпись неверна» без причины. */
+    signPayload: a.status === 'pending'
+      ? approvalPayload({
+        approvalId: a.approvalId,
+        agentId: a.agentId,
+        payloadHash: a.payloadHash,
+        requestedTokens: a.requestedTokens,
+      })
+      : null,
+    expiresAt: Number(a.expiresAt),
+  }));
+
+  res.json({ userId: raw, approvals: list, count: list.length });
+});
+
+/* Решение по подтверждению. Подпись обязательна — без неё это был бы
+ * эндпоинт «одобрить что угодно», доступный любому, кто знает approvalId. */
+app.post('/agents/approve', (req, res) => {
+  const body = req.body || {};
+  const approvalId = typeof body.approvalId === 'string' ? body.approvalId.trim() : '';
+  const decision = typeof body.decision === 'string' ? body.decision.trim().toLowerCase() : '';
+  const signature = typeof body.signature === 'string' ? body.signature : '';
+
+  if (!approvalId) return res.status(400).json({ error: 'approvalId is required' });
+  if (decision !== 'approve' && decision !== 'reject') {
+    return res.status(400).json({ error: 'decision must be approve or reject' });
+  }
+  if (!signature) {
+    return res.status(400).json({
+      error: 'signature is required',
+      hint: 'подписывается signPayload ключом владельца (tar_id), не ключом агента',
+    });
+  }
+
+  const row = expireApprovalIfNeeded(get('SELECT * FROM approvals WHERE approvalId = ?', [approvalId]));
+  if (!row) return res.status(404).json({ error: 'unknown approvalId', approvalId });
+
+  if (row.status !== 'pending') {
+    return res.status(409).json({
+      error: 'approval_already_decided',
+      status: row.status,
+      decidedAt: row.decidedAt,
+      /* Просроченное — отдельным кодом: клиенту это говорит «создай заново»,
+       * а не «кто-то уже решил». */
+      hint: row.status === 'expired' ? 'срок истёк, создайте задачу заново' : undefined,
+    });
+  }
+
+  const owner = get('SELECT address, pubkey FROM tar_id WHERE address = ?', [row.ownerAddress]);
+  if (!owner?.pubkey) {
+    return res.status(409).json({
+      error: 'owner_has_no_pubkey',
+      ownerAddress: row.ownerAddress,
+      hint: 'владелец должен быть зарегистрирован через POST /id/register с pubkey',
+    });
+  }
+
+  /* Подпись проверяется над строкой, собранной ИЗ БАЗЫ, а не из тела
+   * запроса: иначе клиент мог бы прислать свою строку и подписать её,
+   * подменив сумму подтверждения. */
+  const payload = approvalPayload({
+    approvalId: row.approvalId,
+    agentId: row.agentId,
+    payloadHash: row.payloadHash,
+    requestedTokens: row.requestedTokens,
+  });
+  let valid = false;
+  try {
+    valid = tarIdentity.verifyWithPubkey(owner.pubkey, payload, signature);
+  } catch (_e) {
+    valid = false;
+  }
+  if (!valid) {
+    return res.status(400).json({
+      error: 'signature_rejected',
+      reason: 'подпись не сходится с ключом владельца',
+      /* Строка возвращается, чтобы клиент мог отладить формат. Она не
+       * секретна: это те же числа, что уже в подтверждении. */
+      signPayload: payload,
+      ownerAddress: row.ownerAddress,
+    });
+  }
+
+  const now = new Date().toISOString();
+  const status = decision === 'approve' ? 'approved' : 'rejected';
+  run(`UPDATE approvals SET status = ?, decidedAt = ?, decidedBy = ?
+        WHERE approvalId = ? AND status = 'pending'`, [status, now, row.ownerAddress, approvalId]);
+
+  /* Отказ не тратит токены резерва, потому что его не было: резерв берётся
+   * ПОСЛЕ одобрения. Это отражено в ответе, чтобы не создавать впечатление,
+   * что отказ что-то вернул. */
+  res.json({
+    ok: true,
+    approvalId,
+    status,
+    decision,
+    agentId: row.agentId,
+    requestedTokens: Number(row.requestedTokens),
+    projectedTar: Number(row.projectedTar),
+    decidedAt: now,
+    decidedBy: row.ownerAddress,
+    charged: false,
+    note: decision === 'approve'
+      ? 'одобрено: резерв и задача создаются при следующем вызове /inference с этим approvalId'
+      : 'отказ: ничего не списано',
   });
 });
 
@@ -2856,6 +3303,8 @@ app.get('/summary', (_req, res) => {
       distributed: Number(distributed.toFixed(6)),
       delta: Number((distributed - gross).toFixed(6)),
       holds: Math.abs(distributed - gross) < 1e-6,
+      /* См. /health: резерв отдаётся рядом с delta, но не внутри неё. */
+      reservedTar: Number(reservedTarTotal().toFixed(6)),
     },
   });
 });
@@ -3311,6 +3760,204 @@ async function runInference(req, res) {
     return res.status(400).json({ error: 'client_signature rejected', reason: sig.reason, payload: sig.payload });
   }
 
+  /* ===== 2.5) Агентский шлюз (Волна 4) =====
+   * agentId опционален: без него /inference работает как раньше, и старые
+   * клиенты ничего не замечают. С ним включаются лимиты в токенах, резерв
+   * и подтверждение владельцем.
+   *
+   * ПОЧЕМУ ПРОВЕРКА ЗДЕСЬ, А НЕ ПОСЛЕ ГЕНЕРАЦИИ: после работы деньги уже
+   * обещаны, и любой отказ превратился бы либо в недоплату, либо в дыру.
+   * Лимит, проверенный после, не лимит.
+   *
+   * Резерв берётся по maxTokens, а не по факту: настоящий расход =
+   * tokens × κ × γ, где γ (качество) известен только ПОСЛЕ проверки ответа.
+   * Факт всегда ≤ maxTokens и γ ≤ 1, поэтому лимит, пройденный по худшему
+   * случаю, физически нельзя превысить. */
+  const agentIdRaw = typeof body.agentId === 'string' ? body.agentId.trim().toLowerCase() : '';
+  let agentCtx = null;
+  let reservation = null;
+  let reserveTarHeld = 0;
+
+  if (agentIdRaw) {
+    if (!/^[0-9a-f]{64}$/.test(agentIdRaw)) {
+      return res.status(400).json({
+        error: 'agentId must be 64 hex chars',
+        got: agentIdRaw.slice(0, 16) + (agentIdRaw.length > 16 ? '…' : ''),
+      });
+    }
+
+    const agentRow = get(`SELECT a.agentId, a.userId, a.role, a.allowedTools, a.status,
+                                 w.maxPerTaskTokens, w.dailyLimitTokens,
+                                 w.humanApprovalThresholdTokens, w.allowlistTools
+                            FROM agent_registry a
+                            LEFT JOIN agent_wallets w ON w.agentId = a.agentId
+                           WHERE a.agentId = ?`, [agentIdRaw]);
+    if (!agentRow) {
+      return res.status(404).json({ error: 'unknown_agent', agentId: agentIdRaw, hint: 'POST /agents' });
+    }
+    if (agentRow.status !== 'active') {
+      return res.status(403).json({ error: 'agent_not_active', status: agentRow.status, agentId: agentIdRaw });
+    }
+
+    /* Агент тратит бюджет СВОЕГО владельца. Если clientAddress не совпадает
+     * с userId агента, то либо клиент пытается списать чужой бюджет, либо
+     * кошелёк не передан вовсе (сервер сгенерировал новый) — в обоих случаях
+     * атрибуция расхода была бы ложной. */
+    if (!clientAddress || clientAddress !== agentRow.userId) {
+      return res.status(403).json({
+        error: 'agent_owner_mismatch',
+        note: 'agentId тратит бюджет своего владельца: clientAddress должен совпадать с userId агента',
+        agentId: agentIdRaw,
+        agentUserId: agentRow.userId,
+        clientAddress: clientAddress || null,
+      });
+    }
+
+    const maxTokens = Math.trunc(Number(body.maxTokens ?? 512));
+    if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
+      return res.status(400).json({ error: 'maxTokens must be a positive integer', got: body.maxTokens ?? null });
+    }
+
+    const actionIdForApproval = typeof body.actionId === 'string' && body.actionId.length
+      ? body.actionId
+      : 'inf_' + crypto.randomBytes(12).toString('hex');
+    const promptHash = crypto.createHash('sha256').update(String(body.prompt ?? ''), 'utf8').digest('hex');
+
+    /* Порог подтверждения не отказ: задача не отменяется, а ждёт человека.
+     * Принимаем только уже одобренное подтверждение того же агента с тем же
+     * хешем промпта и той же суммой — иначе одобрение дешёвой задачи
+     * открывало бы дорогую. */
+    const approvalId = typeof body.approvalId === 'string' ? body.approvalId.trim() : '';
+    let usedApproval = null;
+    if (approvalId) {
+      const ap = expireApprovalIfNeeded(get('SELECT * FROM approvals WHERE approvalId = ?', [approvalId]));
+      if (!ap) return res.status(404).json({ error: 'unknown_approvalId', approvalId });
+      if (ap.agentId !== agentIdRaw) {
+        return res.status(403).json({ error: 'approval_agent_mismatch', approvalId, agentId: ap.agentId });
+      }
+      if (ap.status !== 'approved') {
+        return res.status(409).json({ error: 'approval_not_granted', status: ap.status, approvalId });
+      }
+      if (ap.payloadHash !== promptHash) {
+        return res.status(409).json({
+          error: 'approval_payload_mismatch',
+          note: 'одобрение выдано на другой промпт', approvalId,
+        });
+      }
+      if (Number(ap.requestedTokens) !== maxTokens) {
+        return res.status(409).json({
+          error: 'approval_amount_mismatch',
+          approvedTokens: Number(ap.requestedTokens), requestedTokens: maxTokens, approvalId,
+        });
+      }
+      usedApproval = ap;
+    }
+
+    const limitsCheck = agentRuntime.checkTaskLimits({
+      wallet: agentRow,
+      maxTokens,
+      spentTokensToday: Number(agentSpendOf(agentIdRaw).spentTokens || 0),
+      heldTokens: agentHeldTokens(agentIdRaw),
+    });
+
+    if (!limitsCheck.ok) {
+      const status = limitsCheck.reason === 'invalid_max_tokens' ? 400 : 402;
+      return res.status(status).json({
+        error: limitsCheck.reason,
+        agentId: agentIdRaw,
+        ...limitsCheck,
+        limits: undefined,
+        note: limitsCheck.reason === 'daily_limit_exceeded'
+          ? 'дневной лимит агента исчерпан: сумма считается с учётом уже занятых задач'
+          : 'задача дороже лимита на одну задачу',
+      });
+    }
+
+    if (limitsCheck.needsApproval && !usedApproval) {
+      const ap = createApproval({
+        agentId: agentIdRaw,
+        ownerAddress: agentRow.userId,
+        actionId: actionIdForApproval,
+        payloadHash: promptHash,
+        requestedTokens: maxTokens,
+        projectedTar: limitsCheck.projectedTar,
+      });
+      /* 202, а не 402: отказ требует действия человека, а не пополнения.
+       * Ничего не списано и не зарезервировано — траты ещё нет. */
+      return res.status(202).json({
+        error: 'approval_required',
+        note: 'сумма выше порога подтверждения: подпишите запрос ключом владельца',
+        approvalId: ap.approvalId,
+        status: 'pending_approval',
+        agentId: agentIdRaw,
+        requestedTokens: maxTokens,
+        thresholdTokens: limitsCheck.thresholdTokens,
+        projectedTar: ap.projectedTar,
+        payloadHash: promptHash,
+        expiresAt: ap.expiresAt,
+        endpoints: { read: 'GET /agents/approvals?userId=…', decide: 'POST /agents/approve' },
+      });
+    }
+
+    /* Одобрение одноразовое: иначе одну подпись можно было бы предъявлять
+     * к каждой следующей задаче с тем же промптом и тем же объёмом. */
+    if (usedApproval) {
+      run(`UPDATE approvals SET status = 'expired', decidedAt = ?
+            WHERE approvalId = ? AND status = 'approved'`,
+        [new Date().toISOString(), usedApproval.approvalId]);
+    }
+
+    reservation = reserveAgentTokens({
+      agentId: agentIdRaw,
+      actionId: actionIdForApproval,
+      tokens: maxTokens,
+      tar: limitsCheck.projectedTar,
+    });
+    reserveTarHeld = reservation.created ? Number(reservation.reservedTar) || 0 : 0;
+    /* Резерв отражается и на счету владельца: до сих пор balances.reservedTar
+     * был мёртвым полем, и /health не мог показать занятые деньги. На ретрае
+     * (created: false) повторно не начисляем — иначе занято было бы вдвое
+     * больше, чем реально зарезервировано. */
+    if (reservation.created) {
+      run(`INSERT INTO balances (address, balanceTar, stakedTar, reservedTar, updatedAt)
+           VALUES (?, 0, 0, ?, ?)
+           ON CONFLICT(address) DO UPDATE SET reservedTar = reservedTar + excluded.reservedTar`,
+        [clientAddress, reserveTarHeld, new Date().toISOString()]);
+    }
+
+    agentCtx = {
+      agentId: agentIdRaw,
+      userId: agentRow.userId,
+      maxTokens,
+      actionId: actionIdForApproval,
+      promptHash,
+      usedApproval: usedApproval ? usedApproval.approvalId : null,
+      limits: limitsCheck.limits,
+    };
+  }
+
+  /* Снятие резерва ровно один раз: и на успешной работе, и на любой ошибке
+   * ниже. Без этого брошенный резерв навсегда съел бы дневной лимит. */
+  const releaseReserve = (actualTar, worked = true) => {
+    if (!reservation) return;
+    try {
+      if (reserveTarHeld > 0) {
+        run(`UPDATE balances SET reservedTar = MAX(0, reservedTar - ?), updatedAt = ?
+              WHERE address = ?`, [reserveTarHeld, new Date().toISOString(), agentCtx.userId]);
+        reserveTarHeld = 0;
+      }
+      if (reservation.state === 'held') {
+        settleAgentReservation(reservation.reservationId, {
+          agentId: agentCtx.agentId,
+          tokens: agentCtx.maxTokens,
+          tar: Number(actualTar) || 0,
+          settled: Boolean(actualTar),
+          worked,
+        });
+      }
+    } catch (_e) { /* учёт не должен ломать ответ клиенту */ }
+  };
+
   /* 3) Инференс. Три режима в порядке приоритета:
    *    worker -> external_api -> deterministic_fallback.
    *    Disk footprint нулевой: .gguf не скачиваются, зависимостей нет. */
@@ -3441,6 +4088,76 @@ async function runInference(req, res) {
     domain,
   );
 
+  /* ===== Учёт расхода агента =====
+   * Резерв снимается ВСЕГДА и ровно один раз: если этого не сделать,
+   * брошенный резерв навсегда съест дневной лимит, и агент «закончится»
+   * без единой траты.
+   *
+   * Списываем не maxTokens, а фактическую работу: γ=0 значит «работы не
+   * было», и записывать её в расход значило бы отнимать лимит за пустоту.
+   * Поэтому actualTar = 0 при провале качества → резерв освобождается, а не
+   * тратится. */
+  let agentBlock = null;
+  let toolCharges = [];
+  if (agentCtx) {
+    /* Заявленные вызовы инструментов. Проверяются ДО начисления: неизвестный
+     * или запрещённый инструмент не должен ни списывать деньги, ни попадать
+     * в леджер. Ограничение, которое нельзя замалчивать: это проверка
+     * ДЕКЛАРАЦИИ — сервер не докажет, что инструмент действительно вызывался. */
+    const declared = Array.isArray(body.toolCalls) ? body.toolCalls : [];
+    if (declared.length) {
+      const catalog = all(`SELECT toolId, costPerCallTar, isAvailable FROM tool_registry`);
+      const agent = get('SELECT allowedTools FROM agent_registry WHERE agentId = ?', [agentCtx.agentId]);
+      const allowed = parseJsonList(agent?.allowedTools);
+      let accepted = 0;
+      for (const call of declared) {
+        const verdict = agentRuntime.checkToolCall({
+          toolId: call?.toolId,
+          allowedTools: allowed,
+          tools: catalog,
+          callsSoFar: accepted,
+        });
+        if (!verdict.ok) {
+          /* До любого списания: резерв освобождается, деньги не двигаются. */
+          releaseReserve(0);
+          return res.status(400).json({
+            error: verdict.reason,
+            ...verdict,
+            agentId: agentCtx.agentId,
+            note: 'вызов инструмента отклонён до начисления: ничего не списано',
+          });
+        }
+        toolCharges.push(verdict);
+        accepted++;
+      }
+    }
+
+    const actualTar = outcome.settled ? Number(outcome.settled.fee.gross) || 0 : 0;
+    /* worked: провал качества (γ=0) значит «работы не было» — токены за него
+     * лимит не отнимают. Всё остальное (чек выпущен ИЛИ работа накоплена в
+     * pending_work) — расход, который надо учесть. */
+    releaseReserve(actualTar, !outcome.rejected);
+
+    if (toolCharges.length) {
+      const costTar = agentRuntime.toolCallsCost(toolCharges);
+      /* Инструменты оплачиваются отдельно от инференса: они не создают
+       * cwu, но стоят денег в tool_registry. */
+      if (costTar > 0) debit(clientAddress, costTar, 'tool_spend', agentCtx.actionId, TREASURY_ADDRESS);
+      recordToolSpend({ agentId: agentCtx.agentId, calls: toolCharges.length, tar: costTar });
+    }
+
+    agentBlock = {
+      agentId: agentCtx.agentId,
+      maxTokens: agentCtx.maxTokens,
+      tokensUsed: tokensGenerated,
+      limits: agentCtx.limits,
+      spendToday: agentSpendOf(agentCtx.agentId),
+      approvalUsed: agentCtx.usedApproval,
+      toolCalls: toolCharges.map(t => ({ toolId: t.toolId, costTar: t.costTar })),
+      toolCostTar: agentRuntime.toolCallsCost(toolCharges),
+    };
+  }
+
   res.json({
     ...result,
     /* Почему ответ не от модели. null = ответ дала живая модель. */
@@ -3478,6 +4195,7 @@ async function runInference(req, res) {
     } : null,
     batchedFrom: outcome.batchedFrom || [],
     conservation: outcome.conservation ?? null,
+    agent: agentBlock,
   });
 }
 

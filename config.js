@@ -85,6 +85,31 @@ const CONFIG = {
   // означает «месячный OPEX не задан», а не «резерв не нужен».
   RESERVE_OPEX_USD: Number(process.env.RESERVE_OPEX_USD || 0),
 
+  /* --- Волна 4: лимиты агентов ---
+   * В ТОКЕНАХ, а не в TAR. Причина: TAR-лимит ломается от смены κ или курса
+   * USD_PER_TAR, а токен — та единица, в которой реально меряется работа.
+   * 1 TAR = 1e8 cwu при текущих константах, поэтому лимит «1 TAR» означает
+   * 100 000 000 токенов, то есть не значит ничего.
+   *
+   * Дефолты — из директивы. НЕ увеличивать их «на глаз»: тест 21.2 проверяет
+   * именно эти числа, и расхождение между документом и кодом ловится там. */
+  AGENT_MAX_PER_TASK_TOKENS: Number(process.env.AGENT_MAX_PER_TASK_TOKENS || 5000),
+  AGENT_DAILY_LIMIT_TOKENS: Number(process.env.AGENT_DAILY_LIMIT_TOKENS || 50000),
+  AGENT_APPROVAL_THRESHOLD_TOKENS: Number(process.env.AGENT_APPROVAL_THRESHOLD_TOKENS || 2000),
+
+  /* Потолок вызовов инструментов на одну задачу. Без него агент с
+   * allowedTools из 8 инструментов мог бы звать их в цикле, и резерв под
+   * задачу не ограничивал бы ничего: каждый вызов — отдельные деньги. */
+  AGENT_MAX_TOOL_CALLS_PER_TASK: Number(process.env.AGENT_MAX_TOOL_CALLS_PER_TASK || 8),
+
+  /* Сколько живёт запрос на подтверждение. Человек может думать минуты,
+   * но не сутки: просроченное одобрение не должно срабатывать потом. */
+  AGENT_APPROVAL_TTL_MS: Number(process.env.AGENT_APPROVAL_TTL_MS || 300000),
+
+  /* Потолок шагов Think→Act→Observe. Значение из директивы; цикл всё равно
+   * ограничен ещё и общим таймаутом, потому что шаг может ждать воркера. */
+  AGENT_MAX_ITERATIONS: Number(process.env.AGENT_MAX_ITERATIONS || 10),
+
   // Адрес сжигания: получатель есть (для аудита суммы), но ключа не существует,
   // поэтому баланс необратимо выведен из оборота.
   BURN_ADDRESS: '0x' + 'dead'.repeat(10),
