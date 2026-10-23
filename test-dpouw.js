@@ -26,6 +26,7 @@ const dag = require('./dag-chain');
 const onion = require('./onion');
 const benchmarkGate = require('./benchmark-gate');
 const piiModule = require('./pii-classifier');
+const p2pTransport = require('./p2p-transport');
 
 /* Флаг --test поднимает собственный изолированный сервер на временной БД и
  * свободном порту. Позиционный аргумент (URL) сохраняется для прогона против
@@ -1853,6 +1854,58 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('submit-lora всё ещё НЕ одобряет адаптер', loraWithCommittee.body.gate.approved === false);
   ok('submit-lora возвращает quorumRequired=4', loraWithCommittee.body.gate.quorumRequired === 4,
     loraWithCommittee.body.gate.quorumRequired);
+
+  /* ---------------- 17. Anti-Replay и маркировка он-чейна ---------------- */
+  section('17. Anti-Replay: кэш повторов и честный simulated');
+
+  /* Юнит-тесты: правила вытеснения и протухания проверяются без сети и без
+   * ожидания реальных 60 секунд. */
+  const cache = new p2pTransport.ReplayCache({ max: 3, ttlMs: 50 });
+  ok('новый пакет не считается повтором', cache.has('a') === false);
+  cache.add('a');
+  ok('добавленный пакет считается повтором', cache.has('a') === true);
+  ok('повторное добавление не растит размер', (cache.add('a'), cache.size === 1), cache.size);
+  cache.add('b'); cache.add('c');
+  ok('в пределах max все живы', cache.has('a') && cache.has('b') && cache.has('c'));
+  cache.add('d');
+  ok('вытеснен самый старый, а не случайный',
+    cache.has('a') === false && cache.has('b') && cache.has('d'), cache.size);
+  ok('размер не превышает max', cache.size === 3, cache.size);
+
+  const expiring = new p2pTransport.ReplayCache({ max: 10, ttlMs: 40 });
+  expiring.add('x');
+  ok('сразу после добавления — повтор', expiring.has('x') === true);
+  await new Promise(r => setTimeout(r, 70));
+  ok('после TTL пакет больше не повтор', expiring.has('x') === false);
+  ok('протухшая запись удалена, а не просто скрыта', expiring.size === 0, expiring.size);
+  ok('clear обнуляет кэш', (expiring.add('y'), expiring.clear(), expiring.size === 0));
+
+  ok('ошибка повтора — константа ONION_REPLAY_DETECTED',
+    p2pTransport.ERR.REPLAY_DETECTED === 'ONION_REPLAY_DETECTED', p2pTransport.ERR.REPLAY_DETECTED);
+  ok('TTL по умолчанию — 60 с', p2pTransport.REPLAY_TTL_MS === 60000, p2pTransport.REPLAY_TTL_MS);
+  ok('потолок кэша — 10 000', p2pTransport.REPLAY_CACHE_MAX === 10000, p2pTransport.REPLAY_CACHE_MAX);
+
+  /* Интеграция: каждый settlement помечен simulated, статус confirmed не
+   * должен читаться как подтверждение в блокчейне. */
+  const setl = await api('/settlements?limit=5');
+  ok('/settlements отвечает 200', setl.status === 200, setl.status);
+  ok('/settlements — массив', Array.isArray(setl.body), typeof setl.body);
+  ok('каждый settlement помечен simulated=true',
+    setl.body.every(s => s.simulated === true),
+    setl.body.map(s => s.simulated));
+  ok('simulated — булево, а не 1/0 из SQLite',
+    setl.body.every(s => typeof s.simulated === 'boolean'),
+    typeof setl.body[0]?.simulated);
+
+  const healthOnchain = (await api('/health')).body;
+  ok('/health отдаёт блок onchain', healthOnchain.onchain !== undefined, Object.keys(healthOnchain).slice(-4));
+  ok('/health: onchain.simulated=true', healthOnchain.onchain.simulated === true);
+  ok('/health прямо говорит об отсутствии блокчейна',
+    /no blockchain/i.test(String(healthOnchain.onchain.note)), healthOnchain.onchain.note);
+  /* Счётчик лежит внутри onchain рядом с флагом: число локальных расчётов
+   * без пометки simulated читалось бы как реальные транзакции. */
+  ok('счётчик settlement-ов рядом с флагом и это число',
+    typeof healthOnchain.onchain.settlements === 'number', healthOnchain.onchain.settlements);
 
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌`);

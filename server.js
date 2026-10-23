@@ -301,7 +301,8 @@ CREATE TABLE IF NOT EXISTS onchain_settlements (
   amountTar REAL NOT NULL,
   txHash TEXT NOT NULL,
   status TEXT NOT NULL,
-  createdAt TEXT
+  createdAt TEXT,
+  simulated INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS balances (
   address TEXT PRIMARY KEY,
@@ -394,6 +395,11 @@ ensureColumn('worker_tasks', 'source', 'source TEXT');
  * экономике всегда 0, но колонка обязана существовать до первой записи,
  * иначе резервирование пришлось бы делать миграцией на живой базе. */
 ensureColumn('balances', 'reservedTar', 'reservedTar REAL NOT NULL DEFAULT 0');
+/* Признак имитации он-чейна. txHash у нас — randomBytes(32), а не транзакция
+ * в сети, и статус `confirmed` без этой колонки читается как «подтверждено
+ * блокчейном». Значение по умолчанию 1 честно помечает и старые записи: они
+ * все созданы тем же локальным генератором хеша. */
+ensureColumn('onchain_settlements', 'simulated', 'simulated INTEGER NOT NULL DEFAULT 1');
 /* Строка состояния казны должна существовать сразу: /health читает её
  * на каждом запросе, и null вместо нуля выглядел бы как отсутствие данных. */
 db.prepare('INSERT OR IGNORE INTO treasury_state (id) VALUES (1)').run();
@@ -1323,6 +1329,9 @@ app.get('/health', (_req, res) => {
    * идёт в $TAR, а фиат — задел [SPEC Phase 2.5]. Поля отдаются всё равно,
    * чтобы клиент не гадал, есть они или нет. */
   const tstate = get('SELECT reserveUsdc, lastOracleRate, lastOracleUpdate FROM treasury_state WHERE id = 1');
+  /* Число записей он-чейна — рядом с флагом simulated: мониторинг должен
+   * видеть объём расчётов и сразу понимать, что они локальные. */
+  const settledCount = get('SELECT COUNT(*) AS c FROM onchain_settlements').c;
   const epoch = epochIndex();
   const emissionTar = epochEmission(epoch);
   const st = epochState(dbx, epoch, emissionTar);
@@ -1360,6 +1369,15 @@ app.get('/health', (_req, res) => {
       inconsistentRows: bad,
     },
     treasuryBalanceTar: Number((treas?.balanceTar ?? 0).toFixed(6)),
+    /* Честная маркировка он-чейна: записи в onchain_settlements созданы
+     * локально, txHash — randomBytes(32), статус `confirmed` к блокчейну
+     * отношения не имеет. Флаг отдаётся в /health, потому что именно
+     * /health читают мониторинг и аудит, а не только /summary. */
+    onchain: {
+      simulated: true,
+      note: 'No blockchain integration',
+      settlements: settledCount,
+    },
     treasury: {
       balanceTar: Number((treas?.balanceTar ?? 0).toFixed(6)),
       reserveUsdc: Number((tstate?.reserveUsdc ?? 0).toFixed(6)),
@@ -2289,8 +2307,13 @@ app.post('/settle', (req, res) => {
 
 app.get('/settlements', (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
-  res.json(all(`SELECT id, workerAddress, receiptSeq, amountTar, txHash, status, createdAt
-                FROM onchain_settlements ORDER BY createdAt DESC LIMIT ?`, [limit]));
+  /* `simulated` отдаётся явно булевым и всегда true, пока нет интеграции с
+   * сетью: клиент не должен выводить это из статуса `confirmed`, который к
+   * блокчейну отношения не имеет. */
+  const rows = all(`SELECT id, workerAddress, receiptSeq, amountTar, txHash, status, createdAt,
+                           simulated
+                    FROM onchain_settlements ORDER BY createdAt DESC LIMIT ?`, [limit]);
+  res.json(rows.map((r) => ({ ...r, simulated: r.simulated === 1 || r.simulated === true })));
 });
 
 /* --- Summary --- */
@@ -2323,6 +2346,14 @@ app.get('/summary', (_req, res) => {
     burnAddressBalanceTar: Number((burnt?.balanceTar ?? 0).toFixed(6)),
     treasuryBalanceTar: Number((treas?.balanceTar ?? 0).toFixed(6)),
     onchainSettlements: settledCount,
+    /* Честная маркировка: записи в onchain_settlements созданы локально,
+     * txHash — randomBytes(32). Пока это так, флаг не должен становиться
+     * false ни при каких условиях, иначе статус `confirmed` начнут читать
+     * как подтверждение в сети. */
+    onchain: {
+      simulated: true,
+      note: 'No blockchain integration',
+    },
     receiptsByTier: byTier,
     conservation: {
       gross: Number(gross.toFixed(6)),

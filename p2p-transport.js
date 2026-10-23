@@ -45,6 +45,26 @@ const REVERSE_TTL_MS = 2 * 60 * 1000;
  * 2 MiB с запасом покрывает 5 прыжков и оставляет отказ на мусорный вход. */
 const MAX_FRAME_BYTES = 2 * 1024 * 1024;
 
+/* ===== Anti-Replay =====
+ * Кэш хешей принятых onion-пакетов. Пакет, хеш которого уже в кэше, второй раз
+ * не обрабатывается: иначе один и тот же конверт можно разослать повторно и
+ * получить второй ответ — то есть второй расход ресурса воркера за одну оплату.
+ *
+ * ПОЧЕМУ ХЕШ ПАКЕТА, А НЕ requestId. requestId лежит ВНУТРИ слоя, и реле его не
+ * видит, не сломав приватность. sha256 от байтов пакета доступен каждому прыжку
+ * и при этом не раскрывает ни промпт, ни адрес следующего прыжка.
+ *
+ * ПОЧЕМУ 60 СЕКУНД. Столько же живёт слой (onion TTL 60 с). Держать хеш дольше
+ * бессмысленно: протухший пакет отвергается проверкой срока ещё до расшифровки.
+ * Кэш короче REVERSE_TTL_MS намеренно — защита не должна переживать то, что
+ * защищает.
+ *
+ * ПОЧЕМУ 10 000. Это предел памяти, а не точность: при переполнении вытесняется
+ * самый старый хеш. Поток мусорных пакетов тогда вымывает историю, но иначе
+ * кэш сам стал бы вектором роста памяти. */
+const REPLAY_CACHE_MAX = 10000;
+const REPLAY_TTL_MS = 60000;
+
 /* Коды ошибок транспорта. Клиент должен отличать «узел умер» от «пакет
  * протух» и от «никто не слушает»: это разные реакции. */
 const ERR = {
@@ -54,7 +74,45 @@ const ERR = {
   BAD_FRAME: 'P2P_BAD_FRAME',
   NO_WORKER_HANDLER: 'P2P_NO_WORKER_HANDLER',
   ROUTE_EMPTY: 'P2P_ROUTE_EMPTY',
+  /* Повторно пришёл пакет, который этот узел уже обработал. */
+  REPLAY_DETECTED: 'ONION_REPLAY_DETECTED',
 };
+
+/* LRU-кэш хешей пакетов с TTL. Отдельный класс, а не голый Map: правила
+ * вытеснения и протухания должны быть проверяемы юнит-тестом без сети. */
+class ReplayCache {
+  constructor({ max = REPLAY_CACHE_MAX, ttlMs = REPLAY_TTL_MS } = {}) {
+    this.max = max;
+    this.ttlMs = ttlMs;
+    /* Map хранит порядок вставки: первым ключом всегда самый старый. */
+    this.map = new Map();
+  }
+
+  /* Был ли такой пакет. Протухшая запись удаляется и не считается повтором:
+   * иначе пакет отвергался бы как дубль уже после того, как его срок истёк. */
+  has(hash) {
+    const exp = this.map.get(hash);
+    if (exp === undefined) return false;
+    if (Date.now() > exp) {
+      this.map.delete(hash);
+      return false;
+    }
+    return true;
+  }
+
+  /* Регистрирует пакет и обновляет его место в очереди вытеснения. */
+  add(hash) {
+    if (this.map.has(hash)) this.map.delete(hash);
+    this.map.set(hash, Date.now() + this.ttlMs);
+    while (this.map.size > this.max) {
+      const oldest = this.map.keys().next().value;
+      this.map.delete(oldest);
+    }
+  }
+
+  get size() { return this.map.size; }
+  clear() { this.map.clear(); }
+}
 
 function shortId(rid) {
   return typeof rid === 'string' ? rid.slice(0, 12) : String(rid);
@@ -110,11 +168,17 @@ class Transport {
       responsesIn: 0,
       errors: 0,
       dropped: 0,
+      /* Сколько пакетов отброшено как повтор. Отдельно от dropped: dropped —
+       * это мусор и опоздавшие ответы, а здесь осознанный отказ по политике. */
+      replays: 0,
     };
 
     /* Что узел увидел после снятия слоя. Для тестов и для честной диагностики:
      * содержимое НЕ пишется, только размеры и признак «был ли конец маршрута». */
     this.seen = [];
+
+    /* Защита от повторной обработки одного и того же конверта. */
+    this.replay = new ReplayCache();
 
     this._sweeper = null;
   }
@@ -137,9 +201,12 @@ class Transport {
       this.wss.on('connection', (ws) => this._onConnection(ws));
     });
 
-    /* Уборка протухших записей возврата. unref, чтобы интервал не держал
-     * процесс живым: тест должен завершаться сам. */
-    this._sweeper = setInterval(() => this._sweepReverse(), 15000);
+    /* Уборка протухших записей возврата и кэша повторов. unref, чтобы интервал
+     * не держал процесс живым: тест должен завершаться сам. */
+    this._sweeper = setInterval(() => {
+      this._sweepReverse();
+      this._sweepReplay();
+    }, 15000);
     if (this._sweeper.unref) this._sweeper.unref();
 
     return this;
@@ -206,9 +273,24 @@ class Transport {
   }
 
   async _onRequest(ws, frame) {
+    /* Anti-Replay стоит ДО снятия слоя: повторный конверт не должен тратить
+     * RSA на расшифровку, чтобы потом выяснилось, что он уже был. Хеш считается
+     * от ровно тех байтов, что пришли по сокету. */
+    const packet = Buffer.from(frame.payload, 'base64');
+    const hash = crypto.createHash('sha256').update(packet).digest('hex');
+    if (this.replay.has(hash)) {
+      this.stats.replays++;
+      /* Не молчим: отправитель получает внятный код сразу, а не таймаут
+       * через полминуты. Это тот же принцип, что и для мёртвого воркера. */
+      return this._send(ws, {
+        v: FRAME_VERSION, kind: 'err', rid: frame.rid, code: ERR.REPLAY_DETECTED,
+      });
+    }
+    this.replay.add(hash);
+
     let peeled;
     try {
-      peeled = onion.unwrapLayer(Buffer.from(frame.payload, 'base64'), onion.nodePrivateKey(this.keypair));
+      peeled = onion.unwrapLayer(packet, onion.nodePrivateKey(this.keypair));
     } catch (e) {
       /* Свой слой не снялся: протух, чужой адресат или подделка. Отвечаем
        * кодом, чтобы клиент не ждал таймаут. */
@@ -478,12 +560,22 @@ class Transport {
       if (now > entry.exp) this.reverse.delete(rid);
     }
   }
+
+  _sweepReplay() {
+    const now = Date.now();
+    for (const [hash, exp] of this.replay.map) {
+      if (now > exp) this.replay.map.delete(hash);
+    }
+  }
 }
 
 module.exports = {
   Transport,
+  ReplayCache,
   FRAME_VERSION,
   REVERSE_TTL_MS,
+  REPLAY_CACHE_MAX,
+  REPLAY_TTL_MS,
   MAX_FRAME_BYTES,
   ERR,
   shortId,

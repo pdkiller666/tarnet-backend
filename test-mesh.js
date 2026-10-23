@@ -24,8 +24,9 @@ const crypto = require('crypto');
 const net = require('net');
 const path = require('path');
 const { spawn } = require('child_process');
+const { WebSocket } = require('ws');
 const onion = require('./onion');
-const { Transport, ERR } = require('./p2p-transport');
+const { Transport, ERR, FRAME_VERSION } = require('./p2p-transport');
 
 let pass = 0;
 let fail = 0;
@@ -56,6 +57,41 @@ function freePort() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* Ожидание условия с бюджетом. Возвращает true, если условие стало истинным.
+ *
+ * ПОЧЕМУ НЕ ГОЛЫЙ while СО СЧЁТЧИКОМ. Прежний цикл опроса имел две беды: бюджет
+ * 3000 мс мог истечь на загруженной машине (две WebSocket-рукопожатия плюс
+ * сборка луковицы), и при истечении тест молча получал пустые таблицы — те самые
+ * 5 падений подряд. Здесь истечение видно по возвращённому false и печатается
+ * диагностика, поэтому «флаки» становится отличим от «сломалось». */
+/* Сырой обмен одним кадром с узлом: нужен там, где транспорт-обёртка недоступна.
+ * Возвращает разобранный ответ узла или бросает по таймауту. */
+function rawExchange(url, frame, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url, { maxPayload: 2 * 1024 * 1024 });
+    const timer = setTimeout(() => {
+      try { ws.terminate(); } catch (_e) { /* уже мёртв */ }
+      reject(new Error('raw exchange timeout'));
+    }, timeoutMs);
+    ws.once('message', (d) => {
+      clearTimeout(timer);
+      try { ws.close(); } catch (_e) { /* уже закрыт */ }
+      try { resolve(JSON.parse(d.toString())); } catch (e) { reject(e); }
+    });
+    ws.once('error', (e) => { clearTimeout(timer); reject(e); });
+    ws.once('open', () => ws.send(JSON.stringify(frame)));
+  });
+}
+
+async function waitFor(cond, { timeoutMs = 8000, stepMs = 20 } = {}) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (cond()) return true;
+    await sleep(stepMs);
+  }
+  return cond();
+}
 
 /* Поднимает воркер отдельным процессом. Возвращает дескриптор с kill() и
  * waitReady(): тест должен знать, что порт уже слушается, иначе гонка. */
@@ -174,7 +210,11 @@ async function main() {
       port: slowPort,
       privPem: wKp.privateKeyPem,
       answer: 'медленный-ответ',
-      delayMs: 400,
+      /* 800 мс вместо 400: окно наблюдения должно быть шире, чем два
+       * рукопожатия и сборка луковицы на загруженной машине. При 400 мс первый
+       * прогон на холодном кеше успевал закрыть записи возврата раньше, чем
+       * тест их читал. */
+      delayMs: 800,
     });
     await delayWorker.waitReady();
 
@@ -196,13 +236,34 @@ async function main() {
       { address: slowWorkerAddr, ...wKp },
     ];
 
+    /* Пауза после подъёма узлов: сокеты должны успеть встать в listen, прежде
+     * чем по ним пойдёт первый кадр. Без неё первый прогон на холодном кеше
+     * проигрывал гонку. */
+    await sleep(100);
+
     const inFlight = clientB.sendOnion({ route: slowRoute, innerRequest: { prompt } });
-    /* Ждём, пока оба реле заведут записи возврата. */
-    let waited = 0;
-    while ((relay1b.reverse.size === 0 || relay2b.reverse.size === 0) && waited < 3000) {
-      await sleep(20);
-      waited += 20;
-    }
+    /* Перехватываем ошибку сразу и запоминаем: если запрос упал на соединении,
+     * таблицы возврата останутся пустыми не из-за гонки таймаутов, а потому что
+     * пакет вообще не дошёл. Без этого диагноз уводил в сторону. */
+    let inFlightErr = null;
+    inFlight.catch((e) => { inFlightErr = e.message; });
+    /* Ждём, пока оба реле заведут записи возврата. Бюджет 8000 мс и явный
+     * отказ вместо молчаливого таймаута — иначе пустые таблицы выдавались за
+     * «token не совпал» и диагноз уводил в сторону. */
+    const sawReverse = await waitFor(() => relay1b.reverse.size > 0 && relay2b.reverse.size > 0);
+    ok('оба реле успели завести записи возврата за отведённое время', sawReverse, {
+      r1: relay1b.reverse.size,
+      r2: relay2b.reverse.size,
+      inFlightErr,
+      clientConns: clientB.conns.size,
+      r1Conns: relay1b.conns.size,
+      r2Conns: relay2b.conns.size,
+      r1Stats: relay1b.stats,
+      r2Stats: relay2b.stats,
+      slowPort,
+      r1Url: relay1b.url,
+      r2Url: relay2b.url,
+    });
 
     const r1Entries = [...relay1b.reverse.entries()];
     const r2Entries = [...relay2b.reverse.entries()];
@@ -342,6 +403,43 @@ async function main() {
 
     await clientC.stop();
     await dumb.stop();
+
+    // ---------- 8. Anti-Replay ----------
+    section('8. Тот же onion-пакет вторично не обрабатывается');
+    /* Пакет собирается вручную и отправляется дважды: через sendOnion так не
+     * сделать, потому что каждый вызов строит НОВУЮ луковицу с новым
+     * requestId, и хеши не совпали бы. */
+    const replayInner = { prompt, requestId: crypto.randomBytes(16).toString('hex') };
+    const replayBuilt = onion.buildOnionRequest(replayInner, route);
+
+    const firstReply = await rawExchange(relay1.url, {
+      v: FRAME_VERSION, kind: 'req', rid: crypto.randomBytes(16).toString('hex'),
+      payload: replayBuilt.onionPacket,
+    });
+    ok('первый экземпляр пакета обработан (не отброшен как повтор)',
+      firstReply.kind === 'res' || (firstReply.kind === 'err' && firstReply.code !== ERR.REPLAY_DETECTED),
+      firstReply);
+
+    const secondReply = await rawExchange(relay1.url, {
+      v: FRAME_VERSION, kind: 'req', rid: crypto.randomBytes(16).toString('hex'),
+      payload: replayBuilt.onionPacket,
+    });
+    ok('второй экземпляр того же пакета отброшен с ONION_REPLAY_DETECTED',
+      secondReply.kind === 'err' && secondReply.code === ERR.REPLAY_DETECTED, secondReply);
+    ok('счётчик повторов учёл отказ', relay1.stats.replays === 1, relay1.stats.replays);
+
+    /* Свежий пакет на том же узле должен пройти: кэш отбрасывает именно
+     * дубликат, а не всё подряд после первого запроса. */
+    const freshBuilt = onion.buildOnionRequest(
+      { prompt, requestId: crypto.randomBytes(16).toString('hex') }, route,
+    );
+    const freshReply = await rawExchange(relay1.url, {
+      v: FRAME_VERSION, kind: 'req', rid: crypto.randomBytes(16).toString('hex'),
+      payload: freshBuilt.onionPacket,
+    });
+    ok('новый пакет после отказа проходит нормально',
+      freshReply.kind === 'res' || (freshReply.kind === 'err' && freshReply.code !== ERR.REPLAY_DETECTED),
+      freshReply);
 
     await revived.hardKill();
   } finally {
