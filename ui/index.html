@@ -519,7 +519,7 @@
   </section>
 
   <footer>
-    <div>TarNet / Synapse · демонстрационный стенд · экономика v2.1</div>
+    <div>TarNet / Synapse · демонстрационный стенд · экономика dPoUW 2.1</div>
     <div><a href="/console.html">Консоль для инженеров →</a></div>
   </footer>
 </div>
@@ -799,7 +799,7 @@
 
     fetch(B + '/health').then(function (r) { return r.json(); }).then(function (h) {
       var b = $('liveBadge');
-      if (h.status === 'ok') b.textContent = 'сеть работает · версия ' + h.version;
+      if (h.status === 'ok') b.textContent = 'сеть работает · сборка ' + (h.buildVersion || h.version);
     }).catch(function () {
       $('liveBadge').textContent = 'сеть недоступна';
     });
