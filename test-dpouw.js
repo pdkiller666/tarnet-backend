@@ -3435,7 +3435,30 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   {
     const sw = await api('/app/sw.js');
     const src = typeof sw.body === 'string' ? sw.body : '';
-    ok('25.4 sw.js — версия кэша v8 (фиксы аудита 3614b13)', /tarnet-app-v8/.test(src), src.slice(0, 60));
+
+    /* Раньше здесь стояла жёсткая строка tarnet-app-v7, потом v8 — и каждый
+     * bump кэша требовал правки теста. Тест, который сам надо обновлять при
+     * каждом релизе, проверяет аккуратность правки теста, а не свежесть
+     * кэша. Держим два настоящих инварианта: имя кэша вообще версионировано
+     * и оно не откатилось назад к версии без фиксов. */
+    const cacheMatch = src.match(/const CACHE = 'tarnet-app-v(\d+)'/);
+    ok('25.4 имя кэша версионировано', Boolean(cacheMatch), (cacheMatch || [])[0]);
+    ok('25.4 кэш не откатился ниже v9 (фиксы аудита)',
+      cacheMatch && Number(cacheMatch[1]) >= 9, cacheMatch && cacheMatch[1]);
+
+    /* Второй инвариант сильнее версии: каждый локальный ассет, на который
+     * ссылается оболочка, обязан быть в предзагрузке. Иначе офлайн-режим
+     * отрисуется без стилей или без вендора. */
+    const assetsSrc = (src.match(/const ASSETS = \[([\s\S]*?)\];/) || [])[1] || '';
+    const assets = [...assetsSrc.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+    const html = await api('/app/index.html');
+    const htmlSrc = typeof html.body === 'string' ? html.body : '';
+    const refs = [...htmlSrc.matchAll(/(?:href|src)="([^"]+)"/g)]
+      .map((m) => m[1])
+      .filter((u) => u.startsWith('/app/'));
+    const missing = refs.filter((u) => !assets.includes(u));
+    ok('25.4 все локальные ссылки HTML есть в ASSETS', missing.length === 0, missing);
+
     ok('25.4 sw.js кэширует vendor',
       src.includes('/app/vendor/marked.min.js') && src.includes('/app/vendor/highlight.min.js'));
   }
@@ -3568,6 +3591,16 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       !/opacity:\s*0\s*[;\}]/.test(actBlock), actBlock.trim().slice(0, 80));
     ok('26.2 при hover/focus-within кнопки проявляются полностью',
       /\.msg:hover \.msg-actions[\s\S]{0,120}opacity:\s*1/.test(css));
+
+    /* Задача 4 директивы: алиасы .text-error/.text-info. В шаблонах их пока
+     * никто не создаёт, поэтому тест закрепляет именно контракт классов:
+     * если алиас уберут как «неиспользуемый», правило вернётся молча, когда
+     * кто-то начнёт их генерировать. */
+    ok('26.3 CSS определяет .text-error', /\.text-error\s*\{[^}]*color:/.test(css));
+    ok('26.3 CSS определяет .text-info', /\.text-info\s*\{[^}]*color:/.test(css));
+    ok('26.3 .text-error использует токен, а не литерал #ff6b6b',
+      /\.text-error\s*\{\s*color:\s*var\(--danger\)/.test(css));
+    ok('26.3 токен --info объявлен', /--info:\s*#[0-9a-fA-F]{3,8}/.test(css));
   }
 
   console.log('\n' + '─'.repeat(50));
