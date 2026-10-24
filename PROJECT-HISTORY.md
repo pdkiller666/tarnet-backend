@@ -1,7 +1,7 @@
 # PROJECT-HISTORY — полная история TarNet / Synapse
 
 > **Статус:** единый источник исторического контекста. Обновляется при каждой вехе.
-> **Собран:** 2026-10-24 21:40 MSK из трёх независимых источников: `git log` (74 коммита), БД прода `/var/lib/tarnet/tarnet.db`, живой стенд `https://v1107336.hosted-by-vdsina.com`.
+> **Собран:** 2026-10-24 21:40 MSK из трёх независимых источников: `git log` (75 коммитов), БД прода `/var/lib/tarnet/tarnet.db`, живой стенд `https://v1107336.hosted-by-vdsina.com`.
 > **Канон по текущему состоянию:** `MANIFEST.v3.4-UNIFIED.md`. Этот файл — про **как мы сюда пришли**, а не про то, что работает сейчас.
 
 ---
@@ -56,7 +56,7 @@
 - **PII**: IPv4 в фильтре, один источник паттернов (`cc570c3`).
 - **Волна 3** (`e50c1c8`): Agent Foundation — `agent_registry`, `agent_wallets`, `tool_registry`.
 
-### 2026-10-24 — 25 коммитов: волны 4–9 и Tier 6
+### 2026-10-24 — 26 коммитов: волны 4–9, Tier 6 и PROJECT-HISTORY
 
 - **Волна 4** (`224d508`): Agent Runtime — лимиты в токенах, резерв, HITL.
 - **Волна 5** (`1f06e95`): UI агентов в PWA, HITL-подпись **Ed25519 в браузере** через `crypto.subtle`.
@@ -67,7 +67,7 @@
 - **Tier 6 BYOK** (`3ff5034`, 20:33): ключ провайдера в PWA, кэшбэк, инвариант; 649 тестов.
 - **`0373b2d`** (21:20): TTL-резерв, `tier6_receipts` против double-spend, `funded_by` только `client`; **660 тестов**.
 
-### Теги (20 штук, все на месте)
+### Теги (19 штук, все на месте)
 
 `v2.1.0-stable` → `v2.2.0-p2p` → `v2.2.1-p2p-live` → `v2.3.0-identity` → `v2.4.0-pii` → `v2.4.1-tier-fix` → `v2.4.1-production-ready` → `v2.5.0-prep` → `v2.5.1-prep` → `v2.6.0-tier6-prep` → `v2.7.0-wave2-prep` → `v2.7.1-manifest-fix` → `v2.8.0-agent-foundation` → `v2.9.1-agent-ui` → `v2.9.2-agent-runtime-fix` → `v2.10.0-knowledge-loop-schema` → `v2.11.0-chat-ux` → `v2.11.2-chat-ux-tests` → `v2.12.1-tier6-fix`
 
