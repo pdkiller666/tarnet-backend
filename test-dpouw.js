@@ -1544,6 +1544,58 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('режим сети переключился на worker',
     (await api('/health')).body?.llm_mode === 'worker');
 
+  /* ---------- 8.20. [hidden] побеждает компонентный display ----------
+   * Симптом, с которого началось: «переключаю вкладки — ничего не
+   * меняется». Причина не в JS: .panel имел display: flex, а это авторский
+   * стиль, который сильнее браузерного [hidden] { display: none } при любой
+   * специфичности. Атрибут выставлялся, панели оставались видимыми, клик
+   * менял только подсветку кнопки.
+   *
+   * Тест ловит класс бага, а не одну панель: берём из ОТДАВАЕМОЙ разметки
+   * все элементы с hidden, смотрим, у каких их классов есть свой display,
+   * и требуем, чтобы глобальное правило [hidden] перебивало их. Новый
+   * компонент с display: flex и hidden попадёт под ту же проверку сам. */
+  section('8.20. [hidden] перебивает компонентный display');
+
+  const cssNow = await (await fetch(`${BASE}/app/styles.css`)).text();
+  const htmlNow = await (await fetch(`${BASE}/app/`)).text();
+
+  const hiddenRule = cssNow.match(/(^|\n)\s*\[hidden\]\s*\{([^}]*)\}/);
+  ok('в CSS есть глобальное правило [hidden]', !!hiddenRule,
+    hiddenRule ? hiddenRule[2].trim() : 'правила нет');
+  ok('[hidden] задаёт display: none',
+    !!hiddenRule && /display\s*:\s*none/.test(hiddenRule[2]));
+  ok('[hidden] помечен !important — без него компонентный display сильнее',
+    !!hiddenRule && /!important/.test(hiddenRule[2]),
+    'авторский .panel { display: flex } победит браузерный [hidden]');
+
+  /* Какие классы реально рискуют: несут hidden в разметке И имеют свой
+   * display в CSS. Их список печатаем: если станет пусто, проверка выше
+   * потеряет смысл, и это будет видно в отчёте, а не молча. */
+  const hiddenTags = htmlNow.match(/<[a-z]+[^>]*\shidden[\s>][^>]*>/g) || [];
+  const riskClasses = new Set();
+  for (const tag of hiddenTags) {
+    const m = tag.match(/class="([^"]*)"/);
+    if (!m) continue;
+    for (const c of m[1].split(/\s+/).filter(Boolean)) {
+      const esc = c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (new RegExp(`\\.${esc}\\s*\\{[^}]*display\\s*:`).test(cssNow)) riskClasses.add(c);
+    }
+  }
+  ok('компоненты с hidden и своим display защищены глобальным правилом',
+    riskClasses.size === 0 || !!hiddenRule,
+    { hiddenElements: hiddenTags.length, withDisplay: [...riskClasses] });
+
+  /* Service worker: без смены CACHE фикс не дойдёт до уже установленных
+   * PWA — они отдадут старый CSS из кэша, и баг «переживёт» выкладку.
+   * Поэтому версия кэша — часть контракта, а не деталь реализации. */
+  const swNow = await (await fetch(`${BASE}/app/sw.js`)).text();
+  const cacheVer = (swNow.match(/const CACHE = '([^']+)'/) || [])[1];
+  ok('/app/sw.js отдаётся и содержит CACHE', !!cacheVer, cacheVer);
+  ok('версия кэша поднята выше tarnet-app-v3 (в v3 фикса [hidden] не было)',
+    !!cacheVer && cacheVer !== 'tarnet-app-v3',
+    { served: cacheVer, stale: 'tarnet-app-v3' });
+
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
   const summary = await api('/summary');
