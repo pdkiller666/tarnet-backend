@@ -1,8 +1,8 @@
 # 🌐 TARNET & SYNAPSE (SWARM-GRID CORE)
 # ЕДИНЫЙ ЭТАЛОННЫЙ СТАНДАРТ АРХИТЕКТУРЫ, ЭКОНОМИКИ И МАНИФЕСТ ПРОЕКТА
 **Версия:** 3.4-UNIFIED (Consensus Standard: Gemini + Qwen + OpenClaw)  
-**Дата:** 22 октября 2026 г. | **Схема живого стенда:** `2.1.0-dpouw`  
-**Ревизия:** 22.10.2026 — сверка с кодом (6 расхождений устранены, см. Приложение Б)  
+**Дата:** 22 октября 2026 г. (ревизия 24.10.2026) | **Схема живого стенда:** `2.10.0-knowledge-loop-schema`  
+**Ревизия:** 22.10.2026 — сверка с кодом (6 расхождений устранены, см. Приложение Б) · **24.10.2026** — полный аудит: 5 расхождений (3 занижали проект, 2 завышали), см. Приложение Б.6  
 **Основатель и Главный Архитектор:** Илья Тарасов  
 
 > ⚠️ **ДИРЕКТИВА ДЛЯ ВСЕХ ИИ-АГЕНТОВ (GEMINI, QWEN, OPENCLAW):** этот документ — **единственный канонический источник истины**. Он объединяет проверенный код Фазы 1 (`OpenClaw v3.3`), интерфейсы (`Qwen v2.4`) и физику роевого ИИ (`Gemini Swarm-Grid`).  
@@ -71,13 +71,13 @@
 
 ---
 
-## 4. ДЕЙСТВУЮЩЕЕ ЯДРО ФАЗЫ 1 (`2.1.0-dpouw`) — ЧТО РЕАЛЬНО РАБОТАЕТ В КОДЕ СЕГОДНЯ
+## 4. ДЕЙСТВУЮЩЕЕ ЯДРО ФАЗЫ 1 (`2.10.0-knowledge-loop-schema`) — ЧТО РЕАЛЬНО РАБОТАЕТ В КОДЕ СЕГОДНЯ
 
-Проверяется запросами к `localhost:3001` и прогоном `node test-dpouw.js --test` (**369 проверок, 0 провалов**, снимок 2026-10-23). Флаг `--test` поднимает изолированный сервер на временной БД (`mktemp`) с отдельным `TARNET_SECRETS_DIR` и свободным портом: приёмка не требует запущенного стенда и не затрагивает его БД. Адреса и `actionId` уникальны по суффиксу `RUN`, поэтому прогон воспроизводим.
+Проверяется запросами к `localhost:3001` и прогоном `node test-dpouw.js --test` (**514 проверок, 0 провалов**) и `node test-mesh.js` (**25 проверок, 0 провалов**), итого **539**, снимок 24.10.2026. Флаг `--test` поднимает изолированный сервер на временной БД (`mktemp`) с отдельным `TARNET_SECRETS_DIR` и свободным портом: приёмка не требует запущенного стенда и не затрагивает его БД. Адреса и `actionId` уникальны по суффиксу `RUN`, поэтому прогон воспроизводим.
 
 ### 4.1. Матрица живой функциональности
 
-| Компонент | Статус `2.1.0-dpouw` | Проверка |
+| Компонент | Статус `2.10.0-knowledge-loop-schema` | Проверка |
 | :--- | :--- | :--- |
 | Реестр узлов, стейк, репутация | ✅ работает | `GET /nodes`, `POST /node` |
 | Антимонопольный роутинг `√stake × reputation` | ✅ работает | `routingWeight` в `POST /inference` |
@@ -92,8 +92,8 @@
 | Батчинг коротких работ | ✅ порог генерации чека — `max(50, tokens_for_nonzero_payout(tier))`: `base` = 50, `nano` = 500, `expert` = 13. Работы ниже порога копятся в `pending_work` и объединяются в следующий чек | `POST /work` → `202 {queued, pending_work, threshold}`; чек несёт `batchedFrom[]` |
 | Идемпотентность `actionId` | ✅ работает: `POST /work` — ключ, а не подсказка. Повтор → `200 {duplicate:true, existing:'receipt'}` (тот же `seq`, без второго начисления); повтор короткой работы → `202 {reason:'already_pending'}`, накопление не удваивается; повтор работы из `batchedFrom` → тот чек, `batchedInto = seq`; тот же ключ на другого воркера → `409`; без `actionId` ключа нет — два одинаковых запроса дают две работы | `POST /work` → раздел 8.11 приёмки |
 | Soft delete адаптеров | ✅ `DELETE /adapter/:id` ставит `deleted_at`; физического удаления нет, история роялти цела, новые работы → 409 | `GET /adapters` → `deleted_at`; чек несёт `adapterDeletedAt` |
-| Реальный LLM-инференс | ✅ режим `worker` | `source: live_llm`, `provider: home_worker`, `model: qwen2.5-coder-7b` |
-| Onion Routing | ⏳ `[SPEC]`. Каталога `app/` нет. `archive/python-app/crypto.py` — `Wallet`, `generate_wallet()`, `sign_message()` на **SHA-256** (хеш-заглушка, **не Ed25519**); Ed25519 только в `ledger.js` | проверено 22.10.2026 |
+| Реальный LLM-инференс | ⚠️ **не активен**: `llm_mode: deterministic_fallback`, `active_workers: 0`. Механика режима `worker` (маршрут воркер → external_api → fallback) в коде есть, но ни один воркер не подключён | `GET /health` → `active_workers: 0`; `POST /inference` отдаёт «Модель не подключена». Реальный инференс — при подключённом воркере (Фаза 1, режим `worker`) |
+| Onion Routing | ✅ работает: `onion.js` (289 строк) — RSA-2048-OAEP-SHA256 шифрует 32-байтный ключ AES, нагрузка идёт AES-256-GCM; TTL слоя, защита от replay, шифрование обратного пути. `app/` — полная PWA (веб-манифест, service worker, 3 иконки). Остаётся: `archive/python-app/crypto.py` — `Wallet`, `generate_wallet()`, `sign_message()` на **SHA-256** (хеш-заглушка, **не Ed25519**) | `POST /inference/onion` → `delivered: true`, `hops: 3`; `test-mesh.js` → 25 ✅ |
 | Аппаратная проверка TEE Quote | ⏳ Фаза 2–3, в БД лишь флаг `isTeeAttested` | `nodes.isTeeAttested` |
 | Смарт-контракты L1/L2 и DAO | ⏳ `[SPEC]`, **0 файлов `.sol`**, письменной спеки нет | `/settlements` — синтетический `txHash` |
 
@@ -103,7 +103,7 @@
 
 1. **Единица полезной работы (CWU):**
    $$W_i = N_{\text{tokens}} \times \kappa_{\text{tier}} \times \gamma_{\text{verify}}, \qquad \gamma \in \{0, 1\}$$
-   Расширение ($0.25N_{\text{in}} + 1.0N_{\text{out}}$ и доменный $\delta_{\text{domain}}$) — RFC Фазы 2, в `2.1.0-dpouw` не применяется, чтобы не искажать инвариант эмиссии.
+   Расширение ($0.25N_{\text{in}} + 1.0N_{\text{out}}$ и доменный $\delta_{\text{domain}}$) — RFC Фазы 2, в `2.10.0-knowledge-loop-schema` не применяется, чтобы не искажать инвариант эмиссии.
 
 2. **Двухпоточная награда (`Dual-Stream`):**
    $$\text{Reward}_i = \text{Fee\_Reward}_i + \text{Block\_Reward}_i$$
@@ -130,14 +130,14 @@
 
 ### 5.1. Нативный безгазовый DAG-леджер (`PoUWReceipt`)
 
-**Статус: частично реализовано.** Подписанные Ed25519-чеки и связывание в цепочку работают (`ledger.js`). Хеш-цепочка `prevReceiptHash` / `receiptHash` — `[SPEC / ROADMAP]`, в коде отсутствует (grep по репозиторию → 0 совпадений).
+**Статус: реализовано.** Подписанные Ed25519-чеки и связывание в цепочку работают (`ledger.js`). Хеш-цепочка `prevReceiptHash` / `receiptHash` **реализована**: модуль `dag-chain.js`, колонки добавляются через `ensureColumn` и пишутся при выпуске чека (`server.js`), `cumulativeCwu` / `cumulativeTar` считаются независимо от накопленных итогов.
 
-Целостность в `2.1.0-dpouw` держится **не на хешах, а на предыдущей подписи**: `prevSignature` предыдущего чека воркера входит в подписываемый payload (`receiptPayload()`), плюс монотонный `seq` и `cumulativeTotal`. Это защищает от подмены истории, но **не** даёт DAG-ветвления и адресации по хешу.
+Целостность держится **на двух механизмах сразу**: `prevSignature` предыдущего чека воркера входит в подписываемый payload (`receiptPayload()`), а `prevReceiptHash` связывает чеки по хешу. Чеки, выпущенные после Волны 2, несут `payloadVersion: 2` — хеш-сцепка внутри подписи. **Остаточное ограничение, которое нельзя замалчивать:** исторические чеки на `payloadVersion: 1` проверяются только сравнением с хранимым `receiptHash`, их подписи не перевыпускаются (история append-only). DAG-ветвления (несколько родителей) по-прежнему нет — цепочка линейна.
 
 **Фактическая структура чека (по `ledger.js` → `decorate()`), проверено `GET /receipt/:worker`:**
 
 ```typescript
-interface PoUWReceipt {          // ФАКТ: schema 2.1.0-dpouw
+interface PoUWReceipt {          // ФАКТ: schema 2.10.0-knowledge-loop-schema
   seq: number;                   // глобальный монотонный счётчик
   workerId: string;              // дубль workerAddress для API
   workerAddress: string;
@@ -164,14 +164,15 @@ interface PoUWReceipt {          // ФАКТ: schema 2.1.0-dpouw
 }
 ```
 
-**Целевая структура Фазы 2 `[SPEC / ROADMAP]`** — хеш-адресация и недостающие поля учёта:
+**Хеш-поля реализованы, отсутствуют два поля учёта.** `prevReceiptHash` и `receiptHash` пишутся в БД и входят
+в подпись у чеков `payloadVersion: 2` (`dag-chain.js`). Чего в коде нет:
 
 ```typescript
-interface PoUWReceiptV2 {        // SPEC: не реализовано
-  prevReceiptHash: string;       // SHA-256 предыдущего чека — в коде нет
-  receiptHash: string;           // SHA-256 текущего чека — в коде нет
-  clientAddress?: string;        // не хранится в 2.1.0-dpouw
-  tokensGenerated: number;       // не хранится (только cwu)
+interface PoUWReceiptV2 {        // ЧАСТИЧНО: хеши есть, поля ниже — нет
+  prevReceiptHash: string;       // ✅ SHA-256 предыдущего чека (dag-chain.js)
+  receiptHash: string;           // ✅ SHA-256 текущего чека (dag-chain.js)
+  clientAddress?: string;        // ❌ не хранится — [SPEC / ROADMAP]
+  tokensGenerated: number;       // ❌ не хранится (только cwu) — [SPEC / ROADMAP]
 }
 ```
 ## ПРИЛОЖЕНИЕ Б. ЖУРНАЛ СВЕРКИ С КОДОМ (РЕВИЗИЯ 22.10.2026)
@@ -183,9 +184,9 @@ interface PoUWReceiptV2 {        // SPEC: не реализовано
 | № | Было | Стало | Доказательство |
 | :-- | :--- | :--- | :--- |
 | 1 | Tier 3: `κ = 10.0` (heavy), `$2.00/1M` | `κ = 4.0` (expert), `$0.80/1M`; heavy → `[SPEC]` | `TIER_WEIGHTS = {nano:0.1, base:1, expert:4}`; grep «heavy» → 0 |
-| 2 | Onion Routing «готов в Python (`app/crypto.py`)» | ⏳ `[SPEC / ROADMAP]` | каталога `app/` нет; `archive/python-app/crypto.py` — `Wallet`, `generate_wallet()`, `sign_message()` на SHA-256 |
+| 2 | Onion Routing «готов в Python (`app/crypto.py`)» | ⏳ `[SPEC / ROADMAP]` **на 22.10**; ⚠️ факт обновлён 24.10 — см. Б.6 (в Node `onion.js` реализован) | каталога `app/` нет **на 22.10**; `archive/python-app/crypto.py` — `Wallet`, `generate_wallet()`, `sign_message()` на SHA-256 |
 | 3 | Контракты «спецификация готова (Solidity)» | ⏳ `[SPEC / ROADMAP]` | `find -name '*.sol'` → **0 файлов** |
-| 4 | `prevReceiptHash` / `receiptHash` (DAG) | связь через `prevSignature`; хеш-поля → `[SPEC]` | `receiptPayload()` включает `prevSignature`; в `decorate()` хешей нет |
+| 4 | `prevReceiptHash` / `receiptHash` (DAG) | ✅ **закрыто 24.10:** `dag-chain.js` + `server.js` пишут хеш-поля | `receiptPayload()` включает `prevSignature`; `payloadVersion: 2` несёт хеш-сцепку внутри подписи |
 | 5 | 2× RTX 4090 «$330+/мес при `κ=5.0`» | **$236.39** при `κ=4.0`; при `κ=5.0` → `$295.49` (см. Б.2) | `240 × 0.5 × 86400 × 30 / 1e6 × $0.20 × κ × 0.95` |
 | 6 | Tier 6 «5% Orchestration Fee» как факт | `[SPEC]`, Tier 6 в коде нет | grep `tier6\|orchestration\|byok` → 0 |
 
@@ -203,18 +204,18 @@ interface PoUWReceiptV2 {        // SPEC: не реализовано
 
 ### Б.3. Сверка с живым стендом
 
-Замер `23.10.2026`, `localhost:3001` на боевом VPS (он же `https://v1107336.hosted-by-vdsina.com`), схема `2.1.0-dpouw`. Всё ниже — **снимок, а не константа**: в отчётах пересчитывать из `/summary`.
+Замер `24.10.2026 08:00 MSK`, `localhost:3001` на боевом VPS (он же `https://v1107336.hosted-by-vdsina.com`), схема `2.10.0-knowledge-loop-schema`. Всё ниже — **снимок, а не константа**: в отчётах пересчитывать из `/summary`.
 
-> **Сноска о среде замера.** `localhost:3001` — это стенд на VPS. Локальная dev-копия на машине агента слушает тот же порт, но у неё **другая база**: на момент замера там было `688` чеков и `37.925244 TAR` против боевых `693` и `43.519994`. Снимать цифры для документа с dev-копии нельзя — они уедут в отчёт как боевые.
+> **Сноска о среде замера.** `localhost:3001` — это стенд на VPS. Локальная dev-копия на машине агента слушает тот же порт, но у неё **другая база**: на момент замера там было `688` чеков и `37.925244 TAR` против боевых `702` и `50.237216`. Снимать цифры для документа с dev-копии нельзя — они уедут в отчёт как боевые.
 
 | Источник | Значение |
 | :--- | :--- |
 | `GET /config` | `tierWeights {nano:0.1, base:1, expert:4}` · `price {usdPer1MTokens:0.2, usdPerTar:20}` · `fee {protocol:0.05, burn:0.025, treasury:0.025, loraRoyalty:0.05}` · `decimals:6` · `minReceiptTokens:50` |
-| `GET /health` | `conservation {gross:43.89602, distributed:43.89602, delta:0, holds:true, inconsistentRows:0}` · эпоха `367` |
-| `GET /summary` | чеков `693` · воркеров `72` · CWU `725 192 968` · выплачено `43.519994 TAR` |
-| `GET /summary` | Fee `6.875905` (**15.8%**) · Block `36.644089` (**84.2%**) · сожжено `0.181363` · казна `0.181363` · settlements `17` |
+| `GET /health` | `conservation {gross:50.615242, distributed:50.615242, delta:0, holds:true, inconsistentRows:0}` · эпоха `368` · `buildVersion 2.10.0-knowledge-loop-schema` · `active_workers: 0`, `llm_mode: deterministic_fallback` |
+| `GET /summary` | чеков `702` · воркеров `77` · CWU `729 193 477` · выплачено `50.237216 TAR` |
+| `GET /summary` | Fee `6.913912` (**13.8%**) · Block `43.323304` (**86.2%**) · сожжено `0.182363` · казна `0.182363` · settlements `17` |
 | `GET /adapters` | 3 фикстуры (`code` / `math` / `medical`), `totalLoraRoyaltyTar: 0.0133` |
-| Автотесты | `node test-dpouw.js --test` → **369 ✅ / 0 ❌** · `node test-mesh.js` → **25 ✅ / 0 ❌** (снимок 2026-10-23) |
+| Автотесты | `node test-dpouw.js --test` → **514 ✅ / 0 ❌** · `node test-mesh.js` → **25 ✅ / 0 ❌** — итого **539** (снимок 2026-10-24) |
 
 Доля эмиссии — не константа: `totalBlockRewardTar / totalRewardTar` из `/summary` в момент публикации (для доли оплаты — `totalFeeRewardTar / totalRewardTar`).
 
@@ -230,3 +231,26 @@ interface PoUWReceiptV2 {        // SPEC: не реализовано
 - **2026-10-22** — аудит OpenClaw: 6 расхождений закрыто (см. Б.1). `crypto.py` подписывает SHA-256, а не Ed25519; тир `heavy` вынесен в Фазу 3, `κ = 10.0` в код не добавлен.
 - **2026-10-22 (actionId)** — 89/89 тестов. Исправлено расхождение кода и API: `POST /work` принимал `actionId`, но не передавал его в `recordWork()`, поэтому ключ терялся и клиент не мог получить ни дубликат-защиты, ни повтора. Теперь `actionId` доходит до ядра и работает как ключ идемпотентности (см. §4.1); поиск идёт по трём местам — `work_receipts.actionId`, `work_receipts.batchedFrom`, `pending_work.actions` — иначе повтор уже слитой короткой работы выпустил бы второй чек. `POST /inference` и `POST /batch-test` не менялись: первый ключа не принимает, второй передаёт свой. Живой стенд: `conservation delta 0`.
 - **2026-10-22 (batching)** — 69/69 тестов. Батчинг коротких работ: `MIN_RECEIPT_TOKENS = 50`, `pending_work`, `batchedFrom`; порог per-tier `base = 50`, `nano = 500`, `expert = 13`. 3 фикстуры адаптеров с доменами. Удалено 2 тестовых адаптера; 6 чеков ссылаются на них — исторически корректно, роялти выплачены, инвариант сохранён. Введён soft delete (`deleted_at`, `DELETE /adapter/:id`, снимок `adapterDeletedAt` в чеке); физическое удаление запрещено. Приёмка `--test` изолирована: чистая БД, рабочая не затрагивается.
+
+### Б.6. Аудит 24.10.2026 — расхождения, найденные после ревизии 22.10
+
+Ревизия 22.10 искала только завышения. Полный аудит 24.10 нашёл расхождения **в обе стороны**: три места
+**занижали** проект (функция работала, а документ объявлял её отсутствующей), два — **завышали**.
+
+| # | Что утверждал документ | Факт кода на 24.10 | Направление |
+| :--- | :--- | :--- | :--- |
+| 1 | Onion Routing — `[SPEC]`, «каталога `app/` нет» | `onion.js` 289 строк, RSA-OAEP + AES-256-GCM, 3 хопа; `app/` — полная PWA | 📉 занижал |
+| 2 | `prevReceiptHash` / `receiptHash` «в коде отсутствует (grep → 0)» | `dag-chain.js` есть, колонки пишутся, чек `#696` несёт реальные хеши при `payloadVersion: 2` | 📉 занижал |
+| 3 | Схема стенда `2.1.0-dpouw`, 369 проверок | `2.10.0-knowledge-loop-schema`, 539 проверок (514 + 25) | 📉 занижал |
+| 4 | Реальный LLM-инференс ✅ `source: live_llm` | `llm_mode: deterministic_fallback`, `active_workers: 0` | 📈 завышал |
+| 5 | Tier 5 / Tier 6 как часть архитектуры | в коде отсутствуют, `grep tier6\|orchestration\|byok` → 0 | 📈 завышал |
+
+**Следствие для позиционирования.** Проект — не «работающая сеть роевого ИИ», а **работающий протокол,
+ожидающий сети исполнителей**. Ядро экономики и криптографии проверяемо; распределённого инференса нет.
+Формулировка «мы не можем прочитать ваш промпт» остаётся запрещённой (см. §3.1).
+
+**Что осталось незакрытым в коде, а не в документе:** `active_workers: 0`; P2P только на `localhost`
+(3 узла на одной машине, `framesIn: 0`); комитет валидаторов — 0 членов при `REQUIRED_COMMITTEE_SIZE = 5`
+и `VALIDATOR_STAKE_LOCK_TAR = 10` (нужно 50 TAR стейка); 86.2% награды — эмиссия при 13.8% fee;
+0 файлов `.sol`; GPU-обучения нет (`pending_gpu`).
+
