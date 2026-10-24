@@ -204,16 +204,18 @@ interface PoUWReceiptV2 {        // ЧАСТИЧНО: хеши есть, пол�
 
 ### Б.3. Сверка с живым стендом
 
-Замер `24.10.2026 08:00 MSK`, `localhost:3001` на боевом VPS (он же `https://v1107336.hosted-by-vdsina.com`), сборка `2.12.0-tier6-byok` (схема `2.1.0-dpouw`). Всё ниже — **снимок, а не константа**: в отчётах пересчитывать из `/summary`.
+Замер `24.10.2026 20:45 MSK`, `localhost:3001` на боевом VPS (он же `https://v1107336.hosted-by-vdsina.com`), сборка `2.12.0-tier6-byok` (commit `3ff5034`, схема `2.1.0-dpouw`). Всё ниже — **снимок, а не константа**: в отчётах пересчитывать из `/summary`.
 
-> **Сноска о среде замера.** `localhost:3001` — это стенд на VPS. Локальная dev-копия на машине агента слушает тот же порт, но у неё **другая база**: на момент замера там было `688` чеков и `37.925244 TAR` против боевых `702` и `50.237216`. Снимать цифры для документа с dev-копии нельзя — они уедут в отчёт как боевые.
+> **Сноска о среде замера.** `localhost:3001` — это стенд на VPS. Локальная dev-копия на машине агента слушает тот же порт, но у неё **другая база**: при сверке 24.10 утром там было `688` чеков и `37.925244 TAR` против боевых `702` и `50.237216`. Снимать цифры для документа с dev-копии нельзя — они уедут в отчёт как боевые.
 
 | Источник | Значение |
 | :--- | :--- |
 | `GET /config` | `tierWeights {nano:0.1, base:1, expert:4}` · `price {usdPer1MTokens:0.2, usdPerTar:20}` · `fee {protocol:0.05, burn:0.025, treasury:0.025, loraRoyalty:0.05}` · `decimals:6` · `minReceiptTokens:50` |
-| `GET /health` | `conservation {gross:50.615242, distributed:50.615242, delta:0, holds:true, inconsistentRows:0}` · эпоха `368` · `buildVersion 2.12.0-tier6-byok` · `active_workers: 0`, `llm_mode: deterministic_fallback` |
-| `GET /summary` | чеков `702` · воркеров `77` · CWU `729 193 477` · выплачено `50.237216 TAR` |
-| `GET /summary` | Fee `6.913912` (**13.8%**) · Block `43.323304` (**86.2%**) · сожжено `0.182363` · казна `0.182363` · settlements `17` |
+| `GET /health` | `conservation {gross:56.929946, distributed:56.929946, delta:0, holds:true, inconsistentRows:0}` · эпоха `368` · `buildVersion 2.12.0-tier6-byok` · `active_workers: 0`, `llm_mode: deterministic_fallback` |
+| `GET /health` | `conservationTier6 {calls:0, gross:0, distributed:0, delta:0, holds:true, fundedByClient:0, fundedByEmission:0}` |
+| `GET /summary` | чеков `705` · воркеров `78` · CWU `739 193 616` · выплачено `56.546920 TAR` |
+| `GET /summary` | Fee `7.008914` (**12.4%**) · Block `49.538006` (**87.6%**) · сожжено `0.184863` · казна `0.184863` · settlements `17` |
+| `GET /p2p/status` | 3 узла, у каждого блок `stats` (`framesIn/framesOut/requests/responses/dropped/replays`) |
 | `GET /adapters` | 3 фикстуры (`code` / `math` / `medical`), `totalLoraRoyaltyTar: 0.0133` |
 | Автотесты | `node test-dpouw.js --test` → **624 ✅ / 0 ❌** · `node test-mesh.js` → **25 ✅ / 0 ❌** — итого **649** (снимок 2026-10-24) |
 
