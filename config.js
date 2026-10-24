@@ -38,6 +38,9 @@ const TIER6 = {
   ORCHESTRATION_FEE_TAR: 0.0005,
   CASHBACK_TAR: 0.0001,
   TIMEOUT_MS: 30000,
+  /* Срок жизни резерва комиссии. Пять минут — из спеки; env нужен
+   * тестам: проверять реальные 5 минут в приёмке невозможно. */
+  RESERVE_TTL_MS: Number(process.env.TIER6_RESERVE_TTL_MS || 300000),
   /* Доля комиссии, уходящая в кэшбэк. Выводится, а не задаётся вторым
    * числом: два независимых литерала разъехались бы при первой правке. */
   get cashbackRate() { return this.CASHBACK_TAR / this.ORCHESTRATION_FEE_TAR; },

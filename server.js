@@ -431,6 +431,34 @@ db.exec(`CREATE TABLE IF NOT EXISTS tier6_calls (
   createdAt TEXT
 )`);
 
+/* ===== Tier 6: защита от double-spend и резерв с TTL =====
+ * `tier6_receipts` — журнал погашенных чеков. PK на receiptId, а не
+ * UNIQUE-индекс: повторная вставка обязана падать, а не тихо игнорироваться.
+ *
+ * ОТСТУПЛЕНИЕ ОТ СПЕКИ GEMINI: там `userId … REFERENCES tar_id(userId)`.
+ * В этом коде у `tar_id` первичный ключ — `address`, колонки `userId` нет
+ * вовсе. Ссылка на несуществующую колонку не создалась бы ни на одной
+ * базе, поэтому здесь `clientAddress`, а FK не ставим: чек может прийти
+ * от кошелька, который ещё не зарегистрировал TarNet ID, и отшивать его
+ * из-за отсутствия строки в реестре — значит терять уже оплаченный вызов. */
+db.exec(`CREATE TABLE IF NOT EXISTS tier6_receipts (
+  receiptId TEXT PRIMARY KEY,
+  clientAddress TEXT NOT NULL,
+  usedAt TEXT NOT NULL
+)`);
+
+/* Журнал резервов: деньги, уже обещанные под вызов, но ещё не списанные.
+ * `balances.reservedTar` показывает СУММУ, а тут лежит срок жизни каждой
+ * брони — без него TTL нечем проверить. */
+db.exec(`CREATE TABLE IF NOT EXISTS tier6_reserves (
+  receiptId TEXT PRIMARY KEY,
+  clientAddress TEXT NOT NULL,
+  amountTar REAL NOT NULL CHECK (amountTar >= 0),
+  state TEXT NOT NULL DEFAULT 'held' CHECK (state IN ('held','settled','released')),
+  createdAt TEXT NOT NULL,
+  expiresAt INTEGER NOT NULL
+)`);
+
 /* ===== Миграция очереди воркера на шифрование промптов =====
  * Старая схема лежала с колонкой prompt NOT NULL: переименованием колонки
  * её не убрать, поэтому таблица пересобирается один раз. Сначала из всех
@@ -1367,6 +1395,93 @@ function debit(address, amount, kind, actionId, toAddress) {
     [txHash, actionId, kind, address, toAddress || TREASURY_ADDRESS, amt],
   );
   return { charged: true, txHash, amountTar: amt, balanceTar: round(have - amt) };
+}
+
+/* ===== Tier 6: резерв комиссии с TTL и гашение чеков =====
+ *
+ * Зачем резерв вообще: проверка «хватает ли баланса» и фактическое списание
+ * разнесены во времени (между ними сетевой вызов провайдера). Без брони два
+ * параллельных запроса с одним балансом прошли бы оба, и второй ушёл бы в
+ * минус или в «эмиссию». `balances.reservedTar` уже существовал как мёртвое
+ * поле — здесь он начинает работать.
+ */
+
+/* Снимает брони с истёкшим сроком. Вызывается на входе в Tier 6, а не по
+ * таймеру: отдельный интервал в процессе — это ещё один ресурс, который
+ * после падения сервера некому закрыть, а проверка на входе всегда актуальна
+ * и ничего не стоит (индекс по state). */
+function sweepExpiredTier6Reserves(now = Date.now()) {
+  const expired = all(
+    `SELECT receiptId, clientAddress, amountTar FROM tier6_reserves
+      WHERE state = 'held' AND expiresAt <= ?`, [now],
+  );
+  if (!expired.length) return 0;
+  tx(() => {
+    for (const r of expired) {
+      run(`UPDATE tier6_reserves SET state = 'released' WHERE receiptId = ?`, [r.receiptId]);
+      run(`UPDATE balances SET reservedTar = MAX(0, reservedTar - ?), updatedAt = ?
+            WHERE address = ?`, [r.amountTar, new Date().toISOString(), r.clientAddress]);
+    }
+  });
+  return expired.length;
+}
+
+/* Бронь комиссии. Свободный остаток — balanceTar − reservedTar: считать от
+ * одного balanceTar значило бы разрешать тратить уже обещанное. */
+function reserveTier6Fee(receiptId, clientAddress, amountTar, ttlMs) {
+  const amount = round(amountTar);
+  if (!clientAddress || !(amount > 0)) return { ok: false, reason: 'no_client' };
+  const row = get('SELECT balanceTar, reservedTar FROM balances WHERE address = ?', [clientAddress]);
+  const have = Number(row?.balanceTar ?? 0);
+  const held = Number(row?.reservedTar ?? 0);
+  const free = round(have - held);
+  if (free < amount) {
+    return { ok: false, reason: 'insufficient_balance', availableTar: free, neededTar: amount };
+  }
+  const now = Date.now();
+  const expiresAt = now + Number(ttlMs ?? TIER6.RESERVE_TTL_MS);
+  try {
+    tx(() => {
+      run(`INSERT INTO tier6_reserves (receiptId, clientAddress, amountTar, state, createdAt, expiresAt)
+           VALUES (?, ?, ?, 'held', ?, ?)`,
+        [receiptId, clientAddress, amount, new Date(now).toISOString(), expiresAt]);
+      run(`INSERT INTO balances (address, balanceTar, stakedTar, reservedTar, updatedAt)
+           VALUES (?, 0, 0, ?, ?)
+           ON CONFLICT(address) DO UPDATE SET reservedTar = reservedTar + excluded.reservedTar`,
+        [clientAddress, amount, new Date(now).toISOString()]);
+    });
+  } catch (_e) {
+    /* PK по receiptId: та же бронь дважды — не ошибка вызывающего, но и не
+     * повод списать дважды. Пусть решает вызывающий код. */
+    return { ok: false, reason: 'duplicate_receipt' };
+  }
+  return { ok: true, amountTar: amount, expiresAt };
+}
+
+/* Успех: бронь превращается в расход. Сначала снимаем reservedTar, потом
+ * debit — иначе debit увидит деньги, но они всё ещё обещаны. */
+function settleTier6Reserve(receiptId) {
+  const r = get(`SELECT clientAddress, amountTar FROM tier6_reserves
+                  WHERE receiptId = ? AND state = 'held'`, [receiptId]);
+  if (!r) return { ok: false, reason: 'reserve_not_held' };
+  run(`UPDATE tier6_reserves SET state = 'settled' WHERE receiptId = ?`, [receiptId]);
+  run(`UPDATE balances SET reservedTar = MAX(0, reservedTar - ?), updatedAt = ?
+        WHERE address = ?`, [r.amountTar, new Date().toISOString(), r.clientAddress]);
+  return { ok: true, amountTar: Number(r.amountTar) };
+}
+
+/* Неудача или TTL: деньги возвращаются в свободный остаток. Повторный
+ * вызов безопасен — state проверяется, поэтому списать бронь дважды нельзя. */
+function releaseTier6Reserve(receiptId, reason) {
+  const r = get(`SELECT clientAddress, amountTar FROM tier6_reserves
+                  WHERE receiptId = ? AND state = 'held'`, [receiptId]);
+  if (!r) return { ok: false, reason: 'reserve_not_held', why: reason };
+  tx(() => {
+    run(`UPDATE tier6_reserves SET state = 'released' WHERE receiptId = ?`, [receiptId]);
+    run(`UPDATE balances SET reservedTar = MAX(0, reservedTar - ?), updatedAt = ?
+          WHERE address = ?`, [r.amountTar, new Date().toISOString(), r.clientAddress]);
+  });
+  return { ok: true, amountTar: Number(r.amountTar), why: reason };
 }
 
 /* Вес маршрутизации: √stake × reputation — анти-монополистический. */
@@ -4454,6 +4569,51 @@ async function runInference(req, res) {
         });
       }
 
+      /* ===== Резерв комиссии до сетевого вызова =====
+       * Клиент обязателен: комиссию платит он, а не протокол. Раньше без
+       * баланса вызов помечался funded_by: emission — credit() без debit(),
+       * то есть печать денег на каждом запросе. Теперь нет денег — нет
+       * вызова, и «эмиссии» в Tier 6 не существует как класса. */
+      if (!tier6Client) {
+        return res.status(402).json({
+          error: 'CLIENT_REQUIRED',
+          note: 'Tier 6 списывает комиссию с баланса клиента: передайте clientAddress.',
+          modelId, tier: 6,
+        });
+      }
+      sweepExpiredTier6Reserves();
+
+      /* Идемпотентность: ключ даёт клиент. Сервер не отличает ретрай от
+       * нового намерения, если о ретрае не сказали, — поэтому без ключа
+       * чеком становится свежий UUID, и защита от double-spend просто не
+       * включается (списать дважды по одному запросу нечего). */
+      const idemKey = String(body.clientRequestId || req.get('x-request-id') || '').trim();
+      const receiptId = idemKey || crypto.randomUUID();
+      const prevUse = get('SELECT clientAddress FROM tier6_receipts WHERE receiptId = ?', [receiptId]);
+      if (prevUse) {
+        const sameClient = String(prevUse.clientAddress) === String(tier6Client);
+        return res.status(sameClient ? 400 : 403).json({
+          error: sameClient ? 'RECEIPT_ALREADY_USED' : 'RECEIPT_FOREIGN',
+          note: sameClient
+            ? 'Этот чек уже погашен: повтор не спишет комиссию второй раз.'
+            : 'Чек принадлежит другому клиенту.',
+          receipt_id: receiptId, tier: 6,
+        });
+      }
+      const reserve = reserveTier6Fee(receiptId, tier6Client, TIER6.ORCHESTRATION_FEE_TAR);
+      if (!reserve.ok) {
+        return res.status(402).json({
+          error: reserve.reason === 'insufficient_balance' ? 'INSUFFICIENT_FUNDS' : 'RESERVE_FAILED',
+          note: 'Недостаточно свободного баланса для комиссии Tier 6.',
+          needed_tar: reserve.neededTar,
+          available_tar: reserve.availableTar,
+          modelId, tier: 6,
+        });
+      }
+      /* Любой выход ниже без списания обязан снять бронь, иначе деньги
+       * висят до TTL и клиент видит занятый баланс без причины. */
+      const dropReserve = (why) => releaseTier6Reserve(receiptId, why);
+
       const provider = LLM.providerForModel(modelId) || modelRow.provider;
 
       /* Fallback-цепочка. ЧЕСТНО О ЕЁ ГРАНИЦАХ: с BYOK-ключом одного
@@ -4473,6 +4633,7 @@ async function runInference(req, res) {
         /* Ключ плох — это ошибка клиента, а не повод молча считать локально:
          * он просил именно внешнюю модель. Возвращаем без списаний. */
         if (e.code === 'PROVIDER_AUTH_FAILED' || e.code === 'AUTH_MISSING_KEY') {
+          dropReserve('provider_auth_failed');
           return res.status(401).json({
             error: e.code,
             note: 'Проверьте ваш API-ключ провайдера',
@@ -4482,6 +4643,7 @@ async function runInference(req, res) {
           });
         }
         if (e.code === 'PROVIDER_RATE_LIMIT') {
+          dropReserve('provider_rate_limit');
           return res.status(429).json({
             error: 'PROVIDER_RATE_LIMIT',
             note: 'Лимит провайдера исчерпан. Повторите позже или используйте локальную модель.',
@@ -4493,6 +4655,7 @@ async function runInference(req, res) {
          * выполнена локально. Уходим в воркер, если он есть. */
         if (e.code !== 'PROVIDER_TIMEOUT' && e.code !== 'PROVIDER_NETWORK' &&
             e.code !== 'PROVIDER_HTTP_ERROR' && e.code !== 'PROVIDER_EMPTY') {
+          dropReserve('provider_error');
           return res.status(Number(e.status) || 502).json({
             error: e.code || 'PROVIDER_ERROR', note: e.message, provider, modelId, tier: 6,
           });
@@ -4503,6 +4666,7 @@ async function runInference(req, res) {
         /* Облако не ответило — пробуем локальный узел. Это не "тихий"
          * фолбэк: source будет worker, и клиент увидит, что модель была не
          * та, что он просил. */
+        dropReserve('provider_unavailable');
         const localPick = pickWorker('base');
         if (!localPick) {
           return res.status(503).json({
@@ -4522,20 +4686,37 @@ async function runInference(req, res) {
         /* ===== Успех: экономика Tier 6 =====
          * Комиссия 0.0005 делится на burn, treasury и кэшбэк так, чтобы
          * сумма равнялась ровно ей (см. config.js, TIER6).
-         * Если у клиента есть баланс — списываем с него (delta держится
-         * честно). Нет баланса — помечаем funded_by: emission, а не делаем
-         * вид, что деньги пришли от клиента. */
+         * `funded_by` больше не бывает 'emission': деньги обязаны прийти от
+         * клиента, иначе вызов не состоялся (402 выше). */
         const fee = round(TIER6.ORCHESTRATION_FEE_TAR);
         const cashback = round(TIER6.CASHBACK_TAR);
         const rest = round(fee - cashback);
         const burnTar = round(rest / 2);
         const treasuryTar = round(rest - burnTar);
+        const callId = receiptId;
 
-        const callId = crypto.randomUUID();
-        const funding = tier6Client
-          ? debit(tier6Client, fee, 'spend', callId, TREASURY_ADDRESS)
-          : { charged: false, reason: 'no_client' };
-        const fundedBy = funding.charged ? 'client' : 'emission';
+        /* Гашение брони, списание и отметка чека — одной транзакцией: либо
+         * все три факта, либо ни одного. Иначе чек может оказаться
+         * погашенным без списания (кэшбэк бесплатно) или наоборот. */
+        try {
+          tx(() => {
+            const settled = settleTier6Reserve(callId);
+            if (!settled.ok) throw new Error('RESERVE_NOT_HELD');
+            const funding = debit(tier6Client, fee, 'spend', callId, TREASURY_ADDRESS);
+            if (!funding.charged) throw new Error('INSUFFICIENT_FUNDS_AT_SETTLE');
+            run(`INSERT INTO tier6_receipts (receiptId, clientAddress, usedAt) VALUES (?, ?, ?)`,
+              [callId, tier6Client, new Date().toISOString()]);
+          });
+        } catch (e) {
+          dropReserve('settle_failed');
+          return res.status(409).json({
+            error: 'RESERVE_NOT_SETTLEABLE',
+            note: 'Резерв не удалось погасить — комиссия не списана, повтор безопасен.',
+            detail: e.message,
+            modelId, tier: 6,
+          });
+        }
+        const fundedBy = 'client';
 
         /* training_allowed — тремя условиями одновременно: модель разрешает
          * обучение, пользователь дал согласие, PII не найден. Любое

@@ -3920,12 +3920,30 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     const provPort = await freePort();
     let provHits = 0;
     let seenAuth = null;
+    /* Режим ответа переключается между кейсами: отказы провайдера иначе не
+     * воспроизвести без реальной сети. 'ok' — штатный ответ. */
+    let provMode = 'ok';
     const fakeProvider = http.createServer((req, res) => {
       provHits += 1;
       seenAuth = req.headers.authorization || null;
       let raw = '';
       req.on('data', (d) => { raw += d; });
       req.on('end', () => {
+        if (provMode === 'auth401') {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'invalid api key' } }));
+          return;
+        }
+        if (provMode === 'rate429') {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'rate limited' } }));
+          return;
+        }
+        if (provMode === 'netdown') {
+          /* Сокет рвётся без ответа — тот же путь, что у реального таймаута; */
+          req.socket.destroy();
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           model: 'qwen3-coder',
@@ -3949,67 +3967,172 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     ok('29.13 не-loopback подмена адреса провайдера запрещена',
       badOverride?.code === 'BAD_ENDPOINT_OVERRIDE', { code: badOverride?.code });
 
+    const { DatabaseSync } = require('node:sqlite');
+    /* Пополнение баланса в тестах идёт прямой записью в БД: публичного
+     * эндпоинта пополнения в API нет и не должно быть в приёмке — иначе
+     * тест доказывал бы работу обходного пути, которого нет у клиента. */
+    const seedBalance = (dbDir, address, tar) => {
+      const sdb = new DatabaseSync(path.join(dbDir, 'test.db'));
+      sdb.exec('PRAGMA busy_timeout = 3000;');
+      sdb.prepare(`INSERT INTO balances (address, balanceTar, stakedTar, reservedTar, updatedAt)
+                   VALUES (?, ?, 0, 0, ?)
+                   ON CONFLICT(address) DO UPDATE
+                     SET balanceTar = balances.balanceTar + excluded.balanceTar`)
+        .run(address, tar, new Date().toISOString());
+      sdb.close();
+    };
+    const readMoney = (dbDir, address) => {
+      const sdb = new DatabaseSync(path.join(dbDir, 'test.db'));
+      sdb.exec('PRAGMA busy_timeout = 3000;');
+      const row = sdb.prepare('SELECT balanceTar, reservedTar FROM balances WHERE address = ?').get(address);
+      sdb.close();
+      return { balanceTar: Number(row?.balanceTar ?? 0), reservedTar: Number(row?.reservedTar ?? 0) };
+    };
+
+    /* Режим фейкового провайдера переключается между кейсами: один сервер
+     * вместо четырёх, и все отказы воспроизводятся без выхода в сеть. */
+
     const t6 = await spawnServer({
       TARNET_TIER6_ENDPOINT: `http://127.0.0.1:${provPort}/v1/chat/completions`,
     });
     try {
       const t6client = '0x' + ('t6c' + RUN).padEnd(40, '0');
+      const t6other = '0x' + ('t6d' + RUN).padEnd(40, '0');
       const before = (await apiAt(t6.base, '/health')).body?.conservationTier6;
+      const callT6 = (addr, extra = {}, headers = {}) => apiAt(t6.base, '/inference', 'POST', {
+        prompt: 'тест Tier 6',
+        modelId: 'openrouter/qwen3-coder',
+        clientAddress: addr,
+        tier: 6,
+        ...extra,
+      }, { 'X-Provider-Key': 'sk-test-key', ...headers });
 
-      /* Шесть вызовов, а не один: кэшбэк 0.0001 за вызов копится в баланс,
-       * и только с пятого накопленного вызова клиент способен оплатить
-       * комиссию 0.0005. Так проверяются ОБЕ ветки — emission и client —
-       * без единого обходного эндпоинта пополнения, которого в API нет. */
-      const calls = [];
-      for (let i = 0; i < 6; i += 1) {
-        calls.push(await apiAt(t6.base, '/inference', 'POST', {
-          prompt: `тест кэшбэка номер ${i}`,
-          modelId: 'openrouter/qwen3-coder',
-          clientAddress: t6client,
-          tier: 6,
-        }, { 'X-Provider-Key': 'sk-test-key' }));
-      }
-      const last = calls[calls.length - 1];
+      /* --- Кейс 1: без клиента вызова нет ---------------------------
+       * Раньше такой запрос проходил и печатал комиссию (funded_by:
+       * emission). Теперь 402 до сети: комиссию платит клиент. */
+      const noClient = await apiAt(t6.base, '/inference', 'POST', {
+        prompt: 'без клиента', modelId: 'openrouter/qwen3-coder', tier: 6,
+      }, { 'X-Provider-Key': 'sk-test-key' });
+      ok('29.13 без clientAddress → 402 CLIENT_REQUIRED',
+        noClient.status === 402 && noClient.body?.error === 'CLIENT_REQUIRED',
+        { status: noClient.status, error: noClient.body?.error });
 
+      /* --- Кейс 2: пустой баланс → отказ, провайдер не тронут ------- */
+      const hitsBeforePoor = provHits;
+      const poor = await callT6('0x' + ('t6p' + RUN).padEnd(40, '0'));
+      ok('29.13 пустой баланс → 402 INSUFFICIENT_FUNDS',
+        poor.status === 402 && poor.body?.error === 'INSUFFICIENT_FUNDS',
+        { status: poor.status, error: poor.body?.error });
+      ok('29.13 при отказе по балансу провайдер не вызывался',
+        provHits === hitsBeforePoor, { before: hitsBeforePoor, after: provHits });
+
+      /* --- Кейс 3: успешный цикл с реальным балансом ---------------- */
+      seedBalance(t6.dir, t6client, 0.01);
+      const okCall = await callT6(t6client);
       ok('29.13 провайдер ответил → 200 external_api',
-        last.status === 200 && last.body?.source === 'external_api',
-        { status: last.status, source: last.body?.source, err: last.body?.error });
+        okCall.status === 200 && okCall.body?.source === 'external_api',
+        { status: okCall.status, source: okCall.body?.source, err: okCall.body?.error });
       ok('29.13 ответ провайдера дошёл до клиента',
-        last.body?.response === 'ответ фейкового провайдера', last.body?.response);
+        okCall.body?.response === 'ответ фейкового провайдера', okCall.body?.response);
       ok('29.13 ключ ушёл провайдеру в Authorization: Bearer',
         seenAuth === 'Bearer sk-test-key', seenAuth ? 'present' : 'missing');
-      ok('29.13 провайдер получил ровно 6 запросов', provHits === 6, provHits);
+      ok('29.13 funded_by всегда client — emission больше не существует',
+        okCall.body?.funded_by === 'client', okCall.body?.funded_by);
       ok('29.13 кэшбэк в ответе равен 0.0001 TAR',
-        Math.abs(Number(last.body?.cashback_tar) - 0.0001) < 1e-12, last.body?.cashback_tar);
+        Math.abs(Number(okCall.body?.cashback_tar) - 0.0001) < 1e-12, okCall.body?.cashback_tar);
       ok('29.13 delta одного вызова = 0',
-        Number(last.body?.economics?.delta) === 0, last.body?.economics?.delta);
+        Number(okCall.body?.economics?.delta) === 0, okCall.body?.economics?.delta);
+      ok('29.13 burn + treasury = 0.0004 TAR',
+        Math.abs(Number(okCall.body?.economics?.burn_tar) + Number(okCall.body?.economics?.treasury_tar) - 0.0004) < 1e-12,
+        { burn: okCall.body?.economics?.burn_tar, treasury: okCall.body?.economics?.treasury_tar });
       ok('29.13 usage взят от провайдера, а не оценён',
-        last.body?.tokens_used === 33 && last.body?.tokens_source === 'provider',
-        { tokens: last.body?.tokens_used, source: last.body?.tokens_source });
+        okCall.body?.tokens_used === 33 && okCall.body?.tokens_source === 'provider',
+        { tokens: okCall.body?.tokens_used, source: okCall.body?.tokens_source });
 
-      /* Деньги в БД, а не только в ответе: кэшбэк обязан быть зачислен. */
-      const bal = await apiAt(t6.base, `/balance/${t6client}`);
-      ok('29.13 кэшбэк реально зачислен на баланс клиента',
-        Math.abs(Number(bal.body?.balanceTar) - 0.0001) < 1e-9, bal.body?.balanceTar);
-      ok('29.13 вызов без баланса помечен funded_by: emission',
-        calls[0].body?.funded_by === 'emission', calls[0].body?.funded_by);
-      ok('29.13 накопленный кэшбэк оплатил комиссию → funded_by: client',
-        last.body?.funded_by === 'client', last.body?.funded_by);
+      /* Деньги в БД: комиссия списана, кэшбэк зачислен, резерв пуст.
+       * Нетто-изменение = −0.0005 + 0.0001 = −0.0004. */
+      const moneyAfter = readMoney(t6.dir, t6client);
+      ok('29.13 с клиента списано ровно 0.0004 TAR нетто',
+        Math.abs((0.01 - moneyAfter.balanceTar) - 0.0004) < 1e-9, moneyAfter.balanceTar);
+      ok('29.13 резерв после успеха освобождён',
+        moneyAfter.reservedTar === 0, moneyAfter.reservedTar);
+
+      /* --- Кейс 4: double-spend по одному чеку --------------------- */
+      const seqId = 'idem-' + RUN;
+      const hitsBeforeDup = provHits;
+      const first = await callT6(t6client, { clientRequestId: seqId });
+      const dup = await callT6(t6client, { clientRequestId: seqId });
+      ok('29.13 первый чек с clientRequestId → 200', first.status === 200, first.status);
+      ok('29.13 повторный чек → 400 RECEIPT_ALREADY_USED',
+        dup.status === 400 && dup.body?.error === 'RECEIPT_ALREADY_USED',
+        { status: dup.status, error: dup.body?.error });
+      ok('29.13 повтор не дошёл до провайдера (списания не было)',
+        provHits - hitsBeforeDup === 1, { hits: provHits - hitsBeforeDup });
+
+      /* --- Кейс 5: чужой чек -------------------------------------- */
+      seedBalance(t6.dir, t6other, 0.01);
+      const foreign = await callT6(t6other, { clientRequestId: seqId });
+      ok('29.13 чужой чек → 403 RECEIPT_FOREIGN',
+        foreign.status === 403 && foreign.body?.error === 'RECEIPT_FOREIGN',
+        { status: foreign.status, error: foreign.body?.error });
+
+      /* --- Кейс 6: заявленные клиентом токены не влияют на кэшбэк -- */
+      const fakeTokens = await callT6(t6client, { tokens: 999999, maxTokens: 999999 });
+      ok('29.13 tokens:999999 не раздувает кэшбэк',
+        Math.abs(Number(fakeTokens.body?.cashback_tar) - 0.0001) < 1e-12,
+        fakeTokens.body?.cashback_tar);
+
+      /* --- Кейсы 7–9: отказ провайдера возвращает резерв -----------
+       * Три разные причины, одно требование: деньги не должны остаться
+       * занятыми. Проверяется reservedTar в БД, а не только код ответа. */
+      for (const [mode, label, expectStatus] of [
+        ['auth401', '401 от провайдера', 401],
+        ['rate429', '429 от провайдера', 429],
+        ['netdown', 'обрыв сети (тот же путь, что таймаут)', 503],
+      ]) {
+        provMode = mode;
+        const r = await callT6(t6client);
+        const m = readMoney(t6.dir, t6client);
+        ok(`29.13 ${label} → ${expectStatus}, резерв снят`,
+          r.status === expectStatus && m.reservedTar === 0,
+          { status: r.status, error: r.body?.error, reserved: m.reservedTar });
+      }
+      provMode = 'ok';
+
+      /* --- Кейс 10: TTL освобождает брошенную бронь ----------------
+       * Бронь, пережившая падение процесса между резервом и гашением,
+       * иначе висела бы вечно. Срок в БД уже истёк — вход в Tier 6
+       * обязан её подобрать. */
+      {
+        const stuck = '0x' + ('t6s' + RUN).padEnd(40, '0');
+        const sdb = new DatabaseSync(path.join(t6.dir, 'test.db'));
+        sdb.exec('PRAGMA busy_timeout = 3000;');
+        sdb.prepare(`INSERT INTO balances (address, balanceTar, stakedTar, reservedTar, updatedAt)
+                     VALUES (?, 0.01, 0, 0.0005, ?)
+                     ON CONFLICT(address) DO UPDATE SET reservedTar = 0.0005`)
+          .run(stuck, new Date().toISOString());
+        sdb.prepare(`INSERT INTO tier6_reserves (receiptId, clientAddress, amountTar, state, createdAt, expiresAt)
+                     VALUES (?, ?, 0.0005, 'held', ?, ?)`)
+          .run('expired-' + RUN, stuck, new Date(Date.now() - 600000).toISOString(), Date.now() - 60000);
+        sdb.close();
+
+        const beforeTtl = readMoney(t6.dir, stuck);
+        await callT6(t6client); // любой вход в Tier 6 запускает сбор истёкших
+        const afterTtl = readMoney(t6.dir, stuck);
+        ok('29.13 истёкшая бронь освобождена по TTL',
+          beforeTtl.reservedTar === 0.0005 && afterTtl.reservedTar === 0,
+          { before: beforeTtl.reservedTar, after: afterTtl.reservedTar });
+      }
 
       const after = (await apiAt(t6.base, '/health')).body?.conservationTier6;
-      ok('29.13 tier6_calls выросла ровно на 6',
-        Number(after?.calls) - Number(before?.calls) === 6,
-        { before: before?.calls, after: after?.calls });
-      ok('29.13 комиссия за 6 вызовов = 0.003 TAR',
-        Math.abs(Number(after?.gross) - Number(before?.gross) - 0.003) < 1e-6,
-        { before: before?.gross, after: after?.gross });
       ok('29.13 инвариант Tier 6 держится после реальных вызовов',
         after?.holds === true && Number(after?.delta) === 0,
         { delta: after?.delta, holds: after?.holds, bad: after?.inconsistentRows });
-      ok('29.13 смешанное финансирование видно в /health',
-        Number(after?.fundedByClient) - Number(before?.fundedByClient) === 1 &&
-        Number(after?.fundedByEmission) - Number(before?.fundedByEmission) === 5,
-        { client: after?.fundedByClient, emission: after?.fundedByEmission });
+      ok('29.13 эмиссионных вызовов Tier 6 не осталось',
+        Number(after?.fundedByEmission) === 0, after?.fundedByEmission);
+      ok('29.13 все вызовы в этом прогоне оплачены клиентом',
+        Number(after?.fundedByClient) - Number(before?.fundedByClient) >= 4,
+        { before: before?.fundedByClient, after: after?.fundedByClient });
     } finally {
       t6.stop();
       await new Promise((r) => fakeProvider.close(r));
