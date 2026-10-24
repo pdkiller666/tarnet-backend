@@ -82,7 +82,7 @@ document.querySelectorAll('.tab').forEach((tab) => {
      * agents.js. Прячем здесь, а событием ниже сообщаем, что пора грузить
      * данные — иначе вкладка открывалась бы пустой до первого клика. */
     if ($('tab-agents')) $('tab-agents').hidden = name !== 'agents';
-    if (name === 'devices') refreshBalance();
+    if (name === 'devices') { refreshBalance(); refreshFaucet(); }
     document.dispatchEvent(new CustomEvent('tarnet:tab', { detail: name }));
   });
 });
@@ -780,6 +780,72 @@ async function refreshBalance() {
 }
 
 $('refreshBal').addEventListener('click', refreshBalance);
+
+/* ---------- Faucet ----------
+ * Состояние читается из /faucet/status, а не из localStorage: выдачу
+ * помнит только сервер, и после смены устройства браузерная память
+ * сказала бы «не получал», а сервер ответил бы 400.
+ *
+ * Кнопка не прячется после выдачи, а гаснет и получает truthful подпись:
+ * если человек сменит адрес (другой профиль), состояние пересчитается.
+ */
+const FAUCET_AMOUNT = 0.01;
+
+async function refreshFaucet() {
+  const row = document.querySelector('.faucet-row');
+  const btn = $('faucetBtn');
+  const note = $('faucetState');
+  if (!btn || !note) return;
+
+  try {
+    const st = await call(`/faucet/status/${ADDR}`);
+    if (st.claimed) {
+      btn.disabled = true;
+      if (row) row.dataset.done = '1';
+      note.textContent = `получено ${fmt(st.amountTar)} TAR — один раз на адрес`;
+    } else {
+      btn.disabled = false;
+      if (row) delete row.dataset.done;
+      note.textContent = 'тестовые деньги для комиссии Tier 6';
+    }
+  } catch (_e) {
+    /* Сеть лежит — не блокируем кнопку: пусть попытка расскажет сама. */
+    btn.disabled = false;
+    note.textContent = 'тестовые деньги для комиссии Tier 6';
+  }
+}
+
+async function claimFaucet() {
+  const btn = $('faucetBtn');
+  const note = $('faucetState');
+  if (!btn || btn.disabled) return;
+
+  btn.disabled = true;
+  note.textContent = 'запрашиваем…';
+  try {
+    const r = await call('/faucet/claim', { method: 'POST', body: { address: ADDR } });
+    note.textContent = `+${fmt(r.creditedTar)} TAR · баланс ${fmt(r.balanceTar)}`;
+    const row = document.querySelector('.faucet-row');
+    if (row) row.dataset.done = '1';
+    await refreshBalance();
+  } catch (e) {
+    /* 400 ALREADY_CLAIMED — не ошибка сети, а нормальное состояние.
+     * Показываем это как факт, а не как сбой. */
+    if (e.data && e.data.error === 'ALREADY_CLAIMED') {
+      note.textContent = 'faucet уже получен этим адресом';
+      const row = document.querySelector('.faucet-row');
+      if (row) row.dataset.done = '1';
+    } else {
+      note.textContent = `не вышло: ${e.message}`;
+      btn.disabled = false;
+    }
+  }
+}
+
+{
+  const btn = $('faucetBtn');
+  if (btn) btn.addEventListener('click', claimFaucet);
+}
 
 /* ---------- Свой ключ провайдера (Tier 6, BYOK) ----------
  * Ключ лежит ТОЛЬКО в localStorage этого устройства. На сервер он уходит

@@ -257,9 +257,22 @@ rollback_hint() {
     "$SSH_KEY" "$VPS" "$REMOTE_DIR" "${VPS_PREV:-<prev>}" "$SERVICE"
 }
 
-H_LOCAL=$(ssh "${SSH_OPTS[@]}" "$VPS" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 $HEALTH_LOCAL" 2>/dev/null)
-printf '/health на VPS:   HTTP %s\n' "${H_LOCAL:-нет ответа}"
-[ "$H_LOCAL" = "200" ] || { rollback_hint; die "/health на VPS вернул $H_LOCAL"; }
+# /health опрашивается с повтором, а не одним curl.
+# ПОЧЕМУ: после systemctl restart процесс уже active, но порт 3001 ещё не
+# занят — Node доделывает инициализацию БД и миграции. Одиночный curl ловил
+# код 000, и деплой печатал ПРОВАЛ при полностью раскатанном коммите.
+# Хуже того: откат по такому выводу вернул бы рабочий сервис на прошлый
+# коммит из-за тайминга. Три попытки по 2 с — этого хватает с запасом.
+H_LOCAL=""
+H_LOCAL_TRY=0
+for i in 1 2 3; do
+  H_LOCAL_TRY=$i
+  H_LOCAL=$(ssh "${SSH_OPTS[@]}" "$VPS" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 $HEALTH_LOCAL" 2>/dev/null)
+  [ "$H_LOCAL" = "200" ] && break
+  if [ "$i" -lt 3 ]; then sleep 2; fi
+done
+printf '/health на VPS:   HTTP %s (попытка %s/3)\n' "${H_LOCAL:-нет ответа}" "$H_LOCAL_TRY"
+[ "$H_LOCAL" = "200" ] || { rollback_hint; die "/health на VPS вернул $H_LOCAL после 3 попыток"; }
 
 H_PUB=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/health")
 H_APP=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/app/")

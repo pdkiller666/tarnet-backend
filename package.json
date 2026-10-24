@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.12.1-tier6-fix",
+  "version": "2.12.2-faucet",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

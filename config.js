@@ -46,6 +46,26 @@ const TIER6 = {
   get cashbackRate() { return this.CASHBACK_TAR / this.ORCHESTRATION_FEE_TAR; },
 };
 
+/* Faucet — разовая выдача на адрес, чтобы новый кошелёк мог оплатить
+ * комиссию Tier 6. До него свежий PWA получал 402 на пустом балансе.
+ *
+ * ПОЧЕМУ ЭТО ЭМИССИЯ И ЕЁ НЕЛЬЗЯ МОЛЧА СМЕШИВАТЬ С ОСНОВНЫМ ЛЕДЖЕРОМ:
+ * 0.01 TAR создаётся из ничего, а не заработано. Основной инвариант
+ * /health (delta) считается только по work_receipts, поэтому faucet его
+ * не ломает — но если бы его сумма попала в тот же отчёт, «delta: 0»
+ * выглядел бы зелёным при напечатанных деньгах. Отсюда отдельное поле
+ * faucetEmission в /health.
+ *
+ * Сумма подобрана от цены комиссии: ORCHESTRATION_FEE_TAR = 0.0005, значит
+ * 0.01 TAR — это ровно 20 вызовов Tier 6. Меньше было бы нечем проверить
+ * кэшбэк, больше — уже не «тестовая», а реальная раздача. */
+const FAUCET = {
+  AMOUNT_TAR: Number(process.env.FAUCET_AMOUNT_TAR || 0.01),
+  /* Один раз на адрес. Не на IP: за одним NAT сидят разные люди, и
+   * привязка к IP блокировала бы второго из них без вины. */
+  ONCE_PER_ADDRESS: true,
+};
+
 const CONFIG = {
   // Режим вознаграждения: только два потока, никаких вероятностей.
   REWARD_MODE: process.env.REWARD_MODE || 'hybrid', // bootstrap | demand | hybrid
@@ -150,4 +170,4 @@ function round(value, decimals = CONFIG.DECIMALS) {
   return Math.round((Number(value) + Number.EPSILON) * f) / f;
 }
 
-module.exports = { CONFIG, TIER6, TIER_WEIGHTS, normalizeTier, round };
+module.exports = { CONFIG, TIER6, FAUCET, TIER_WEIGHTS, normalizeTier, round };

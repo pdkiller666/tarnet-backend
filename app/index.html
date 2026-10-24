@@ -129,6 +129,17 @@
       </div>
       <p class="balance"><span id="balanceVal">—</span> <span class="unit">TAR</span></p>
       <p class="mono dim addr-line" id="walletAddr">кошелёк: —</p>
+
+      <!-- ===== Faucet =====
+           Зачем кнопка: Tier 6 требует баланс (402 на пустом кошельке),
+           а публичного пополнения нет. Без неё новый PWA не может
+           сделать ни одного вызова. Текст сразу говорит, что это
+           эмиссия, а не заработок — иначе 0.01 TAR легко принять
+           за награду за работу. -->
+      <div class="faucet-row">
+        <button id="faucetBtn" class="btn ghost small">Получить 0.01 TAR (тест)</button>
+        <span class="hint tiny" id="faucetState">тестовые деньги для комиссии Tier 6</span>
+      </div>
     </div>
 
     <div class="card">

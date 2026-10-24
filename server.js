@@ -18,7 +18,7 @@ const { DatabaseSync } = require('node:sqlite');
 const crypto = require('crypto');
 const fs = require('fs');
 
-const { CONFIG, TIER6, TIER_WEIGHTS, normalizeTier, round } = require('./config');
+const { CONFIG, TIER6, FAUCET, TIER_WEIGHTS, normalizeTier, round } = require('./config');
 const { classifyDomain, selectModel } = require('./model-router');
 const { CWUCalculator, RewardEngine, verifyQuality, epochEmission, epochIndex, omega } = require('./economics');
 const { CumulativeLedger, receiptPayload, epochState, releasedFor, bumpEpoch } = require('./ledger');
@@ -457,6 +457,18 @@ db.exec(`CREATE TABLE IF NOT EXISTS tier6_reserves (
   state TEXT NOT NULL DEFAULT 'held' CHECK (state IN ('held','settled','released')),
   createdAt TEXT NOT NULL,
   expiresAt INTEGER NOT NULL
+)`);
+
+/* ===== Faucet: журнал разовых выдач =====
+ * Ключ — сам адрес: ONCE_PER_ADDRESS требует, чтобы повторная попытка
+ * упиралась в PK, а не проходила проверку «а не выдавали ли раньше?»
+ * отдельным SELECT: две одновременные заявки прошли бы обе.
+ * amountTar хранится, а не берётся из конфига при чтении: сумма может
+ * измениться, а аудит должен видеть, сколько реально выдали тогда. */
+db.exec(`CREATE TABLE IF NOT EXISTS faucet_claims (
+  address TEXT PRIMARY KEY,
+  amountTar REAL NOT NULL CHECK (amountTar > 0),
+  claimedAt TEXT NOT NULL
 )`);
 
 /* ===== Миграция очереди воркера на шифрование промптов =====
@@ -2113,7 +2125,7 @@ const RATE_READ_PATH =
   /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|p2p\/status|worker\/status|agents(\/approvals)?|tools)$/;
 /* `/id/<pubkey>/balance` — чтение, а не запись: клиент опрашивает баланс так же
  * часто, как /balance/<addr>. Без этой ветки он упирался бы в 10/мин. */
-const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$|^\/id\/[0-9a-fA-F]{0,64}\/balance$/;
+const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$|^\/id\/[0-9a-fA-F]{0,64}\/balance$|^\/faucet\/status\/[^/]+$/;
 const RATE_READ_ASSET = /\.(html|css|js|svg|webmanifest|png|ico|woff2?)$/;
 /* Оболочки UI: `/` и `/app/` — это HTML-контейнеры без расширения, без этой
  * ветки открытие консоли списывалось бы с бюджета записи (10/мин).
@@ -2319,6 +2331,26 @@ app.get('/health', (_req, res) => {
         fundedByEmission: get(`SELECT COUNT(*) AS c FROM tier6_calls WHERE fundedBy = 'emission'`).c,
       };
     })(),
+    /* ===== Faucet: напечатанное отдельно от заработанного =====
+     * Сумма разовых выдач. Стоит рядом с инвариантом, но НЕ внутри него:
+     * основной delta считается по work_receipts, а faucet в них не пишется.
+     * Если бы эти деньги попали в delta, инвариант краснел бы на каждой
+     * выдаче — или, хуже, оставался бы зелёным при напечатанных деньгах.
+     * Отдельное поле говорит правду обоими способами сразу: инвариант
+     * держится, и при этом видно, сколько создано из ничего. */
+    faucetEmission: (() => {
+      const f = get(`SELECT COUNT(*) AS claims,
+          COALESCE(SUM(amountTar),0) AS total FROM faucet_claims`);
+      return {
+        claims: Number(f.claims),
+        totalTar: Number(Number(f.total).toFixed(6)),
+        /* Явно: это не заработанные деньги. Метка нужна, чтобы никто
+         * (включая меня через месяц) не сложил faucetEmission с
+         * totalRewardTar и не выдал первое за второе. */
+        emission: true,
+        note: 'разовые выдачи на адрес, не заработок',
+      };
+    })(),
     treasuryBalanceTar: Number((treas?.balanceTar ?? 0).toFixed(6)),
     /* Честная маркировка он-чейна: записи в onchain_settlements созданы
      * локально, txHash — randomBytes(32), статус `confirmed` к блокчейну
@@ -2438,6 +2470,91 @@ app.get('/balance/:address', (req, res) => {
 app.get('/balances', (_req, res) => {
   res.json(all('SELECT address, balanceTar, stakedTar, updatedAt FROM balances ORDER BY balanceTar DESC LIMIT 200')
     .map(b => ({ ...b, balanceTar: Number(b.balanceTar.toFixed(6)) })));
+});
+
+/* ===== Faucet =====
+ * Зачем он существует: после 2.12.1 Tier 6 требует баланс (402 на пустом
+ * кошельке). Публичного пополнения нет, поэтому новый PWA не мог
+ * сделать ни одного вызова. Faucet — единственный вход в демо.
+ *
+ * ЧЕСТНО ПРО ЭМИССИЮ: здесь деньги создаются. Раньше это происходило
+ * молча и на каждом вызове (funded_by: emission). Теперь — один раз на
+ * адрес, фиксированной суммой и с отдельным полем faucetEmission в
+ * /health, чтобы напечатанное нельзя было принять за заработанное.
+ */
+const FAUCET_ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
+
+function faucetState(address) {
+  const row = get('SELECT amountTar, claimedAt FROM faucet_claims WHERE address = ?', [address]);
+  return row
+    ? { claimed: true, amountTar: Number(row.amountTar.toFixed(6)), claimedAt: row.claimedAt }
+    : { claimed: false, amountTar: FAUCET.AMOUNT_TAR };
+}
+
+app.post('/faucet/claim', (req, res) => {
+  const raw = String((req.body || {}).address || '').trim();
+  if (!FAUCET_ADDR_RE.test(raw)) {
+    return res.status(400).json({
+      error: 'invalid_address',
+      message: 'Нужен адрес вида 0x + 40 hex-символов',
+    });
+  }
+  /* Приводим к нижнему регистру: checksum-форма и строчная — один и тот
+   * же адрес. Без нормализации один кошелёк получил бы faucet дважды,
+   * просто записав адрес в другом регистре. */
+  const address = raw.toLowerCase();
+
+  const before = faucetState(address);
+  if (before.claimed) {
+    return res.status(400).json({
+      error: 'ALREADY_CLAIMED',
+      message: `Faucet уже получен этим адресом ${before.claimedAt}`,
+      claimedAt: before.claimedAt,
+      amountTar: before.amountTar,
+      balanceTar: Number((get('SELECT balanceTar FROM balances WHERE address = ?', [address])?.balanceTar ?? 0).toFixed(6)),
+    });
+  }
+
+  const amount = FAUCET.AMOUNT_TAR;
+  try {
+    /* Одна транзакция на всё: отметка о выдаче и начисление. Если
+     * credit упадёт, отметка откатится — иначе адрес остался бы с
+     * записью «получил», но без денег, и повторно получить не смог бы. */
+    tx(() => {
+      run('INSERT INTO faucet_claims (address, amountTar, claimedAt) VALUES (?, ?, ?)',
+        [address, round(amount), new Date().toISOString()]);
+      credit(address, amount, 'faucet', null, null);
+    });
+  } catch (e) {
+    /* Гонка двух одновременных заявок: обе прошли SELECT, вторая упала
+     * на PK. Это не ошибка сервера, а тот же отказ, что и выше. */
+    if (/UNIQUE|PRIMARY KEY/i.test(String(e.message))) {
+      return res.status(400).json({
+        error: 'ALREADY_CLAIMED',
+        message: 'Faucet уже получен этим адресом',
+      });
+    }
+    return res.status(500).json({ error: 'faucet_failed', message: e.message });
+  }
+
+  const bal = get('SELECT balanceTar FROM balances WHERE address = ?', [address]);
+  res.json({
+    ok: true,
+    address,
+    creditedTar: round(amount),
+    balanceTar: Number((bal?.balanceTar ?? 0).toFixed(6)),
+    /* Прямо в ответе: эти деньги напечатаны, а не заработаны. */
+    emission: true,
+  });
+});
+
+/* Состояние без записи: PWA надо знать до нажатия, показывать ли кнопку. */
+app.get('/faucet/status/:address', (req, res) => {
+  const address = String(req.params.address || '').toLowerCase();
+  if (!FAUCET_ADDR_RE.test(address)) {
+    return res.status(400).json({ error: 'invalid_address' });
+  }
+  res.json({ address, ...faucetState(address) });
 });
 
 /* ===== TarNet ID =====

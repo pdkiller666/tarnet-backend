@@ -650,6 +650,21 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .balance .unit { font-size: 14px; color: var(--muted); font-weight: 550; letter-spacing: 0; }
 .addr-line { margin: 0; font-size: 11.5px; }
 
+/* Faucet: кнопка и подпись в одну строку, но на узком экране переносятся.
+   Отдельный блок, а не в card-head: рядом с «Обновить» кнопка читалась бы
+   как ещ҅ одно обновление баланса, а она печатает деньги. */
+.faucet-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.faucet-row .hint { margin: 0; }
+.faucet-row[data-done="1"] #faucetBtn { opacity: .55; }
+
 .section-label {
   margin: 18px 0 8px !important;
   font-size: 10.5px;

@@ -4139,6 +4139,98 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+  /* ===== 29.14 Faucet: разовая выдача и её отдельный учёт =====
+   * Проверяется не только «кнопка работает», а главное: faucet печатает
+   * деньги, но НЕ попадает в основной инвариант. Если бы его сумма
+   * считалась в conservation.delta, инвариант краснел бы на каждой
+   * выдаче — или, хуже, оставался бы зелёным при напечатанных деньгах.
+   */
+  {
+    const f = await spawnServer();
+    try {
+      /* Префикс только из hex-символов: 'fau' содержал 'u' и адрес не
+       * проходил FAUCET_ADDR_RE — тесты падали до самой логики faucet. */
+      const addr = '0x' + ('fac' + RUN).padEnd(40, '0');
+      const addrUpper = '0x' + ('FAC' + RUN).padEnd(40, '0');
+
+      const st0 = await apiAt(f.base, `/faucet/status/${addr}`);
+      ok('29.14 до выдачи status: claimed false',
+        st0.status === 200 && st0.body?.claimed === false, st0.body);
+
+      const bad = await apiAt(f.base, '/faucet/claim', 'POST', { address: 'не-адрес' });
+      ok('29.14 мусорный адрес → 400 invalid_address',
+        bad.status === 400 && bad.body?.error === 'invalid_address', bad.body?.error);
+
+      const noBody = await apiAt(f.base, '/faucet/claim', 'POST', {});
+      ok('29.14 без адреса → 400, а не 500',
+        noBody.status === 400, noBody.status);
+
+      const first = await apiAt(f.base, '/faucet/claim', 'POST', { address: addr });
+      ok('29.14 первая выдача → 200', first.status === 200, first.status);
+      ok('29.14 начислено ровно 0.01 TAR',
+        Number(first.body?.creditedTar) === 0.01, first.body?.creditedTar);
+      ok('29.14 ответ помечает деньги как эмиссию',
+        first.body?.emission === true, first.body?.emission);
+      ok('29.14 баланс после выдачи = 0.01',
+        Math.abs(Number(first.body?.balanceTar) - 0.01) < 1e-9, first.body?.balanceTar);
+
+      /* Повтор — 400, и баланс не вырос. Второе важнее статуса: без него
+       * «400» мог бы отдаваться вместе с повторным начислением. */
+      const again = await apiAt(f.base, '/faucet/claim', 'POST', { address: addr });
+      ok('29.14 повторная заявка → 400 ALREADY_CLAIMED',
+        again.status === 400 && again.body?.error === 'ALREADY_CLAIMED',
+        { status: again.status, error: again.body?.error });
+      ok('29.14 повтор НЕ начислил второй раз',
+        Math.abs(Number(again.body?.balanceTar) - 0.01) < 1e-9, again.body?.balanceTar);
+
+      /* Регистр: checksum-форма и строчная — один кошелёк. Без
+       * нормализации адрес получил бы faucet дважды. */
+      const upper = await apiAt(f.base, '/faucet/claim', 'POST', { address: addrUpper });
+      ok('29.14 адрес в другом регистре уже получал faucet',
+        upper.status === 400 && upper.body?.error === 'ALREADY_CLAIMED',
+        { status: upper.status, attempted: addrUpper });
+
+      const st1 = await apiAt(f.base, `/faucet/status/${addr}`);
+      ok('29.14 после выдачи status: claimed true',
+        st1.body?.claimed === true && Number(st1.body?.amountTar) === 0.01, st1.body);
+
+      /* Деньги реально в балансе — через публичный эндпоинт, а не по БД. */
+      const bal = await apiAt(f.base, `/balance/${addr}`);
+      ok('29.14 /balance показывает 0.01 TAR',
+        bal.status === 200 && Math.abs(Number(bal.body?.balanceTar) - 0.01) < 1e-9,
+        bal.body?.balanceTar);
+
+      /* Главное: учёт отделён. */
+      const hres = await apiAt(f.base, '/health');
+      const fe = hres.body?.faucetEmission;
+      ok('29.14 /health отдаёт faucetEmission отдельным блоком',
+        Boolean(fe), Object.keys(hres.body || {}).includes('faucetEmission'));
+      ok('29.14 faucetEmission: 1 выдача на 0.01 TAR',
+        Number(fe?.claims) === 1 && Math.abs(Number(fe?.totalTar) - 0.01) < 1e-9, fe);
+      ok('29.14 faucetEmission помечен как эмиссия',
+        fe?.emission === true && typeof fe?.note === 'string', fe?.emission);
+
+      /* Инвариант не тронут: faucet не пишется в work_receipts. */
+      ok('29.14 основной delta остался 0',
+        Number(hres.body?.conservation?.delta) === 0, hres.body?.conservation?.delta);
+      ok('29.14 инвариант цел после печати денег',
+        hres.body?.conservation?.holds === true, hres.body?.conservation?.holds);
+
+      /* След KIND в реестре — для аудита: видно, что деньги созданы
+       * именно faucet'ом, а не пришли за работу. */
+      const { DatabaseSync } = require('node:sqlite');
+      const sdb = new DatabaseSync(path.join(f.dir, 'test.db'));
+      const row = sdb.prepare(`SELECT COUNT(*) AS c, COALESCE(SUM(amountTar),0) AS s
+                               FROM ledger_txs WHERE kind = 'faucet'`).get();
+      sdb.close();
+      ok('29.14 в ledger_txs есть ровно одна запись kind=faucet',
+        Number(row.c) === 1 && Math.abs(Number(row.s) - 0.01) < 1e-9,
+        { rows: Number(row.c), sum: Number(row.s) });
+    } finally {
+      f.stop();
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {
