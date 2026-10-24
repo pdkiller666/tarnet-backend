@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.8.0-agent-foundation",
+  "version": "2.9.1-agent-ui",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {
