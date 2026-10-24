@@ -13,6 +13,10 @@ node_modules/
 
 # Базы данных и их WAL/SHM
 tarnet.db
+# Боевая БД живёт НЕ здесь, а в /var/lib/tarnet/tarnet.db (TARNET_DB в systemd).
+# Пустой файл рядом с кодом сбивает с толку: кто-то откроет его и решит, что данных нет.
+# 2026-10-24 такой файл (0 байт) удалён с VPS. Путь здесь не указывать: корень
+# репозитория — сам backend-api, и строка вида backend-api/tarnet.db не матчит ничего.
 tarnet.db-wal
 tarnet.db-shm
 *.db

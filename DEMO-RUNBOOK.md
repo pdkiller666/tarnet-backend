@@ -456,6 +456,22 @@ curl -s -X POST https://v1107336.hosted-by-vdsina.com/demo/flush-work \
 | 5 | `POST /inference/onion` | 200, `delivered: true`, 3 хопа, ≈2.4 КБ |
 | 6 | `GET /adapters` | 200, 3 адаптера |
 
+## Где лежит боевая база
+
+**Настоящая БД — `/var/lib/tarnet/tarnet.db`** (задаётся переменной `TARNET_DB` в systemd-юните).
+Все чеки, балансы и узлы читаются оттуда.
+
+Не путать с пустым файлом в репозитории: до 2026-10-24 в `/opt/tarnet/backend-api/tarnet.db`
+лежал файл **0 байт**. Кто открывал его, видел пустую базу и решал, что данных нет.
+Файл удалён, а `backend-api/tarnet.db` занесён в `.gitignore`, чтобы не вернулся.
+
+Проверка, какую базу видит сервис:
+
+```bash
+ssh VPS 'systemctl show tarnet -p Environment | tr " " "\n" | grep TARNET_DB'
+# ожидаем: TARNET_DB=/var/lib/tarnet/tarnet.db
+```
+
 ## Где лежит этот файл
 
 `backend-api/DEMO-RUNBOOK.md` в репозитории `pdkiller666/tarnet-backend`, и
