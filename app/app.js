@@ -549,7 +549,7 @@ async function loadChatHistory() {
   if (!msgs.length) return 0;
 
   msgs.sort((a, b) => a.lt - b.lt);
-  const empty = log.querySelector('.empty');
+  const empty = log.querySelector('.empty-chat');
   if (empty) empty.remove();
   for (const m of msgs) {
     const w = bubble(m.role, m.text);
@@ -647,7 +647,7 @@ async function sendPrompt(prompt, opts = {}) {
   btn.disabled = true;
   $('chatHint').textContent = '';
 
-  const empty = log.querySelector('.empty');
+  const empty = log.querySelector('.empty-chat');
   if (empty) empty.remove();
 
   /* При повторе сообщение человека уже висит в ленте — не дублируем его,

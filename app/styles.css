@@ -253,11 +253,17 @@ select:focus-visible, textarea:focus-visible, input:focus-visible, button:focus-
 .chat-log::-webkit-scrollbar { width: 8px; }
 .chat-log::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
 
-/* Пустое состояние — первый экран продукта. Раньше это была одна строка
-   текста в пунктирной рамке: посетитель не понимал, что здесь можно делать.
-   Теперь: иконка, заголовок, объяснение и три готовых вопроса — они же
-   служат подсказкой о возможностях. */
-.empty {
+/* Пустое состояние чата — первый экран продукта. Раньше это была одна
+   строка текста в пунктирной рамке: посетитель не понимал, что здесь можно
+   делать. Теперь: иконка, заголовок, объяснение и три готовых вопроса — они
+   же служат подсказкой о возможностях.
+
+   Класс назван .empty-chat, а не .empty: этот же .empty раньше делил
+   плейсхолдер списка агентов, и после редизайна «загружаю…» в карточке
+   получило 40px отступов и flex-колонку — то есть чужой набор стилей.
+   Общий класс на два разных места — это и есть та ошибка, которую не видит
+   проверка id. */
+.empty-chat {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -285,6 +291,18 @@ select:focus-visible, textarea:focus-visible, input:focus-visible, button:focus-
 }
 
 .empty-sub { margin: 0; font-size: 13px; color: var(--muted-2); max-width: 34ch; }
+
+/* Плейсхолдер внутри карточки: «загружаю…» и «агентов пока нет». Пунктирная
+   рамка возвращена — она отделяет текст-заглушку от настоящего содержимого
+   карточки, чтобы пустой список не читался как сломанный. */
+.empty-list {
+  padding: 26px 16px;
+  color: var(--muted);
+  font-size: 14px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+}
 
 .suggest-wrap {
   display: flex;
@@ -407,7 +425,10 @@ select:focus-visible, textarea:focus-visible, input:focus-visible, button:focus-
 .msg-actions {
   display: flex;
   gap: 6px;
-  opacity: 0;
+  /* .55, а не 0: на тач-устройствах шире 560px наведения нет вовсе, и
+   * opacity: 0 делал «Редактировать»/«Повторить» невидимыми, но при этом
+   * кликабельными. Приглушённость скрывает шум, не пряча функцию. */
+  opacity: .55;
   transition: opacity .16s var(--ease);
 }
 .msg:hover .msg-actions,
@@ -927,7 +948,8 @@ pre.cmd {
   .suggest-wrap { flex-direction: column; align-items: stretch; }
   .suggest { width: 100%; }
   .msg-actions { opacity: 1; }
-  .empty { padding: 28px 12px 24px; }
+  .empty-chat { padding: 28px 12px 24px; }
+  .empty-list { padding: 20px 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

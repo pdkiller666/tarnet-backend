@@ -297,7 +297,7 @@
       return;
     }
     if (!agents.length) {
-      list.innerHTML = `<div class="empty">Агентов пока нет. Создайте первого.</div>`;
+      list.innerHTML = `<div class="empty-list">Агентов пока нет. Создайте первого.</div>`;
       return;
     }
     list.innerHTML = agents.map(agentCard).join('');

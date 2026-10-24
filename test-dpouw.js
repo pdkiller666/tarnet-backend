@@ -3435,7 +3435,7 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   {
     const sw = await api('/app/sw.js');
     const src = typeof sw.body === 'string' ? sw.body : '';
-    ok('25.4 sw.js — версия кэша v7 (Волна 9: редизайн оболочки)', /tarnet-app-v7/.test(src), src.slice(0, 60));
+    ok('25.4 sw.js — версия кэша v8 (фиксы аудита 3614b13)', /tarnet-app-v8/.test(src), src.slice(0, 60));
     ok('25.4 sw.js кэширует vendor',
       src.includes('/app/vendor/marked.min.js') && src.includes('/app/vendor/highlight.min.js'));
   }
@@ -3518,6 +3518,57 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('Волна 8 не сломала conservation (delta 0)',
     cfWave8.conservation.delta === 0 && cfWave8.conservation.holds === true,
     { delta: cfWave8.conservation.delta, holds: cfWave8.conservation.holds });
+
+  /* 26. Регрессии аудита 3614b13: то, что нельзя увидеть без браузера.
+   * Смысл секции — закрепить два класса ошибок, которые прошли мимо всех
+   * существующих тестов: общий класс на два разных места и кнопки, видимые
+   * только при наведении. */
+  section('26. Регрессии редизайна');
+  {
+    const html = await api('/app/index.html');
+    const doc = typeof html.body === 'string' ? html.body : '';
+
+    /* Пустое состояние чата и плейсхолдер списка агентов — разные вещи и
+     * должны иметь разные классы. Общий .empty давал «загружаю…» в карточке
+     * агентов 40px отступов и flex-колонку от большого пустого экрана. */
+    ok('26.1 пустое состояние чата — .empty-chat', doc.includes('class="empty-chat"'));
+    ok('26.1 плейсхолдер агентов — .empty-list', doc.includes('class="empty-list"'));
+    ok('26.1 в разметке не осталось class="empty"', !/class="empty"/.test(doc));
+
+    const ag = await api('/app/agents.js');
+    const agSrc = typeof ag.body === 'string' ? ag.body : '';
+    ok('26.1 agents.js рисует пустой список через .empty-list',
+      agSrc.includes('class="empty-list"') && !/class="empty"/.test(agSrc));
+
+    /* app.js обязан искать НОВЫЙ класс. Здесь легко промахнуться: класс в
+     * разметке переименован, а два querySelector остались старыми — тогда
+     * пустой экран не удаляется и висит над первым сообщением навсегда. */
+    const app = await api('/app/app.js');
+    const appSrc = typeof app.body === 'string' ? app.body : '';
+    ok('26.1 app.js убирает .empty-chat', appSrc.includes("querySelector('.empty-chat')"));
+    ok('26.1 app.js не ищет устаревший .empty',
+      !/querySelector\('\.empty'\)/.test(appSrc));
+
+    /* Комментарии вырезаем: в них встречается текст «opacity: 0», и проверка
+     * на скрытые кнопки ловила бы собственное объяснение, а не правило. */
+    const cssRaw = await api('/app/styles.css');
+    const css = (typeof cssRaw.body === 'string' ? cssRaw.body : '')
+      .replace(/\/\*[\s\S]*?\*\//g, '');
+
+    ok('26.1 CSS определяет .empty-chat', /\.empty-chat\s*\{/.test(css));
+    ok('26.1 CSS определяет .empty-list', /\.empty-list\s*\{/.test(css));
+
+    /* Кнопки под сообщением: приглушены, но присутствуют. opacity: 0 означал
+     * бы, что на тач-устройствах шире 560px «Редактировать» и «Повторить»
+     * невидимы — их можно нажать только вслепую. */
+    const actBlock = (css.match(/\.msg-actions\s*\{[^}]*\}/) || [''])[0];
+    ok('26.2 .msg-actions приглушены (opacity .55), а не скрыты',
+      /opacity:\s*\.55/.test(actBlock), actBlock.trim().slice(0, 80));
+    ok('26.2 .msg-actions не имеют opacity: 0',
+      !/opacity:\s*0\s*[;\}]/.test(actBlock), actBlock.trim().slice(0, 80));
+    ok('26.2 при hover/focus-within кнопки проявляются полностью',
+      /\.msg:hover \.msg-actions[\s\S]{0,120}opacity:\s*1/.test(css));
+  }
 
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌`);
