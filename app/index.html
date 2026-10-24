@@ -91,7 +91,34 @@
     <div class="card" id="workerCard">
       <h2>Воркер для ПК</h2>
       <p class="dim">Скрипт забирает задачи, считает моделью на вашем ПК и возвращает результат. Нужен для режима <code>worker</code>.</p>
-      <a class="btn" href="/download/worker.js" download>⬇ Скачать worker.js</a>
+
+      <!-- ===== Установка в один клик =====
+           Адрес подставляется в скрипт на сервере, поэтому файл персонален.
+           Ссылки строятся в app.js: до появления ADDR подставлять нечего,
+           а статичный href с пустым addr вернул бы 400. -->
+      <div class="onboard">
+        <p class="dim" style="margin:0 0 10px">
+          <strong>Быстрый путь.</strong> Скачайте установщик и запустите двойным кликом —
+          он сам поставит Node.js и Ollama, скачает модель и запустит воркер.
+          Ваш адрес уже внутри.
+        </p>
+        <div class="row">
+          <a class="btn" id="dlWin" href="#" download>⬇ Windows (.bat)</a>
+          <a class="btn ghost" id="dlMac" href="#" download>⬇ macOS / Linux (.command)</a>
+        </div>
+        <p class="hint" id="dlHint">
+          <strong>Windows</strong> — скачали, дважды кликнули, готово.<br>
+          <strong>macOS</strong> — браузер сохраняет файл без права на запуск и
+          помечает его карантином. Один раз перед запуском в Терминале:
+          <code>chmod +x ~/Downloads/install-tarnet-worker.command</code>,
+          потом правый клик → «Открыть». Обойти это кодом нельзя — так работает Gatekeeper.
+        </p>
+      </div>
+
+      <p class="dim" style="margin:18px 0 8px">
+        <strong>Или вручную</strong> — если предпочитаете контролировать каждый шаг:
+      </p>
+      <a class="ghost small" href="/download/worker.js" download>⬇ Скачать worker.js</a>
 
       <!-- Адрес показываем здесь, а не только в «Балансе»: именно его надо
            скопировать в команду запуска. Без него воркер создаст свой

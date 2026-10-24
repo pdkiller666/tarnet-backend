@@ -432,6 +432,16 @@ pre.cmd {
   align-items: center;
 }
 
+/* Блок быстрой установки: отделён от ручного пути, чтобы новичок видел
+ * только две кнопки и не читал команды терминала. */
+.onboard {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--elevated, rgba(255, 255, 255, 0.03));
+}
+
 .tiny { font-size: 12px; }
 .text-ok { color: var(--ok); }
 .text-warn { color: var(--warn); }

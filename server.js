@@ -1812,6 +1812,106 @@ app.get('/download/worker.js', (_req, res) => {
   res.sendFile(file);
 });
 
+/* ===== Установщики воркера в один клик =====
+ *
+ * Идея: человек не должен открывать терминал. Он нажимает кнопку в PWA,
+ * получает готовый файл со СВОИМ адресом внутри и запускает двойным кликом.
+ *
+ * ПОЧЕМУ ШАБЛОН, А НЕ ПАРАМЕТР. Адрес обязан попасть в текст скрипта, а
+ * скрипт исполняется оболочкой. Значит любая подстановка — это код, который
+ * выполнится на машине пользователя. Поэтому:
+ *   1) адрес проверяется регуляркой на ровно 40 hex-символов, иначе 400;
+ *   2) публичный URL берётся из окружения, а НЕ из заголовка Host запроса.
+ *      Host подделывается одним заголовком, и подстановка его в .bat дала бы
+ *      исполнение произвольной команды на чужом ПК;
+ *   3) в шаблоне нет ни одной конкатенации значений в код — только три
+ *      фиксированных маркера, которые заменяются на проверенные строки.
+ *
+ * Маршруты объявлены ДО rateLimiter намеренно: скачивание установщика не
+ * должно списываться с бюджета записи (10/мин) — человек может жать кнопку
+ * повторно, если файл не сохранился. */
+
+const INSTALL_DIR = path.join(__dirname, 'install');
+
+/* Адрес воркера: тот же формат, что проверяет worker-demo.js (ADDRESS_RE).
+ * Нижний регистр обязателен — сервер адреса не нормализует. */
+const INSTALL_ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
+
+/* Публичный адрес стенда для подстановки внутрь скрипта. Именно константа,
+ * а не req.get('host'): см. пункт 2 выше. */
+const INSTALL_PUBLIC_URL = (process.env.TARNET_PUBLIC_URL
+  || 'https://v1107336.hosted-by-vdsina.com').replace(/\/+$/, '');
+
+/* Значение уходит внутрь .bat и .command, где опасны кавычки, %, ^, &, |, <, >
+ * и перевод строки. Проверяем формат URL целиком, а не ищем отдельные
+ * символы: так нельзя «протащить» что-то, чего нет в ожидаемой форме. */
+const INSTALL_URL_RE = /^https?:\/\/[A-Za-z0-9.\-]+(?::\d{1,5})?$/;
+
+const INSTALL_MODEL = process.env.TARNET_WORKER_MODEL || 'qwen2.5-coder:1.5b';
+
+/* Модель тоже попадает в командную строку, поэтому допускаем только имя
+ * тега: буквы, цифры, точка, двоеточие, дефис, подчёркивание, слэш. */
+const INSTALL_MODEL_RE = /^[A-Za-z0-9._:\/-]{1,120}$/;
+
+function renderInstaller(templateName, addr) {
+  const tplPath = path.join(INSTALL_DIR, templateName);
+  if (!fs.existsSync(tplPath)) return null;
+
+  let text = fs.readFileSync(tplPath, 'utf8');
+
+  /* Модель, не прошедшая проверку, откатывается к значению по умолчанию —
+   * это безопасно, потому что умолчание задано в коде, а не пришло снаружи. */
+  const model = INSTALL_MODEL_RE.test(INSTALL_MODEL)
+    ? INSTALL_MODEL
+    : 'qwen2.5-coder:1.5b';
+
+  text = text
+    .split('__TARNET_ADDR__').join(addr)
+    .split('__TARNET_API__').join(INSTALL_PUBLIC_URL)
+    .split('__TARNET_MODEL__').join(model);
+
+  return text;
+}
+
+app.get('/install/:file', (req, res) => {
+  const which = String(req.params.file || '').toLowerCase();
+
+  const spec = which === 'install.bat'
+    ? { tpl: 'install.bat.tpl', mime: 'application/x-bat; charset=utf-8', name: 'install-tarnet-worker.bat' }
+    : which === 'install.command'
+      ? { tpl: 'install.command.tpl', mime: 'application/x-sh; charset=utf-8', name: 'install-tarnet-worker.command' }
+      : null;
+
+  if (!spec) return res.status(404).json({ error: 'unknown installer', want: ['install.bat', 'install.command'] });
+
+  const addr = String(req.query.addr || '').trim();
+  if (!INSTALL_ADDR_RE.test(addr)) {
+    /* Отдавать скрипт без адреса нельзя: воркер создаст свой кошелёк, работа
+     * будет считаться, а деньги уйдут в чужой баланс. Человек будет смотреть
+     * на нулевой счёт и не понимать, почему. Лучше явная ошибка сразу. */
+    return res.status(400).json({
+      error: 'addr required',
+      detail: 'нужен адрес воркера: 0x и ровно 40 hex-символов',
+      got: addr ? addr.slice(0, 8) + '…' : '(пусто)',
+    });
+  }
+
+  /* Публичный URL тоже подставляется в скрипт — проверяем и его. */
+  if (!INSTALL_URL_RE.test(INSTALL_PUBLIC_URL)) {
+    return res.status(500).json({ error: 'TARNET_PUBLIC_URL has unsafe format', got: INSTALL_PUBLIC_URL.slice(0, 20) });
+  }
+
+  const body = renderInstaller(spec.tpl, addr.toLowerCase());
+  if (body === null) return res.status(500).json({ error: 'installer template missing on server', tpl: spec.tpl });
+
+  /* Установщик персонален (внутри адрес кошелька) — кешировать нельзя,
+   * иначе прокси отдаст одному человеку файл с адресом другого. */
+  res.setHeader('Content-Type', spec.mime);
+  res.setHeader('Content-Disposition', `attachment; filename="${spec.name}"`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(body);
+});
+
 /* ===== Rate limiting (in-memory, без внешних пакетов) =====
  * Считаем не «запросы вообще», а по классам: у живого UI и у воркера
  * профили трафика принципиально разные.

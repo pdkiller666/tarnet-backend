@@ -565,6 +565,15 @@ function renderWorkerHelp() {
    * продовом домене, и на туннеле, и на localhost — без правки руками. */
   const api = location.origin;
 
+  /* Установщики в один клик. Адрес подставляется на сервере, поэтому
+   * строим ссылки здесь: до появления ADDR подставлять было бы нечего.
+   * encodeURIComponent обязателен — адрес уходит в query-параметр. */
+  const q = `?addr=${encodeURIComponent(ADDR)}`;
+  const dlWin = $('dlWin');
+  if (dlWin) dlWin.href = `/install/install.bat${q}`;
+  const dlMac = $('dlMac');
+  if (dlMac) dlMac.href = `/install/install.command${q}`;
+
   const posix = $('runCmdPosix');
   if (posix) {
     posix.textContent =
