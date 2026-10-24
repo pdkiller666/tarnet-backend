@@ -1552,6 +1552,26 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   const h2 = await api('/health');
   ok('инвариант сохранения в /health', h2.body.conservation.holds === true, h2.body.conservation);
 
+  /* /summary.receipts обязан равняться COUNT(*) в таблице чеков.
+   * Раньше расхождение "697 против 699" приняли за фильтр в агрегате, а
+   * оказалось — замер сделан в разные моменты. Гард фиксирует чтение
+   * из ОДНОЙ базы сразу после ответа: если когда-нибудь в totals()
+   * появится фильтр (demo, gamma), тест упадёт и это будет видно.
+   * Читается файл тестовой БД, а не боевой: тот же tmpDir, что у spawn. */
+  {
+    const { DatabaseSync } = require('node:sqlite');
+    const sdb = new DatabaseSync(path.join(tmpDir, 'test.db'));
+    const rawCount = sdb.prepare('SELECT COUNT(*) AS c FROM work_receipts').get().c;
+    const demoCount = sdb.prepare('SELECT COUNT(*) AS c FROM work_receipts WHERE demo = 1').get().c;
+    sdb.close();
+    const sumCount = Number(summary.body.receipts);
+    ok('/summary.receipts совпадает с COUNT(*) в таблице чеков',
+      sumCount === Number(rawCount), { summary: sumCount, db: Number(rawCount) });
+    ok('в агрегате нет скрытого фильтра по demo',
+      demoCount === 0 || Number(rawCount) === sumCount,
+      { demo: demoCount, db: Number(rawCount), summary: sumCount });
+  }
+
   // Лотерейных маршрутов быть не должно.
   section('10. Лотерея удалена');
   for (const p of ['/lottery/commitment', '/ticket', '/draw/x']) {

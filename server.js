@@ -2494,9 +2494,13 @@ app.post('/agents', (req, res) => {
       agentId = tarIdentity.deriveAgentKey(body.masterEntropy).agentId;
       serverDerived = true;
     } else {
+      /* Полная цепочка в подсказке: без неё клиент получает «нужен pubkey»,
+       * хотя pubkey берётся не из воздуха, а из ответа /id/register. Иначе
+       * агент пытается передать userId и упирается в 400 второй раз. */
       return res.status(400).json({
         error: 'pubkey or masterEntropy required',
-        hint: 'prefer pubkey: agent key must be derived on the device',
+        hint: 'сначала POST /id/register (или возьмите pubkey из PWA), затем POST /agents с этим pubkey',
+        note: 'prefer pubkey: agent key must be derived on the device',
       });
     }
   } catch (e) {
