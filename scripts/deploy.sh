@@ -164,6 +164,78 @@ VPS_DIRTY=$(printf '%s\n' "$RESET_OUT" | sed -n 's/^DIRTY=//p')
 [ "$VPS_NEW" = "$LOCAL_HEAD" ] || die "HEAD на VPS ($VPS_NEW) != локальный ($LOCAL_HEAD)"
 [ "$VPS_DIRTY" = "0" ] || die "на VPS осталось $VPS_DIRTY грязных путей после reset"
 
+# ---------- 4.5 systemd drop-in ----------
+# Юниты и drop-in'ы не лежат в рабочем дереве сервиса, поэтому их не раскатывает
+# ни git reset, ни bundle. Без этого шага TARNET_PUBLIC_URL и RESERVE_OPEX_USD
+# жили только на одном конкретном сервере: пересборка машины или переезд на
+# новый VPS молча возвращали fallback из server.js, а verify.sh показывал
+# «всё зелёное» — он про /etc/systemd ничего не знает.
+#
+# Порядок: drop-in → daemon-reload → restart (шаг 5). Без reload перезапуск
+# применит старое значение, и проверка ниже этого не заметит.
+info "раскатываю systemd drop-in"
+DROPIN_DIR="deploy/systemd/tarnet.service.d"
+[ -d "$REPO_DIR/$DROPIN_DIR" ] || die "нет каталога $DROPIN_DIR в репозитории"
+
+# Сверка до отправки: если адрес в drop-in и адрес, по которому deploy.sh
+# проверяет /health, разойдутся — установщик уедет на один сервер, а проверка
+# будет смотреть на другой, и обе будут «зелёными».
+DROPIN_URL=$(sed -n 's/^Environment=TARNET_PUBLIC_URL=//p' "$REPO_DIR/$DROPIN_DIR"/*.conf | head -1)
+[ "$DROPIN_URL" = "$PUBLIC_URL" ] || die "рассинхрон адреса:
+  $DROPIN_DIR: $DROPIN_URL
+  deploy.sh:      $PUBLIC_URL
+Поправь одно из двух — иначе установщик и проверка смотрят на разные серверы."
+
+# Ожидаемые переменные берём из самих файлов, без списка в коде: новый drop-in
+# в репозитории начинает проверяться сам, без правки этого скрипта.
+DROPIN_EXPECT=$(sed -n 's/^Environment=//p' "$REPO_DIR/$DROPIN_DIR"/*.conf)
+
+DROPIN_OUT=$(ssh "${SSH_OPTS[@]}" "$VPS" "bash -s" -- "$REMOTE_DIR" "$SERVICE" "$DROPIN_DIR" <<'REMOTE'
+set -uo pipefail
+DIR=$1; SVC=$2; REL=$3
+SRC="$DIR/$REL"
+DST_DIR="/etc/systemd/system/${SVC}.service.d"
+[ -d "$SRC" ] || { echo "ERR: нет $SRC на VPS"; exit 8; }
+mkdir -p "$DST_DIR" || { echo "ERR: mkdir $DST_DIR"; exit 8; }
+
+# rsync БЕЗ --delete сознательно. С --delete ручной drop-in, поставленный на
+# сервере при аварии, исчез бы молча — а deploy.sh по своей же логике (см.
+# резервное копирование перед reset выше) сначала сохраняет, потом затирает.
+# Лишние файлы не удаляем, но называем вслух.
+rsync -a "$SRC"/ "$DST_DIR"/ || { echo "ERR: rsync в $DST_DIR"; exit 8; }
+for f in "$DST_DIR"/*.conf; do
+  [ -f "$f" ] || continue
+  b=$(basename "$f")
+  [ -f "$SRC/$b" ] || echo "WARN: drop-in на сервере вне репозитория: $b"
+done
+
+systemctl daemon-reload || { echo "ERR: daemon-reload"; exit 8; }
+
+# Проверяем, что systemd реально видит переменные, а не что файл лёг на диск.
+# Файл без применения — это не раскатка.
+echo "ENV=$(systemctl show "$SVC" -p Environment)"
+REMOTE
+) || die "раскатка drop-in упала:
+$DROPIN_OUT"
+
+printf '%s\n' "$DROPIN_OUT"
+DROPIN_ENV=$(printf '%s\n' "$DROPIN_OUT" | sed -n 's/^ENV=//p' | head -1)
+[ -n "$DROPIN_ENV" ] || die "systemd не отдал Environment после daemon-reload"
+
+# Каждая ожидаемая пара KEY=VALUE должна быть в окружении сервиса целиком:
+# KEY без нужного значения — тот же молчаливый откат к дефолту из кода.
+DROPIN_BAD=""
+while IFS= read -r kv; do
+  [ -n "$kv" ] || continue
+  case " $DROPIN_ENV " in
+    *" $kv "*) : ;;
+    *) DROPIN_BAD="$DROPIN_BAD $kv" ;;
+  esac
+done <<< "$DROPIN_EXPECT"
+[ -z "$DROPIN_BAD" ] || die "systemd не видит после reload:$DROPIN_BAD
+Фактическое окружение: $DROPIN_ENV"
+printf 'drop-in применён: %s\n' "$(printf '%s' "$DROPIN_EXPECT" | tr '\n' ' ')"
+
 # ---------- 5. перезапуск ----------
 info "перезапускаю $SERVICE"
 ssh "${SSH_OPTS[@]}" "$VPS" "bash -s" -- "$SERVICE" <<'REMOTE' || die "сервис не поднялся"

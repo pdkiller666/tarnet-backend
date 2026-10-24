@@ -128,6 +128,59 @@ else
   no "sha256 файлов" "$MATCH/$TOTAL, отличия:$MISMATCH"
 fi
 
+# ---------- 3.5 systemd drop-in ----------
+# Файлы в /etc/systemd не входят в рабочее дерево сервиса: их не видит ни
+# git reset, ни сверка sha256 выше. Без этой проверки дрейф drop-in'а
+# остаётся невидимым — именно так значение жило только на одном сервере,
+# а verify показывал «всё зелёное».
+DROPIN_DIR="deploy/systemd/tarnet.service.d"
+mapfile -t DROPINS < <(git ls-tree -r --name-only HEAD -- "$DROPIN_DIR" 2>/dev/null | grep '\.conf$' || true)
+
+if [ "${#DROPINS[@]}" -eq 0 ]; then
+  no "systemd drop-in" "в репозитории нет $DROPIN_DIR/*.conf"
+else
+  INST_SHAS=$(ssh "${SSH_OPTS[@]}" "$VPS" \
+    "cd /etc/systemd/system/${SERVICE}.service.d 2>/dev/null && sha256sum *.conf" 2>/dev/null)
+
+  declare -A INST_SHA=()
+  while IFS= read -r line; do
+    h=${line%% *}
+    p=${line#*  }
+    [ -n "$h" ] && [ -n "$p" ] && INST_SHA["$(basename "$p")"]=$h
+  done <<< "$INST_SHAS"
+
+  DMIS=""
+  for f in "${DROPINS[@]}"; do
+    b=$(basename "$f")
+    want=$(git show "HEAD:$f" | sha256sum | cut -d' ' -f1)
+    [ "${INST_SHA[$b]:-}" = "$want" ] || DMIS="$DMIS $b"
+  done
+
+  if [ -z "$DMIS" ]; then
+    ok "systemd drop-in" "${#DROPINS[@]} файлов = репозиторию"
+  else
+    no "systemd drop-in" "расходится с репозиторием:$DMIS (лечится deploy.sh)"
+  fi
+
+  # Файл на диске и переменная в сервисе — разные вещи: без daemon-reload
+  # файл лежит, а процесс работает на старом значении.
+  SVC_ENV=$(ssh "${SSH_OPTS[@]}" "$VPS" "systemctl show $SERVICE -p Environment" 2>/dev/null)
+  ENV_MISS=""
+  while IFS= read -r kv; do
+    [ -n "$kv" ] || continue
+    case " $SVC_ENV " in
+      *" $kv "*) : ;;
+      *) ENV_MISS="$ENV_MISS $kv" ;;
+    esac
+  done <<< "$(sed -n 's/^Environment=//p' "$DROPIN_DIR"/*.conf)"
+
+  if [ -z "$ENV_MISS" ]; then
+    ok "переменные применены" "systemd видит все значения"
+  else
+    no "переменные применены" "нет в окружении сервиса:$ENV_MISS"
+  fi
+fi
+
 # ---------- 4. сервис и эндпоинты ----------
 if [ "$VPS_ACTIVE" = "active" ]; then
   ok "systemd $SERVICE" "active"
