@@ -1596,6 +1596,29 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     !!cacheVer && cacheVer !== 'tarnet-app-v3',
     { served: cacheVer, stale: 'tarnet-app-v3' });
 
+  /* Поднять версию кэша недостаточно. cache.add() делает обычный fetch
+   * и уважает HTTP-кэш, поэтому в новый кэш мог лечь СТАРЫЙ CSS: имя v4,
+   * а байты старые — баг пережил бы выкладку. Проверяем сам способ
+   * предзагрузки, иначе подъём версии создаёт ложное спокойствие. */
+  ok('предзагрузка ассетов идёт мимо HTTP-кэша (cache: reload)',
+    swNow.includes("cache: 'reload'"));
+  ok('предзагрузка не использует cache.add — он читает HTTP-кеш',
+    !/cache\.add\s*\(/.test(swNow));
+  ok('ассет кладётся через cache.put — свежие байты под своим именем',
+    /cache\.put\s*\(/.test(swNow));
+
+  /* Оболочка не должна залипать на час после выкладки. max-age на /app/
+   * — ровно то, из-за чего старый CSS переживает релиз. no-cache на
+   * статике означает сверку с сервером (304 без тела), а не запрет кеша. */
+  const appCssHeaders = await fetch(`${BASE}/app/styles.css`, { method: 'HEAD' });
+  const appCc = appCssHeaders.headers.get('cache-control') || '';
+  ok('/app/styles.css не имеет max-age — иначе старый CSS переживёт релиз',
+    !/max-age=[1-9]/.test(appCc), appCc);
+
+  const swHeaders = await fetch(`${BASE}/app/sw.js`, { method: 'HEAD' });
+  const swCc = swHeaders.headers.get('cache-control') || '';
+  ok('sw.js отдаётся с no-store', /no-store/.test(swCc), swCc);
+
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
   const summary = await api('/summary');
