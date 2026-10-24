@@ -1,6 +1,6 @@
 # DEMO-RUNBOOK — показ TarNet инвестору
 
-**Версия:** `2.9.2-agent-runtime-fix` · **Стенд:** `https://v1107336.hosted-by-vdsina.com`
+**Версия:** `2.10.0-knowledge-loop-schema` · **Стенд:** `https://v1107336.hosted-by-vdsina.com`
 **Приёмка:** 369/369 ✅ (`test-dpouw.js`) + 25/25 (`test-mesh.js`) = **394 проверки**
 **Сверено:** 2026-10-23. Хеш сборки здесь намеренно не указан — он меняется
 каждый деплой, и такая строка устаревает быстрее, чем её успевают прочитать.
@@ -42,7 +42,7 @@
 ```bash
 curl -s https://v1107336.hosted-by-vdsina.com/health \
   | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).buildVersion))"
-# ожидаем: 2.9.2-agent-runtime-fix  (и cloudflared_processes: 0)
+# ожидаем: 2.10.0-knowledge-loop-schema  (и cloudflared_processes: 0)
 ```
 
 Если `buildVersion` пустой или `cloudflared_processes > 0` — открыт dev-стенд,
@@ -363,7 +363,7 @@ curl -s -X POST https://v1107336.hosted-by-vdsina.com/demo/flush-work \
 
 | # | Проверка | Результат |
 |---|---|---|
-| 1 | `GET /health` | 200, `delta: 0`, `buildVersion: 2.9.2-agent-runtime-fix` |
+| 1 | `GET /health` | 200, `delta: 0`, `buildVersion: 2.10.0-knowledge-loop-schema` |
 | 2 | `GET /p2p/status` | 200, 3 узла |
 | 3 | `POST /id/register` | 200, `serverDerived: false` |
 | 4 | `GET /app/` | 200, 4950 байт |

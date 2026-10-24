@@ -532,6 +532,74 @@ CREATE TABLE IF NOT EXISTS user_consent (
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+/* ===== Волна 7: Knowledge Loop, схема (Фаза 2.5) =====
+ *
+ * ПОЧЕМУ TEXT, А НЕ VARCHAR(64) ИЗ ДИРЕКТИВЫ: в SQLite длина в VARCHAR не
+ * проверяется. Заявленная длина без CHECK — документация, которая не
+ * работает. Формат закреплён CHECK'ом ниже там, где он важен.
+ *
+ * ПОЧЕМУ promptText МОЖЕТ БЫТЬ NULL: при отзыве согласия текст стирается,
+ * но rating/response/домен остаются. Строка перестаёт быть обучающим
+ * примером (её отфильтрует JOIN по user_consent), но счётчики и история
+ * не рассыпаются.
+ */
+CREATE TABLE IF NOT EXISTS distillation_buffer (
+  id TEXT PRIMARY KEY,
+  promptHash TEXT NOT NULL,
+  promptText TEXT,
+  response TEXT NOT NULL,
+  rating INTEGER NOT NULL CHECK(rating IN (-1, 1)),
+  modelId TEXT NOT NULL,
+  domain TEXT NOT NULL DEFAULT 'general',
+  userId TEXT NOT NULL,
+  timestamp INTEGER NOT NULL,
+  usedInTraining INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(modelId) REFERENCES model_registry(modelId)
+);
+
+/* Индекс под единственный реальный запрос: «неиспользованные пары домена».
+ * Порядок колонок совпадает с порядком в WHERE — (domain, usedInTraining). */
+CREATE INDEX IF NOT EXISTS idx_distill_domain_unused
+  ON distillation_buffer(domain, usedInTraining);
+
+/* Версии LoRA-адаптеров.
+ *
+ * status: 'pending' — версия зарегистрирована, 'pending_gpu' — ждёт GPU,
+ * 'accepted'/'rejected' — решение комитета Benchmark Gate.
+ *
+ * ПОЧЕМУ CHECK НА status: опечатка 'acepted' иначе тихо создала бы
+ * адаптер, который не подходит ни под один фильтр и не виден ни в одном
+ * отчёте — он просто перестал бы существовать для системы. */
+CREATE TABLE IF NOT EXISTS adapter_versions (
+  adapterHash TEXT PRIMARY KEY,
+  domain TEXT NOT NULL,
+  baseModel TEXT NOT NULL,
+  evalScore REAL DEFAULT 0.0,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK(status IN ('pending', 'pending_gpu', 'accepted', 'rejected')),
+  signedByCommittee TEXT NOT NULL DEFAULT '[]',
+  /* committee — JSON-массив адресов, вытянутых жребием. Нужен, чтобы
+   * повторный запуск Benchmark Gate не блокировал стейк второй раз:
+   * состав комитета фиксируется в момент жребия, а не пересчитывается. */
+  committee TEXT,
+  createdAt TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+/* История голосов. Первичный ключ — runId: один валидатор может прислать
+ * голос дважды (ретрай), и это не должно считаться двумя голосами в
+ * кворуме. Дедупликация по (adapterHash, validatorId) — UNIQUE ниже. */
+CREATE TABLE IF NOT EXISTS benchmark_runs (
+  runId TEXT PRIMARY KEY,
+  adapterHash TEXT NOT NULL,
+  validatorId TEXT NOT NULL,
+  score REAL NOT NULL,
+  timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(adapterHash) REFERENCES adapter_versions(adapterHash)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_benchmark_one_vote_per_validator
+  ON benchmark_runs(adapterHash, validatorId);
+
 /* ===== Agent Foundation (Волна 3) =====
  *
  * Почему TEXT, а не VARCHAR(64) из директивы: в SQLite длина в VARCHAR не
@@ -788,6 +856,15 @@ ensureColumn('adapters', 'domain', 'domain TEXT');
  * бы роялти. Удалённый адаптер перестаёт принимать новые работы, история
  * остаётся целой. */
 ensureColumn('adapters', 'deleted_at', 'deleted_at TEXT');
+/* committee — состав комитета Benchmark Gate, вытянутый жребием (Волна 7).
+ *
+ * ПОЧЕМУ ensureColumn, А НЕ ТОЛЬКО CREATE TABLE: на стенде и на VPS таблица
+ * adapter_versions создалась бы новым CREATE уже после того, как... нет —
+ * она создаётся им же. Но колонка могла появиться позже самого CREATE в
+ * процессе разработки, и тогда на уже поднятой базе её бы не было, а
+ * CREATE TABLE IF NOT EXISTS молча ничего не делает с существующей
+ * таблицей. Без этой строки идемпотентность жребия не работает. */
+ensureColumn('adapter_versions', 'committee', 'committee TEXT');
 /* rsaPublicKeyPem — публичный ключ узла для Onion Routing (Фаза 2).
  * Опционален: без него узел не может быть ретранслятором или воркером
  * луковой цепи, но обычная работа идёт по-прежнему. Колонка nullable
@@ -987,6 +1064,21 @@ function get(sql, params = []) {
   const stmt = db.prepare(sql);
   return params.length ? stmt.get(...params) : stmt.get();
 }
+
+/* Координатор Knowledge Loop (Волна 7).
+ *
+ * Собирается ЗДЕСЬ, а не рядом с прочими require: ему нужны обёртки
+ * run/all/get, объявленные выше, а не голый db. Передать `db` напрямую
+ * было бы можно, но тогда координатор вызывал бы prepare() в другом стиле,
+ * чем весь остальной сервер, и различие проявилось бы только на ошибке.
+ *
+ * p2p НЕ передаётся: в этой сборке нет межузлового RPC общего вида
+ * (p2p-transport умеет только sendOnion). Координатор честно сообщит
+ * rpc.delivered = 0 и причину, вместо того чтобы отчитаться об отправке,
+ * которой не было. */
+const knowledgeCoordinator = new knowledgeLoop.KnowledgeLoopCoordinator({
+  db: { run, all, get },
+});
 
 /* Сумма всех резервов по счетам.
  *
@@ -2850,7 +2942,31 @@ app.post('/consent', (req, res) => {
        ON CONFLICT(userId) DO UPDATE SET is_opt_in = excluded.is_opt_in,
        updated_at = excluded.updated_at`,
     [id, isOptIn ? 1 : 0, now]);
-  res.json({ userId: id, isOptIn, updatedAt: now });
+
+  /* Отзыв согласия — это не флаг, а удаление права на данные.
+   *
+   * Что снимается: неиспользованные пары УДАЛЯЮТСЯ (они ещё не ушли в
+   * обучение, значит их не должно остаться ни в буфере, ни в следующем
+   * JSONL). Использованные — обезличиваются: текст промпта стирается,
+   * потому что он и есть персональные данные. Структура строки остаётся,
+   * иначе поехали бы счётчики и уже посчитанная статистика по доменам.
+   *
+   * ПОЧЕМУ НЕ DELETE ВСЕГО: на использованные пары ссылается адаптер,
+   * который мог быть принят комитетом. Удалить историю обучения — значит
+   * сделать происхождение весов недоказуемым. */
+  let deletedPrefixes = 0;
+  let scrubbed = 0;
+  if (!isOptIn) {
+    deletedPrefixes = Number(run(
+      `DELETE FROM distillation_buffer WHERE userId = ? AND usedInTraining = 0`,
+      [id])?.changes ?? 0);
+    scrubbed = Number(run(
+      `UPDATE distillation_buffer SET promptText = NULL
+        WHERE userId = ? AND promptText IS NOT NULL`,
+      [id])?.changes ?? 0);
+  }
+  res.json({ userId: id, isOptIn, updatedAt: now,
+    revoke: isOptIn ? null : { deletedUnused: deletedPrefixes, scrubbedUsed: scrubbed } });
 });
 
 app.get('/consent/:userId', (req, res) => {
@@ -2861,6 +2977,263 @@ app.get('/consent/:userId', (req, res) => {
    * валидный ответ «не разрешено», а не ошибка запроса. */
   if (!row) return res.json({ userId: id, isOptIn: false, updatedAt: null });
   res.json({ userId: id, isOptIn: row.is_opt_in === 1, updatedAt: row.updated_at });
+});
+
+/* --- Волна 7: запись оценённого ответа в буфер дистилляции ---
+ *
+ * Вызывается после лайка/дизлайка в PWA. Три независимых условия, и все три
+ * обязательны: согласие пользователя, лицензия модели и отсутствие PII.
+ * Проверяются ДО записи, а не при обучении: пара с PII не должна полежать
+ * в буфере «до проверки» — она там уже персональные данные.
+ *
+ * Отказ не считается ошибкой клиента: 200 с status:'ignored' и причиной.
+ * 4xx здесь означал бы «повтори запрос», а повторять нечего. */
+const DISTILL_TEXT_MAX = 20000;
+app.post('/distill/record', async (req, res) => {
+  const body = req.body || {};
+  const { userId, modelId, domain, promptText, response, rating } = body;
+
+  if (rating !== 1 && rating !== -1) {
+    return res.status(400).json({ error: 'RATING_MUST_BE_1_OR_MINUS_1', got: rating });
+  }
+  for (const [name, value] of [['userId', userId], ['modelId', modelId], ['response', response]]) {
+    if (typeof value !== 'string' || !value.trim()) {
+      return res.status(400).json({ error: `${name} must be a non-empty string` });
+    }
+  }
+  if (typeof promptText !== 'string' || !promptText.trim()) {
+    return res.status(400).json({ error: 'promptText must be a non-empty string' });
+  }
+  /* Ограничение длины: строка в SQLite не проверяет VARCHAR, и один запрос
+   * на 50 МБ раздул бы БД, которую потом надо бэкапить целиком. */
+  if (promptText.length > DISTILL_TEXT_MAX || response.length > DISTILL_TEXT_MAX) {
+    return res.status(400).json({ error: `promptText/response must be <= ${DISTILL_TEXT_MAX} chars` });
+  }
+  if (domain !== undefined && domain !== null && typeof domain !== 'string') {
+    return res.status(400).json({ error: 'domain must be a string' });
+  }
+
+  const consent = get('SELECT is_opt_in FROM user_consent WHERE userId = ?', [userId.trim()]);
+  const model = get('SELECT allowsTraining FROM model_registry WHERE modelId = ?', [modelId.trim()]);
+
+  if (!consent || consent.is_opt_in !== 1) {
+    return res.json({ status: 'ignored', reason: 'no_opt_in' });
+  }
+  if (!model) {
+    return res.json({ status: 'ignored', reason: 'unknown_model' });
+  }
+  if (model.allowsTraining !== 1) {
+    return res.json({ status: 'ignored', reason: 'license_restricted' });
+  }
+
+  let pii;
+  try {
+    pii = await piiClassifier.classify(promptText);
+  } catch (err) {
+    /* Классификатор недоступен — это не «чисто». Отказ, а не пропуск:
+     * неизвестный результат проверки нельзя трактовать как успешный. */
+    return res.json({ status: 'ignored', reason: 'pii_check_unavailable', detail: err.message });
+  }
+  if (pii.blocked) {
+    return res.json({ status: 'ignored', reason: 'pii_detected', matches: pii.matches || [] });
+  }
+
+  const id = crypto.randomUUID();
+  const promptHash = crypto.createHash('sha256').update(promptText).digest('hex');
+  run(`INSERT INTO distillation_buffer
+         (id, promptHash, promptText, response, rating, modelId, domain, userId, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, promptHash, promptText, response, rating, modelId.trim(),
+      (domain || 'general').trim(), userId.trim(), Date.now()]);
+
+  res.json({ status: 'recorded', id, promptHash,
+    pii: { checked: true, nerUsed: Boolean(pii.nerUsed) } });
+});
+
+/* --- Волна 7: ручной или cron-триггер обучения ---
+ *
+ * Обучение не запускается: mock_train.py возвращает pending_gpu. Статус
+ * insufficient_data — не ошибка, а факт «пар меньше порога», поэтому 200. */
+app.post('/knowledge/trigger-train', (req, res) => {
+  const body = req.body || {};
+  const domain = typeof body.domain === 'string' ? body.domain.trim() : '';
+  if (!domain) return res.status(400).json({ error: 'domain required' });
+  const minPairs = Number.isInteger(body.minPairs) ? body.minPairs : undefined;
+  if (minPairs !== undefined && (minPairs < 1 || minPairs > 100000)) {
+    return res.status(400).json({ error: 'minPairs must be 1..100000' });
+  }
+  try {
+    const result = knowledgeCoordinator.triggerTrainingPipeline(domain, { minPairs });
+    res.json(result);
+  } catch (err) {
+    const code = String(err.message || '');
+    const status = code.startsWith('INVALID_DOMAIN') ? 400 : 500;
+    res.status(status).json({ error: code });
+  }
+});
+
+/* --- Волна 7: запуск Benchmark Gate ---
+ *
+ * Комитет выбирается детерминированным жребием и блокирует стейк. Голоса
+ * приходят отдельно, в /knowledge/benchmark-vote. */
+app.post('/knowledge/benchmark-gate', (req, res) => {
+  const body = req.body || {};
+  const adapterHash = typeof body.adapterHash === 'string' ? body.adapterHash.trim() : '';
+  if (!adapterHash) return res.status(400).json({ error: 'MISSING_ADAPTER_HASH' });
+  try {
+    res.json(knowledgeCoordinator.triggerBenchmarkGate(adapterHash));
+  } catch (err) {
+    const code = String(err.message || '');
+    const status = code.startsWith('INSUFFICIENT_VALIDATORS')
+      || code.startsWith('COMMITTEE_STAKE_LOCK_FAILED') ? 409 : 500;
+    res.status(status).json({ error: code });
+  }
+});
+
+/* --- Волна 7: приём голосов комитета (кворум 4 из 5) ---
+ *
+ * Один валидатор — один голос: ретрай обновляет оценку, а не добавляет
+ * вторую (UNIQUE(adapterHash, validatorId)). Иначе пятикратный повтор
+ * одного узла выглядел бы как кворум. */
+const BENCHMARK_EPSILON = 0.01;
+const BENCHMARK_QUORUM = 4;
+const BENCHMARK_VOTES_REQUIRED = 5;
+
+app.post('/knowledge/benchmark-vote', (req, res) => {
+  const body = req.body || {};
+  const { adapterHash, validatorId, score, baselineScore } = body;
+
+  if (typeof adapterHash !== 'string' || !adapterHash.trim()) {
+    return res.status(400).json({ error: 'adapterHash required' });
+  }
+  if (typeof validatorId !== 'string' || !validatorId.trim()) {
+    return res.status(400).json({ error: 'validatorId required' });
+  }
+  if (typeof score !== 'number' || !Number.isFinite(score)) {
+    return res.status(400).json({ error: 'score must be a finite number' });
+  }
+  /* baseline обязателен: без него сравнение шло бы с нулём, и модель,
+   * которая хуже базовой, но лучше нуля, считалась бы улучшением. */
+  if (typeof baselineScore !== 'number' || !Number.isFinite(baselineScore)) {
+    return res.status(400).json({ error: 'baselineScore must be a finite number' });
+  }
+
+  const adapter = get('SELECT status FROM adapter_versions WHERE adapterHash = ?', [adapterHash.trim()]);
+  if (!adapter) {
+    /* Голос за несуществующий адаптер никуда не ведёт: отдаём 404, а не
+     * 500 от сработавшего внешнего ключа. */
+    return res.status(404).json({ error: 'ADAPTER_NOT_FOUND', adapterHash });
+  }
+
+  const runId_ = crypto.randomUUID();
+  run(`INSERT INTO benchmark_runs (runId, adapterHash, validatorId, score)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(adapterHash, validatorId) DO UPDATE SET
+         score = excluded.score,
+         timestamp = CURRENT_TIMESTAMP`,
+    [runId_, adapterHash.trim(), validatorId.trim(), score]);
+
+  const runs = all(`SELECT validatorId, score FROM benchmark_runs
+                     WHERE adapterHash = ? ORDER BY validatorId ASC`, [adapterHash.trim()]);
+
+  if (runs.length < BENCHMARK_VOTES_REQUIRED) {
+    return res.json({ status: 'vote_recorded', votesCollected: runs.length,
+      votesRequired: BENCHMARK_VOTES_REQUIRED });
+  }
+
+  const positive = runs.filter((r) => Number(r.score) > baselineScore + BENCHMARK_EPSILON);
+  const newStatus = positive.length >= BENCHMARK_QUORUM ? 'accepted' : 'rejected';
+  const avg = runs.reduce((s, r) => s + Number(r.score), 0) / runs.length;
+
+  /* WHERE status IN ('pending','pending_gpu') делает финализацию ровно
+   * однократной: повторный голос после решения не должен ни переписать
+   * вердикт, ни снять стейк второй раз. */
+  const updated = run(`UPDATE adapter_versions
+                          SET status = ?, evalScore = ?, signedByCommittee = ?
+                        WHERE adapterHash = ? AND status IN ('pending', 'pending_gpu')`,
+    [newStatus, Number(avg.toFixed(4)),
+      JSON.stringify(runs.map((r) => r.validatorId)), adapterHash.trim()]);
+
+  const finalizedNow = Number(updated?.changes) === 1;
+  let releasedStakes = 0;
+  if (finalizedNow) {
+    /* Залог возвращается после решения: держать его дальше нечем —
+     * слэшинг относится к Фазе 3 и в этой сборке не реализован. */
+    for (const r of runs) {
+      try {
+        /* Считаем ФАКТИЧЕСКИ снятые блокировки, а не число попыток:
+         * голос мог прийти от id, у которого нет счёта в balances, и
+         * отчитаться «снято 5» значило бы показать операцию, которой не было. */
+        const rel = knowledgeCoordinator.releaseStake(r.validatorId);
+        if (Number(rel?.changes) === 1) releasedStakes++;
+      } catch (_e) { /* один сбой не отменяет остальные возвраты */ }
+    }
+  }
+
+  /* При повторном голосе после решения вердикт берётся ИЗ БД, а не из
+   * пересчёта: голоса уже не меняют статус (UPDATE ограничен pending), и
+   * отдавать пересчитанное значение значило бы показать «rejected» для
+   * адаптера, который в базе accepted. */
+  const finalRow = get('SELECT status, evalScore FROM adapter_versions WHERE adapterHash = ?',
+    [adapterHash.trim()]);
+
+  res.json({
+    status: finalizedNow ? 'finalized' : 'already_finalized',
+    adapterStatus: finalRow?.status ?? newStatus,
+    positiveVotes: positive.length,
+    votesCollected: runs.length,
+    quorumRequired: BENCHMARK_QUORUM,
+    avgScore: Number(finalRow?.evalScore ?? avg.toFixed(4)),
+    releasedStakes,
+    stakeReleasedPerValidator: knowledgeLoop.VALIDATOR_STAKE_LOCK_TAR,
+  });
+});
+
+/* --- Волна 7: состояние Knowledge Loop ---
+ *
+ * Отдаёт то, что реально лежит в трёх таблицах, и явно помечает
+ * незавершённое: обучение на GPU не запускалось ни разу. */
+app.get('/knowledge/status', (_req, res) => {
+  const buffer = get(`SELECT COUNT(*) AS total,
+                             COALESCE(SUM(CASE WHEN usedInTraining = 0 THEN 1 ELSE 0 END), 0) AS unused,
+                             COALESCE(SUM(CASE WHEN usedInTraining = 1 THEN 1 ELSE 0 END), 0) AS used,
+                             COALESCE(SUM(CASE WHEN promptText IS NULL THEN 1 ELSE 0 END), 0) AS scrubbed,
+                             COUNT(DISTINCT domain) AS domains
+                        FROM distillation_buffer`);
+  const adapters = all(`SELECT adapterHash, domain, baseModel, status, evalScore, createdAt
+                          FROM adapter_versions ORDER BY createdAt DESC, adapterHash ASC LIMIT 20`);
+  const votes = get(`SELECT COUNT(*) AS total, COUNT(DISTINCT adapterHash) AS adapters
+                       FROM benchmark_runs`);
+  const byStatus = all(`SELECT status, COUNT(*) AS c FROM adapter_versions GROUP BY status`);
+  const optIn = get('SELECT COUNT(*) AS c FROM user_consent WHERE is_opt_in = 1');
+
+  res.json({
+    phase: '2.5 [SPEC / ROADMAP]',
+    training: {
+      implemented: false,
+      reason: 'LoRA training requires GPU (RunPod/Modal). mock_train.py returns pending_gpu.',
+      minPairsForTraining: knowledgeLoop.MIN_PAIRS_FOR_TRAINING,
+    },
+    benchmarkGate: {
+      committeeSize: knowledgeLoop.REQUIRED_COMMITTEE_SIZE,
+      quorumRequired: BENCHMARK_QUORUM,
+      stakeLockedTar: knowledgeLoop.VALIDATOR_STAKE_LOCK_TAR,
+      votingImplemented: true,
+      verificationImplemented: false,
+      verificationReason: 'verifyAdapter() is a stub: no benchmark harness in this build',
+    },
+    buffer: {
+      total: Number(buffer?.total || 0),
+      unused: Number(buffer?.unused || 0),
+      used: Number(buffer?.used || 0),
+      scrubbed: Number(buffer?.scrubbed || 0),
+      domains: Number(buffer?.domains || 0),
+    },
+    consent: { optInUsers: Number(optIn?.c || 0) },
+    adapters: { total: adapters.length, byStatus },
+    votes: { total: Number(votes?.total || 0), adapters: Number(votes?.adapters || 0) },
+    recentAdapters: adapters.map((a) => ({ ...a, evalScore: Number(a.evalScore) })),
+  });
 });
 
 app.get('/adapters', (_req, res) => res.json(all('SELECT adapterId, authorAddress, baseModel, domain, royaltyRate, deleted_at FROM adapters ORDER BY adapterId')));

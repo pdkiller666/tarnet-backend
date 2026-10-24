@@ -2974,6 +2974,289 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     cfWave6.conservation.delta === 0 && cfWave6.conservation.holds === true,
     { delta: cfWave6.conservation.delta, holds: cfWave6.conservation.holds });
 
+  /* ===== Волна 7: Knowledge Loop, схема и координатор (Фаза 2.5) =====
+   *
+   * Проверяется проводка, а не обучение: обучения здесь нет и быть не может
+   * (VPS 1.6 ГБ без GPU). Заглушка mock_train.py обязана возвращать
+   * pending_gpu, и тест это закрепляет — иначе «Knowledge Loop готов»
+   * читалось бы как «модель обучена». */
+  section('24. Волна 7: Knowledge Loop — буфер, обучение-заглушка, комитет');
+
+  /* ---------- 24.1: запись пары без согласия ---------- */
+  const w7User = runAddress('w7u');
+  const w7NoConsent = await api('/distill/record', 'POST', {
+    userId: w7User, modelId: 'qwen2.5-coder-7b', domain: 'w7code',
+    promptText: 'отсортируй массив', response: 'arr.sort()', rating: 1,
+  });
+  ok('24.1 без opt-in пара не пишется (ignored, no_opt_in)',
+    w7NoConsent.body?.status === 'ignored' && w7NoConsent.body?.reason === 'no_opt_in',
+    w7NoConsent.body);
+
+  /* ---------- 24.2: согласие ---------- */
+  const w7Consent = await api('/consent', 'POST', { userId: w7User, isOptIn: true });
+  ok('24.2 POST /consent включает opt-in',
+    w7Consent.body?.isOptIn === true, w7Consent.body);
+
+  /* ---------- 24.3: PII не попадает в буфер ---------- */
+  const w7Pii = await api('/distill/record', 'POST', {
+    userId: w7User, modelId: 'qwen2.5-coder-7b', domain: 'w7code',
+    promptText: 'мой email ivan@example.com и телефон +79161234567',
+    response: 'ок', rating: 1,
+  });
+  ok('24.3 текст с PII отклонён (ignored, pii_detected)',
+    w7Pii.body?.status === 'ignored' && w7Pii.body?.reason === 'pii_detected',
+    w7Pii.body);
+  ok('24.3 отказ называет найденные типы PII',
+    Array.isArray(w7Pii.body?.matches) && w7Pii.body.matches.length > 0,
+    w7Pii.body?.matches);
+
+  /* ---------- 24.4: лицензия модели ---------- */
+  /* openai/gpt-4o в реестре с allowsTraining = 0. Согласие пользователя не
+   * отменяет лицензию: два независимых условия, и оба обязательны. */
+  const w7License = await api('/distill/record', 'POST', {
+    userId: w7User, modelId: 'openai/gpt-4o', domain: 'w7code',
+    promptText: 'чистый текст без персональных данных', response: 'ок', rating: 1,
+  });
+  ok('24.4 proprietary-модель отклонена (license_restricted)',
+    w7License.body?.status === 'ignored' && w7License.body?.reason === 'license_restricted',
+    w7License.body);
+
+  /* ---------- 24.5: валидные пары ---------- */
+  const w7Recorded = [];
+  for (let i = 0; i < 3; i++) {
+    const r = await api('/distill/record', 'POST', {
+      userId: w7User, modelId: 'qwen2.5-coder-7b', domain: 'w7code',
+      promptText: `задача номер ${i} про сортировку`,
+      response: `решение ${i}`, rating: i === 2 ? -1 : 1,
+    });
+    w7Recorded.push(r);
+  }
+  ok('24.5 три чистые пары записаны (recorded)',
+    w7Recorded.every(r => r.body?.status === 'recorded'),
+    w7Recorded.map(r => ({ s: r.body?.status, r: r.body?.reason })));
+  ok('24.5 пара несёт promptHash из 64 hex',
+    w7Recorded.every(r => /^[0-9a-f]{64}$/.test(r.body?.promptHash || '')),
+    w7Recorded[0]?.body?.promptHash);
+  ok('24.5 PII-проверка отмечена как выполненная',
+    w7Recorded[0]?.body?.pii?.checked === true, w7Recorded[0]?.body?.pii);
+
+  /* ---------- 24.6: валидация rating ---------- */
+  const w7BadRating = await api('/distill/record', 'POST', {
+    userId: w7User, modelId: 'qwen2.5-coder-7b', domain: 'w7code',
+    promptText: 'текст', response: 'ответ', rating: 0,
+  });
+  ok('24.6 rating = 0 → 400 (только 1 и −1)',
+    w7BadRating.status === 400 && /RATING_MUST_BE/.test(JSON.stringify(w7BadRating.body)),
+    { status: w7BadRating.status, body: w7BadRating.body });
+
+  /* ---------- 24.7: порог датасета ---------- */
+  /* minPairs передаётся параметром: боевой порог 100, но ждать сотню пар в
+   * приёмке бессмысленно — проверяется поведение порога, а не его значение. */
+  const w7Insufficient = await api('/knowledge/trigger-train', 'POST', {
+    domain: 'w7code', minPairs: 10,
+  });
+  ok('24.7 пар меньше порога → insufficient_data',
+    w7Insufficient.body?.status === 'insufficient_data',
+    w7Insufficient.body);
+  ok('24.7 insufficient_data называет count и required',
+    w7Insufficient.body?.count === 3 && w7Insufficient.body?.required === 10,
+    { count: w7Insufficient.body?.count, required: w7Insufficient.body?.required });
+
+  /* ---------- 24.8: обучение-заглушка ---------- */
+  const w7Trained = await api('/knowledge/trigger-train', 'POST', {
+    domain: 'w7code', minPairs: 3,
+  });
+  ok('24.8 trigger-train → pending_gpu (обучения нет)',
+    w7Trained.body?.status === 'pending_gpu', w7Trained.body);
+  const w7AdapterHash = w7Trained.body?.adapterHash;
+  ok('24.8 вернулся adapterHash (64 hex)',
+    typeof w7AdapterHash === 'string' && /^[0-9a-f]{64}$/.test(w7AdapterHash),
+    w7AdapterHash);
+  ok('24.8 count равен числу отобранных пар',
+    w7Trained.body?.count === 3, w7Trained.body?.count);
+
+  /* ---------- 24.9: JSONL на диске ---------- */
+  const w7JsonlPath = w7Trained.body?.jsonlPath;
+  const w7JsonlOk = w7JsonlPath && fs.existsSync(w7JsonlPath);
+  ok('24.9 JSONL создан на диске', Boolean(w7JsonlOk), w7JsonlPath);
+  if (w7JsonlOk) {
+    const w7Lines = fs.readFileSync(w7JsonlPath, 'utf8').trim().split('\n');
+    ok('24.9 в JSONL ровно 3 строки', w7Lines.length === 3, w7Lines.length);
+    const w7First = JSON.parse(w7Lines[0]);
+    ok('24.9 строка JSONL несёт prompt/response/rating/домен',
+      typeof w7First.prompt === 'string' && typeof w7First.response === 'string'
+        && (w7First.rating === 1 || w7First.rating === -1) && w7First.domain === 'w7code',
+      { prompt: w7First.prompt, rating: w7First.rating, domain: w7First.domain });
+  }
+
+  /* ---------- 24.10: пары помечены использованными ---------- */
+  /* Повторный прогон обязан найти пусто: те же пары не должны уйти в
+   * обучение дважды — это дублирование весов и двойной счёт. */
+  const w7Again = await api('/knowledge/trigger-train', 'POST', {
+    domain: 'w7code', minPairs: 3,
+  });
+  ok('24.10 повторный прогон не находит пар (usedInTraining = TRUE)',
+    w7Again.body?.status === 'insufficient_data' && w7Again.body?.count === 0,
+    w7Again.body);
+
+  /* ---------- 24.11: версия адаптера в реестре ---------- */
+  const w7Status = await api('/knowledge/status');
+  const w7AdapterRow = (w7Status.body?.recentAdapters || [])
+    .find(a => a.adapterHash === w7AdapterHash);
+  ok('24.11 adapter_versions содержит версию',
+    Boolean(w7AdapterRow), w7AdapterRow);
+  ok('24.11 baseModel взят из данных, а не литералом',
+    w7AdapterRow?.baseModel === 'qwen2.5-coder-7b', w7AdapterRow?.baseModel);
+  ok('24.11 у адаптера status = pending_gpu',
+    w7AdapterRow?.status === 'pending_gpu', w7AdapterRow?.status);
+
+  /* ---------- 24.12: Benchmark Gate без хеша ---------- */
+  const w7NoHash = await api('/knowledge/benchmark-gate', 'POST', {});
+  ok('24.12 gate без adapterHash → 400 MISSING_ADAPTER_HASH',
+    w7NoHash.status === 400 && /MISSING_ADAPTER_HASH/.test(JSON.stringify(w7NoHash.body)),
+    { status: w7NoHash.status, body: w7NoHash.body });
+
+  /* ---------- 24.13: нехватка валидаторов ---------- */
+  /* Изолированная БД пуста, поэтому проверка идёт ДО сидинга узлов: иначе
+   * различить «нет кандидатов» и «кандидаты есть, но мало» было бы нечем. */
+  const w7Sparse = await api('/knowledge/benchmark-gate', 'POST', {
+    adapterHash: w7AdapterHash,
+  });
+  ok('24.13 при < 5 кандидатах → 409 INSUFFICIENT_VALIDATORS',
+    w7Sparse.status === 409 && /INSUFFICIENT_VALIDATORS/.test(JSON.stringify(w7Sparse.body)),
+    { status: w7Sparse.status, body: w7Sparse.body });
+
+  /* ---------- сидинг валидаторов ---------- */
+  /* 6 узлов expert: пять для комитета и один запасной, чтобы проверить, что
+   * выбирается РОВНО пять, а не все подходящие. Балансы пишутся напрямую:
+   * эндпоинта пополнения в этой сборке нет, а блокировка стейка требует
+   * реальных денег на счету (balanceTar − reservedTar >= 10). */
+  const w7Validators = [];
+  for (let i = 0; i < 6; i++) {
+    const addr = runAddress('w7v' + i);
+    await api('/node', 'POST', {
+      address: addr, stake: 50, reputation: 0.95, tier: 'expert', isTeeAttested: true,
+    });
+    w7Validators.push(addr);
+  }
+  if (TEST_MODE && tmpDir) {
+    const { DatabaseSync } = require('node:sqlite');
+    const fdb = new DatabaseSync(path.join(tmpDir, 'test.db'));
+    fdb.exec('PRAGMA busy_timeout = 3000;');
+    const setBal = fdb.prepare(`UPDATE balances SET balanceTar = 50, updatedAt = ?
+                                 WHERE address = ?`);
+    for (const a of w7Validators) setBal.run(new Date().toISOString(), a);
+    fdb.close();
+  }
+
+  /* ---------- 24.14: жребий комитета ---------- */
+  const w7Gate = await api('/knowledge/benchmark-gate', 'POST', {
+    adapterHash: w7AdapterHash,
+  });
+  ok('24.14 gate выбрал комитет (benchmark_started)',
+    w7Gate.body?.status === 'benchmark_started', w7Gate.body?.status);
+  ok('24.14 комитет ровно 5 из 6 кандидатов',
+    w7Gate.body?.committeeSize === 5 && Array.isArray(w7Gate.body?.committee)
+      && w7Gate.body.committee.length === 5,
+    { size: w7Gate.body?.committeeSize });
+  ok('24.14 все члены комитета — из пула валидаторов',
+    (w7Gate.body?.committee || []).every(a => w7Validators.includes(a)),
+    w7Gate.body?.committee);
+  ok('24.14 RPC не выдуман: delivered 0 и причина названа',
+    w7Gate.body?.rpc?.delivered === 0 && typeof w7Gate.body?.rpc?.reason === 'string',
+    w7Gate.body?.rpc);
+
+  /* ---------- 24.15: стейк заблокирован ---------- */
+  const w7Locked = [];
+  for (const addr of w7Gate.body?.committee || []) {
+    const b = await api(`/balance/${addr}`);
+    w7Locked.push({ addr, reserved: b.body?.reservedTar, bal: b.body?.balanceTar });
+  }
+  ok('24.15 с каждого из 5 заблокировано по 10 TAR',
+    w7Locked.length === 5 && w7Locked.every(l => Math.abs(l.reserved - 10) < 1e-9),
+    w7Locked.map(l => l.reserved));
+  ok('24.15 баланс не списан — только зарезервирован',
+    w7Locked.every(l => Math.abs(l.bal - 50) < 1e-9),
+    w7Locked.map(l => l.bal));
+
+  /* ---------- 24.16: повторный жребий не блокирует дважды ---------- */
+  const w7GateAgain = await api('/knowledge/benchmark-gate', 'POST', {
+    adapterHash: w7AdapterHash,
+  });
+  const w7AgainLocked = [];
+  for (const addr of w7GateAgain.body?.committee || []) {
+    const b = await api(`/balance/${addr}`);
+    w7AgainLocked.push(b.body?.reservedTar);
+  }
+  ok('24.16 повторный gate не блокирует стейк второй раз',
+    w7AgainLocked.every(r => Math.abs(r - 10) < 1e-9), w7AgainLocked);
+  ok('24.16 повторный gate отдаёт тот же комитет',
+    JSON.stringify(w7GateAgain.body?.committee) === JSON.stringify(w7Gate.body?.committee),
+    w7GateAgain.body?.committee);
+
+  /* ---------- 24.17: кворум голосов ---------- */
+  /* baselineScore = 0.80: четыре голоса выше baseline + 0.01 дают accepted,
+   * пятый (ниже) не мешает — кворум 4 из 5. */
+  const w7VoteScores = [0.90, 0.88, 0.86, 0.85, 0.70];
+  const w7Votes = [];
+  for (let i = 0; i < w7VoteScores.length; i++) {
+    const v = await api('/knowledge/benchmark-vote', 'POST', {
+      adapterHash: w7AdapterHash,
+      validatorId: w7Gate.body.committee[i],
+      score: w7VoteScores[i],
+      baselineScore: 0.80,
+    });
+    w7Votes.push(v);
+  }
+  ok('24.17 первые 4 голоса копятся (vote_recorded)',
+    w7Votes.slice(0, 4).every(v => v.body?.status === 'vote_recorded'),
+    w7Votes.map(v => v.body?.status));
+  ok('24.17 пять голосов → кворум 4/5 → accepted',
+    w7Votes[4]?.body?.status === 'finalized' && w7Votes[4]?.body?.adapterStatus === 'accepted',
+    w7Votes[4]?.body);
+  ok('24.17 positiveVotes = 4',
+    w7Votes[4]?.body?.positiveVotes === 4, w7Votes[4]?.body?.positiveVotes);
+  ok('24.17 залог снят у 5 валидаторов после решения',
+    w7Votes[4]?.body?.releasedStakes === 5, w7Votes[4]?.body?.releasedStakes);
+
+  /* ---------- 24.18: один валидатор — один голос ---------- */
+  const w7DupVote = await api('/knowledge/benchmark-vote', 'POST', {
+    adapterHash: w7AdapterHash,
+    validatorId: w7Gate.body.committee[0],
+    score: 0.10, baselineScore: 0.80,
+  });
+  ok('24.18 повторный голос не отменяет уже принятое решение',
+    w7DupVote.body?.adapterStatus === 'accepted', w7DupVote.body);
+
+  /* ---------- 24.19: отзыв согласия ---------- */
+  const w7Fresh = await api('/distill/record', 'POST', {
+    userId: w7User, modelId: 'qwen2.5-coder-7b', domain: 'w7code',
+    promptText: 'ещё одна пара перед отзывом', response: 'ок', rating: 1,
+  });
+  ok('24.19 пара записана перед отзывом', w7Fresh.body?.status === 'recorded', w7Fresh.body);
+
+  const w7Revoke = await api('/consent', 'POST', { userId: w7User, isOptIn: false });
+  ok('24.19 отзыв удалил неиспользованную пару',
+    w7Revoke.body?.revoke?.deletedUnused === 1, w7Revoke.body?.revoke);
+  ok('24.19 отзыв обезличил использованные пары (promptText = NULL)',
+    w7Revoke.body?.revoke?.scrubbedUsed >= 3, w7Revoke.body?.revoke);
+
+  const w7AfterRevoke = await api('/knowledge/status');
+  ok('24.19 после отзыва буфер не содержит текстов промптов',
+    w7AfterRevoke.body?.buffer?.scrubbed === w7AfterRevoke.body?.buffer?.total,
+    { total: w7AfterRevoke.body?.buffer?.total, scrubbed: w7AfterRevoke.body?.buffer?.scrubbed });
+  ok('24.19 /knowledge/status честно сообщает об отсутствии обучения',
+    w7AfterRevoke.body?.training?.implemented === false,
+    w7AfterRevoke.body?.training);
+
+  /* ---------- 24.20: сохранность денег ---------- */
+  /* Отзыв, жребий и голосование трогали reservedTar и балансы. Инвариант
+   * обязан остаться прежним: новые функции не печатают денег. */
+  const cfWave7 = (await api('/health')).body;
+  ok('Волна 7 не сломала conservation (delta 0)',
+    cfWave7.conservation.delta === 0 && cfWave7.conservation.holds === true,
+    { delta: cfWave7.conservation.delta, holds: cfWave7.conservation.holds });
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌`);
   if (fail) {
