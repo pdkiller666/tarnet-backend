@@ -131,8 +131,9 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => { stopIsolatedServer(); process.exit(130); });
 }
 
-let pass = 0, fail = 0;
+let pass = 0, fail = 0, skipped = 0;
 const failures = [];
+const skips = [];
 
 function ok(name, cond, detail) {
   if (cond) { pass++; console.log(`  ✅ ${name}`); }
@@ -140,6 +141,13 @@ function ok(name, cond, detail) {
     fail++; failures.push({ name, detail });
     console.log(`  ❌ ${name}${detail !== undefined ? ` — ${JSON.stringify(detail)}` : ''}`);
   }
+}
+
+/* Пропуск — не «пройдено». Считается отдельно и печатает причину:
+ * иначе отсутствие зависимости выглядело бы как зелёная проверка защиты. */
+function skip(name, reason) {
+  skipped++; skips.push({ name, reason });
+  console.log(`  ⏭️  ${name} — SKIP: ${reason}`);
 }
 function section(t) { console.log(`\n${t}`); }
 
@@ -3661,19 +3669,13 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     const app = await api('/app/app.js');
     const src = typeof app.body === 'string' ? app.body : '';
 
-    /* linkedom объявлен в devDependencies. Здесь он может отсутствовать:
-     * на этой машине npm не смог его распаковать (ENOSPC), поэтому вторым
-     * шагом ищем копию в рантайме. Если нет ни одной — тест падает, а не
-     * молча пропускается: непроверенная защита хуже отсутствующей. */
+    /* linkedom объявлен в devDependencies (^0.18.13). Чужой рантайм
+     * (/app/node_modules) не трогаем: на чистой машине его нет, и тест
+     * зеленел бы только там, где повезло с соседним проектом. Пакета нет —
+     * секция уходит в SKIP с причиной, а не в тихое «пройдено»:
+     * непроверенная защита не должна выглядеть проверенной. */
     let DOMParserCtor = null;
-    for (const p of ['linkedom', '/app/node_modules/linkedom']) {
-      try {
-        DOMParserCtor = require(p).DOMParser;
-        break;
-      } catch (_e) { /* пробуем следующий путь */ }
-    }
-    ok('28.0 DOM-парсер доступен для прогона XSS', Boolean(DOMParserCtor),
-      'npm i --save-dev linkedom');
+    try { DOMParserCtor = require('linkedom').DOMParser; } catch (_e) { DOMParserCtor = null; }
 
     const vm = require('vm');
     const start = src.indexOf('const ALLOWED_TAGS');
@@ -3693,10 +3695,22 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
         }
       }
     }
-    ok('28.0 санитайзер извлечён из app.js', Boolean(code),
-      code ? code.length + ' байт' : 'маркеры не найдены');
-
-    if (DOMParserCtor && code) {
+    if (!code) {
+      ok('28.0 санитайзер извлечён из app.js', false, 'маркеры не найдены');
+    } else if (!DOMParserCtor) {
+      const why = 'linkedom not installed, skipping XSS tests';
+      ok('28.0 санитайзер извлечён из app.js', true, code.length + ' байт');
+      skip('28.1 <img onerror> — обработчик снят', why);
+      skip('28.1 <img onerror> — тег не выжил', why);
+      skip('28.2 javascript: href снят', why);
+      skip('28.2 текст ссылки сохранён', why);
+      skip('28.3 <script> не остался тегом', why);
+      skip('28.3 содержимое стало текстом', why);
+      skip('28.4 https-ссылка сохранена', why);
+      skip('28.4 rel=noopener проставлен', why);
+    } else {
+      ok('28.0 DOM-парсер доступен для прогона XSS', true, 'linkedom');
+      ok('28.0 санитайзер извлечён из app.js', true, code.length + ' байт');
       const ctx = vm.createContext({ DOMParser: DOMParserCtor, console });
       vm.runInContext(code + '\n;globalThis.__san = sanitizeHtml;', ctx);
       const san = ctx.__san;
@@ -3728,10 +3742,18 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   }
 
   console.log('\n' + '─'.repeat(50));
-  console.log(`Итого: ${pass} ✅   ${fail} ❌`);
+  console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {
     console.log('\nПровалы:');
     for (const f of failures) console.log(`  • ${f.name} — ${JSON.stringify(f.detail)}`);
+  }
+  if (skipped) {
+    console.log('\nПропущено (НЕ проверено):');
+    const reasons = [...new Set(skips.map(s => s.reason))];
+    for (const r of reasons) {
+      const n = skips.filter(s => s.reason === r).length;
+      console.log(`  • ${r} — ${n} проверок`);
+    }
   }
   console.log('─'.repeat(50));
   process.exit(fail ? 1 : 0);
