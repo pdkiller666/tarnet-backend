@@ -3,19 +3,38 @@
  * к Google Fonts означал бы, что страница не работает без интернета. */
 
 :root {
-  --bg: #0b0e14;
-  --panel: #131823;
-  --panel-2: #1a2130;
-  --border: #263045;
-  --text: #e6ebf5;
-  --muted: #8b97ad;
-  --accent: #4f9cf9;
-  --accent-fg: #06101f;
-  --ok: #37d67a;
-  --warn: #f5a524;
-  --danger: #f2555a;
-  --radius: 12px;
+  /* Глубина строится тремя слоями: фон → панель → приподнятый блок.
+   * Раньше было два, из-за чего карточки сливались с фоном. */
+  --bg: #08090d;
+  --bg-elev: #0c0e14;
+  --panel: #101319;
+  --panel-2: #161a22;
+  --panel-3: #1d222c;
+  --border: #232936;
+  --border-strong: #303849;
+  --text: #e8ecf4;
+  --text-strong: #ffffff;
+  --muted: #8e99ad;
+  --muted-2: #6b7488;
+
+  --accent: #4d7cfe;
+  --accent-strong: #3d6bf0;
+  --accent-soft: rgba(77, 124, 254, .12);
+  --accent-fg: #ffffff;
+  --grad: linear-gradient(135deg, #4d7cfe 0%, #7b5cff 100%);
+
+  --ok: #3ddc84;
+  --warn: #f7b955;
+  --danger: #ff6b6b;
+
+  --radius: 16px;
+  --radius-sm: 10px;
+  --radius-xs: 8px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .3);
+  --shadow-md: 0 8px 24px -8px rgba(0, 0, 0, .55);
+  --shadow-lg: 0 24px 64px -16px rgba(0, 0, 0, .7);
+  --ease: cubic-bezier(.22, .61, .36, 1);
 }
 
 * { box-sizing: border-box; }
@@ -44,126 +63,297 @@ html, body {
   padding: 0;
   background: var(--bg);
   color: var(--text);
-  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   -webkit-text-size-adjust: 100%;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* iOS: safe-area, иначе контент уезжает под чёлку и домашнюю полоску */
+/* Фон: очень слабое свечение сверху, чтобы плоский тёмный экран не выглядел
+ * мёртвым. Радиальный градиент дешевле картинки и не требует сети. */
 body {
+  min-height: 100vh;
+  background:
+    radial-gradient(80rem 40rem at 50% -20%, rgba(77, 124, 254, .07), transparent 70%),
+    var(--bg);
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
   padding-bottom: calc(env(safe-area-inset-bottom) + 16px);
 }
 
+/* ================= Шапка ================= */
+
 .top {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter: blur(14px) saturate(160%);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+}
+
+.top-inner {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 14px 16px 10px;
+  padding: 12px 16px;
+  max-width: 900px;
+  margin: 0 auto;
 }
 
-.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.logo { width: 30px; height: 30px; color: var(--accent); flex: 0 0 auto; }
+.brand { display: flex; align-items: center; gap: 11px; min-width: 0; }
 
-h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
-.sub { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+.logo-wrap {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 11px;
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.logo { width: 21px; height: 21px; display: block; }
+
+.brand-text { min-width: 0; }
+
+h1 {
+  font-size: 16px;
+  margin: 0;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  color: var(--text-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.brand-sep { color: var(--muted-2); font-weight: 400; }
+.brand-sub { color: var(--muted); font-weight: 500; }
+
+.sub {
+  margin: 1px 0 0;
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .dim { color: var(--muted); }
 .mono { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+.tiny { font-size: 12px; }
+
+/* ================= Вкладки ================= */
 
 .tabs {
   display: flex;
-  gap: 6px;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--border);
-  position: sticky;
-  top: 0;
-  background: var(--bg);
-  z-index: 5;
+  gap: 4px;
+  padding: 6px 12px;
+  max-width: 900px;
+  margin: 0 auto;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
+.tabs::-webkit-scrollbar { display: none; }
 
 .tab {
-  flex: 1;
-  padding: 11px 8px;
-  background: none;
-  border: none;
-  border-bottom: 2px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 auto;
+  justify-content: center;
+  padding: 9px 14px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 999px;
   color: var(--muted);
-  font-size: 14px;
+  font-size: 13.5px;
   font-weight: 550;
   cursor: pointer;
-  transition: color .15s ease, border-color .15s ease;
+  white-space: nowrap;
+  transition: background .18s var(--ease), color .18s var(--ease), border-color .18s var(--ease);
 }
-.tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.tab svg { width: 16px; height: 16px; flex: 0 0 auto; opacity: .8; }
+.tab:hover { color: var(--text); background: var(--panel); }
+.tab.active {
+  color: var(--text-strong);
+  background: var(--panel-2);
+  border-color: var(--border);
+  box-shadow: var(--shadow-sm);
+}
+.tab.active svg { opacity: 1; color: var(--accent); }
 
-main { padding: 12px; max-width: 860px; margin: 0 auto; }
-.panel { display: flex; flex-direction: column; gap: 12px; }
+main { padding: 14px 12px 8px; max-width: 900px; margin: 0 auto; }
+.panel { display: flex; flex-direction: column; gap: 14px; }
 
-.controls { display: flex; gap: 10px; flex-wrap: wrap; }
-.field { flex: 1 1 180px; display: flex; flex-direction: column; gap: 4px; }
-.field > span { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+/* ================= Чат ================= */
 
-select, textarea, button { font: inherit; color: inherit; }
+/* НЕ sticky: шапка сама sticky с z-index 20, и панель фильтров на top:0
+ * уезжала бы под неё. Фильтры и так видны над лентой. */
+.chat-head { padding-top: 2px; }
+
+.controls { display: flex; gap: 8px; flex-wrap: wrap; }
+.field { flex: 1 1 150px; display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.field > span {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--muted-2);
+  font-weight: 600;
+}
+
+select, textarea, input, button { font: inherit; color: inherit; }
 
 select {
   width: 100%;
-  padding: 9px 10px;
+  padding: 9px 30px 9px 11px;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238e99ad' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")
+    no-repeat right 9px center / 14px,
+    var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  appearance: none;
+  -webkit-appearance: none;
+  font-size: 13.5px;
+  transition: border-color .16s var(--ease), background-color .16s var(--ease);
+  text-overflow: ellipsis;
+}
+select:hover { border-color: var(--border-strong); }
+
+input[type="number"] {
+  width: 100%;
+  padding: 9px 11px;
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 9px;
-  appearance: none;
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
 }
-select:focus-visible, textarea:focus-visible, button:focus-visible {
+
+select:focus-visible, textarea:focus-visible, input:focus-visible, button:focus-visible, a:focus-visible {
   outline: 2px solid var(--accent);
-  outline-offset: 1px;
+  outline-offset: 2px;
 }
 
 .chat-log {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  min-height: 220px;
-  max-height: 55vh;
+  gap: 18px;
+  min-height: 260px;
+  max-height: min(58vh, 620px);
   overflow-y: auto;
   overscroll-behavior: contain;
+  padding: 4px 2px 8px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
+.chat-log::-webkit-scrollbar { width: 8px; }
+.chat-log::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
 
+/* Пустое состояние — первый экран продукта. Раньше это была одна строка
+   текста в пунктирной рамке: посетитель не понимал, что здесь можно делать.
+   Теперь: иконка, заголовок, объяснение и три готовых вопроса — они же
+   служат подсказкой о возможностях. */
 .empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+  padding: 40px 20px 32px;
   color: var(--muted);
   font-size: 14px;
-  text-align: center;
-  padding: 40px 20px;
-  border: 1px dashed var(--border);
-  border-radius: var(--radius);
 }
 
-.msg { display: flex; flex-direction: column; gap: 6px; }
-.msg.user { align-items: flex-end; }
-.msg.user .bubble {
-  background: var(--accent);
-  color: var(--accent-fg);
-  border-radius: var(--radius) var(--radius) 4px var(--radius);
-  font-weight: 500;
+.empty-icon {
+  width: 38px;
+  height: 38px;
+  color: var(--accent);
+  opacity: .85;
+  margin-bottom: 6px;
 }
+
+.empty-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 620;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.empty-sub { margin: 0; font-size: 13px; color: var(--muted-2); max-width: 34ch; }
+
+.suggest-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 16px;
+}
+
+.suggest {
+  padding: 8px 14px;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all .16s var(--ease);
+}
+.suggest:hover {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  transform: translateY(-1px);
+}
+
+/* ---------- Сообщения ---------- */
+
+.msg { display: flex; flex-direction: column; gap: 7px; animation: msg-in .22s var(--ease); }
+
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+.msg.user { align-items: flex-end; }
+
+.msg.user .bubble {
+  background: var(--grad);
+  color: var(--accent-fg);
+  border: none;
+  border-radius: 16px 16px 5px 16px;
+  font-weight: 450;
+  box-shadow: 0 4px 16px -6px rgba(77, 124, 254, .5);
+}
+
 .msg.bot .bubble {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: var(--radius) var(--radius) var(--radius) 4px;
+  border-radius: 16px 16px 16px 5px;
+  color: var(--text);
 }
+
 .bubble {
-  padding: 10px 12px;
-  max-width: min(88%, 620px);
+  padding: 11px 14px;
+  max-width: min(86%, 640px);
   white-space: pre-wrap;
   word-wrap: break-word;
   overflow-wrap: anywhere;
+  font-size: 14.5px;
+  line-height: 1.6;
 }
 
 /* Ответ модели — это HTML после markdown-рендера, а не текст. Если оставить
  * pre-wrap, браузер сохранит переводы строк из исходника в дополнение к <p>,
  * и в каждом абзаце появятся лишние пустые строки. Поэтому только для bot
  * снимаем pre-wrap; user остаётся текстом и pre-wrap ему нужен. */
-.msg.bot .bubble {
-  white-space: normal;
-}
+.msg.bot .bubble { white-space: normal; }
 
 /* Заголовки внутри ответа не должны выглядеть как заголовки страницы:
  * h1 модели — это акцент в реплике, а не название документа. */
@@ -171,39 +361,45 @@ select:focus-visible, textarea:focus-visible, button:focus-visible {
 .msg.bot .bubble h2,
 .msg.bot .bubble h3,
 .msg.bot .bubble h4 {
-  margin: 14px 0 6px;
+  margin: 16px 0 7px;
   line-height: 1.3;
+  color: var(--text-strong);
+  font-weight: 640;
 }
-.msg.bot .bubble h1 { font-size: 1.22em; }
-.msg.bot .bubble h2 { font-size: 1.12em; }
+.msg.bot .bubble h1 { font-size: 1.24em; }
+.msg.bot .bubble h2 { font-size: 1.13em; }
 .msg.bot .bubble h3 { font-size: 1.04em; }
 .msg.bot .bubble > :first-child { margin-top: 0; }
 .msg.bot .bubble > :last-child { margin-bottom: 0; }
-.msg.bot .bubble p { margin: 0 0 8px; }
+.msg.bot .bubble p { margin: 0 0 9px; }
+.msg.bot .bubble strong { color: var(--text-strong); font-weight: 620; }
 .msg.bot .bubble ul,
-.msg.bot .bubble ol { margin: 0 0 8px; padding-left: 22px; }
-.msg.bot .bubble li { margin: 2px 0; }
+.msg.bot .bubble ol { margin: 0 0 9px; padding-left: 22px; }
+.msg.bot .bubble li { margin: 3px 0; }
+.msg.bot .bubble li::marker { color: var(--muted-2); }
 .msg.bot .bubble blockquote {
-  margin: 8px 0;
-  padding: 2px 0 2px 10px;
-  border-left: 3px solid var(--border);
+  margin: 10px 0;
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--border-strong);
   color: var(--muted);
 }
+.msg.bot .bubble hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
 .msg.bot .bubble table {
   border-collapse: collapse;
-  margin: 8px 0;
-  font-size: .94em;
+  margin: 10px 0;
+  font-size: .92em;
   display: block;
   overflow-x: auto;
 }
 .msg.bot .bubble th,
 .msg.bot .bubble td {
   border: 1px solid var(--border);
-  padding: 5px 8px;
+  padding: 6px 10px;
   text-align: left;
 }
-.msg.bot .bubble th { background: var(--panel-2); }
-.msg.bot .bubble a { color: var(--accent); }
+.msg.bot .bubble th { background: var(--panel-2); font-weight: 620; color: var(--text-strong); }
+.msg.bot .bubble a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; }
+.msg.bot .bubble a:hover { border-bottom-color: currentColor; }
 
 /* Кнопки под сообщением: «Редактировать» / «Повторить».
  * Приглушены до наведения — в ленте из 20 сообщений двадцать одинаковых
@@ -211,66 +407,58 @@ select:focus-visible, textarea:focus-visible, button:focus-visible {
 .msg-actions {
   display: flex;
   gap: 6px;
-  opacity: .55;
-  transition: opacity .15s ease;
+  opacity: 0;
+  transition: opacity .16s var(--ease);
 }
 .msg:hover .msg-actions,
 .msg:focus-within .msg-actions { opacity: 1; }
-.tiny-btn {
-  padding: 4px 9px;
-  font-size: 12px;
-  border-radius: 6px;
-}
+.tiny-btn { padding: 4px 10px; font-size: 11.5px; border-radius: 7px; }
 
-/* Блок кода с кнопкой копирования. Кнопка позиционируется поверх правого
- * верхнего угла, поэтому pre получает запас сверху. */
-.code-wrap {
-  position: relative;
-  margin: 8px 0;
-}
+/* Блок кода с кнопкой копирования. */
+.code-wrap { position: relative; margin: 10px 0; }
 .code-wrap > pre {
   margin: 0;
-  padding: 30px 10px 10px;
-  background: var(--panel-2);
+  padding: 34px 12px 12px;
+  background: var(--bg-elev);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   overflow-x: auto;
   font-family: var(--mono);
   font-size: 12.5px;
-  line-height: 1.5;
+  line-height: 1.6;
 }
-.code-wrap > pre code {
-  background: none;
-  padding: 0;
-  font-size: inherit;
-}
+.code-wrap > pre code { background: none; padding: 0; font-size: inherit; }
+/* Тема hljs задаёт свой фон — убираем, чтобы блок кода жил в нашей палитре,
+   а не вырезался прямоугольником #0d1117. */
+pre code.hljs { background: transparent !important; padding: 0 !important; }
+
 .code-copy {
   position: absolute;
-  top: 6px;
-  right: 6px;
+  top: 7px;
+  right: 7px;
   z-index: 1;
-  padding: 3px 8px;
+  padding: 4px 9px;
   font-size: 11px;
-  font-family: var(--font, inherit);
-  border-radius: 5px;
+  border-radius: 6px;
   border: 1px solid var(--border);
-  background: var(--panel);
+  background: var(--panel-2);
   color: var(--muted);
   cursor: pointer;
+  transition: all .16s var(--ease);
 }
-.code-copy:hover { color: var(--text); border-color: var(--border-strong, var(--border)); }
+.code-copy:hover { color: var(--text); border-color: var(--border-strong); background: var(--panel-3); }
 
 /* Чек под ответом: моноширинный блок, читается как распечатка */
 .receipt {
-  max-width: min(88%, 620px);
-  background: var(--panel-2);
+  max-width: min(86%, 640px);
+  background: var(--bg-elev);
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent);
-  border-radius: 8px;
-  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
   font-family: var(--mono);
   font-size: 11.5px;
-  line-height: 1.55;
+  line-height: 1.65;
   color: var(--muted);
 }
 .receipt .row { display: flex; justify-content: space-between; gap: 10px; }
@@ -278,103 +466,262 @@ select:focus-visible, textarea:focus-visible, button:focus-visible {
 .receipt .sig-ok { color: var(--ok); }
 .receipt .sig-bad { color: var(--danger); }
 .receipt .queued { color: var(--warn); }
-/* Строка прогресса до чека. Отдельный стиль, а не .queued: это не причина
-   отказа, а объяснение, почему чека пока нет — глаз должен цепляться за неё
-   первой, поэтому текст на всю ширину и чуть ярче обычных строк. */
 .receipt .pending-line { justify-content: flex-start; }
 .receipt .pending-line b { color: var(--warn); font-weight: 600; }
 
-.composer { display: flex; gap: 8px; align-items: flex-end; }
+/* ---------- Композер ---------- */
+
+/* Композер прилипает к низу: в длинной ленте поле ввода всегда под рукой.
+ * Фон и градиент сверху обязательны — иначе сообщения будут просвечивать
+ * сквозь подсказку под полем и читаться как часть ответа. */
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  position: sticky;
+  bottom: 0;
+  padding: 12px 0 4px;
+  background: linear-gradient(to bottom, transparent 0%, var(--bg) 30%, var(--bg) 100%);
+}
+.composer-box {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 8px 8px 8px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  box-shadow: var(--shadow-md);
+  transition: border-color .18s var(--ease), box-shadow .18s var(--ease);
+}
+.composer-box:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+  box-shadow: var(--shadow-md), 0 0 0 3px var(--accent-soft);
+}
+
 textarea {
   flex: 1;
   resize: none;
-  padding: 10px 12px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  max-height: 140px;
-  min-height: 44px;
+  padding: 8px 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  max-height: 160px;
+  min-height: 26px;
+  font-size: 14.5px;
+  line-height: 1.5;
 }
+textarea:focus { outline: none; }
+textarea::placeholder { color: var(--muted-2); }
+
+#sendBtn {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border-radius: 12px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  transition: background .16s var(--ease), transform .12s var(--ease), opacity .16s var(--ease);
+}
+#sendBtn svg { width: 18px; height: 18px; margin-top: -2px; }
+#sendBtn:hover:not(:disabled) { background: var(--accent-strong); }
+#sendBtn:active:not(:disabled) { transform: scale(.94); }
+#sendBtn:disabled { opacity: .45; cursor: not-allowed; }
+
+.hint { font-size: 12px; color: var(--muted); margin: 8px 2px 0; min-height: 16px; }
+.composer-note {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--muted-2);
+  text-align: center;
+}
+
+/* ================= Кнопки ================= */
 
 button, .btn {
   padding: 10px 16px;
   background: var(--accent);
   color: var(--accent-fg);
   border: none;
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   font-weight: 600;
+  font-size: 13.5px;
   cursor: pointer;
   text-decoration: none;
-  display: inline-block;
-  text-align: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  transition: background .16s var(--ease), border-color .16s var(--ease), transform .1s var(--ease);
 }
+button:hover:not(:disabled), .btn:hover { background: var(--accent-strong); }
+button:active:not(:disabled), .btn:active { transform: translateY(1px); }
 button:disabled { opacity: .5; cursor: not-allowed; }
+
+.btn svg { width: 15px; height: 15px; }
+
 .ghost {
   background: transparent;
   color: var(--text);
   border: 1px solid var(--border);
-  font-weight: 500;
+  font-weight: 550;
 }
-.ghost.small { padding: 6px 12px; font-size: 13px; }
-.btn { background: var(--accent); color: var(--accent-fg); }
+.ghost:hover:not(:disabled) { background: var(--panel-2); border-color: var(--border-strong); }
+.ghost.small { padding: 6px 12px; font-size: 12.5px; }
+.btn { background: var(--grad); color: var(--accent-fg); }
+.btn.ghost { background: transparent; }
+.btn.small, .ghost.small { padding: 7px 13px; font-size: 12.5px; }
 
-.hint { font-size: 12px; color: var(--muted); margin: 0; min-height: 16px; }
+/* ================= Карточки ================= */
 
 .card {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 14px;
+  padding: 16px;
+  box-shadow: var(--shadow-sm);
 }
-.card h2 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+.card h2 { margin: 0; font-size: 14px; font-weight: 620; color: var(--text-strong); letter-spacing: -0.01em; }
 .card p { margin: 0 0 10px; font-size: 13px; }
-.balance { font-size: 28px; font-weight: 650; letter-spacing: -0.02em; margin: 0 0 4px !important; }
-.balance .unit { font-size: 14px; color: var(--muted); font-weight: 500; }
+.card > p:last-child { margin-bottom: 0; }
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.chip {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.chip-accent {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: var(--accent-soft);
+}
+
+.card-balance { background: linear-gradient(160deg, var(--panel-2), var(--panel)); }
+
+.balance {
+  font-size: 34px;
+  font-weight: 680;
+  letter-spacing: -0.03em;
+  margin: 2px 0 6px !important;
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+.balance .unit { font-size: 14px; color: var(--muted); font-weight: 550; letter-spacing: 0; }
+.addr-line { margin: 0; font-size: 11.5px; }
+
+.section-label {
+  margin: 18px 0 8px !important;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--muted-2);
+  font-weight: 600;
+}
+
+.step {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.step-num {
+  margin: 0 0 6px !important;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  font-weight: 700;
+  color: var(--accent);
+}
+.addr-box {
+  margin: 6px 0 10px !important;
+  padding: 10px 12px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  font-size: 11.5px;
+  color: var(--text);
+}
+.cmd-label { margin: 12px 0 5px !important; color: var(--muted-2); }
 
 .log {
   font-family: var(--mono);
   font-size: 11px;
   color: var(--muted);
-  max-height: 150px;
+  max-height: 160px;
   overflow-y: auto;
-  margin-top: 8px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  line-height: 1.7;
 }
+.log:empty { display: none; }
 
 code {
   font-family: var(--mono);
-  font-size: .92em;
+  font-size: .9em;
   background: var(--panel-2);
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   padding: 1px 5px;
-  border-radius: 4px;
+  border-radius: 5px;
+  color: var(--text);
 }
 
 /* Команда запуска воркера: длинная строка должна переноситься, а не
    растягивать карточку на телефоне. */
 pre.cmd {
   font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.5;
-  background: var(--panel-2);
+  font-size: 11.5px;
+  line-height: 1.65;
+  background: var(--bg-elev);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px;
+  border-radius: var(--radius-xs);
+  padding: 11px;
   margin: 0 0 10px;
   white-space: pre-wrap;
   word-break: break-all;
   overflow-x: auto;
+  color: var(--text);
 }
 
-/* Телефон: кнопки на всю ширину, таблетки не ломаются */
-@media (max-width: 520px) {
-  .composer { flex-direction: column; align-items: stretch; }
-  .composer button { width: 100%; }
-  .bubble, .receipt { max-width: 100%; }
-  .controls { flex-direction: column; }
-}
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 
-@media (prefers-reduced-motion: reduce) {
-  * { transition: none !important; animation: none !important; }
+.tool-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+
+/* Блок быстрой установки: отделён от ручного пути, чтобы новичок видел
+ * только две кнопки и не читал команды терминала. */
+.onboard {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  border-radius: var(--radius-sm);
+  background: linear-gradient(160deg, var(--accent-soft), transparent 65%);
 }
+.onboard-title { margin: 0 0 5px !important; font-size: 13px; font-weight: 640; color: var(--text-strong); }
+.onboard-desc { margin: 0 0 12px !important; line-height: 1.55; }
+
+.text-ok { color: var(--ok); }
+.text-warn { color: var(--warn); }
+.text-danger { color: var(--danger); }
 
 /* ===== Баннер статуса воркера =====
  * Стоит между шапкой и табами и виден без прокрутки: смысл баннера в том,
@@ -386,27 +733,30 @@ pre.cmd {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  margin: 0 12px 10px;
-  padding: 10px 12px;
+  margin: 10px 12px 0;
+  max-width: 876px;
+  padding: 10px 13px;
   border: 1px solid var(--border);
   border-left: 3px solid var(--muted);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   background: var(--panel);
-  font-size: 13px;
-  line-height: 1.4;
+  font-size: 12.5px;
+  line-height: 1.45;
+  animation: msg-in .25s var(--ease);
 }
+@media (min-width: 924px) { .banner { margin-left: auto; margin-right: auto; } }
 
 /* ПК не в сети: ответы идут от демо-обработчика, это предупреждение, а не факт */
 .banner.offline {
   border-left-color: var(--warn);
-  background: color-mix(in srgb, var(--warn) 10%, var(--panel));
+  background: color-mix(in srgb, var(--warn) 9%, var(--panel));
 }
 .banner.offline #workerBannerText { color: var(--warn); }
 
 /* ПК в сети: всё штатно */
 .banner.online {
   border-left-color: var(--ok);
-  background: color-mix(in srgb, var(--ok) 10%, var(--panel));
+  background: color-mix(in srgb, var(--ok) 9%, var(--panel));
 }
 .banner.online #workerBannerText { color: var(--ok); }
 
@@ -416,7 +766,7 @@ pre.cmd {
  * Цвет accent (синий), а не ok (зелёный): нейтральное «сеть жива». */
 .banner.online-other {
   border-left-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+  background: color-mix(in srgb, var(--accent) 9%, var(--panel));
 }
 .banner.online-other #workerBannerText { color: var(--accent); }
 
@@ -432,7 +782,9 @@ pre.cmd {
   background: none;
   color: var(--accent);
   font: inherit;
+  font-weight: 550;
   text-decoration: underline;
+  text-underline-offset: 2px;
   cursor: pointer;
 }
 
@@ -444,7 +796,7 @@ pre.cmd {
   gap: 10px;
   margin: 0 0 10px;
   font-size: 13px;
-  line-height: 1.45;
+  line-height: 1.5;
   cursor: pointer;
 }
 .consent input[type="checkbox"] {
@@ -464,28 +816,31 @@ pre.cmd {
  * смене --panel карточки остались бы чужими. */
 
 .agent-card {
-  padding: 12px;
-  border-radius: 8px;
+  padding: 13px;
+  border-radius: var(--radius-sm);
   background: var(--panel-2);
   border: 1px solid var(--border);
   margin-bottom: 10px;
+  transition: border-color .16s var(--ease);
 }
+.agent-card:hover { border-color: var(--border-strong); }
 
 .agent-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  margin-bottom: 6px;
+  margin-bottom: 7px;
 }
 
 .tag {
-  font-size: 11px;
-  padding: 2px 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 3px 8px;
   border-radius: 999px;
   border: 1px solid var(--border);
 }
-.tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 8%, transparent); }
 .tag.muted { color: var(--muted); }
 
 /* ROI. Зелёный — только для положительного числа; отрицательный и «не
@@ -505,17 +860,17 @@ pre.cmd {
  * приближение к лимиту было видно до отказа, а не после. */
 .limit-progress-bg {
   width: 100%;
-  height: 4px;
+  height: 5px;
   background: var(--border);
-  border-radius: 2px;
+  border-radius: 3px;
   overflow: hidden;
-  margin: 8px 0 4px;
+  margin: 9px 0 4px;
 }
 .limit-progress-fill {
   height: 100%;
   background: var(--accent);
-  border-radius: 2px;
-  transition: width 0.3s;
+  border-radius: 3px;
+  transition: width .3s var(--ease);
 }
 .limit-progress-fill.warn { background: var(--warn); }
 .limit-progress-fill.danger { background: var(--danger); }
@@ -530,42 +885,51 @@ pre.cmd {
   right: 0;
   width: 100%;
   background: var(--panel-2);
-  border-top: 1px solid var(--border);
-  padding: 20px;
-  border-radius: 12px 12px 0 0;
+  border-top: 1px solid var(--border-strong);
+  padding: 22px 20px calc(22px + env(safe-area-inset-bottom));
+  border-radius: 20px 20px 0 0;
   z-index: 100;
-  box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.55);
+  box-shadow: var(--shadow-lg);
+  animation: slide-up .26s var(--ease);
 }
-.hitl-modal h2 { margin: 0 0 8px; font-size: 16px; }
-.hitl-modal p { margin: 0 0 14px; font-size: 14px; }
+@media (min-width: 640px) {
+  .hitl-modal {
+    left: 50%;
+    right: auto;
+    bottom: 24px;
+    width: min(480px, calc(100% - 48px));
+    transform: translateX(-50%);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+  }
+}
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: none; }
+}
+@media (min-width: 640px) {
+  @keyframes slide-up {
+    from { opacity: 0; transform: translate(-50%, 16px); }
+    to { opacity: 1; transform: translate(-50%, 0); }
+  }
+}
+.hitl-modal h2 { margin: 0 0 8px; font-size: 16px; color: var(--text-strong); }
+.hitl-modal p { margin: 0 0 16px; font-size: 13.5px; color: var(--muted); }
 
-.tool-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-bottom: 12px;
+/* ================= Адаптив ================= */
+
+@media (max-width: 560px) {
+  .bubble, .receipt { max-width: 100%; }
+  .controls { flex-direction: column; }
+  .tab { padding: 9px 10px; font-size: 12.5px; flex: 0 0 auto; }
+  .chat-log { max-height: 52vh; }
+  .balance { font-size: 30px; }
+  .suggest-wrap { flex-direction: column; align-items: stretch; }
+  .suggest { width: 100%; }
+  .msg-actions { opacity: 1; }
+  .empty { padding: 28px 12px 24px; }
 }
 
-.row {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  align-items: center;
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
 }
-
-/* Блок быстрой установки: отделён от ручного пути, чтобы новичок видел
- * только две кнопки и не читал команды терминала. */
-.onboard {
-  margin-top: 14px;
-  padding: 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--elevated, rgba(255, 255, 255, 0.03));
-}
-
-.tiny { font-size: 12px; }
-.text-ok { color: var(--ok); }
-.text-warn { color: var(--warn); }
-.text-danger { color: var(--danger); }
-
-.btn.small, .ghost.small { padding: 7px 13px; font-size: 13px; }

@@ -3435,7 +3435,7 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   {
     const sw = await api('/app/sw.js');
     const src = typeof sw.body === 'string' ? sw.body : '';
-    ok('25.4 sw.js — версия кэша v6', /tarnet-app-v6/.test(src), src.slice(0, 60));
+    ok('25.4 sw.js — версия кэша v7 (Волна 9: редизайн оболочки)', /tarnet-app-v7/.test(src), src.slice(0, 60));
     ok('25.4 sw.js кэширует vendor',
       src.includes('/app/vendor/marked.min.js') && src.includes('/app/vendor/highlight.min.js'));
   }

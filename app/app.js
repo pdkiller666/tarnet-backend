@@ -655,7 +655,13 @@ async function sendPrompt(prompt, opts = {}) {
   if (!opts.retryOf) {
     const u = bubble('user', text);
     addActions(u, { role: 'user', text });
+    /* Очистка и сброс высоты — только здесь, после реальной отправки.
+     * В submit-обработчике так делать нельзя: при chatBusy === true
+     * sendPrompt выходит раньше, и сброс стёр бы набранный текст,
+     * который никуда не ушёл. autoGrow объявлена ниже как function —
+     * поднимается, поэтому вызов отсюда корректен. */
     $('prompt').value = '';
+    autoGrow($('prompt'));
     syncSave('user', text);
   }
 
@@ -701,6 +707,29 @@ async function sendPrompt(prompt, opts = {}) {
     log.scrollTop = log.scrollHeight;
   }
 }
+
+/* Автовысота поля ввода: в покое одна строка, растёт до 160px, дальше
+ * скролл. Без этого textarea с rows="1" либо обрезал бы многострочный
+ * запрос, либо всегда занимал три строки пустым. */
+function autoGrow(el) {
+  if (!el) return;
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+}
+
+$('prompt').addEventListener('input', (ev) => autoGrow(ev.target));
+
+/* Подсказки в пустом состоянии. Подставляют текст в поле, а не отправляют
+ * сразу: человек может поправить формулировку вместо того, чтобы получить
+ * ответ на чужой вопрос. */
+document.querySelectorAll('.suggest').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const p = $('prompt');
+    p.value = btn.dataset.prompt || btn.textContent.trim();
+    p.focus();
+    autoGrow(p);
+  });
+});
 
 $('chatForm').addEventListener('submit', (ev) => {
   ev.preventDefault();
@@ -862,7 +891,7 @@ $('nanoBtn').addEventListener('click', async () => {
   if (nanoTimer) {
     clearInterval(nanoTimer);
     nanoTimer = null;
-    btn.textContent = '▶ Включить Nano-Node';
+    btn.textContent = 'Включить Nano-Node';
     nanoLog('остановлено');
     return;
   }
@@ -878,7 +907,7 @@ $('nanoBtn').addEventListener('click', async () => {
   btn.disabled = false;
 
   $('nanoAddr').textContent = `адрес: ${ADDR}`;
-  btn.textContent = '⏸ Остановить';
+  btn.textContent = 'Остановить';
 
   nanoTick();
   nanoTimer = setInterval(nanoTick, 10000);

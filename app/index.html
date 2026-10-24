@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>TarNet — Synapse</title>
-<meta name="theme-color" content="#0b0e14">
+<meta name="theme-color" content="#08090d">
 <meta name="description" content="TarNet: приватный инференс на распределённой сети">
 <link rel="manifest" href="/app/manifest.webmanifest">
 <link rel="icon" href="/app/icon.svg" type="image/svg+xml">
@@ -16,102 +16,159 @@
 </head>
 <body>
 
+<!-- ================= ШАПКА ================= -->
 <header class="top">
-  <div class="brand">
-    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
-      <circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="2"/>
-      <circle cx="16" cy="16" r="4" fill="currentColor"/>
-      <circle cx="16" cy="5" r="2.2" fill="currentColor"/>
-      <circle cx="27" cy="16" r="2.2" fill="currentColor"/>
-    </svg>
-    <div>
-      <h1>TarNet <span class="dim">/ Synapse</span></h1>
-      <p class="sub" id="modeLine">проверяю режим…</p>
+  <div class="top-inner">
+    <div class="brand">
+      <span class="logo-wrap" aria-hidden="true">
+        <svg class="logo" viewBox="0 0 32 32">
+          <defs>
+            <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="currentColor" stop-opacity="1"/>
+              <stop offset="1" stop-color="currentColor" stop-opacity=".55"/>
+            </linearGradient>
+          </defs>
+          <circle cx="16" cy="16" r="12.5" fill="none" stroke="url(#lg)" stroke-width="1.6" opacity=".55"/>
+          <circle cx="16" cy="16" r="4.6" fill="currentColor"/>
+          <circle cx="16" cy="4" r="2.1" fill="currentColor"/>
+          <circle cx="28" cy="16" r="2.1" fill="currentColor"/>
+          <circle cx="16" cy="28" r="2.1" fill="currentColor" opacity=".6"/>
+          <circle cx="4" cy="16" r="2.1" fill="currentColor" opacity=".6"/>
+        </svg>
+      </span>
+      <div class="brand-text">
+        <h1>TarNet <span class="brand-sep">/</span> <span class="brand-sub">Synapse</span></h1>
+        <p class="sub" id="modeLine">проверяю режим…</p>
+      </div>
     </div>
+    <button id="installBtn" class="ghost small" hidden>Установить</button>
   </div>
-  <button id="installBtn" class="ghost" hidden>Установить</button>
 </header>
 
 <!-- Статус воркера: виден до первого вопроса. Если ПК спит, ответы тихо
      уходят в deterministic_fallback — пользователь должен знать это заранее,
      а не догадываться по качеству ответа. -->
-<div id="workerBanner" class="banner" hidden role="status" aria-live="polite">
+<div id="workerBanner" class="banner" role="status" aria-live="polite" hidden>
   <span id="workerBannerText"></span>
   <button id="workerHowto" class="link" hidden>Инструкция по подключению</button>
 </div>
 
-<nav class="tabs" role="tablist">
-  <button class="tab active" role="tab" data-tab="chat" aria-selected="true">💬 Synapse Chat</button>
-  <button class="tab" role="tab" data-tab="devices" aria-selected="false">📱 Мои устройства</button>
-  <button class="tab" role="tab" data-tab="agents" aria-selected="false">🤖 Агенты</button>
+<!-- ================= НАВИГАЦИЯ ================= -->
+<nav class="tabs" role="tablist" aria-label="Разделы приложения">
+  <button class="tab active" role="tab" data-tab="chat" aria-selected="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9.5 9.5 0 0 1-3.6-.7L3 21l1.9-4.7A8.4 8.4 0 0 1 12 3.1a8.4 8.4 0 0 1 9 8.4Z"/></svg>
+    <span>Synapse Chat</span>
+  </button>
+  <button class="tab" role="tab" data-tab="devices" aria-selected="false">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="14" height="11" rx="2"/><path d="M6 19h8"/><path d="M10 15v4"/><rect x="17.5" y="10" width="4" height="9" rx="1.2"/></svg>
+    <span>Мои устройства</span>
+  </button>
+  <button class="tab" role="tab" data-tab="agents" aria-selected="false">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="7.5" width="16" height="12" rx="3"/><path d="M12 3.5v4"/><circle cx="9" cy="13" r="1.1" fill="currentColor" stroke="none"/><circle cx="15" cy="13" r="1.1" fill="currentColor" stroke="none"/><path d="M9.5 16.5h5"/></svg>
+    <span>Агенты</span>
+  </button>
 </nav>
 
 <main>
   <!-- ================= ЧАТ ================= -->
   <section id="tab-chat" class="panel">
-    <div class="controls">
-      <label class="field">
-        <span>Адаптер</span>
-        <select id="adapter"><option value="">загружаю…</option></select>
-      </label>
-      <label class="field">
-        <span>Модель</span>
-        <select id="model"><option value="">авто (базовая)</option></select>
-      </label>
-      <label class="field">
-        <span>Контур</span>
-        <select id="contour">
-          <option value="private">🔒 Private (промпт не уходит наружу)</option>
-        </select>
-      </label>
+    <div class="chat-head">
+      <div class="controls">
+        <label class="field">
+          <span>Адаптер</span>
+          <select id="adapter"><option value="">загружаю…</option></select>
+        </label>
+        <label class="field">
+          <span>Модель</span>
+          <select id="model"><option value="">авто (базовая)</option></select>
+        </label>
+        <label class="field">
+          <span>Контур</span>
+          <select id="contour">
+            <option value="private">Private — промпт не уходит наружу</option>
+          </select>
+        </label>
+      </div>
     </div>
 
     <div id="chatLog" class="chat-log" aria-live="polite">
-      <div class="empty">Спросите что-нибудь. Под каждым ответом появится подписанный чек.</div>
+      <div class="empty">
+        <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 3v3.2"/><path d="M12 17.8V21"/><path d="M3 12h3.2"/><path d="M17.8 12H21"/>
+          <circle cx="12" cy="12" r="4.4"/>
+          <path d="M5.6 5.6l2.3 2.3"/><path d="M16.1 16.1l2.3 2.3"/><path d="M18.4 5.6l-2.3 2.3"/><path d="M7.9 16.1l-2.3 2.3"/>
+        </svg>
+        <p class="empty-title">Спросите что угодно</p>
+        <p class="empty-sub">Под каждым ответом появится подписанный чек — его можно проверить.</p>
+        <div class="suggest-wrap">
+          <button type="button" class="suggest" data-prompt="Объясни, как TarNet обеспечивает приватность промптов">Как работает приватность?</button>
+          <button type="button" class="suggest" data-prompt="Напиши функцию на JavaScript, которая считает SHA-256 через WebCrypto">Пример кода</button>
+          <button type="button" class="suggest" data-prompt="Чем отличается работа воркера от nano-узла?">Воркер и nano-узел</button>
+        </div>
+      </div>
     </div>
 
     <form id="chatForm" class="composer">
-      <textarea id="prompt" rows="2" placeholder="Ваш запрос… (Enter — отправить, Shift+Enter — новая строка)" maxlength="65536"></textarea>
-      <button type="submit" id="sendBtn">Отправить</button>
+      <div class="composer-box">
+        <textarea id="prompt" rows="1" placeholder="Спросите Synapse…" maxlength="65536" aria-label="Запрос"></textarea>
+        <button type="submit" id="sendBtn" aria-label="Отправить">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+        </button>
+      </div>
+      <p class="hint" id="chatHint"></p>
+      <p class="composer-note">Enter — отправить · Shift+Enter — новая строка</p>
     </form>
-    <p class="hint" id="chatHint"></p>
   </section>
 
   <!-- ================= УСТРОЙСТВА ================= -->
   <section id="tab-devices" class="panel" hidden>
-    <div class="card">
-      <h2>Баланс</h2>
+    <div class="card card-balance">
+      <div class="card-head">
+        <h2>Баланс</h2>
+        <button id="refreshBal" class="ghost small">Обновить</button>
+      </div>
       <p class="balance"><span id="balanceVal">—</span> <span class="unit">TAR</span></p>
-      <p class="mono dim" id="walletAddr">кошелёк: —</p>
-      <button id="refreshBal" class="ghost small">Обновить</button>
+      <p class="mono dim addr-line" id="walletAddr">кошелёк: —</p>
     </div>
 
     <div class="card">
-      <h2>Приватность</h2>
+      <div class="card-head">
+        <h2>Приватность</h2>
+        <span class="chip">по умолчанию выкл.</span>
+      </div>
       <label class="consent">
         <input type="checkbox" id="consentBox">
         <span>Разрешить использовать мои анонимизированные запросы для улучшения сети TarNet</span>
       </label>
-      <p class="dim mono" id="consentState">—</p>
+      <p class="dim mono tiny" id="consentState">—</p>
     </div>
 
     <div class="card" id="workerCard">
-      <h2>Воркер для ПК</h2>
-      <p class="dim">Скрипт забирает задачи, считает моделью на вашем ПК и возвращает результат. Нужен для режима <code>worker</code>.</p>
+      <div class="card-head">
+        <h2>Воркер для ПК</h2>
+        <span class="chip chip-accent">режим worker</span>
+      </div>
+      <p class="dim">Скрипт забирает задачи, считает моделью на вашем ПК и возвращает результат.</p>
 
       <!-- ===== Установка в один клик =====
            Адрес подставляется в скрипт на сервере, поэтому файл персонален.
            Ссылки строятся в app.js: до появления ADDR подставлять нечего,
            а статичный href с пустым addr вернул бы 400. -->
       <div class="onboard">
-        <p class="dim" style="margin:0 0 10px">
-          <strong>Быстрый путь.</strong> Скачайте установщик и запустите двойным кликом —
-          он сам поставит Node.js и Ollama, скачает модель и запустит воркер.
-          Ваш адрес уже внутри.
+        <p class="onboard-title">Быстрый путь</p>
+        <p class="dim tiny onboard-desc">
+          Скачайте установщик и запустите двойным кликом — он сам поставит
+          Node.js и Ollama, скачает модель и запустит воркер. Ваш адрес уже внутри.
         </p>
         <div class="row">
-          <a class="btn" id="dlWin" href="#" download>⬇ Windows (.bat)</a>
-          <a class="btn ghost" id="dlMac" href="#" download>⬇ macOS / Linux (.command)</a>
+          <a class="btn" id="dlWin" href="#" download>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 18v2h16v-2"/></svg>
+            Windows (.bat)
+          </a>
+          <a class="btn ghost" id="dlMac" href="#" download>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 18v2h16v-2"/></svg>
+            macOS / Linux (.command)
+          </a>
         </div>
         <p class="hint" id="dlHint">
           <strong>Windows</strong> — скачали, дважды кликнули, готово.<br>
@@ -122,35 +179,39 @@
         </p>
       </div>
 
-      <p class="dim" style="margin:18px 0 8px">
-        <strong>Или вручную</strong> — если предпочитаете контролировать каждый шаг:
-      </p>
-      <a class="ghost small" href="/download/worker.js" download>⬇ Скачать worker.js</a>
+      <p class="dim tiny section-label">Или вручную — если предпочитаете контролировать каждый шаг</p>
+      <a class="ghost small" href="/download/worker.js" download>Скачать worker.js</a>
 
       <!-- Адрес показываем здесь, а не только в «Балансе»: именно его надо
            скопировать в команду запуска. Без него воркер создаст свой
            кошелёк, и начисления не попадут в этот баланс. -->
-      <p class="dim" style="margin-top:16px">Шаг 1. Ваш адрес — тот же, что под балансом:</p>
-      <p class="mono" id="workerAddr">—</p>
-      <button id="copyAddr" class="ghost small">📋 Скопировать адрес</button>
-      <p class="hint" id="copyHint"></p>
+      <div class="step">
+        <p class="step-num">Шаг 1</p>
+        <p class="dim tiny">Ваш адрес — тот же, что под балансом:</p>
+        <p class="mono addr-box" id="workerAddr">—</p>
+        <button id="copyAddr" class="ghost small">Скопировать адрес</button>
+        <p class="hint" id="copyHint"></p>
+      </div>
 
-      <p class="dim" style="margin-top:14px">Шаг 2. Запустите воркер в терминале рядом со скачанным файлом — <strong>подставьте адрес из шага 1</strong>:</p>
-
-      <p class="dim" style="margin:0 0 4px">Linux / macOS:</p>
-      <pre class="cmd" id="runCmdPosix">—</pre>
-
-      <p class="dim" style="margin:0 0 4px">Windows (cmd):</p>
-      <pre class="cmd" id="runCmdWin">—</pre>
-
-      <p class="dim">Без <code>WORKER_ADDRESS</code> воркер сгенерирует свой кошелёк: работа будет считаться, но деньги придут не сюда, и баланс останется нулевым.</p>
+      <div class="step">
+        <p class="step-num">Шаг 2</p>
+        <p class="dim tiny">Запустите воркер в терминале рядом со скачанным файлом — <strong>подставьте адрес из шага 1</strong>:</p>
+        <p class="dim tiny cmd-label">Linux / macOS</p>
+        <pre class="cmd" id="runCmdPosix">—</pre>
+        <p class="dim tiny cmd-label">Windows (cmd)</p>
+        <pre class="cmd" id="runCmdWin">—</pre>
+        <p class="hint">Без <code>WORKER_ADDRESS</code> воркер сгенерирует свой кошелёк: работа будет считаться, но деньги придут не сюда, и баланс останется нулевым.</p>
+      </div>
     </div>
 
     <div class="card">
-      <h2>Nano-node в браузере</h2>
+      <div class="card-head">
+        <h2>Nano-node в браузере</h2>
+        <span class="chip">демо</span>
+      </div>
       <p class="dim">Пока вкладка открыта, устройство раз в 10 секунд отправляет короткую работу. Токены копятся в <code>pending_work</code> — это демонстрация участия, а не полноценный инференс.</p>
-      <button id="nanoBtn" class="btn">▶ Включить Nano-Node</button>
-      <p class="mono dim" id="nanoAddr">—</p>
+      <button id="nanoBtn" class="btn">Включить Nano-Node</button>
+      <p class="mono dim tiny addr-line" id="nanoAddr">—</p>
       <div class="log" id="nanoLog"></div>
     </div>
   </section>
@@ -160,7 +221,7 @@
     <!-- Ключ выводится в браузере: мастер-энтропия не уходит на сервер.
          Форма показывается, пока ключа на устройстве нет. -->
     <div class="card" id="agentSetup" hidden>
-      <h2>Создать TarNet ID</h2>
+      <div class="card-head"><h2>Создать TarNet ID</h2></div>
       <p class="dim">Агенты привязаны к аккаунту TarNet ID. Ключ выводится
         <strong>на этом устройстве</strong> из мастер-энтропии — на сервер уходит только публичный ключ.</p>
       <label class="field">
@@ -168,7 +229,7 @@
         <textarea id="entropyInput" rows="2" placeholder="32 байта hex — например, 64 символа 0-9a-f" autocomplete="off" spellcheck="false"></textarea>
       </label>
       <div class="row">
-        <button id="genEntropy" class="ghost small" type="button">🎲 Сгенерировать</button>
+        <button id="genEntropy" class="ghost small" type="button">Сгенерировать</button>
         <button id="createIdBtn" class="btn small" type="button">Создать ID</button>
       </div>
       <p class="hint">Энтропия сохраняется в localStorage этого браузера: без неё
@@ -178,9 +239,9 @@
 
     <div id="agentMain" hidden>
       <div class="card">
-        <h2>Баланс агентов</h2>
+        <div class="card-head"><h2>Баланс агентов</h2></div>
         <div id="agentBalance"><span class="dim">—</span></div>
-        <p class="mono dim tiny" id="agentIdLine">TarNet ID: —</p>
+        <p class="mono dim tiny addr-line" id="agentIdLine">TarNet ID: —</p>
         <div class="row">
           <button id="agentRefresh" class="ghost small" type="button">Обновить</button>
           <button id="forgetKey" class="ghost small" type="button">Забыть ключ</button>
@@ -188,7 +249,7 @@
       </div>
 
       <div class="card">
-        <h2>+ Создать агента</h2>
+        <div class="card-head"><h2>Создать агента</h2></div>
         <form id="agentCreateForm">
           <label class="field">
             <span>Роль</span>
@@ -198,7 +259,7 @@
               <option value="researcher">researcher</option>
             </select>
           </label>
-          <p class="dim tiny" style="margin:12px 0 4px">Разрешённые инструменты</p>
+          <p class="dim tiny section-label">Разрешённые инструменты</p>
           <div id="agentTools" class="tool-list">
             <p class="dim tiny">загружаю каталог…</p>
           </div>
@@ -212,7 +273,7 @@
       </div>
 
       <div class="card">
-        <h2>Мои агенты</h2>
+        <div class="card-head"><h2>Мои агенты</h2></div>
         <div id="agentList"><div class="empty">загружаю…</div></div>
         <p class="hint" id="agentStatus"></p>
       </div>
@@ -220,7 +281,10 @@
 
     <!-- Экран запуска задачи -->
     <div class="card" id="agentRunPanel" hidden>
-      <h2>Запуск задачи · <span class="mono" id="runAgentId">—</span></h2>
+      <div class="card-head">
+        <h2>Запуск задачи</h2>
+        <span class="mono tiny dim" id="runAgentId">—</span>
+      </div>
       <label class="field">
         <span>Промпт</span>
         <textarea id="runPrompt" rows="3" placeholder="Что должен сделать агент?" maxlength="65536"></textarea>
@@ -229,10 +293,10 @@
         <span>Максимум токенов</span>
         <input id="runMaxTokens" type="number" value="512" min="1" max="5000" inputmode="numeric">
       </label>
-      <p class="dim tiny" style="margin:12px 0 4px">Инструменты (только разрешённые агенту)</p>
+      <p class="dim tiny section-label">Инструменты (только разрешённые агенту)</p>
       <div id="runTools" class="tool-list"></div>
       <div class="row">
-        <button id="runSubmit" class="btn small" type="button">▶ Запустить задачу</button>
+        <button id="runSubmit" class="btn small" type="button">Запустить задачу</button>
         <button id="runClose" class="ghost small" type="button">Закрыть</button>
       </div>
       <div class="log" id="runLog"></div>
@@ -253,7 +317,7 @@
   <h2 id="hitlTitle">Требуется подтверждение</h2>
   <p id="hitlText"></p>
   <div class="row">
-    <button id="hitlApprove" class="btn small">Подтвердить ✍️</button>
+    <button id="hitlApprove" class="btn small">Подтвердить</button>
     <button id="hitlCancel" class="ghost small">Отменить</button>
   </div>
 </div>
