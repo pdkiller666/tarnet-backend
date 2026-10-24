@@ -3603,6 +3603,130 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     ok('26.3 токен --info объявлен', /--info:\s*#[0-9a-fA-F]{3,8}/.test(css));
   }
 
+  /* ---------- 27. Новый UI Волны 9: классы и атрибуты ----------
+   * Проверяем не подстроку, а токен класса: `includes('suggest')` дал бы
+   * ложное срабатывание на `.suggest-wrap`, которого в задаче нет. Поэтому
+   * разбираем каждый class="..." на отдельные имена и сверяем по множеству. */
+  console.log('\n27. Элементы нового UI (Волна 9)');
+  {
+    const classTokens = (src) => {
+      const set = new Set();
+      for (const m of src.matchAll(/class="([^"]*)"/g)) {
+        for (const t of m[1].split(/\s+/)) if (t) set.add(t);
+      }
+      return set;
+    };
+
+    const h = await api('/app/index.html');
+    const htmlSrc = typeof h.body === 'string' ? h.body : '';
+    const a = await api('/app/app.js');
+    const appSrc2 = typeof a.body === 'string' ? a.body : '';
+    const g = await api('/app/agents.js');
+    const agSrc2 = typeof g.body === 'string' ? g.body : '';
+
+    const htmlClasses = classTokens(htmlSrc);
+    const jsClasses = new Set([...classTokens(appSrc2), ...classTokens(agSrc2)]);
+    const ui = [
+      ['27.1', '.suggest', 'suggest', 'подсказки под пустым состоянием'],
+      ['27.2', '.composer-box', 'composer-box', 'рамка композера'],
+      ['27.3', '.empty-title', 'empty-title', 'заголовок пустого экрана'],
+      ['27.4', '.chip', 'chip', 'таблетка-подсказка'],
+      ['27.5', '.top-inner', 'top-inner', 'внутренний контейнер шапки'],
+    ];
+    for (const [id, cls, token, why] of ui) {
+      ok(`${id} ${cls} есть в разметке (${why})`, htmlClasses.has(token),
+        [...htmlClasses].filter((c) => c.includes(token)));
+    }
+
+    /* data-prompt — не класс, а атрибут: по нему click-обработчик достаёт
+     * текст, который подставит в поле ввода. Без него подсказка кликабельна,
+     * но ничего не делает. */
+    ok('27.6 data-prompt есть в разметке', /\bdata-prompt="[^"]+"/.test(htmlSrc), null);
+
+    /* .empty-list живёт в двух местах сразу: стартовый HTML (пока агенты не
+     * загружены) и agents.js (когда список пришёл пустым). Проверяем оба,
+     * иначе пустой список в одном из состояний останется без стилей. */
+    ok('27.7 .empty-list есть и в HTML, и в agents.js',
+      htmlClasses.has('empty-list') && jsClasses.has('empty-list'),
+      { html: htmlClasses.has('empty-list'), js: jsClasses.has('empty-list') });
+  }
+
+  /* ---------- 28. XSS: санитайзер на реальном DOM ----------
+   * Тест гоняет НАСТОЯЩИЙ sanitizeHtml из app.js, а не его копию: исходник
+   * вырезается из отдаваемого браузеру файла и исполняется в vm-контексте.
+   * Грепать app.js на слово `onerror` было бы бесполезно — оно там есть
+   * в комментарии, и такая проверка прошла бы при полностью сломанном коде. */
+  console.log('\n28. XSS — санитайзер markdown');
+  {
+    const app = await api('/app/app.js');
+    const src = typeof app.body === 'string' ? app.body : '';
+
+    /* linkedom объявлен в devDependencies. Здесь он может отсутствовать:
+     * на этой машине npm не смог его распаковать (ENOSPC), поэтому вторым
+     * шагом ищем копию в рантайме. Если нет ни одной — тест падает, а не
+     * молча пропускается: непроверенная защита хуже отсутствующей. */
+    let DOMParserCtor = null;
+    for (const p of ['linkedom', '/app/node_modules/linkedom']) {
+      try {
+        DOMParserCtor = require(p).DOMParser;
+        break;
+      } catch (_e) { /* пробуем следующий путь */ }
+    }
+    ok('28.0 DOM-парсер доступен для прогона XSS', Boolean(DOMParserCtor),
+      'npm i --save-dev linkedom');
+
+    const vm = require('vm');
+    const start = src.indexOf('const ALLOWED_TAGS');
+    const fnAt = start < 0 ? -1 : src.indexOf('function sanitizeHtml', start);
+    let code = null;
+    if (fnAt > 0) {
+      /* Границы функции ищем счётом скобок от её тела, а не по отступу:
+       * отступ поедет при любом переформатировании, и тест начнёт резать
+       * код посередине, выдавая ложную зелень. */
+      let depth = 0;
+      const open = src.indexOf('{', src.indexOf(')', fnAt));
+      for (let j = open; j < src.length; j++) {
+        if (src[j] === '{') depth++;
+        else if (src[j] === '}') {
+          depth--;
+          if (depth === 0) { code = src.slice(start, j + 1); break; }
+        }
+      }
+    }
+    ok('28.0 санитайзер извлечён из app.js', Boolean(code),
+      code ? code.length + ' байт' : 'маркеры не найдены');
+
+    if (DOMParserCtor && code) {
+      const ctx = vm.createContext({ DOMParser: DOMParserCtor, console });
+      vm.runInContext(code + '\n;globalThis.__san = sanitizeHtml;', ctx);
+      const san = ctx.__san;
+
+      /* 1. onerror на картинке: IMG нет в allowlist, узел разворачивается
+       * в текст, поэтому обработчик не может сработать в принципе. */
+      const img = String(san('<img src=x onerror=alert(1)>'));
+      ok('28.1 <img onerror> — обработчик снят', !/onerror/i.test(img), img);
+      ok('28.1 <img onerror> — тег не выжил', !/<img/i.test(img), img);
+
+      /* 2. javascript: в href: тег A разрешён, но схему проверяем отдельно —
+       * именно этот случай allowlist по тегам пропустил бы. */
+      const js = String(san('<a href="javascript:alert(1)">x</a>'));
+      ok('28.2 javascript: href снят', !/javascript:/i.test(js), js);
+      ok('28.2 текст ссылки сохранён', />x</.test(js), js);
+
+      /* 3. script: разворачивается в текстовый узел — код остаётся видимым
+       * как текст и не исполняется. */
+      const sc = String(san('<script>alert(1)</script>'));
+      ok('28.3 <script> не остался тегом', !/<script/i.test(sc), sc);
+      ok('28.3 содержимое стало текстом', sc.includes('alert(1)'), sc);
+
+      /* 4. Контроль в обратную сторону: обычная ссылка обязана выжить.
+       * Без него тест прошёл бы и при санитайзере, сносящем вообще всё. */
+      const good = String(san('<a href="https://example.com">ok</a>'));
+      ok('28.4 https-ссылка сохранена', /href="https:\/\/example\.com"/.test(good), good);
+      ok('28.4 rel=noopener проставлен', /rel="noopener noreferrer"/.test(good), good);
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌`);
   if (fail) {

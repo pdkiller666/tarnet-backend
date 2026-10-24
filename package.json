@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.11.0-chat-ux",
+  "version": "2.11.2-chat-ux-tests",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {
