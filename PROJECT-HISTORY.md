@@ -66,14 +66,17 @@
 - **Волны 8–9**: история чата, выбор модели, markdown, копирование кода (`c5c5a15`); редизайн интерфейса (`3614b13`).
 - **Tier 6 BYOK** (`3ff5034`, 20:33): ключ провайдера в PWA, кэшбэк, инвариант; 649 тестов.
 - **`0373b2d`** (21:20): TTL-резерв, `tier6_receipts` против double-spend, `funded_by` только `client`; **660 тестов**.
+- **`16f9158`** (22:00): **faucet** `0.01 TAR` на адрес, `faucetEmission` в `/health`, retry `/health` в `deploy.sh`; **678 тестов**, тег `v2.12.2-faucet`.
 
-### Теги (19 штук, все на месте)
+### Теги (20 штук, все на месте)
 
-`v2.1.0-stable` → `v2.2.0-p2p` → `v2.2.1-p2p-live` → `v2.3.0-identity` → `v2.4.0-pii` → `v2.4.1-tier-fix` → `v2.4.1-production-ready` → `v2.5.0-prep` → `v2.5.1-prep` → `v2.6.0-tier6-prep` → `v2.7.0-wave2-prep` → `v2.7.1-manifest-fix` → `v2.8.0-agent-foundation` → `v2.9.1-agent-ui` → `v2.9.2-agent-runtime-fix` → `v2.10.0-knowledge-loop-schema` → `v2.11.0-chat-ux` → `v2.11.2-chat-ux-tests` → `v2.12.1-tier6-fix`
+`v2.1.0-stable` → `v2.2.0-p2p` → `v2.2.1-p2p-live` → `v2.3.0-identity` → `v2.4.0-pii` → `v2.4.1-tier-fix` → `v2.4.1-production-ready` → `v2.5.0-prep` → `v2.5.1-prep` → `v2.6.0-tier6-prep` → `v2.7.0-wave2-prep` → `v2.7.1-manifest-fix` → `v2.8.0-agent-foundation` → `v2.9.1-agent-ui` → `v2.9.2-agent-runtime-fix` → `v2.10.0-knowledge-loop-schema` → `v2.11.0-chat-ux` → `v2.11.2-chat-ux-tests` → `v2.12.1-tier6-fix` → `v2.12.2-faucet`
 
 **Тега `v2.12.0-tier6-byok` не существует.** Это `buildVersion` (метка в `/health`), а не git-тег. Ошибка однажды попала в `MEMORY.md` как факт — при ссылке на тег всегда `git tag -l`.
 
 `v2.12.1-tier6-fix` — annotated: объект тега `bf7c85d`, коммит `0373b2d`.
+
+`v2.12.2-faucet` — annotated: объект тега `7c29a3f` (`d4e8f7c9…b524025` по sha256 тела), коммит `16f9158`.
 
 ---
 
