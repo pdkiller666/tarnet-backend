@@ -2849,6 +2849,131 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     cfFinal.conservation.delta === 0 && cfFinal.conservation.holds === true,
     { delta: cfFinal.conservation.delta, holds: cfFinal.conservation.holds });
 
+  /* ===== Волна 6: закрытие дыр Agent Runtime =====
+   *
+   * До этой волны /inference не вызывал runAgent: агент существовал как
+   * запись в БД и лимиты, но задачу через него выполнить было нельзя.
+   * Проверяется именно проводка, а не наличие функций — runAgent и
+   * checkTaskLimits были написаны в Волне 4 и покрыты отдельно. */
+  section('23. Волна 6: runAgent в /inference, лимиты агента, заработок');
+  const w6Identity = require('./identity');
+
+  /* ---------- 23.1: задача через агентский цикл ---------- */
+  const w6Run = await api('/inference', 'POST', {
+    prompt: 'задача через агентский цикл',
+    agentId: wave4AgentId,
+    clientAddress: wave4OwnerAddr,
+    maxTokens: 100,
+    tier: 'base',
+    workerAddress: wave4Worker,
+    actionId: runId('w6run'),
+  });
+  ok('23.1 /inference с agentId выполняется (200)',
+    w6Run.status === 200, { status: w6Run.status, error: w6Run.body?.error });
+
+  /* Шаги — доказательство, что работал именно цикл, а не один вызов
+   * транспорта. Без них «агент работает» было бы неотличимо от «агент
+   * получает тот же ответ, что и без agentId». */
+  const w6Steps = w6Run.body?.agent?.steps;
+  ok('23.1 в ответе есть шаги Think→Act→Observe',
+    Array.isArray(w6Steps) && w6Steps.length >= 1, w6Steps);
+  ok('23.1 шаг несёт iteration и tokens',
+    Array.isArray(w6Steps) && w6Steps.every(s => typeof s.iteration === 'number' && typeof s.tokens === 'number'),
+    w6Steps?.map(s => ({ i: s.iteration, t: s.tokens })));
+  ok('23.1 шаг несёт toolCalls (пустой массив — честно, а не отсутствие поля)',
+    Array.isArray(w6Steps) && w6Steps.every(s => Array.isArray(s.toolCalls)), w6Steps?.[0]);
+  ok('23.1 в ответе есть iterations и stopReason',
+    typeof w6Run.body?.agent?.iterations === 'number' && typeof w6Run.body?.agent?.stopReason === 'string',
+    { iterations: w6Run.body?.agent?.iterations, stop: w6Run.body?.agent?.stopReason });
+
+  /* ---------- 23.2: лимиты принимаются при создании ---------- */
+  const w6Key = crypto.generateKeyPairSync('ed25519');
+  const w6Pub = Buffer.from(w6Key.publicKey.export({ format: 'jwk' }).x, 'base64url').toString('hex');
+  const w6Agent = await api('/agents', 'POST', {
+    userId: wave4OwnerAddr,
+    pubkey: w6Pub,
+    role: 'general',
+    allowedTools: ['calculator'],
+    maxPerTaskTokens: 3000,
+    dailyLimitTokens: 20000,
+    humanApprovalThresholdTokens: 1000,
+  });
+  ok('23.2 POST /agents принимает лимиты (201)',
+    w6Agent.status === 201, { status: w6Agent.status, error: w6Agent.body?.error });
+  const w6AgentId = w6Agent.body?.agentId;
+
+  /* Читаем обратно через GET: 201 мог бы отчитаться о том, чего не записал.
+   * Проверяется именно то, что увидит UI. */
+  const w6List = await api(`/agents?userId=${wave4OwnerAddr}`);
+  const w6Row = (w6List.body?.agents || []).find(a => a.agentId === w6AgentId);
+  ok('23.2 GET /agents отдаёт выставленные лимиты',
+    w6Row?.wallet?.maxPerTaskTokens === 3000
+      && w6Row?.wallet?.dailyLimitTokens === 20000
+      && w6Row?.wallet?.humanApprovalThresholdTokens === 1000,
+    w6Row?.wallet);
+
+  /* ---------- 23.3: неверные лимиты отклоняются ---------- */
+  const badLimitKey = crypto.generateKeyPairSync('ed25519');
+  const badLimitPub = Buffer.from(badLimitKey.publicKey.export({ format: 'jwk' }).x, 'base64url').toString('hex');
+  const badLimit = await api('/agents', 'POST', {
+    userId: wave4OwnerAddr, pubkey: badLimitPub, role: 'general',
+    maxPerTaskTokens: -5,
+  });
+  ok('23.3 отрицательный лимит → 400 (а не тихая подмена дефолтом)',
+    badLimit.status === 400 && /maxPerTaskTokens/.test(JSON.stringify(badLimit.body)),
+    { status: badLimit.status, body: badLimit.body });
+
+  /* Порог выше лимита на задачу выключил бы HITL навсегда: задача не может
+   * быть дороже maxPerTaskTokens, значит порог не превысить никогда. */
+  const badThresholdKey = crypto.generateKeyPairSync('ed25519');
+  const badThresholdPub = Buffer.from(badThresholdKey.publicKey.export({ format: 'jwk' }).x, 'base64url').toString('hex');
+  const badThreshold = await api('/agents', 'POST', {
+    userId: wave4OwnerAddr, pubkey: badThresholdPub, role: 'general',
+    maxPerTaskTokens: 1000, humanApprovalThresholdTokens: 5000,
+  });
+  ok('23.3 порог подтверждения выше лимита задачи → 400',
+    badThreshold.status === 400 && /humanApprovalThresholdTokens/.test(JSON.stringify(badThreshold.body)),
+    { status: badThreshold.status, body: badThreshold.body });
+
+  /* Дневной лимит ниже лимита на задачу делает агента мёртвым с рождения. */
+  const badDailyKey = crypto.generateKeyPairSync('ed25519');
+  const badDailyPub = Buffer.from(badDailyKey.publicKey.export({ format: 'jwk' }).x, 'base64url').toString('hex');
+  const badDaily = await api('/agents', 'POST', {
+    userId: wave4OwnerAddr, pubkey: badDailyPub, role: 'general',
+    maxPerTaskTokens: 5000, dailyLimitTokens: 100,
+  });
+  ok('23.3 дневной лимит меньше лимита задачи → 400',
+    badDaily.status === 400 && /dailyLimitTokens/.test(JSON.stringify(badDaily.body)),
+    { status: badDaily.status, body: badDaily.body });
+
+  /* ---------- 23.4: заработок агента ---------- */
+  ok('23.4 GET /agents отдаёт earnedTar числом',
+    w6Row && typeof w6Row.earnedTar === 'number', w6Row?.earnedTar);
+
+  /* Адрес заработка выводится из ключа агента. Он обязан совпадать с тем,
+   * что считает identity.js — иначе ROI смотрел бы не на тот кошелёк. */
+  const expectedEarnAddr = w6Identity.addressFromRawPubkey(Buffer.from(w6AgentId, 'hex'));
+  ok('23.4 earnedAddress выведен из ключа агента',
+    w6Row?.earnedAddress === expectedEarnAddr,
+    { got: w6Row?.earnedAddress, want: expectedEarnAddr });
+
+  ok('23.4 netTar = earnedTar − spentTarAllTime',
+    w6Row && Math.abs(
+      Number(w6Row.netTar) - (Number(w6Row.earnedTar) - Number(w6Row.spentTarAllTime))) < 1e-9,
+    { net: w6Row?.netTar, earned: w6Row?.earnedTar, spent: w6Row?.spentTarAllTime });
+
+  /* Новый агент не считал ни одной задачи как воркер: 0 чеков — это факт,
+   * а не сбой. Тест закрепляет, что ноль приходит числом 0, а не null/NaN. */
+  ok('23.4 у нового агента earnedTar = 0 и receipts = 0',
+    w6Row?.earnedTar === 0 && w6Row?.earnedReceipts === 0,
+    { earned: w6Row?.earnedTar, receipts: w6Row?.earnedReceipts });
+
+  /* Вся серия не должна была сдвинуть деньги. */
+  const cfWave6 = (await api('/health')).body;
+  ok('Волна 6 не сломала conservation (delta 0)',
+    cfWave6.conservation.delta === 0 && cfWave6.conservation.holds === true,
+    { delta: cfWave6.conservation.delta, holds: cfWave6.conservation.holds });
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌`);
   if (fail) {

@@ -1016,6 +1016,37 @@ function agentSpendOf(agentId, day = agentDayKey()) {
   return r || { spentTokens: 0, spentTar: 0, calls: 0, toolCalls: 0 };
 }
 
+/* Заработок агента как ВОРКЕРА (Волна 6).
+ *
+ * ПОЧЕМУ ЧЕРЕЗ АДРЕС, А НЕ ЧЕРЕЗ agentId: чеки в work_receipts адресованы
+ * кошельку (workerAddress), а agentId — это hex публичного ключа, не адрес.
+ * Связь между ними детерминирована: адрес = sha256(SPKI || pubkey)[:40].
+ * Считать по agentId напрямую было бы нечем — такой колонки в чеках нет.
+ *
+ * ЧЕСТНОЕ ОГРАНИЧЕНИЕ, которое нельзя замалчивать: агент зарабатывает
+ * только если тот же ключ зарегистрирован как воркер и реально считает
+ * задачи. Иначе сумма честно равна 0 — это не ошибка учёта, а отсутствие
+ * работы. На 2026-10-24 у обоих агентов в боевой БД ровно 0 чеков.
+ *
+ * Считается по ВСЕМУ времени, а не за день: ROI — накопительная величина,
+ * а расход рядом отдаётся и за день (spendToday), и накопительно (spentTar).
+ */
+function agentEarnedOf(agentId) {
+  let address;
+  try {
+    address = tarIdentity.addressFromRawPubkey(Buffer.from(String(agentId), 'hex'));
+  } catch (_e) {
+    return { address: null, earnedTar: 0, receipts: 0 };
+  }
+  const r = get(`SELECT COUNT(*) AS c, COALESCE(SUM(rewardTar), 0) AS s
+                   FROM work_receipts WHERE workerAddress = ?`, [address]);
+  return {
+    address,
+    earnedTar: round(Number(r?.s) || 0),
+    receipts: Number(r?.c) || 0,
+  };
+}
+
 /* Сколько токенов уже занято незавершёнными задачами.
  * Без этой суммы пять параллельных задач по 5000 токенов прошли бы дневной
  * лимит 50 000 каждая по отдельности — лимит проверялся бы против нуля. */
@@ -2200,6 +2231,25 @@ app.get('/agents', (req, res) => {
        * отказ всегда показывают одно и то же число. */
       spendToday: agentSpendOf(a.agentId),
       heldTokens: agentHeldTokens(a.agentId),
+      /* Заработок как воркера (Волна 6). Плоские поля рядом с spendToday,
+       * чтобы UI мог нарисовать ROI без вложенных разборов:
+       *   netTar = earnedTar − spentTar (накопительный, не за день).
+       * Адрес, по которому посчитано, отдаётся явно: если он не совпадает
+       * с тем, под которым работает воркер на ПК, earnedTar будет 0 — и это
+       * должно быть видно, а не выглядеть как «агент ничего не заработал». */
+      ...(() => {
+        const earned = agentEarnedOf(a.agentId);
+        const spentAll = Number(get(
+          `SELECT COALESCE(SUM(spentTar), 0) AS s FROM agent_spend WHERE agentId = ?`,
+          [a.agentId])?.s) || 0;
+        return {
+          earnedTar: earned.earnedTar,
+          earnedReceipts: earned.receipts,
+          earnedAddress: earned.address,
+          spentTarAllTime: round(spentAll),
+          netTar: round(earned.earnedTar - spentAll),
+        };
+      })(),
       wallet: a.maxPerTaskTokens === null ? null : {
         /* Лимиты в токенах — основная единица (Волна 4). TAR-эквиваленты
          * отдаются рядом для отображения, но НЕ хранятся: если бы они
@@ -2281,6 +2331,62 @@ app.post('/agents', (req, res) => {
     }
   }
 
+  /* Лимиты агента (Волна 6). До этого они всегда брались из конфига, и
+   * выставить их можно было только правкой .env — то есть никак для
+   * отдельного агента. Форма в PWA их уже не отправляла, потому что сервер
+   * их не принимал; теперь принимает.
+   *
+   * ВАЛИДАЦИЯ ЖЁСТКАЯ, а не «привести как получится»: лимит — это граница
+   * траты. Число, прочитанное как NaN, в checkTaskLimits превратилось бы в
+   * fallback из конфига, и пользователь думал бы, что поставил 100, а
+   * работал бы лимит 5000. Молчаливая подмена здесь дороже отказа.
+   */
+  const limitInput = {};
+  const limitFields = [
+    'maxPerTaskTokens', 'dailyLimitTokens', 'humanApprovalThresholdTokens',
+  ];
+  for (const field of limitFields) {
+    const v = body[field];
+    if (v === undefined || v === null) continue;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 0) {
+      return res.status(400).json({
+        error: field + ' must be a non-negative integer',
+        field,
+        got: v,
+      });
+    }
+    limitInput[field] = n;
+  }
+
+  /* Порог подтверждения выше лимита на задачу — это не ошибка ввода, а
+   * выключенный механизм: задача не может быть дороже maxPerTaskTokens,
+   * значит needsApproval не сработает никогда, и HITL молча исчезнет.
+   * Отказываем явно, а не оставляем владельца думать, что подпись включена. */
+  const effMaxPerTask = limitInput.maxPerTaskTokens ?? CONFIG.AGENT_MAX_PER_TASK_TOKENS;
+  const effThreshold = limitInput.humanApprovalThresholdTokens
+    ?? CONFIG.AGENT_APPROVAL_THRESHOLD_TOKENS;
+  if (effThreshold > effMaxPerTask) {
+    return res.status(400).json({
+      error: 'humanApprovalThresholdTokens must not exceed maxPerTaskTokens',
+      note: 'иначе задача не сможет превысить порог, и подтверждение владельцем не сработает никогда',
+      humanApprovalThresholdTokens: effThreshold,
+      maxPerTaskTokens: effMaxPerTask,
+    });
+  }
+
+  /* Дневной лимит ниже лимита на задачу — та же логика: ни одна задача не
+   * пройдёт проверку дневного бюджета, агент мёртв с рождения. */
+  const effDaily = limitInput.dailyLimitTokens ?? CONFIG.AGENT_DAILY_LIMIT_TOKENS;
+  if (effDaily < effMaxPerTask) {
+    return res.status(400).json({
+      error: 'dailyLimitTokens must not be less than maxPerTaskTokens',
+      note: 'иначе ни одна задача не пройдёт дневной бюджет',
+      dailyLimitTokens: effDaily,
+      maxPerTaskTokens: effMaxPerTask,
+    });
+  }
+
   /* Два пути, как у /id/register, и разница та же:
    *   pubkey        — штатный: ключ выведен на устройстве, сервер видит
    *                   только публичную часть.
@@ -2333,8 +2439,11 @@ app.post('/agents', (req, res) => {
          (agentId, maxPerTaskTokens, dailyLimitTokens, humanApprovalThresholdTokens,
           allowlistTools, updatedAt)
        VALUES (?, ?, ?, ?, ?, ?)`,
-    [agentId, CONFIG.AGENT_MAX_PER_TASK_TOKENS, CONFIG.AGENT_DAILY_LIMIT_TOKENS,
-      CONFIG.AGENT_APPROVAL_THRESHOLD_TOKENS, JSON.stringify(allowedTools), now]);
+    [agentId,
+      limitInput.maxPerTaskTokens ?? CONFIG.AGENT_MAX_PER_TASK_TOKENS,
+      limitInput.dailyLimitTokens ?? CONFIG.AGENT_DAILY_LIMIT_TOKENS,
+      limitInput.humanApprovalThresholdTokens ?? CONFIG.AGENT_APPROVAL_THRESHOLD_TOKENS,
+      JSON.stringify(allowedTools), now]);
 
   res.status(201).json({
     ok: true,
@@ -3979,6 +4088,20 @@ async function runInference(req, res) {
    * модель молчит" неотличим от честной работы: source одинаковый. */
   let fallbackReason = null;
 
+  /* Один шаг транспорта: worker -> external_api -> deterministic_fallback.
+   *
+   * ПОЧЕМУ ЗАМЫКАНИЕ, А НЕ ОТДЕЛЬНАЯ ФУНКЦИЯ: этот блок уже умеет живой путь
+   * (очередь воркера, шифрование промпта, ожидание до 30 с). Второй его
+   * экземпляр разошёлся бы с первым при первой же правке — ровно поэтому
+   * agent-runtime.js не содержит транспорта и принимает `infer` снаружи.
+   * Здесь замыкание заодно видит modelId/tier/routing, которые считаются выше.
+   *
+   * `const prompt = stepPrompt` — намеренное затенение: тело шага не меняется,
+   * но каждый шаг цикла получает свой промпт (наблюдение + задание).
+   */
+  const runTransport = async (stepPrompt) => {
+    const prompt = stepPrompt;
+
   if (hasActiveWorker()) {
     // Режим A: домашний узел забирает задачу и присылает результат.
     try {
@@ -4044,7 +4167,67 @@ async function runInference(req, res) {
     result = LLM.deterministicFallback(prompt, null);
   }
 
-  const tokensGenerated = Math.max(1, Math.floor(Number(result.tokensGenerated) || 0));
+    /* Снимок, а не сам объект: следующий шаг цикла перезапишет `result`, а
+     * вызывающему нужен ответ именно этого шага. */
+    return result;
+  };
+
+  /* ===== 3.5) Агентский цикл (Волна 6) =====
+   *
+   * ПОЧЕМУ ЦИКЛ ЗДЕСЬ, А НЕ В agent-runtime.js: модуль уже содержит цикл
+   * Think→Act→Observe, но не содержит транспорта — он принимает `infer`
+   * снаружи (см. шапку agent-runtime.js). Проводка транспорта в цикл — это
+   * ровно то, чего не хватало: до Волны 6 /inference вообще не вызывал
+   * runAgent, и агент не работал end-to-end.
+   *
+   * infer получает `runTransport`: тот же живой путь (воркер → внешний API →
+   * шаблон), что и без агента. Второй транспорт разошёлся бы с первым.
+   *
+   * ЧЕСТНОЕ ОГРАНИЧЕНИЕ: воркер пока не порождает toolCalls, поэтому на
+   * стенде цикл почти всегда завершается за одну итерацию. Шаги при этом
+   * реальные — их число и токены видны в ответе (agent.steps).
+   */
+  let agentTrace = null;
+  if (agentCtx) {
+    agentTrace = await agentRuntime.runAgent({
+      agentId: agentCtx.agentId,
+      prompt,
+      maxTokens: agentCtx.maxTokens,
+      infer: async (stepPrompt) => {
+        const stepResult = await runTransport(stepPrompt);
+        return {
+          response: stepResult?.response ?? '',
+          tokens: Math.max(1, Math.floor(Number(stepResult?.tokensGenerated) || 1)),
+          /* Инструменты объявляет воркер. Пока он их не порождает, массив
+           * пуст — и это правда, а не заглушка: выдуманный вызов списал бы
+           * деньги за работу, которой не было. */
+          toolCalls: Array.isArray(stepResult?.toolCalls) ? stepResult.toolCalls : [],
+        };
+      },
+    });
+
+    /* Ответ клиенту — последний шаг: именно он отвечает на задачу, а
+     * промежуточные реплики нужны только как лог. */
+    const lastStep = agentTrace.steps[agentTrace.steps.length - 1];
+    if (lastStep) {
+      result = { ...result, response: lastStep.response };
+    } else {
+      /* Цикл не сделал ни шага (нулевой бюджет или лимит итераций 0).
+       * Без этой ветки `result` остался бы undefined, и следующий доступ
+       * к result.response уронил бы запрос в 500. Причина честная. */
+      result = LLM.deterministicFallback(prompt, agentTrace.stopReason);
+      fallbackReason = fallbackReason || agentTrace.stopReason;
+    }
+  } else {
+    await runTransport(prompt);
+  }
+
+  /* Токены считаются по сумме шагов, а не по последнему: оплата за работу —
+   * это всё, что модель сгенерировала за цикл, а не только финальная реплика.
+   * При одной итерации сумма совпадает с прежним поведением. */
+  const tokensGenerated = agentTrace
+    ? Math.max(1, Math.floor(Number(agentTrace.spentTokens) || 0))
+    : Math.max(1, Math.floor(Number(result.tokensGenerated) || 0));
 
   // 4) Начисление: тот же путь, что и POST /work — расхождений быть не может.
   const outcome = recordWork({
@@ -4167,6 +4350,18 @@ async function runInference(req, res) {
       approvalUsed: agentCtx.usedApproval,
       toolCalls: toolCharges.map(t => ({ toolId: t.toolId, costTar: t.costTar })),
       toolCostTar: agentRuntime.toolCallsCost(toolCharges),
+      /* Пошаговый лог Think→Act→Observe (Волна 6). Отдаётся как есть, без
+       * склейки в строку: UI решает сам, сколько шагов показывать, а тесты
+       * проверяют числа. response оставлен только у последнего шага —
+       * промежуточные реплики в ответе не нужны и раздували бы его. */
+      steps: (agentTrace?.steps ?? []).map((s) => ({
+        iteration: s.iteration,
+        tokens: s.tokens,
+        toolCalls: s.toolCalls.map((c) => c?.toolId ?? null),
+        response: s.iteration === agentTrace.steps.length ? s.response : undefined,
+      })),
+      iterations: agentTrace?.iterations ?? 0,
+      stopReason: agentTrace?.stopReason ?? null,
     };
   }
 

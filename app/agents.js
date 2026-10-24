@@ -263,6 +263,16 @@
     const spent = Number(a.spendToday?.spentTokens || 0);
     const held = Number(a.heldTokens || 0);
     const spentTar = Number(a.spendToday?.spentTar || 0);
+    /* Заработок как воркера и Net ROI (Волна 6). earnedTar = 0 не всегда
+     * значит «не заработал»: частая причина — адрес из ключа агента не тот,
+     * под которым работает воркер на ПК. Поэтому при нуле показываем
+     * подсказку, а не безликий ноль. */
+    const earnedTar = Number(a.earnedTar || 0);
+    const netTar = Number(a.netTar || 0);
+    const earnedHint = earnedTar === 0
+      ? `<p class="dim tiny">заработок: 0 TAR · воркер не считал под этим адресом</p>`
+      : `<p class="dim tiny">заработано: ${earnedTar.toFixed(6)} TAR (${a.earnedReceipts || 0} чек.) ·
+           net: <span class="${netTar >= 0 ? 'roi-positive' : 'roi-negative'}">${netTar >= 0 ? '+' : ''}${netTar.toFixed(6)} TAR</span></p>`;
     const active = a.status === 'active';
     return `<div class="agent-card" data-agent="${a.agentId}">
       <div class="agent-head">
@@ -273,6 +283,7 @@
       <p class="dim tiny">инструменты: ${(a.allowedTools || []).join(', ') || '—'}</p>
       ${limitBar(spent, daily)}
       <p class="dim tiny">потрачено сегодня: ${spentTar.toFixed(6)} TAR${held > 0 ? ` · занято: ${held} ток.` : ''}</p>
+      ${earnedHint}
       <button class="btn small run-btn" data-run="${a.agentId}" ${active ? '' : 'disabled'}>▶ Запустить</button>
     </div>`;
   }
@@ -301,18 +312,27 @@
     if (!el) return;
     if (!account) { el.textContent = '—'; return; }
 
-    /* «Заработано» и «Потрачено» — РАЗНЫЕ вещи, и вторая показывается
-     * только как расход агентов. Заработок агента сервер не отдаёт вообще:
-     * GET /agents возвращает spendToday, но не earnings. Net ROI поэтому
-     * честно считается от нуля заработка и помечается как неполный, а не
-     * рисуется зелёной цифрой из воздуха. */
-    const spent = agents.reduce((s, a) => s + Number(a.spendToday?.spentTar || 0), 0);
+    /* «Заработано» и «Потрачено» — РАЗНЫЕ вещи.
+     *
+     * Заработок (Волна 6) считается по чекам work_receipts на адрес,
+     * выведенный из ключа агента. Расход — по agent_spend. Обе цифры
+     * приходят от сервера готовыми: клиент не пересчитывает деньги сам,
+     * иначе браузер и сервер разошлись бы при смене курса или κ.
+     *
+     * Накопительный spentTarAllTime, а не spendToday: ROI за день и ROI за
+     * всё время — разные величины, и смешивать их нельзя. */
+    const spentDay = agents.reduce((s, a) => s + Number(a.spendToday?.spentTar || 0), 0);
+    const spent = agents.reduce((s, a) => s + Number(a.spentTarAllTime || 0), 0);
+    const earned = agents.reduce((s, a) => s + Number(a.earnedTar || 0), 0);
+    const net = earned - spent;
+    const hasEarnings = earned > 0;
     el.innerHTML = `<div class="roi-row">
-        <div><span class="dim tiny">Потрачено агентами</span><div class="roi-negative">−${spent.toFixed(6)} TAR</div></div>
-        <div><span class="dim tiny">Заработано</span><div class="dim">не учитывается</div></div>
-        <div><span class="dim tiny">Net</span><div class="roi-negative">−${spent.toFixed(6)} TAR</div></div>
+        <div><span class="dim tiny">Заработано</span><div class="${hasEarnings ? 'roi-positive' : 'dim'}">${hasEarnings ? '+' : ''}${earned.toFixed(6)} TAR</div></div>
+        <div><span class="dim tiny">Потрачено (всего)</span><div class="roi-negative">−${spent.toFixed(6)} TAR</div></div>
+        <div><span class="dim tiny">Net ROI</span><div class="${net >= 0 ? 'roi-positive' : 'roi-negative'}">${net >= 0 ? '+' : ''}${net.toFixed(6)} TAR</div></div>
       </div>
-      <p class="dim tiny">Заработок агентов сервер пока не отдаёт: /agents возвращает только расход. Цифра Net — расход, а не ROI.</p>`;
+      <p class="dim tiny">сегодня потрачено: ${spentDay.toFixed(6)} TAR · всего: ${spent.toFixed(6)} TAR</p>
+      ${hasEarnings ? '' : '<p class="dim tiny">Заработок 0 TAR: агент зарабатывает только если его ключ зарегистрирован как воркер и считает задачи. Адреса можно сверить в карточке.</p>'}`;
   }
 
   /* ===== Запуск задачи ===== */
