@@ -4231,6 +4231,110 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+  /* ===== 29.15 Faucet: потолок выдач с одного IP =====
+   * PK на address защищал только от повторной заявки тем же кошельком.
+   * Один скрипт мог напечатать себе 0.01 TAR на каждый сгенерированный
+   * адрес — то есть защита обходилась в три строки кода. Здесь
+   * проверяется, что потолок работает и что заблокированная заявка
+   * НЕ начисляет деньги.
+   *
+   * Разные IP задаются через X-Forwarded-For: сервер доверяет только
+   * loopback (`trust proxy = 'loopback'`), а тест ходит с 127.0.0.1 —
+   * значит заголовок честно принимается и req.ip меняется. Если бы
+   * сервер доверял любому источнику, эта проверка была бы подделкой.
+   */
+  {
+    const f = await spawnServer({ FAUCET_IP_LIMIT: '3' });
+    try {
+      const IP_A = { 'X-Forwarded-For': '203.0.113.10' };
+      const IP_B = { 'X-Forwarded-For': '198.51.100.20' };
+      /* Теги только из hex: 'ipl1' содержал 'l' и адрес не проходил
+       * FAUCET_ADDR_RE — три проверки падали на invalid_address ещё до
+       * логики лимита. Та же ловушка, что была с 'fau' в 29.14. */
+      const mk = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
+
+      const a1 = await apiAt(f.base, '/faucet/claim', 'POST', { address: mk('aa1') }, IP_A);
+      const a2 = await apiAt(f.base, '/faucet/claim', 'POST', { address: mk('aa2') }, IP_A);
+      const a3 = await apiAt(f.base, '/faucet/claim', 'POST', { address: mk('aa3') }, IP_A);
+      ok('29.15 первые 3 выдачи с одного IP → 200',
+        a1.status === 200 && a2.status === 200 && a3.status === 200,
+        [a1.status, a2.status, a3.status]);
+
+      const blockedAddr = mk('aa4');
+      const a4 = await apiAt(f.base, '/faucet/claim', 'POST', { address: blockedAddr }, IP_A);
+      ok('29.15 4-я выдача с того же IP → 400 IP_LIMIT_REACHED',
+        a4.status === 400 && a4.body?.error === 'IP_LIMIT_REACHED',
+        { status: a4.status, error: a4.body?.error });
+
+      /* Главное: отказ не напечатал деньги. Без этой проверки «400» мог бы
+       * отдаваться вместе с начислением — то есть защита была бы декоративной. */
+      const blockedBal = await apiAt(f.base, `/balance/${blockedAddr}`);
+      ok('29.15 заблокированная заявка НЕ начислила TAR',
+        blockedBal.status !== 200 || Number(blockedBal.body?.balanceTar || 0) === 0,
+        blockedBal.body?.balanceTar);
+
+      /* Лимит именно на IP, а не глобальный счётчик: иначе четвёртая
+       * выдача вообще не прошла бы ни с какого адреса. */
+      const b1 = await apiAt(f.base, '/faucet/claim', 'POST', { address: mk('bb1') }, IP_B);
+      ok('29.15 другой IP получает faucet независимо',
+        b1.status === 200, b1.status);
+
+      /* ipHash — не открытый IP и не голый sha256: полный IPv4
+       * перебирается за минуты, и колонка стала бы журналом адресов. */
+      const { DatabaseSync } = require('node:sqlite');
+      const sdb = new DatabaseSync(path.join(f.dir, 'test.db'));
+      const rows = sdb.prepare('SELECT address, ipHash FROM faucet_claims').all();
+      sdb.close();
+      const hashes = rows.map((r) => r.ipHash).filter(Boolean);
+      const plain = rows.filter((r) => r.ipHash === '203.0.113.10' || r.ipHash === '198.51.100.20');
+      ok('29.15 ipHash — HMAC-дайджест, open IP не хранится',
+        hashes.length >= 4 && hashes.every((h) => /^[0-9a-f]{64}$/.test(h)) && plain.length === 0,
+        { rows: rows.length, hashed: hashes.length });
+    } finally {
+      f.stop();
+    }
+  }
+
+  /* ===== 29.16 Фаза 2.5: схема «Ключ как воркер» =====
+   * Создано ТОЛЬКО хранение: ни selectPoolKey, ни decryptKey, ни
+   * routeAndExecuteTier6 нет. Проверяется именно это: таблицы есть,
+   * эндпоинтов нет — схема не выдаёт себя за работающую фичу.
+   */
+  {
+    const f = await spawnServer();
+    try {
+      const { DatabaseSync } = require('node:sqlite');
+      const sdb = new DatabaseSync(path.join(f.dir, 'test.db'));
+      const cols = (t) => sdb.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
+      const userKeys = cols('user_keys');
+      const keyLimits = cols('key_limits');
+      const keyUsage = cols('key_usage');
+      sdb.close();
+
+      ok('29.16 user_keys / key_limits / key_usage созданы',
+        userKeys.length > 0 && keyLimits.length > 0 && keyUsage.length > 0,
+        { userKeys: userKeys.length, keyLimits: keyLimits.length, keyUsage: keyUsage.length });
+
+      /* authTag обязателен: AES-256-GCM без него не расшифровывается.
+       * hourResetAt/dayResetAt вместо одного resetAt: одно поле не может
+       * сбрасывать два разных окна (суточное в USD и часовое в запросах). */
+      const shapeOk = ['keyId', 'userAddress', 'provider', 'encryptedKey', 'iv', 'authTag', 'isAvailableForNetwork', 'createdAt'].every((c) => userKeys.includes(c))
+        && ['maxPerDayUsd', 'maxRequestsPerHour', 'spentTodayUsd', 'requestsThisHour', 'hourResetAt', 'dayResetAt'].every((c) => keyLimits.includes(c))
+        && ['usageId', 'keyId', 'requesterId', 'modelId', 'tokensUsed', 'costUsd', 'rewardTar', 'timestamp'].every((c) => keyUsage.includes(c));
+      ok('29.16 поля схемы на месте (authTag, два resetAt)', shapeOk,
+        { userKeys, keyLimits, keyUsage });
+
+      /* Логики нет: пути ключей отдают 404, а не 200. Если здесь когда-то
+       * появится 200 — это значит, что фича включилась, и тест обязан упасть. */
+      const l1 = await apiAt(f.base, '/keys/pool');
+      const l2 = await apiAt(f.base, '/tier6/pool');
+      ok('29.16 логика пула НЕ реализована (404, не 200)',
+        l1.status === 404 && l2.status === 404, [l1.status, l2.status]);
+    } finally {
+      f.stop();
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.12.2-faucet",
+  "version": "2.12.3-faucet-ip",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

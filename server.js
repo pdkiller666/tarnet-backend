@@ -464,12 +464,95 @@ db.exec(`CREATE TABLE IF NOT EXISTS tier6_reserves (
  * упиралась в PK, а не проходила проверку «а не выдавали ли раньше?»
  * отдельным SELECT: две одновременные заявки прошли бы обе.
  * amountTar хранится, а не берётся из конфига при чтении: сумма может
- * измениться, а аудит должен видеть, сколько реально выдали тогда. */
+ * измениться, а аудит должен видеть, сколько реально выдали тогда.
+ *
+ * `ipHash` (с 2.12.3) — потолок выдач с одного IP. PK на address сам
+ * по себе обходится генерацией кошельков, так что одного адреса мало.
+ * NULL у старых строк: у выдач до 2.12.3 IP никто не сохранял, и
+ * приписать его задним числом нечем. Такие строки в лимит не идут —
+ * это честнее, чем угадывать. */
 db.exec(`CREATE TABLE IF NOT EXISTS faucet_claims (
   address TEXT PRIMARY KEY,
   amountTar REAL NOT NULL CHECK (amountTar > 0),
-  claimedAt TEXT NOT NULL
+  claimedAt TEXT NOT NULL,
+  ipHash TEXT
 )`);
+
+/* Миграция для баз, созданных до 2.12.3: колонки ipHash там нет.
+ * ALTER TABLE ADD COLUMN — не пересборка: данные выдачи сохраняются,
+ * а старые строки просто получают NULL. */
+{
+  const cols = db.prepare('PRAGMA table_info(faucet_claims)').all().map(c => c.name);
+  if (cols.length && !cols.includes('ipHash')) {
+    db.exec('ALTER TABLE faucet_claims ADD COLUMN ipHash TEXT');
+  }
+}
+db.exec('CREATE INDEX IF NOT EXISTS idx_faucet_ip ON faucet_claims (ipHash)');
+
+/* ===== Фаза 2.5: «Ключ как воркер» — ТОЛЬКО СХЕМА =====
+ * Логики нет намеренно: ни selectPoolKey, ни decryptKey, ни
+ * routeAndExecuteTier6. Таблицы созданы, чтобы форма данных была
+ * зафиксирована до кода и чтобы следующий шаг не переделывал миграцию.
+ *
+ * ЗАЧЕМ: чужие ключи провайдеров как ресурс сети. Владелец ключа отдаёт
+ * его в общий пул и получает долю с вызовов. Ключ при этом остаётся
+ * зашифрованным на диске — в открытом виде он не лежит никогда.
+ *
+ * ТРИ ОТСТУПЛЕНИЯ ОТ СПЕКИ GEMINI, каждое вынужденное:
+ *
+ * 1. `userId` → `userAddress`. У `tar_id` первичный ключ — `address`,
+ *    колонки `userId` нет ни в одной таблице. Ссылка на несуществующую
+ *    колонку не создалась бы ни на одной базе. FK не ставим по той же
+ *    причине, что и в tier6_receipts: ключ может принадлежать кошельку,
+ *    который ещё не зарегистрировал TarNet ID, и терять его из-за
+ *    отсутствия строки в реестре бессмысленно.
+ *
+ * 2. Добавлен `authTag`. AES-256-GCM без тега аутентификации не
+ *    расшифровывается вообще: `encryptedKey` + `iv` дают шифротекст,
+ *    который невозможно проверить, а `cipher.final()` без тега падает.
+ *    Спека из трёх колонок (`encryptedKey`, `iv` и всё) неспособна
+ *    вернуть ключ обратно — схема была бы мёртвой с первого дня.
+ *
+ * 3. `key_limits.resetAt` разбит на два. В спеке одно поле на два разных
+ *    окна (суточное в USD и часовое в запросах). Один `resetAt` не может
+ *    одновременно сбрасывать и то, и другое: при сбросе часового окна
+ *    обнулялся бы и суточный счётчик, и `maxPerDayUsd` переставал бы
+ *    что-либо ограничивать. Два поля — `hourResetAt`, `dayResetAt`. */
+db.exec(`CREATE TABLE IF NOT EXISTS user_keys (
+  keyId TEXT PRIMARY KEY,
+  userAddress TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  encryptedKey TEXT NOT NULL,
+  iv TEXT NOT NULL,
+  authTag TEXT,
+  isAvailableForNetwork INTEGER NOT NULL DEFAULT 0 CHECK (isAvailableForNetwork IN (0,1)),
+  createdAt TEXT NOT NULL
+)`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_user_keys_owner ON user_keys (userAddress)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_user_keys_pool ON user_keys (isAvailableForNetwork, provider)');
+
+db.exec(`CREATE TABLE IF NOT EXISTS key_limits (
+  keyId TEXT PRIMARY KEY,
+  maxPerDayUsd REAL NOT NULL DEFAULT 0 CHECK (maxPerDayUsd >= 0),
+  maxRequestsPerHour INTEGER NOT NULL DEFAULT 0 CHECK (maxRequestsPerHour >= 0),
+  spentTodayUsd REAL NOT NULL DEFAULT 0 CHECK (spentTodayUsd >= 0),
+  requestsThisHour INTEGER NOT NULL DEFAULT 0 CHECK (requestsThisHour >= 0),
+  hourResetAt INTEGER,
+  dayResetAt INTEGER
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS key_usage (
+  usageId TEXT PRIMARY KEY,
+  keyId TEXT NOT NULL,
+  requesterId TEXT,
+  modelId TEXT,
+  tokensUsed INTEGER NOT NULL DEFAULT 0,
+  costUsd REAL NOT NULL DEFAULT 0,
+  rewardTar REAL NOT NULL DEFAULT 0,
+  "timestamp" TEXT NOT NULL
+)`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_key_usage_key ON key_usage (keyId, "timestamp")');
+db.exec('CREATE INDEX IF NOT EXISTS idx_key_usage_requester ON key_usage (requesterId)');
 
 /* ===== Миграция очереди воркера на шифрование промптов =====
  * Старая схема лежала с колонкой prompt NOT NULL: переименованием колонки
@@ -2484,6 +2567,49 @@ app.get('/balances', (_req, res) => {
  */
 const FAUCET_ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
 
+/* ===== ipHash: потолок выдач с одного IP =====
+ * Не plain sha256: полный IPv4 — это 2^32 адресов, такой перебор
+ * поднимается на ноутбуке за минуты, и колонка `ipHash` превратилась бы
+ * в открытый журнал «кто откуда заходил». HMAC на секрете из
+ * SECRETS_DIR делает перебор бессмысленным без самого секрета.
+ *
+ * Секрет создаётся лениво и лежит на диске рядом с master.key, а не в
+ * БД: дамп базы без файла секретов не даёт восстановить адреса.
+ * Ротация этого ключа = все старые хеши перестают совпадать с новыми,
+ * то есть лимит обнуляется. Это осознанно и задокументировано. */
+let _faucetIpSecret = null;
+function faucetIpSecret() {
+  if (!_faucetIpSecret) _faucetIpSecret = loadOrCreateSecret('faucet-ip.key');
+  return _faucetIpSecret;
+}
+
+/* Нормализация перед хешированием. Один и тот же клиент приходит то как
+ * `::ffff:127.0.0.1`, то как `127.0.0.1` — без схлопывания это два разных
+ * хеша, и лимит обходится сменой семейства адресов на том же сокете. */
+function normalizeIp(ip) {
+  const s = String(ip || '').trim();
+  if (!s) return '';
+  if (s.startsWith('::ffff:') && s.includes('.')) return s.slice(7);
+  return s;
+}
+
+function faucetIpHash(req) {
+  const ip = normalizeIp(req.ip || req.socket?.remoteAddress || '');
+  /* Пустой IP — не повод пропускать проверку и не повод блокировать:
+   * возвращаем null, и такие выдачи в лимит не идут. Иначе один сбой
+   * определения адреса заблокировал бы faucet всем сразу. */
+  if (!ip) return null;
+  return crypto.createHmac('sha256', faucetIpSecret()).update(ip).digest('hex');
+}
+
+/* Сколько выдач уже ушло на этот IP. NULL-строки (выдачи до 2.12.3)
+ * не считаются: их IP неизвестен. */
+function faucetClaimsFromIp(ipHash) {
+  if (!ipHash) return 0;
+  const row = get('SELECT COUNT(*) AS c FROM faucet_claims WHERE ipHash = ?', [ipHash]);
+  return Number(row?.c || 0);
+}
+
 function faucetState(address) {
   const row = get('SELECT amountTar, claimedAt FROM faucet_claims WHERE address = ?', [address]);
   return row
@@ -2515,16 +2641,41 @@ app.post('/faucet/claim', (req, res) => {
     });
   }
 
+  /* Потолок на IP. Проверка стоит здесь, а не в начале обработчика:
+   * сначала отсекается уже получавший адрес (ALREADY_CLAIMED), и только
+   * потом IP — иначе человек, который повторно жмёт кнопку с того же IP,
+   * получал бы IP_LIMIT_REACHED вместо честного «вы уже получали».
+   *
+   * Между COUNT и INSERT есть окно, в котором параллельные заявки с
+   * одного IP могли бы пройти обе. Закрывает его то, что оба запроса
+   * идут в одной транзакции с BEGIN IMMEDIATE: вторая ждёт коммита
+   * первой и COUNT уже видит её строку. */
+  const ipHash = faucetIpHash(req);
+
   const amount = FAUCET.AMOUNT_TAR;
   try {
-    /* Одна транзакция на всё: отметка о выдаче и начисление. Если
-     * credit упадёт, отметка откатится — иначе адрес остался бы с
-     * записью «получил», но без денег, и повторно получить не смог бы. */
-    tx(() => {
-      run('INSERT INTO faucet_claims (address, amountTar, claimedAt) VALUES (?, ?, ?)',
-        [address, round(amount), new Date().toISOString()]);
+    /* Одна транзакция на всё: проверка лимита, отметка о выдаче и
+     * начисление. Если credit упадёт, откатится всё — иначе адрес
+     * остался бы с записью «получил», но без денег, и не смог бы
+     * получить повторно. */
+    const limitHit = tx(() => {
+      if (FAUCET.IP_LIMIT > 0 && faucetClaimsFromIp(ipHash) >= FAUCET.IP_LIMIT) {
+        return faucetClaimsFromIp(ipHash);
+      }
+      run('INSERT INTO faucet_claims (address, amountTar, claimedAt, ipHash) VALUES (?, ?, ?, ?)',
+        [address, round(amount), new Date().toISOString(), ipHash]);
       credit(address, amount, 'faucet', null, null);
+      return null;
     });
+
+    if (limitHit !== null) {
+      return res.status(400).json({
+        error: 'IP_LIMIT_REACHED',
+        message: `С этого IP уже выдано ${FAUCET.IP_LIMIT} TAR-фаусетов`,
+        limit: FAUCET.IP_LIMIT,
+        claimed: limitHit,
+      });
+    }
   } catch (e) {
     /* Гонка двух одновременных заявок: обе прошли SELECT, вторая упала
      * на PK. Это не ошибка сервера, а тот же отказ, что и выше. */
