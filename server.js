@@ -1948,10 +1948,17 @@ const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 10);
 const RATE_LIMIT_READ_MAX = Number(process.env.RATE_LIMIT_READ_MAX || 300);
 const RATE_LIMIT_WORKER_MAX = Number(process.env.RATE_LIMIT_WORKER_MAX || 240);
+/* Синхронизация чата — запись, но не «редкая»: клиент шлёт её на каждое
+ * сообщение (2 записи на пару вопрос/ответ) плюс один запрос при открытии
+ * страницы. В классе strict (10/мин) третья реплика получала бы 429, и чат
+ * ломался бы ровно тогда, когда им пользуются. Поэтому отдельный класс:
+ * он остаётся записью, но с бюджетом под реальный темп переписки. */
+const RATE_LIMIT_CHAT_MAX = Number(process.env.RATE_LIMIT_CHAT_MAX || 120);
 
 const RATE_LIMITS = {
   read: { max: RATE_LIMIT_READ_MAX, label: 'чтение метрик' },
   worker: { max: RATE_LIMIT_WORKER_MAX, label: 'опрос воркера' },
+  chat: { max: RATE_LIMIT_CHAT_MAX, label: 'синхронизация чата' },
   strict: { max: RATE_LIMIT_MAX, label: 'запись' },
 };
 
@@ -1975,6 +1982,11 @@ const RATE_READ_UI = /^\/($|index\.html$|app$|app\/|ui(\/|$))/;
 
 function rateClass(req) {
   if (req.path === '/worker/poll') return 'worker';
+  /* /chat/sync — POST, поэтому без этой ветки попадал в strict. Проверка
+   * идёт до метода: эндпоинт есть только как POST, GET на него отдаёт 404,
+   * но класс ему нужен всё равно.
+   */
+  if (req.path === '/chat/sync') return 'chat';
   if (req.method === 'GET' || req.method === 'HEAD') {
     if (RATE_READ_PATH.test(req.path) || RATE_READ_SUBPATH.test(req.path) ||
         RATE_READ_ASSET.test(req.path) || RATE_READ_UI.test(req.path)) return 'read';

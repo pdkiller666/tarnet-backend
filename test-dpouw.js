@@ -3390,6 +3390,135 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     cfWave7.conservation.delta === 0 && cfWave7.conservation.holds === true,
     { delta: cfWave7.conservation.delta, holds: cfWave7.conservation.holds });
 
+  /* ===== Волна 8: чат UX — история, модели, markdown, копирование =====
+   * Проверяется то, что реально правилось во фронте, и один серверный
+   * инвариант: /chat/sync обязан иметь СВОЙ класс лимита. Клиент шлёт его
+   * на каждое сообщение (два запроса на пару вопрос/ответ) плюс один при
+   * открытии страницы — в strict (10/мин) третья реплика получала бы 429.
+   */
+  section('25. Волна 8: чат UX');
+
+  /* 25.1 Ассеты лежат локально. CDN запрещён: без сети PWA должен работать
+   * целиком, поэтому библиотеки вендорены в /app/vendor/. */
+  for (const [file, needle] of [
+    ['/app/vendor/marked.min.js', 'marked'],
+    ['/app/vendor/highlight.min.js', 'Highlight.js'],
+    ['/app/vendor/hljs-theme.css', 'hljs'],
+  ]) {
+    const r = await api(file);
+    const body = typeof r.body === 'string' ? r.body : '';
+    ok(`25.1 ${file} отдаётся локально`, r.status === 200 && body.includes(needle),
+      { status: r.status, found: body.includes(needle), len: body.length });
+  }
+
+  /* 25.2 Порядок подключения: vendor ДО app.js. Иначе в момент выполнения
+   * app.js globalThis.marked ещё undefined, и первый же рендер ответа уйдёт
+   * в esc(text) — markdown молча перестанет работать. */
+  {
+    const html = await api('/app/index.html');
+    const doc = typeof html.body === 'string' ? html.body : '';
+    const iMarked = doc.indexOf('/app/vendor/marked.min.js');
+    const iHljs = doc.indexOf('/app/vendor/highlight.min.js');
+    const iApp = doc.indexOf('/app/app.js');
+    ok('25.2 index.html подключает marked и hljs', iMarked > -1 && iHljs > -1, { iMarked, iHljs });
+    ok('25.2 vendor подключён ДО app.js', iMarked > -1 && iApp > -1 && iMarked < iApp && iHljs < iApp,
+      { iMarked, iHljs, iApp });
+
+    ok('25.3 в чате есть select модели', /<select id="model"/.test(doc), 'не найден');
+    ok('25.3 select адаптера не подменён селектом модели',
+      /<select id="adapter"/.test(doc) && /<select id="model"/.test(doc));
+  }
+
+  /* 25.4 Service worker предзагружает вендорные файлы и сменил версию кэша.
+   * Без поднятия CACHE старые клиенты не запросили бы vendor вовсе,
+   * и офлайн-режим рисовал бы ответ простым текстом. */
+  {
+    const sw = await api('/app/sw.js');
+    const src = typeof sw.body === 'string' ? sw.body : '';
+    ok('25.4 sw.js — версия кэша v6', /tarnet-app-v6/.test(src), src.slice(0, 60));
+    ok('25.4 sw.js кэширует vendor',
+      src.includes('/app/vendor/marked.min.js') && src.includes('/app/vendor/highlight.min.js'));
+  }
+
+  /* 25.5 Ключевой серверный инвариант: у /chat/sync свой бюджет. */
+  {
+    const rlChat = await spawnServer({
+      RATE_LIMIT_MAX: '10',        // strict
+      RATE_LIMIT_CHAT_MAX: '5',    // chat
+      RATE_LIMIT_READ_MAX: '50',
+      RATE_LIMIT_WINDOW_MS: '60000',
+    });
+    try {
+      const keyHex = idCrypto.randomBytes(32).toString('hex');
+      const hitChat = (ip) => fetch(rlChat.base + '/chat/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': ip },
+        body: JSON.stringify({ chatSyncKey: keyHex, knownIds: [], messages: [] }),
+      });
+
+      const first = await hitChat('203.0.113.40');
+      ok('25.5 /chat/sync — класс chat, а не strict',
+        first.headers.get('x-ratelimit-class') === 'chat',
+        first.headers.get('x-ratelimit-class'));
+
+      /* Пять запросов проходят, шестой — 429. Это и есть защита от того,
+       * чтобы третья реплика в чате падала из-за лимита записи. */
+      const codes = [];
+      for (let i = 0; i < 5; i++) codes.push((await hitChat('203.0.113.41')).status);
+      const sixth = await hitChat('203.0.113.41');
+      ok('25.5 chat: 5 запросов — 200', codes.every((c) => c === 200), codes);
+      ok('25.5 chat: 6-й — 429', sixth.status === 429, sixth.status);
+      const sixthBody = await sixth.json().catch(() => null);
+      ok('25.5 в теле class = chat', sixthBody?.class === 'chat', sixthBody);
+
+      /* Разделение бюджетов: исчерпанный чат не должен закрывать запись
+       * (strict) и метрики того же IP. */
+      const strictStill = await fetch(rlChat.base + '/wallet', {
+        method: 'POST', headers: { 'X-Forwarded-For': '203.0.113.41' },
+      });
+      ok('25.5 исчерпанный chat не блокирует strict с того же IP',
+        strictStill.status !== 429, strictStill.status);
+    } finally {
+      rlChat.stop();
+    }
+  }
+
+  /* 25.6 Клиент шифрует историю сам: на сервере не должно оказаться
+   * открытого текста промпта. Проверяем сквозным путём — отправляем
+   * зашифрованную пару и убеждаемся, что вернулась именно она. */
+  {
+    const w8Key = idCrypto.randomBytes(32);
+    const w8KeyHex = w8Key.toString('hex');
+    const w8Thread = runId('w8th');
+    const w8Text = `приватный промпт ${RUN}`;
+    const enc = chatMod.encryptPayload(w8Key, JSON.stringify({ role: 'user', text: w8Text }));
+    const w8Msg = {
+      msg_id: `${w8Thread}-1`, chat_thread_id: w8Thread, sender_device_id: 'devW8',
+      logical_time: 1, wall_clock_ms: Date.now(), is_deleted: 0, ...enc,
+    };
+    const w8push = await api('/chat/sync', 'POST', {
+      chatSyncKey: w8KeyHex, knownIds: [], messages: [w8Msg],
+    });
+    ok('25.6 зашифрованное сообщение принято', w8push.body?.applied?.inserted === 1,
+      w8push.body?.applied);
+
+    const w8back = await api('/chat/sync', 'POST', {
+      chatSyncKey: w8KeyHex, knownIds: [], messages: [],
+    });
+    const got = (w8back.body?.messages || []).find((m) => m.msg_id === `${w8Thread}-1`);
+    ok('25.6 сервер вернул запись без открытого текста',
+      got && !JSON.stringify(got).includes(w8Text), got ? 'текст найден в ответе' : 'записи нет');
+    ok('25.6 расшифровывается тем же ключом',
+      got && JSON.parse(chatMod.decryptPayload(w8Key, got)).text === w8Text);
+  }
+
+  /* 25.7 Сохранность денег: правки фронта и новый класс лимита не печатают
+   * TAR. Инвариант обязан остаться прежним. */
+  const cfWave8 = (await api('/health')).body;
+  ok('Волна 8 не сломала conservation (delta 0)',
+    cfWave8.conservation.delta === 0 && cfWave8.conservation.holds === true,
+    { delta: cfWave8.conservation.delta, holds: cfWave8.conservation.holds });
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌`);
   if (fail) {

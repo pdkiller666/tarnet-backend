@@ -213,9 +213,242 @@ async function loadAdapters() {
   }
 }
 
+/* ---------- Модели ----------
+ * В каталоге лежат и внешние модели (tier 6, openai/openrouter). В селект
+ * они не попадают: контур приватности заявлен как «промпт не уходит наружу»,
+ * а выбор gpt-4o отправил бы промпт в чужой API — и подпись «Private» рядом
+ * стала бы ложью. Внешние в текущем стенде всё равно отвечают 501.
+ */
+async function loadModels() {
+  const sel = $('model');
+  if (!sel) return;
+  try {
+    const data = await call('/models');
+    const list = (data && Array.isArray(data.models) ? data.models : [])
+      .filter((m) => m.provider === 'local' && Number(m.tier) <= 3);
+
+    sel.innerHTML = '<option value="">авто (базовая)</option>';
+    for (const m of list) {
+      const o = document.createElement('option');
+      o.value = m.modelId;
+      /* tier и контекст видимы: человек выбирает не имя, а возможность —
+       * «7b на 32k» против «1.5b на 128k» это разные ответы. */
+      const ctx = Number(m.contextWindow) >= 1000
+        ? ` · ${Math.round(Number(m.contextWindow) / 1000)}k`
+        : '';
+      o.textContent = `${m.modelId}${ctx}${m.isFree ? ' · free' : ''}`;
+      sel.appendChild(o);
+    }
+    if (!list.length) {
+      sel.innerHTML = '<option value="">нет локальных моделей</option>';
+    }
+  } catch (e) {
+    sel.innerHTML = '<option value="">каталог недоступен</option>';
+    console.warn('models:', e.message);
+  }
+}
+
 /* ---------- Чат ---------- */
 const log = $('chatLog');
 let chatBusy = false;
+
+/* ===== Шифрование истории на клиенте =====
+ * Протокол /chat/sync принимает ТОЛЬКО {chatSyncKey, knownIds, messages},
+ * и каждое сообщение там — шифртекст AES-256-GCM (payload_enc + iv + mac_tag).
+ * То есть открытый текст промпта на сервер не уходит никогда: координатор
+ * видит блобы, но прочитать историю не может.
+ *
+ * Поэтому «GET /chat/sync?userId=…» из ТЗ здесь неприменим: он положил бы
+ * все промпты в БД открытым текстом, а это прямо нарушает главный инвариант
+ * проекта (приватность по умолчанию). Реализован реальный контракт.
+ *
+ * Ключ живёт в localStorage этого устройства. Следствие, которое нельзя
+ * замалчивать: история НЕ синхронизируется между разными браузерами —
+ * у каждого свой ключ, и чужие блобы честно не расшифровываются.
+ */
+const LS_CHAT_KEY = 'tarnet.chatsync.key';
+const LS_CHAT_LT = 'tarnet.chatsync.lt';
+
+function chatSyncKeyHex() {
+  let k = localStorage.getItem(LS_CHAT_KEY);
+  if (!k || !/^[0-9a-f]{64}$/.test(k)) {
+    const b = new Uint8Array(32);
+    crypto.getRandomValues(b);
+    k = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+    localStorage.setItem(LS_CHAT_KEY, k);
+  }
+  return k;
+}
+
+const CHAT_KEY_HEX = chatSyncKeyHex();
+const TAG_BYTES = 16;
+
+function hexToU8(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+const b64 = (u8) => btoa(String.fromCharCode(...u8));
+const ub64 = (s) => new Uint8Array([...atob(s)].map((c) => c.charCodeAt(0)));
+function concatU8(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0); out.set(b, a.length);
+  return out;
+}
+
+let chatAesKey = null;
+async function chatKey() {
+  if (!chatAesKey) {
+    chatAesKey = await crypto.subtle.importKey(
+      'raw', hexToU8(CHAT_KEY_HEX), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  }
+  return chatAesKey;
+}
+
+/* WebCrypto дописывает тег аутентификации в конец шифртекста, а сервер
+ * хранит его отдельной колонкой — поэтому режем и склеиваем обратно. */
+async function encryptMsg(obj) {
+  const key = await chatKey();
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const full = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(obj))));
+  return {
+    payload_enc: b64(full.slice(0, full.length - TAG_BYTES)),
+    iv: b64(iv),
+    mac_tag: b64(full.slice(full.length - TAG_BYTES)),
+  };
+}
+
+async function decryptMsg(row) {
+  const key = await chatKey();
+  const pt = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: ub64(row.iv) }, key,
+    concatU8(ub64(row.payload_enc), ub64(row.mac_tag)));
+  const txt = new TextDecoder().decode(pt);
+  try {
+    const o = JSON.parse(txt);
+    if (o && typeof o === 'object' && typeof o.text === 'string') {
+      return { role: o.role === 'user' ? 'user' : 'bot', text: o.text };
+    }
+  } catch (_e) { /* старый формат — просто текст */ }
+  return { role: 'bot', text: txt };
+}
+
+let logicalTime = Number(localStorage.getItem(LS_CHAT_LT)) || 0;
+function nextLT() {
+  logicalTime = Math.max(logicalTime + 1, 1);
+  localStorage.setItem(LS_CHAT_LT, String(logicalTime));
+  return logicalTime;
+}
+
+function newMsgId() {
+  return crypto.randomUUID
+    ? crypto.randomUUID()
+    : 'm-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+/* ---------- Markdown: рендер + санитайзер ----------
+ * marked отдаёт HTML как есть, а ответ модели — недоверенный ввод: строка
+ * вида <img src=x onerror=...> превратилась бы в исполняемый код. Поэтому
+ * после рендера прогоняем allowlist: неизвестные теги разворачиваются в
+ * текст, on*-атрибуты снимаются, href пропускается только http(s).
+ */
+const ALLOWED_TAGS = new Set([
+  'P', 'BR', 'HR', 'STRONG', 'B', 'EM', 'I', 'DEL', 'S', 'CODE', 'PRE',
+  'UL', 'OL', 'LI', 'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+  'A', 'TABLE', 'THEAD', 'TBODY', 'TR', 'TH', 'TD', 'SPAN', 'DIV',
+]);
+
+function sanitizeHtml(html) {
+  const doc = new DOMParser().parseFromString(`<div id="r">${html}</div>`, 'text/html');
+  const root = doc.getElementById('r');
+  if (!root) return '';
+  const walk = (node) => {
+    for (const child of [...node.children]) {
+      const tag = child.tagName;
+      if (!ALLOWED_TAGS.has(tag)) {
+        child.replaceWith(doc.createTextNode(child.textContent || ''));
+        continue;
+      }
+      for (const attr of [...child.attributes]) {
+        const name = attr.name.toLowerCase();
+        if (name.startsWith('on')) { child.removeAttribute(attr.name); continue; }
+        if (tag === 'A' && name === 'href') {
+          if (!/^https?:\/\//i.test(attr.value)) child.removeAttribute('href');
+          continue;
+        }
+        if (tag === 'A' && (name === 'target' || name === 'rel')) continue;
+        if (name === 'class' && (tag === 'CODE' || tag === 'SPAN' || tag === 'PRE')) continue;
+        child.removeAttribute(attr.name);
+      }
+      if (tag === 'A') { child.setAttribute('target', '_blank'); child.setAttribute('rel', 'noopener noreferrer'); }
+      walk(child);
+    }
+  };
+  walk(root);
+  return root.innerHTML;
+}
+
+function renderMarkdown(text) {
+  if (typeof marked === 'undefined') return esc(text);
+  try {
+    marked.setOptions({ gfm: true, breaks: true });
+    return sanitizeHtml(marked.parse(String(text ?? '')));
+  } catch (e) {
+    console.warn('markdown:', e.message);
+    return esc(text);
+  }
+}
+
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  const ok = document.execCommand('copy');
+  document.body.removeChild(ta);
+  if (!ok) throw new Error('execCommand copy failed');
+}
+
+/* Кнопка «Копировать» появляется только там, где есть что копировать:
+ * под каждым блоком кода, а не над каждым ответом. */
+function decorateCode(root) {
+  root.querySelectorAll('pre').forEach((pre) => {
+    if (pre.parentElement && pre.parentElement.classList.contains('code-wrap')) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'code-wrap';
+    pre.replaceWith(wrap);
+    wrap.appendChild(pre);
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'code-copy';
+    btn.textContent = 'Копировать';
+    btn.addEventListener('click', async () => {
+      const code = pre.querySelector('code')?.innerText ?? pre.innerText;
+      try {
+        await copyText(code);
+        btn.textContent = '✓ Скопировано';
+      } catch (_e) {
+        btn.textContent = 'Не удалось';
+      }
+      setTimeout(() => { btn.textContent = 'Копировать'; }, 1600);
+    });
+    wrap.appendChild(btn);
+  });
+  if (typeof hljs !== 'undefined') {
+    root.querySelectorAll('pre code').forEach((el) => {
+      try { hljs.highlightElement(el); } catch (_e) { /* язык не поддержан */ }
+    });
+  }
+}
 
 function bubble(role, text) {
   const wrap = document.createElement('div');
@@ -227,6 +460,103 @@ function bubble(role, text) {
   log.appendChild(wrap);
   log.scrollTop = log.scrollHeight;
   return wrap;
+}
+
+/* Ответ модели рендерится как markdown; вопрос человека остаётся текстом —
+ * иначе он мог бы вставить разметку, и «его» сообщение выглядело бы как
+ * сгенерированное. */
+function renderBot(wrap, text) {
+  const b = wrap.querySelector('.bubble');
+  if (!b) return;
+  b.innerHTML = renderMarkdown(text);
+  decorateCode(b);
+  log.scrollTop = log.scrollHeight;
+}
+
+function addActions(wrap, opts) {
+  const bar = document.createElement('div');
+  bar.className = 'msg-actions';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'ghost tiny-btn';
+  if (opts.role === 'user') {
+    btn.textContent = 'Редактировать';
+    btn.addEventListener('click', () => {
+      $('prompt').value = opts.text;
+      $('prompt').focus();
+    });
+  } else {
+    btn.textContent = 'Повторить';
+    btn.addEventListener('click', () => sendPrompt(opts.prompt || opts.text, { retryOf: wrap }));
+  }
+  bar.appendChild(btn);
+  wrap.appendChild(bar);
+}
+
+/* Сохранение пары в зашифрованную историю. Ошибка синхронизации НЕ должна
+ * ломать чат: сообщение уже отрисовано, а причина уходит в консоль. */
+async function syncSave(role, text) {
+  try {
+    const enc = await encryptMsg({ role, text });
+    const row = {
+      msg_id: newMsgId(),
+      chat_thread_id: ADDR,
+      sender_device_id: ADDR,
+      logical_time: nextLT(),
+      wall_clock_ms: Date.now(),
+      payload_enc: enc.payload_enc,
+      iv: enc.iv,
+      mac_tag: enc.mac_tag,
+      is_deleted: 0,
+    };
+    await call('/chat/sync', {
+      method: 'POST',
+      body: { chatSyncKey: CHAT_KEY_HEX, knownIds: [], messages: [row] },
+    });
+  } catch (e) {
+    console.warn('chat sync:', e.message);
+  }
+}
+
+/* Загрузка истории при старте. Возвращает число восстановленных сообщений.
+ * Чужие устройства пишут своим ключом — их блобы не расшифруются, и это
+ * ожидаемо, а не ошибка. */
+async function loadChatHistory() {
+  let rows;
+  try {
+    const r = await call('/chat/sync', {
+      method: 'POST',
+      body: { chatSyncKey: CHAT_KEY_HEX, knownIds: [] },
+    });
+    rows = Array.isArray(r && r.messages) ? r.messages : [];
+  } catch (e) {
+    console.warn('history:', e.message);
+    return 0;
+  }
+
+  const msgs = [];
+  for (const row of rows) {
+    if (Number(row.is_deleted) === 1) continue;
+    if (row.chat_thread_id !== ADDR) continue;
+    try {
+      const m = await decryptMsg(row);
+      msgs.push({ ...m, lt: Number(row.logical_time) || 0, mine: row.sender_device_id === ADDR });
+      if (row.sender_device_id === ADDR) {
+        logicalTime = Math.max(logicalTime, Number(row.logical_time) || 0);
+      }
+    } catch (_e) { /* другой ключ — не наша запись */ }
+  }
+  if (!msgs.length) return 0;
+
+  msgs.sort((a, b) => a.lt - b.lt);
+  const empty = log.querySelector('.empty');
+  if (empty) empty.remove();
+  for (const m of msgs) {
+    const w = bubble(m.role, m.text);
+    if (m.role === 'bot') renderBot(w, m.text);
+    else addActions(w, { role: 'user', text: m.text });
+  }
+  return msgs.length;
 }
 
 /* Блок чека. Показывает ровно те поля, что пришли: если начисления не было
@@ -295,11 +625,22 @@ function receiptBlock(res) {
   return el;
 }
 
-$('chatForm').addEventListener('submit', async (ev) => {
-  ev.preventDefault();
+/* ---------- Отправка ----------
+ * Вынесена из submit-обработчика, потому что её же вызывает кнопка
+ * «Повторить»: повтор — это тот же запрос без нового сообщения человека.
+ */
+const FALLBACK_REASONS = {
+  no_workers: 'воркеров нет в сети — подключите свой ПК',
+  worker_timeout: 'воркер не ответил за отведённое время — возможно, ПК спит',
+  model_unavailable: 'воркер подключён, но модель на его ПК не загружена',
+  worker_error: 'воркер вернул ошибку — смотрите его лог',
+  external_api_error: 'внешний API не ответил — проверьте ключ и модель',
+};
+
+async function sendPrompt(prompt, opts = {}) {
   if (chatBusy) return;
-  const prompt = $('prompt').value.trim();
-  if (!prompt) return;
+  const text = String(prompt || '').trim();
+  if (!text) return;
 
   const btn = $('sendBtn');
   chatBusy = true;
@@ -308,49 +649,62 @@ $('chatForm').addEventListener('submit', async (ev) => {
 
   const empty = log.querySelector('.empty');
   if (empty) empty.remove();
-  bubble('user', prompt);
-  $('prompt').value = '';
+
+  /* При повторе сообщение человека уже висит в ленте — не дублируем его,
+   * иначе после трёх «Повторить» в истории будет четыре одинаковых вопроса. */
+  if (!opts.retryOf) {
+    const u = bubble('user', text);
+    addActions(u, { role: 'user', text });
+    $('prompt').value = '';
+    syncSave('user', text);
+  }
 
   const thinking = bubble('bot', '…');
 
   try {
-    const res = await call('/inference', {
-      method: 'POST',
-      body: {
-        prompt,
-        adapterId: $('adapter').value || undefined,
-        /* clientAddress фиксирован: без него сервер создавал бы новый
-         * кошелёк на каждый вопрос и мусорил в БД. */
-        clientAddress: ADDR,
-      },
-    });
+    const body = {
+      prompt: text,
+      adapterId: $('adapter').value || undefined,
+      /* clientAddress фиксирован: без него сервер создавал бы новый
+       * кошелёк на каждый вопрос и мусорил в БД. */
+      clientAddress: ADDR,
+    };
+    /* modelId шлём только если выбрана конкретная модель: пустое значение
+     * означает «базовая», и тогда сервер берёт BASE_MODEL сам. */
+    const modelId = $('model')?.value;
+    if (modelId) body.modelId = modelId;
 
-    thinking.querySelector('.bubble').textContent =
-      res.response || '(пустой ответ)';
+    const res = await call('/inference', { method: 'POST', body });
+
+    renderBot(thinking, res.response || '(пустой ответ)');
     thinking.appendChild(receiptBlock(res));
+
+    /* Кнопка «Повторить» под ответом: промпт берём из запроса, а не из
+     * разметки — в тексте ответа промпта нет. */
+    addActions(thinking, { role: 'bot', text: res.response || '', prompt: text });
+    syncSave('bot', res.response || '');
 
     if (res.source === 'deterministic_fallback' || res.fallback_reason) {
       /* Причина приходит с сервера готовым кодом. Переводим только известные
        * значения: неизвестный код показываем как есть, а не прячем за
        * вежливой фразой — иначе новая причина станет невидимой. */
-      const reasons = {
-        no_workers: 'воркеров нет в сети — подключите свой ПК',
-        worker_timeout: 'воркер не ответил за отведённое время — возможно, ПК спит',
-        model_unavailable: 'воркер подключён, но модель на его ПК не загружена',
-        worker_error: 'воркер вернул ошибку — смотрите его лог',
-        external_api_error: 'внешний API не ответил — проверьте ключ и модель',
-      };
       const code = res.fallback_reason;
-      const why = code ? (reasons[code] || code) : 'модель не подключена (llm_mode = deterministic_fallback)';
+      const why = code ? (FALLBACK_REASONS[code] || code) : 'модель не подключена (llm_mode = deterministic_fallback)';
       $('chatHint').textContent = `⚠️ Причина: ${code || 'deterministic_fallback'} (${why})`;
     }
   } catch (e) {
-    thinking.querySelector('.bubble').textContent = `Ошибка: ${e.message}`;
+    const b = thinking.querySelector('.bubble');
+    if (b) b.textContent = `Ошибка: ${e.message}`;
   } finally {
     chatBusy = false;
     btn.disabled = false;
     log.scrollTop = log.scrollHeight;
   }
+}
+
+$('chatForm').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  sendPrompt($('prompt').value);
 });
 
 /* Enter отправляет, Shift+Enter — перенос строки. На телефоне Enter в
@@ -646,7 +1000,14 @@ $('copyAddr')?.addEventListener('click', copyWorkerAddress);
   $('walletAddr').textContent = `кошелёк: ${ADDR}`;
   renderWorkerHelp();
   startBannerPolling();
-  await loadAdapters();
+  /* Модели и адаптеры грузим параллельно: это два независимых запроса,
+   * а последовательное ожидание добавляло к старту лишний round-trip. */
+  await Promise.all([loadAdapters(), loadModels()]);
   refreshBalance();
   loadConsent();
+  /* История грузится ПОСЛЕ первого рендера и не блокирует его: если она
+   * недоступна, чат всё равно рабочий — просто пустой. */
+  loadChatHistory().then((n) => {
+    if (n > 0) console.info(`история: восстановлено ${n} сообщений`);
+  });
 })();

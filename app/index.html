@@ -10,6 +10,9 @@
 <link rel="icon" href="/app/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/app/icon.svg">
 <link rel="stylesheet" href="/app/styles.css">
+<!-- Тема подсветки лежит локально: внешних CDN в PWA нет и быть не должно,
+     иначе оффлайн-режим и приватность ломаются одним правилом. -->
+<link rel="stylesheet" href="/app/vendor/hljs-theme.css">
 </head>
 <body>
 
@@ -50,6 +53,10 @@
       <label class="field">
         <span>Адаптер</span>
         <select id="adapter"><option value="">загружаю…</option></select>
+      </label>
+      <label class="field">
+        <span>Модель</span>
+        <select id="model"><option value="">авто (базовая)</option></select>
       </label>
       <label class="field">
         <span>Контур</span>
@@ -233,6 +240,11 @@
   </section>
 </main>
 
+<!-- Вендорные библиотеки подключены ДО app.js: рендер markdown зависит от
+     globalThis.marked, а подсветка — от hljs. Локальные копии в /app/vendor/,
+     потому что CDN запрещён: без сети PWA должен работать целиком. -->
+<script src="/app/vendor/marked.min.js"></script>
+<script src="/app/vendor/highlight.min.js"></script>
 <script src="/app/app.js"></script>
 <script src="/app/agents.js"></script>
 <!-- HITL: подтверждение траты выше порога. Вне <section>, потому что это

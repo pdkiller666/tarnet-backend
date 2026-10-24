@@ -21,7 +21,7 @@
  * v4 ставился через add() из Cache API, и в него мог лечь старый CSS: версия
  * кэша поднята, а байты — прежние. Имя меняем ещё раз, чтобы v5 собрался
  * с нуля уже правильным способом, без остатков v4. */
-const CACHE = 'tarnet-app-v5';
+const CACHE = 'tarnet-app-v6';
 
 const ASSETS = [
   '/app/',
@@ -31,6 +31,12 @@ const ASSETS = [
   '/app/agents.js',
   '/app/icon.svg',
   '/app/manifest.webmanifest',
+  /* Вендорные библиотеки входят в предзагрузку: без них офлайн-режим
+   * отрисовал бы ответ как простой текст, а страница запросила бы
+   * отсутствующие файлы и мигала ошибкой в консоли. */
+  '/app/vendor/marked.min.js',
+  '/app/vendor/highlight.min.js',
+  '/app/vendor/hljs-theme.css',
 ];
 
 self.addEventListener('install', (event) => {
