@@ -1619,6 +1619,44 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   const swCc = swHeaders.headers.get('cache-control') || '';
   ok('sw.js отдаётся с no-store', /no-store/.test(swCc), swCc);
 
+  // ---------- 8.21. Брендинг лендингов ----------
+  /* Лендинг открывали, чтобы узнать, что это за продукт, — а имя TarNet
+   * встречалось 4 раза на 50 КБ, все вне первого экрана. Тот же класс
+   * ошибки повторится при следующей переверстке, если не закрепить
+   * сам факт: бренд есть в шапке и виден до заголовка. */
+  section('8.21. Брендинг лендингов');
+
+  const landing = await (await fetch(`${BASE}/`)).text();
+  const consolePage = await (await fetch(`${BASE}/console.html`)).text();
+
+  ok('лендинг содержит логотип-бренд в nav',
+    /<nav[^>]*class="topbar"/.test(landing) && /class="brand"/.test(landing));
+  ok('в шапке слово TarNet, а не только в подвале',
+    /class="name">Tar<em>Net<\/em>/.test(landing));
+
+  /* Бренд должен идти ДО h1 — иначе первый экран читается как безымянный
+   * текст. Сравниваем позиции в разметке, а не наличие по отдельности. */
+  const posBrand = landing.indexOf('class="brand"');
+  const posEyebrow = landing.indexOf('class="eyebrow"');
+  const posH1 = landing.search(/<h1[\s>]/);
+  ok('бренд и надзаголовок стоят до h1',
+    posBrand > 0 && posH1 > 0 && posBrand < posH1 && posEyebrow > 0 && posEyebrow < posH1,
+    { brand: posBrand, eyebrow: posEyebrow, h1: posH1 });
+
+  ok('якоря навигации имеют цели на странице',
+    ['how', 'demo', 'money'].every((id) =>
+      landing.includes(`href="#${id}"`) && landing.includes(`id="${id}"`)));
+
+  ok('в лендинге нет эмодзи вместо бренда',
+    !landing.includes('🐝') && !consolePage.includes('🐝'));
+  ok('консоль тоже показывает слово TarNet в шапке',
+    /class="brandbar"/.test(consolePage) && /Tar<em>Net<\/em>/.test(consolePage));
+
+  /* Проект обещает приватность по умолчанию: внешний шрифт или CDN — это
+   * IP каждого посетителя в чужом логе. Шрифты только системные. */
+  ok('лендинг не грузит внешние шрифты и CDN',
+    !/fonts\.googleapis|fonts\.gstatic|cdn\.|unpkg|jsdelivr/.test(landing + consolePage));
+
   // ---------- Инварианты сети ----------
   section('9. Глобальные инварианты');
   const summary = await api('/summary');

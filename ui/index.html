@@ -4,6 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TarNet — нейросеть на обычных компьютерах</title>
+<meta name="description" content="TarNet — сеть, где обычные компьютеры считают чужие запросы и получают за это оплату. Дешевле облачных ИИ, без серверных залов и посредников.">
+<meta name="theme-color" content="#0a0e14">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="TarNet">
+<meta property="og:title" content="TarNet — нейросеть на обычных компьютерах">
+<meta property="og:description" content="Обычные компьютеры считают чужие запросы и получают за это оплату. Дешевле облачных ИИ.">
+<link rel="icon" href="/app/icon.svg" type="image/svg+xml">
 <style>
   :root {
     --bg: #0a0e14; --panel: #11161f; --panel2: #161d29; --border: #212b3a;
@@ -163,16 +170,96 @@
     display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between;
     align-items: center; font-size: 13.5px; color: var(--muted);
   }
+  .fbrand { display: inline-flex; align-items: baseline; gap: 7px; }
+  .fbrand .fname { font-size: 16px; font-weight: 750; letter-spacing: -.02em; color: var(--text); }
+  .fbrand .fname em { font-style: normal; color: var(--accent); }
+  .fbrand .fsep { color: var(--border); }
+  .fbrand .fsub { font-size: 13px; color: var(--accent2); }
+  .fmeta { font-size: 12.5px; }
+  .flinks { display: flex; gap: 14px; flex-wrap: wrap; }
   footer a { color: var(--accent2); text-decoration: none; }
   footer a:hover { text-decoration: underline; }
   .err { color: var(--danger); font-size: 14px; margin-top: 10px; display: none; }
   .err.on { display: block; }
+  html { scroll-behavior: smooth; }
+  ::selection { background: rgba(79,209,197,.28); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
+
+  /* ---------- Бренд: шапка сайта ----------
+   * До этой правки на странице не было ни логотипа, ни слова TarNet в первом
+   * экране: бренд встречался 4 раза на 50 КБ, все — в таблице цен и подвале.
+   * Открывший лендинг не понимал, чей это продукт и куда идти дальше. */
+  .topbar {
+    position: sticky; top: 0; z-index: 50; margin: 0 -20px; padding: 10px 20px;
+    background: rgba(10,14,20,.74); backdrop-filter: blur(16px) saturate(150%);
+    -webkit-backdrop-filter: blur(16px) saturate(150%);
+    border-bottom: 1px solid rgba(33,43,58,.85);
+  }
+  .topbar .inner { max-width: 880px; margin: 0 auto; display: flex; align-items: center; gap: 16px; }
+  .brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; color: var(--text); }
+  .brand .mark { width: 30px; height: 30px; flex: none; display: block; }
+  .brand .txt { display: flex; flex-direction: column; line-height: 1.05; }
+  .brand .name { font-size: 17.5px; font-weight: 750; letter-spacing: -.025em; }
+  .brand .name em { font-style: normal; color: var(--accent); }
+  .brand .tag { font-size: 9.5px; letter-spacing: .17em; text-transform: uppercase; color: var(--muted); margin-top: 3px; }
+  .topnav { margin-left: auto; display: flex; gap: 2px; flex-wrap: wrap; }
+  .topnav a {
+    font-size: 13.5px; color: var(--muted); text-decoration: none;
+    padding: 7px 11px; border-radius: 8px; transition: color .15s, background .15s;
+  }
+  .topnav a:hover { color: var(--text); background: rgba(255,255,255,.055); }
+  @media (max-width: 680px) { .topnav { display: none; } }
+  @media (max-width: 420px) { .brand .tag { display: none; } }
+
+  /* Надзаголовок героя: место, где бренд читается до заголовка, а не после. */
+  .eyebrow {
+    display: block; font-size: 12px; letter-spacing: .18em; text-transform: uppercase;
+    color: var(--muted); margin: 0 0 16px; font-weight: 600;
+  }
+  .eyebrow b { color: var(--accent); font-weight: 700; }
+
+  /* Мягкая подсветка карточек: страница перестаёт быть плоской при наведении,
+   * но без transform — сдвиг мешал бы читать длинные тексты. */
+  .card { transition: border-color .18s, box-shadow .18s; }
+  .card:hover { border-color: #2c3c52; box-shadow: 0 10px 30px -18px rgba(0,0,0,.9); }
+
 </style>
 </head>
 <body>
+<nav class="topbar" aria-label="Основная навигация">
+  <div class="inner">
+    <a class="brand" href="/" aria-label="TarNet — на главную">
+      <svg class="mark" viewBox="0 0 32 32" fill="none" aria-hidden="true" focusable="false">
+        <rect x="1.5" y="1.5" width="29" height="29" rx="9" fill="url(#tnGrad)"/>
+        <path d="M16 12.8v-2.6M18.7 17.5l2.3 1.4M13.3 17.5l-2.3 1.4" stroke="#062522" stroke-width="1.7" stroke-linecap="round"/>
+        <circle cx="16" cy="16" r="3.1" fill="#062522"/>
+        <circle cx="16" cy="8.4" r="2.1" fill="#062522"/>
+        <circle cx="22.8" cy="19.9" r="2.1" fill="#062522"/>
+        <circle cx="9.2" cy="19.9" r="2.1" fill="#062522"/>
+        <defs>
+          <linearGradient id="tnGrad" x1="0" y1="0" x2="32" y2="32">
+            <stop stop-color="#5fe0d3"/><stop offset="1" stop-color="#7c9cff"/>
+          </linearGradient>
+        </defs>
+      </svg>
+      <span class="txt">
+        <span class="name">Tar<em>Net</em></span>
+        <span class="tag">Synapse</span>
+      </span>
+    </a>
+    <div class="topnav">
+      <a href="#how">Как работает</a>
+      <a href="#demo">Попробовать</a>
+      <a href="#money">Экономика</a>
+      <a href="/console.html">Консоль</a>
+      <a href="/app/">Приложение</a>
+    </div>
+  </div>
+</nav>
 <div class="wrap">
 
   <header>
+    <span class="eyebrow"><b>TarNet</b> · сеть исполнения Synapse</span>
     <span class="badge"><span class="dot"></span> <span id="liveBadge">сеть работает</span></span>
     <h1>Нейросеть, которая работает<br>на <span class="grad">чужих компьютерах</span> —<br>и платит им за это</h1>
     <p class="lead">
@@ -200,7 +287,7 @@
     </div>
   </section>
 
-  <section>
+  <section id="how">
     <h2><span class="num">2</span>Как это работает у нас</h2>
     <p class="sub">Три шага. Ровно так же, как вы задаёте вопрос обычному чату — только исполнитель другой.</p>
     <div class="flow">
@@ -295,7 +382,7 @@
     </div>
   </section>
 
-  <section>
+  <section id="demo">
     <h2><span class="num">4</span>Попробуйте сами</h2>
     <p class="sub">Это не картинка — кнопка делает настоящий запрос к работающей сети и показывает, как распределились деньги.</p>
 
@@ -354,7 +441,7 @@
     </div>
   </section>
 
-  <section>
+  <section id="money">
     <h2><span class="num">6</span>Сколько это в деньгах</h2>
     <p class="sub">TAR — внутренняя единица сети. Ниже — что она значит в долларах, от чего зависит доход и как он растёт.</p>
 
@@ -535,8 +622,17 @@
   </section>
 
   <footer>
-    <div>TarNet / Synapse · демонстрационный стенд · экономика dPoUW 2.1</div>
-    <div><a href="/console.html">Консоль для инженеров →</a></div>
+    <div class="fbrand">
+      <span class="fname">Tar<em>Net</em></span>
+      <span class="fsep">/</span>
+      <span class="fsub">Synapse</span>
+    </div>
+    <div class="fmeta">Демонстрационный стенд · экономика dPoUW 2.1</div>
+    <div class="flinks">
+      <a href="/console.html">Консоль для инженеров →</a>
+      <a href="/app/">Приложение</a>
+      <a href="/health">Статус сети</a>
+    </div>
   </footer>
 </div>
 
