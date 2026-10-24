@@ -4703,7 +4703,10 @@ async function runInference(req, res) {
   const body = req.body || {};
   const prompt = typeof body.prompt === 'string' && body.prompt.length ? body.prompt : 'Hello from TarNet!';
   const adapterId = typeof body.adapterId === 'string' && body.adapterId.length ? body.adapterId : BASE_MODEL;
-  const tier = String(body.tier ?? 'base').toLowerCase();
+  /* let, а не const: при фолбэке Tier 6 на локальный воркер тир
+   * переписывается на base (external-тир не имеет κ). С const это
+   * падало бы в рантайме уже на первом фолбэке. */
+  let tier = String(body.tier ?? 'base').toLowerCase();
   /* tier === '6' — внешний провайдер по ключу пользователя. Числовой тир
    * приходит строкой, и normalizeTier его не знает намеренно: в
    * TIER_WEIGHTS только локальные тиры с κ. Отшивать 6 здесь значило бы
@@ -4949,6 +4952,11 @@ async function runInference(req, res) {
          * нельзя. Ответ честно помечен source: worker_fallback. */
         body.workerAddress = localPick.address;
         body.tier = 'base';
+        /* Локальная переменная тоже переписывается: ниже recordWork берёт
+         * ИМЕННО её, а не body.tier. Пока правился только body, фолбэк
+         * доходил до recordWork со значением '6' и падал BAD_TIER —
+         * то есть фолбэк-путь не работал вообще. */
+        tier = 'base';
         body.__tier6Fallback = { reason: fallbackReason, provider, modelId };
       } else {
         /* ===== Успех: экономика Tier 6 =====
@@ -5095,6 +5103,26 @@ async function runInference(req, res) {
         });
       }
     }
+  }
+
+  /* ===== Гейт: tier 6 без tier-6 модели =====
+   * Сюда доходит запрос с tier: 6, который НЕ попал в ветку выше: либо
+   * modelId не передан, либо модель в каталоге локальная (tier 1–3).
+   *
+   * Без этого гейта '6' проваливался в общий путь, где normalizeTier его
+   * не знает → recordWork бросал BAD_TIER → async-роут без catch →
+   * unhandled rejection. Express 4 такие ошибки не ловит: процесс падал.
+   * Проверено: `curl -d '{"prompt":"hi","tier":6}'` убивал сервер без
+   * ключа, модели и баланса — негарантированный DoS на одну строку. */
+  if (tier === '6') {
+    return res.status(400).json({
+      error: 'TIER6_MODEL_REQUIRED',
+      note: 'tier 6 — внешний провайдер: нужна модель каталога с tier 6 '
+        + '(provider openai/openrouter/groq/gemini). Список: GET /models',
+      tier: 6,
+      modelId: modelId || null,
+      modelTier: modelRow ? Number(modelRow.tier) : null,
+    });
   }
 
   // 1) Воркер: явный адрес или детерминированный взвешенный выбор.
@@ -5782,7 +5810,19 @@ app.post('/demo/flush-work', (req, res) => {
   }
 });
 
-app.post('/inference', runInference);
+/* ===== Обёртка для async-роутов =====
+ * Express 4 не ловит reject из async-функции: он уходит в unhandled
+ * rejection, а Node 15+ на нём завершает процесс. Именно так `tier: 6`
+ * без модели ронял сервер — запрос без ключа, модели и баланса,
+ * то есть негарантированный DoS на одну строку curl.
+ * Обёртка превращает reject в next(err), и его забирает error-middleware.
+ *
+ * Объявлена ДО первого использования: const в TDZ бросил бы ReferenceError
+ * прямо на загрузке модуля, то есть сервер не стартовал бы вовсе. */
+const wrapAsync = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+app.post('/inference', wrapAsync(runInference));
 app.get('/inference', (_req, res) => res.status(405).json({
   error: 'Use POST /inference with JSON body',
   reason: 'Промпт в URL попадает в логи прокси и туннеля',
@@ -5796,7 +5836,7 @@ const BATCH_MAX_WORKERS = 50;
 const BATCH_MAX_ITERATIONS = 5000;
 const BATCH_CHUNK = 100;
 
-app.post('/batch-test', async (req, res) => {
+app.post('/batch-test', wrapAsync(async (req, res) => {
   const body = req.body || {};
   /* Ключи батча обязаны быть уникальны для каждого запуска. Раньше здесь
    * стоял `batch-${i}` — детерминированный, и после того как POST /work
@@ -5878,7 +5918,7 @@ app.post('/batch-test', async (req, res) => {
     zeroRewardCount: results.filter(r => r.rewardTar === 0).length,
     results,
   });
-});
+}));
 
 /* --- Static UI --- */
 app.use('/', express.static(path.join(__dirname, 'ui')));
@@ -5912,6 +5952,10 @@ if (require.main === module) {
 
 app.use((err, req, res, _next) => {
   console.error(err.stack);
+  /* Заголовки уже ушли — ответить вторым кодом нельзя, Express на этом
+   * бросит ERR_HTTP_HEADERS_SENT и уронит соединение. Отдаём остаток
+   * обработчику закрытия и не пытаемся писать тело. */
+  if (res.headersSent) return _next(err);
   res.status(500).json({ error: 'Internal server error', details: err.message });
 });
 
@@ -5922,6 +5966,24 @@ function shutdown() {
 if (require.main === module) {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  /* ===== Последний рубеж =====
+   * Стенд держит экономику в одном процессе: если он падает, /health и
+   * /summary исчезают вместе с ним, а systemd поднимает сервис только
+   * через несколько секунд. Один кривой запрос не должен стоить дороже
+   * одного 500.
+   *
+   * unhandledRejection — логируем и ЖИВЁМ: это может быть reject любого
+   * роута, и падение здесь — худший выбор, чем ответ 500 на один запрос.
+   * uncaughtException — тоже логируем и живём по той же логике; сознательный
+   * компромисс: состояние может быть несогласованным, но проверка
+   * conservation в /health покажет расхождение честно, а не молча. */
+  process.on('unhandledRejection', (reason) => {
+    console.error('[unhandledRejection]', reason && reason.stack ? reason.stack : reason);
+  });
+  process.on('uncaughtException', (err) => {
+    console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+  });
 }
 
 module.exports = {

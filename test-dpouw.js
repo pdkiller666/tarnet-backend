@@ -4335,6 +4335,61 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+  /* ===== 29.17 tier 6 без tier-6 модели не роняет процесс =====
+   * Найденный баг: `{"prompt":"hi","tier":6}` без ключа, модели и
+   * баланса доходил до recordWork, тот бросал BAD_TIER, async-роут не
+   * имел catch, Express 4 reject не ловит — процесс умирал. То есть
+   * негарантированный DoS на одну строку curl.
+   *
+   * Проверяется ИМЕННО живучесть после запроса: ответ 400 был бы
+   * бесполезен, если бы сервер после него умирал. Поэтому после каждого
+   * вектора идёт /health — если процесс упал, он не ответит.
+   */
+  {
+    const f = await spawnServer();
+    try {
+      /* Воркер в пуле — старое условие падения: без него сервер
+       * отдавал 503 на отсутствии воркеров и падал позже. */
+      await apiAt(f.base, '/node', 'POST', {
+        address: '0x' + 'ab'.repeat(20), stake: 10, reputation: 1,
+      });
+
+      const v1 = await apiAt(f.base, '/inference', 'POST', { prompt: 'hi', tier: 6 });
+      ok('29.17 tier 6 без modelId → 400 TIER6_MODEL_REQUIRED',
+        v1.status === 400 && v1.body?.error === 'TIER6_MODEL_REQUIRED',
+        { status: v1.status, error: v1.body?.error });
+
+      /* Процесс жив: именно этот запрос раньше убивал его безвозвратно. */
+      const alive1 = await apiAt(f.base, '/health');
+      ok('29.17 после запроса сервер ЖИВ (был краш)', alive1.status === 200, alive1.status);
+
+      /* Путь PWA: модель каталога локальная (tier 2), а запрос просит 6.
+       * Отказ обязан быть 400, а не молчаливый локальный счёт. */
+      const cl = '0x' + 'cd'.repeat(20);
+      await apiAt(f.base, '/faucet/claim', 'POST', { address: cl });
+      const v2 = await apiAt(f.base, '/inference', 'POST', {
+        prompt: 'hi', tier: 6, modelId: 'deepseek-r1-distill-1.5b',
+        clientAddress: cl, maxTokens: 8,
+      }, { 'X-Provider-Key': 'sk-fake' });
+      ok('29.17 локальная модель + tier 6 → 400, а не 500/краш',
+        v2.status === 400 && v2.body?.error === 'TIER6_MODEL_REQUIRED',
+        { status: v2.status, error: v2.body?.error });
+
+      const alive2 = await apiAt(f.base, '/health');
+      ok('29.17 после пути PWA сервер ЖИВ', alive2.status === 200, alive2.status);
+
+      /* Штатный чат не сломан починкой: обычный запрос без tier 6
+       * по-прежнему работает и начисляет. */
+      const norm = await apiAt(f.base, '/inference', 'POST', {
+        prompt: 'обычный запрос', tier: 'base', clientAddress: cl,
+      });
+      ok('29.17 обычный чат (tier base) не задет починкой',
+        norm.status === 200, { status: norm.status, error: norm.body?.error });
+    } finally {
+      f.stop();
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {
