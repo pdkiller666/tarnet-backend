@@ -204,6 +204,37 @@
       </div>
     </div>
 
+    <!-- ===== Свой ключ провайдера (Tier 6, BYOK) =====
+         Ключ живёт ТОЛЬКО в localStorage этого устройства и уходит на сервер
+         исключительно заголовком X-Provider-Key на время запроса. Сервер его
+         не сохраняет и не пишет в логи: это обещание закреплено в
+         llm-adapter.js (нет loadSecretKey), а не только в тексте здесь. -->
+    <div class="card" id="byokCard">
+      <div class="card-head">
+        <h2>Ключ провайдера</h2>
+        <span class="chip">Tier 6</span>
+      </div>
+      <p class="dim tiny">
+        Свой ключ OpenRouter / OpenAI / Gemini / Groq. Запросы платите вы,
+        напрямую провайдеру. Ключ не покидает это устройство, кроме как
+        в заголовке одного запроса. Провайдер определяется выбранной моделью.
+      </p>
+      <label class="consent" for="byokKey">
+        <span>Ключ</span>
+      </label>
+      <input type="password" id="byokKey" autocomplete="off" spellcheck="false"
+             placeholder="sk-..." aria-label="Ключ провайдера">
+      <div class="row">
+        <button id="byokSave" class="btn">Сохранить ключ</button>
+        <button id="byokClear" class="btn ghost">Удалить</button>
+      </div>
+      <p class="mono dim tiny addr-line" id="byokState">ключ не задан</p>
+      <p class="dim tiny">
+        Кэшбэк за последний запрос:
+        <strong id="cashbackVal">—</strong> TAR
+      </p>
+    </div>
+
     <div class="card">
       <div class="card-head">
         <h2>Nano-node в браузере</h2>

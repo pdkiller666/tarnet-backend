@@ -124,10 +124,19 @@ class Transport {
    *   keypair        — {publicKeyPem, privateKeyPem} для снятия слоёв
    *   listenPort     — порт для входящих (0 = любой свободный, тесты)
    *   listenHost     — интерфейс прослушивания
+   *   publicUrl      — адрес для анонса пирам (см. ниже)
    *   peers          — { <address>: { url } } — куда подключаться
    *   workerHandler  — async (innerRequest) => string; если задан, узел
    *                    может быть концом маршрута
    *   requestTimeoutMs, connectTimeoutMs
+   *
+   * ПОЧЕМУ listenHost И publicUrl — РАЗНЫЕ ПОЛЯ. Чтобы узел принимал
+   * внешние соединения, сокет обязан слушать 0.0.0.0. Но анонсировать
+   * 0.0.0.0 нельзя: пир попытается подключиться к «всем интерфейсам» и
+   * получит отказ либо подключится к самому себе. Поэтому bind-адрес и
+   * announce-адрес разведены, а в таблицу маршрутизации уходит только
+   * announce. Обратное тоже верно: локальным пирам (демо-меш на loopback)
+   * нужен соединяемый адрес, а не 0.0.0.0.
    */
   constructor(opts = {}) {
     if (!opts.address) throw new Error('P2P_MISSING_ADDRESS');
@@ -139,14 +148,24 @@ class Transport {
     this.keypair = opts.keypair;
     this.peers = opts.peers || {};
     this.workerHandler = opts.workerHandler || null;
-    this.listenHost = opts.listenHost || '127.0.0.1';
-    this.listenPort = opts.listenPort === undefined ? 0 : opts.listenPort;
+    this.listenHost = process.env.P2P_LISTEN_HOST || opts.listenHost || '127.0.0.1';
+    /* Порт: значение из opts главнее env, а 0 остаётся законным значением
+     * (любой свободный). Поэтому проверка на undefined, а не на falsy:
+     * иначе тестовый listenPort: 0 подменился бы портом из окружения. */
+    this.listenPort = opts.listenPort !== undefined
+      ? opts.listenPort
+      : (process.env.P2P_LISTEN_PORT !== undefined ? Number(process.env.P2P_LISTEN_PORT) : 0);
+    /* Явный адрес для анонса. Если не задан — построится в start() из
+     * фактического порта: до listen он неизвестен. */
+    this.publicUrlOpt = process.env.P2P_PUBLIC_URL || opts.publicUrl || null;
+    this.wildcardBind = this.listenHost === '0.0.0.0' || this.listenHost === '::';
     this.connectTimeoutMs = opts.connectTimeoutMs || DEFAULT_CONNECT_TIMEOUT_MS;
     this.requestTimeoutMs = opts.requestTimeoutMs || DEFAULT_REQUEST_TIMEOUT_MS;
 
     this.wss = null;
     this.port = null;
     this.url = null;
+    this.publicUrl = null;
 
     /* Таблица возврата: свой rid → { ridIn, peer, exp }. */
     this.reverse = new Map();
@@ -195,7 +214,17 @@ class Transport {
       this.wss.once('listening', () => {
         this.wss.removeListener('error', onError);
         this.port = this.wss.address().port;
-        this.url = `ws://${this.listenHost}:${this.port}`;
+        /* url — СОЕДИНЯЕМЫЙ адрес для пиров этой машины. При bind на
+         * 0.0.0.0 он невалиден как цель подключения, поэтому берём
+         * loopback. */
+        const connectHost = this.wildcardBind ? '127.0.0.1' : this.listenHost;
+        this.url = `ws://${connectHost}:${this.port}`;
+        /* publicUrl — то, что уйдёт в /p2p/status и в реестр узлов.
+         * Приоритет: явный P2P_PUBLIC_URL → P2P_ADVERTISE_IP → bind-адрес. */
+        const advertiseHost = this.wildcardBind
+          ? (process.env.P2P_ADVERTISE_IP || '127.0.0.1')
+          : this.listenHost;
+        this.publicUrl = (this.publicUrlOpt || `ws://${advertiseHost}:${this.port}`).replace(/\/+$/, '');
         resolve();
       });
       this.wss.on('connection', (ws) => this._onConnection(ws));

@@ -18,7 +18,7 @@ const { DatabaseSync } = require('node:sqlite');
 const crypto = require('crypto');
 const fs = require('fs');
 
-const { CONFIG, TIER_WEIGHTS, normalizeTier, round } = require('./config');
+const { CONFIG, TIER6, TIER_WEIGHTS, normalizeTier, round } = require('./config');
 const { classifyDomain, selectModel } = require('./model-router');
 const { CWUCalculator, RewardEngine, verifyQuality, epochEmission, epochIndex, omega } = require('./economics');
 const { CumulativeLedger, receiptPayload, epochState, releasedFor, bumpEpoch } = require('./ledger');
@@ -404,6 +404,32 @@ ensureColumn('ledger_txs', 'actionId', 'actionId TEXT');
  * /inference не может отличить model_unavailable от честного live-ответа и
  * выдаёт шаблон воркера за работу модели. */
 ensureColumn('worker_tasks', 'source', 'source TEXT');
+
+/* ===== Tier 6: журнал вызовов внешних провайдеров =====
+ * ПОЧЕМУ ОТДЕЛЬНАЯ ТАБЛИЦА, А НЕ work_receipts: у внешнего API нет
+ * локального воркера, и синтетический адрес раздул бы COUNT(DISTINCT
+ * workerAddress) в /summary — то есть сломал бы ровно ту метрику, по
+ * которой принимается тест ПК (workers > 77). Кроме того /health
+ * conservation суммирует work_receipts; подмешать туда чужую строку
+ * значило бы изменить смысл уже опубликованных 704 чеков.
+ *
+ * Схема зеркалит поля леджера, чтобы инвариант считался одной формулой
+ * для обеих таблиц. */
+db.exec(`CREATE TABLE IF NOT EXISTS tier6_calls (
+  id TEXT PRIMARY KEY,
+  clientAddress TEXT,
+  provider TEXT NOT NULL,
+  modelId TEXT,
+  tokensUsed INTEGER NOT NULL DEFAULT 0,
+  feeGrossTar REAL NOT NULL DEFAULT 0,
+  blockRewardTar REAL NOT NULL DEFAULT 0,
+  cashbackTar REAL NOT NULL DEFAULT 0,
+  burnTar REAL NOT NULL DEFAULT 0,
+  treasuryTar REAL NOT NULL DEFAULT 0,
+  fundedBy TEXT NOT NULL DEFAULT 'client',
+  trainingAllowed INTEGER NOT NULL DEFAULT 0,
+  createdAt TEXT
+)`);
 
 /* ===== Миграция очереди воркера на шифрование промптов =====
  * Старая схема лежала с колонкой prompt NOT NULL: переименованием колонки
@@ -2147,6 +2173,37 @@ app.get('/health', (_req, res) => {
       reservedTar: Number(reservedTarTotal().toFixed(6)),
       inconsistentRows: bad,
     },
+    /* ===== Инвариант Tier 6 — ОТДЕЛЬНО от основного =====
+     * Внешние вызовы не пишут work_receipts (у них нет локального воркера),
+     * поэтому основной delta их не видит ВООБЩЕ. Если не считать их здесь,
+     * «delta: 0» оставался бы зелёным просто потому, что новые строки
+     * лежат в другой таблице — то есть метрика врала бы.
+     * Тождество то же по смыслу: cashback + burn + treasury === fee.
+     */
+    conservationTier6: (() => {
+      const t6 = get(`SELECT COUNT(*) AS n,
+          COALESCE(SUM(feeGrossTar),0) AS fee,
+          COALESCE(SUM(cashbackTar),0) AS cashback,
+          COALESCE(SUM(burnTar),0) AS burn,
+          COALESCE(SUM(treasuryTar),0) AS treasury
+        FROM tier6_calls`);
+      const badT6 = get(`SELECT COUNT(*) AS c FROM tier6_calls
+          WHERE ABS(cashbackTar + burnTar + treasuryTar - feeGrossTar) > 1e-6`).c;
+      const distT6 = Number(t6.cashback) + Number(t6.burn) + Number(t6.treasury);
+      return {
+        calls: Number(t6.n),
+        gross: Number(Number(t6.fee).toFixed(6)),
+        distributed: Number(distT6.toFixed(6)),
+        delta: Number((distT6 - Number(t6.fee)).toFixed(6)),
+        holds: Math.abs(distT6 - Number(t6.fee)) < 1e-6 && badT6 === 0,
+        inconsistentRows: badT6,
+        /* Сколько вызовов оплачено из баланса клиента, а сколько —
+         * эмиссией. Отдельное поле, потому что смешивать их в одной цифре
+         * значило бы выдавать напечатанное за оплаченное. */
+        fundedByClient: get(`SELECT COUNT(*) AS c FROM tier6_calls WHERE fundedBy = 'client'`).c,
+        fundedByEmission: get(`SELECT COUNT(*) AS c FROM tier6_calls WHERE fundedBy = 'emission'`).c,
+      };
+    })(),
     treasuryBalanceTar: Number((treas?.balanceTar ?? 0).toFixed(6)),
     /* Честная маркировка он-чейна: записи в onchain_settlements созданы
      * локально, txHash — randomBytes(32), статус `confirmed` к блокчейну
@@ -3595,10 +3652,31 @@ app.get('/p2p/status', async (_req, res) => {
   res.json({
     ok: true,
     transport: 'websocket',
+    /* Где реально слушает сокет и какой адрес отдаётся пирам. Два поля, а не
+     * одно: при bind на 0.0.0.0 в nodes[] уйдёт соединяемый адрес, и без
+     * listenHost снаружи нельзя отличить «слушаем только loopback» от
+     * «слушаем всё, но анонсируем loopback». */
+    listenHost: mesh.nodes[0]?.transport?.listenHost ?? null,
+    publicUrl: mesh.nodes[0]?.transport?.publicUrl ?? null,
+    /* Анонсируется ли публичный адрес или стенд остался на loopback.
+     * Явный флаг, чтобы нельзя было принять localhost за реальный P2P. */
+    announced_public: Boolean(
+      mesh.nodes[0]?.transport?.publicUrl &&
+      !/\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])[:/]/.test(mesh.nodes[0].transport.publicUrl),
+    ),
     /* Порядок важен: это готовый маршрут «реле 1 → реле 2 → воркер»,
      * который можно сразу подставить в routeNodes. */
     routeNodes: mesh.nodes.map(n => n.address),
-    nodes: d.nodes,
+    nodes: mesh.nodes.map(n => ({
+      role: n.role,
+      address: n.address,
+      url: n.url,
+      publicUrl: n.transport?.publicUrl ?? n.url,
+      /* stats обязателен: по нему доказывается, что доставка шла по сети
+       * (воркер requests ≥ 1, реле requests = 0). Без него утверждение
+       * «луковица реально дошла» ничем не подтверждено. */
+      stats: { ...n.transport.stats },
+    })),
     client: d.client,
   });
 });
@@ -4243,8 +4321,12 @@ async function runInference(req, res) {
   const prompt = typeof body.prompt === 'string' && body.prompt.length ? body.prompt : 'Hello from TarNet!';
   const adapterId = typeof body.adapterId === 'string' && body.adapterId.length ? body.adapterId : BASE_MODEL;
   const tier = String(body.tier ?? 'base').toLowerCase();
-  if (!normalizeTier(tier)) {
-    return res.status(400).json({ error: `tier must be one of ${TIERS.join('|')}`, received: tier });
+  /* tier === '6' — внешний провайдер по ключу пользователя. Числовой тир
+   * приходит строкой, и normalizeTier его не знает намеренно: в
+   * TIER_WEIGHTS только локальные тиры с κ. Отшивать 6 здесь значило бы
+   * никогда не дойти до ветки Tier 6 ниже: гейт стоит раньше неё. */
+  if (tier !== '6' && !normalizeTier(tier)) {
+    return res.status(400).json({ error: `tier must be one of ${TIERS.join('|')}|6`, received: tier });
   }
 
   /* Способ оплаты. $TAR — единственный работающий: им платит текущая
@@ -4305,24 +4387,240 @@ async function runInference(req, res) {
         modelId,
       });
     }
-    /* Порядок ворот: существование (400) → доступность (409) → тир (501) →
-     * резерв (402). Тир раньше резерва не случайно: 402 значит «пополни
-     * казну — и заработает», а для тира 4-6 это неправда, там нет кода
-     * вообще. Сказать «нет денег» про несуществующую функцию — ввести
-     * клиента в заблуждение дороже, чем само отсутствие фичи. */
-    const tierBlocked = Number(modelRow.tier) > 3;
-    if (tierBlocked) {
+    /* Порядок ворот: существование (400) → доступность (409) → тир 6 →
+     * резерв (402). Для тира > 6 (не существует) по-прежнему 501. */
+    const modelTier = Number(modelRow.tier);
+    if (modelTier > 6) {
       return res.status(501).json({
-        error: 'Tier 6: [SPEC Phase 2.5] — use paymentMethod: BYOK',
-        note: 'Внешние модели (тир 4-6) не подключены. Локальные модели тира 1-3 работают.',
+        error: 'Tier > 6: [SPEC / ROADMAP] — not implemented',
+        note: 'Тиры выше 6 не описаны ни кодом, ни манифестом.',
         modelId,
-        tier: Number(modelRow.tier),
-        /* Флаг отдаётся и здесь: решение модели о тренировке не зависит от
-         * того, подключена она или нет. Без этого клиент не смог бы
-         * отличить «нельзя тренировать» от «модель недоступна». */
-        training_allowed: Number(modelRow.allowsTraining) === 1,
+        tier: modelTier,
         implemented: false,
       });
+    }
+    if (modelTier === 6) {
+      /* ===== Tier 6: внешний провайдер по ключу ПОЛЬЗОВАТЕЛЯ =====
+       *
+       * Ключ берётся только из X-Provider-Key. Серверных ключей нет: это
+       * явное требование директивы (BYOK-only), и оно же закрывает вопрос
+       * «кто платит провайдеру» — платит владелец ключа, не протокол.
+       *
+       * ПОРЯДОК ВОРОТ ЗДЕСЬ ВАЖЕН:
+       *   1. PII первым: если промпт нельзя выпускать наружу, то наличие
+       *      ключа нерелевантно, и клиент должен увидеть причину отказа,
+       *      а не «вставьте ключ».
+       *   2. Ключ вторым: 401 без него, до любого сетевого вызова.
+       *   3. Только потом — сеть.
+       * Если поменять 1 и 2 местами, клиент без ключа получит 401 вместо
+       * PI­I_BLOCKED и решит, что дело в ключе. */
+      const byokKey = typeof req.get('x-provider-key') === 'string'
+        ? req.get('x-provider-key').trim()
+        : '';
+
+      /* Клиент для Tier 6 резолвится ЗДЕСЬ, а не переиспользуется из общего
+       * потока: общая переменная clientAddress объявлена ниже по функции
+       * (после выбора воркера), и обращение к ней отсюда — TDZ-ошибка,
+       * которая упала бы ровно на первом же запросе с tier: 6.
+       * Кошелёк здесь НЕ создаётся: Tier 6 не обязан платить из своего
+       * баланса, и молчаливая выдача нового адреса исказила бы /summary. */
+      const tier6Client = typeof body.clientAddress === 'string' && body.clientAddress.length
+        ? body.clientAddress
+        : null;
+
+      /* Проверка PII: порог 0.95 из конфига. Фильтр эвристический (0 МБ RAM),
+       * но правило бинарное: нашлось совпадение — наружу не уходит. */
+      const pii = LLM.piiCheck(prompt);
+      if (pii.blocked) {
+        LLM.notePiiBlock();
+        return res.status(422).json({
+          error: 'PII_BLOCKED',
+          note: 'Промпт содержит персональные данные и не может быть отправлен внешнему провайдеру.',
+          matches: pii.matches,
+          pii_free_confidence: pii.confidence,
+          required_confidence: LLM.TIER6_MIN_CONFIDENCE,
+          modelId,
+          tier: 6,
+        });
+      }
+
+      if (!byokKey) {
+        return res.status(401).json({
+          error: 'AUTH_MISSING_KEY',
+          note: 'Вставьте ключ в настройках PWA',
+          modelId,
+          tier: 6,
+          byok_required: true,
+        });
+      }
+
+      const provider = LLM.providerForModel(modelId) || modelRow.provider;
+
+      /* Fallback-цепочка. ЧЕСТНО О ЕЁ ГРАНИЦАХ: с BYOK-ключом одного
+       * провайдера переключиться на ДРУГОГО облачного нельзя — ключ Groq
+       * не работает на OpenRouter. Поэтому реальная цепочка — «провайдер
+       * пользователя → локальный узел», а не «OpenRouter → Groq → Gemini»,
+       * как было в ТЗ. Обещать три облака с одним ключом значило бы врать
+       * в описании и получить 401 на втором шаге в бою. */
+      let apiResult = null;
+      let fallbackReason = null;
+      try {
+        apiResult = await LLM.callExternalProvider({
+          provider, modelId, prompt, maxTokens: Number(body.maxTokens) || 512, byokKey,
+        });
+      } catch (e) {
+        fallbackReason = e.code || 'PROVIDER_ERROR';
+        /* Ключ плох — это ошибка клиента, а не повод молча считать локально:
+         * он просил именно внешнюю модель. Возвращаем без списаний. */
+        if (e.code === 'PROVIDER_AUTH_FAILED' || e.code === 'AUTH_MISSING_KEY') {
+          return res.status(401).json({
+            error: e.code,
+            note: 'Проверьте ваш API-ключ провайдера',
+            provider,
+            modelId,
+            tier: 6,
+          });
+        }
+        if (e.code === 'PROVIDER_RATE_LIMIT') {
+          return res.status(429).json({
+            error: 'PROVIDER_RATE_LIMIT',
+            note: 'Лимит провайдера исчерпан. Повторите позже или используйте локальную модель.',
+            provider, modelId, tier: 6,
+            retry_after_ms: 60000,
+          });
+        }
+        /* Timeout / 5xx / сеть: клиент не виноват, и работа может быть
+         * выполнена локально. Уходим в воркер, если он есть. */
+        if (e.code !== 'PROVIDER_TIMEOUT' && e.code !== 'PROVIDER_NETWORK' &&
+            e.code !== 'PROVIDER_HTTP_ERROR' && e.code !== 'PROVIDER_EMPTY') {
+          return res.status(Number(e.status) || 502).json({
+            error: e.code || 'PROVIDER_ERROR', note: e.message, provider, modelId, tier: 6,
+          });
+        }
+      }
+
+      if (!apiResult) {
+        /* Облако не ответило — пробуем локальный узел. Это не "тихий"
+         * фолбэк: source будет worker, и клиент увидит, что модель была не
+         * та, что он просил. */
+        const localPick = pickWorker('base');
+        if (!localPick) {
+          return res.status(503).json({
+            error: 'TIER6_NO_FALLBACK',
+            note: 'Провайдер недоступен и локальных воркеров нет.',
+            provider, modelId, tier: 6,
+            fallback_reason: fallbackReason,
+          });
+        }
+        /* Передаём дальше как обычный запрос к воркеру, но тиром base:
+         * external-тир не имеет κ, и считать его по весам локальных тиров
+         * нельзя. Ответ честно помечен source: worker_fallback. */
+        body.workerAddress = localPick.address;
+        body.tier = 'base';
+        body.__tier6Fallback = { reason: fallbackReason, provider, modelId };
+      } else {
+        /* ===== Успех: экономика Tier 6 =====
+         * Комиссия 0.0005 делится на burn, treasury и кэшбэк так, чтобы
+         * сумма равнялась ровно ей (см. config.js, TIER6).
+         * Если у клиента есть баланс — списываем с него (delta держится
+         * честно). Нет баланса — помечаем funded_by: emission, а не делаем
+         * вид, что деньги пришли от клиента. */
+        const fee = round(TIER6.ORCHESTRATION_FEE_TAR);
+        const cashback = round(TIER6.CASHBACK_TAR);
+        const rest = round(fee - cashback);
+        const burnTar = round(rest / 2);
+        const treasuryTar = round(rest - burnTar);
+
+        const callId = crypto.randomUUID();
+        const funding = tier6Client
+          ? debit(tier6Client, fee, 'spend', callId, TREASURY_ADDRESS)
+          : { charged: false, reason: 'no_client' };
+        const fundedBy = funding.charged ? 'client' : 'emission';
+
+        /* training_allowed — тремя условиями одновременно: модель разрешает
+         * обучение, пользователь дал согласие, PII не найден. Любое
+         * отсутствие — false. */
+        const consentRow = body.userId
+          ? get('SELECT is_opt_in FROM user_consent WHERE userId = ?', [String(body.userId)])
+          : null;
+        const trainingAllowed = Boolean(
+          Number(modelRow.allowsTraining) === 1 &&
+          Number(consentRow?.is_opt_in) === 1 &&
+          !pii.blocked,
+        );
+
+        if (trainingAllowed) {
+          try {
+            run(`INSERT INTO distillation_buffer
+                   (id, promptHash, promptText, response, rating, modelId, domain, userId, timestamp)
+                 VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+              [crypto.randomUUID(),
+                crypto.createHash('sha256').update(prompt).digest('hex'),
+                prompt, apiResult.text, modelId,
+                (classifyDomain(prompt) || 'general'), String(body.userId), Date.now()]);
+          } catch (_e) { /* буфер — не повод терять уже полученный ответ */ }
+        }
+
+        tx(() => {
+          run(`INSERT INTO tier6_calls
+                 (id, clientAddress, provider, modelId, tokensUsed, feeGrossTar,
+                  blockRewardTar, cashbackTar, burnTar, treasuryTar, fundedBy,
+                  trainingAllowed, createdAt)
+               VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
+            [callId, tier6Client, apiResult.provider, modelId,
+              apiResult.usageTokens, fee, cashback, burnTar, treasuryTar,
+              fundedBy, trainingAllowed ? 1 : 0, new Date().toISOString()]);
+          if (cashback > 0 && tier6Client) {
+            credit(tier6Client, cashback, 'cashback', callId, TREASURY_ADDRESS);
+          }
+          if (treasuryTar > 0) credit(TREASURY_ADDRESS, treasuryTar, 'treasury', callId, TREASURY_ADDRESS);
+          if (burnTar > 0) recordBurn(burnTar, callId, tier6Client || TREASURY_ADDRESS);
+        });
+
+        return res.status(200).json({
+          source: 'external_api',
+          provider: apiResult.provider,
+          model: apiResult.model || modelId,
+          response: apiResult.text,
+          training_allowed: trainingAllowed,
+          cashback_tar: cashback,
+          tokens_used: apiResult.usageTokens,
+          tokens_source: apiResult.usageSource,
+          funded_by: fundedBy,
+          economics: {
+            fee_gross_tar: fee,
+            cashback_tar: cashback,
+            burn_tar: burnTar,
+            treasury_tar: treasuryTar,
+            /* Сумма частей обязана равняться комиссии — то же тождество,
+             * что проверяет /health, но для одного вызова. */
+            delta: round((cashback + burnTar + treasuryTar) - fee),
+          },
+          receipt: {
+            receipt_id: callId,
+            tier: 6,
+            tokens_used: apiResult.usageTokens,
+            cost_tar: fee,
+            burned_tar: burnTar,
+            treasury_tar: treasuryTar,
+            cashback_tar: cashback,
+            conservation: { delta: round((cashback + burnTar + treasuryTar) - fee) },
+            timestamp: Date.now(),
+            signature: signPayload(receiptPayload({
+              seq: 0,
+              workerAddress: tier6Client || '',
+              cwu: 0,
+              rewardTar: 0,
+              cumulativeTotal: 0,
+              burnTar, treasuryTar,
+              royaltyTar: 0,
+              epoch: epochIndex(),
+              timestamp: Date.now(),
+              prevSignature: '',
+            }), GATEWAY.privateKeyPem),
+          },
+        });
+      }
     }
 
     /* Резерв: платная модель не должна вызываться на пустой казне. Проверка

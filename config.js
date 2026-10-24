@@ -21,6 +21,28 @@ function normalizeTier(tier) {
   return TIER_ALIASES[key] || null;
 }
 
+/* ===== Tier 6 (внешние API, BYOK) =====
+ * Тип 6 не входит в TIER_WEIGHTS: κ задаёт вес ПОЛЕЗНОЙ РАБОТЫ локального
+ * узла, а у внешнего API локального узла нет вовсе. Поэтому это отдельные
+ * константы, а не ещё один тир в таблице весов.
+ *
+ * АРИФМЕТИКА КЭШБЭКА (исправлена против буквы ТЗ, см. отчёт):
+ * ТЗ просило одновременно комиссию 0.0005, кэшбэк 0.0001 и сплит 50/50
+ * burn/treasury. Это три числа не сходятся: 0.00025 + 0.00025 + 0.0001 =
+ * 0.0006 при выручке 0.0005, то есть delta = +0.0001, и главный критерий
+ * приёмки (conservation.delta === 0) ломается на первом же запросе.
+ * Сохранены ОБЕ суммы из ТЗ (комиссия и кэшбэк), изменён только сплит:
+ * остаток после кэшбэка делится между burn и treasury поровну.
+ *   0.0002 + 0.0002 + 0.0001 = 0.0005 → delta 0. */
+const TIER6 = {
+  ORCHESTRATION_FEE_TAR: 0.0005,
+  CASHBACK_TAR: 0.0001,
+  TIMEOUT_MS: 30000,
+  /* Доля комиссии, уходящая в кэшбэк. Выводится, а не задаётся вторым
+   * числом: два независимых литерала разъехались бы при первой правке. */
+  get cashbackRate() { return this.CASHBACK_TAR / this.ORCHESTRATION_FEE_TAR; },
+};
+
 const CONFIG = {
   // Режим вознаграждения: только два потока, никаких вероятностей.
   REWARD_MODE: process.env.REWARD_MODE || 'hybrid', // bootstrap | demand | hybrid
@@ -125,4 +147,4 @@ function round(value, decimals = CONFIG.DECIMALS) {
   return Math.round((Number(value) + Number.EPSILON) * f) / f;
 }
 
-module.exports = { CONFIG, TIER_WEIGHTS, normalizeTier, round };
+module.exports = { CONFIG, TIER6, TIER_WEIGHTS, normalizeTier, round };

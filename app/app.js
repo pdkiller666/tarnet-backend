@@ -35,9 +35,11 @@ const ADDR = deviceAddress();
  * минуту включён намеренно. Показываем это прямо, а не «что-то пошло не так».
  */
 async function call(path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  if (opts.body) headers['Content-Type'] = 'application/json';
   const res = await fetch(API + path, {
     method: opts.method || 'GET',
-    headers: opts.body ? { 'Content-Type': 'application/json' } : undefined,
+    headers: Object.keys(headers).length ? headers : undefined,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   const text = await res.text();
@@ -680,7 +682,23 @@ async function sendPrompt(prompt, opts = {}) {
     const modelId = $('model')?.value;
     if (modelId) body.modelId = modelId;
 
-    const res = await call('/inference', { method: 'POST', body });
+    /* ===== Tier 6: свой ключ провайдера =====
+     * tier: 6 отправляется ТОЛЬКО когда ключ реально задан. Пустой ключ с
+     * tier: 6 дал бы 401 на каждый обычный вопрос — то есть выключил бы
+     * чат для всех, кто ключ не вводил. Заголовок собирается здесь же:
+     * он живёт ровно один запрос и не попадает ни в историю, ни в кэш. */
+    const byok = byokKey();
+    const reqOpts = { method: 'POST', body };
+    if (byok) {
+      body.tier = '6';
+      reqOpts.headers = { 'X-Provider-Key': byok };
+    }
+
+    const res = await call('/inference', reqOpts);
+
+    /* Кэшбэк показываем из ответа сервера, а не пересчитываем на клиенте:
+     * арифметика денег должна иметь один источник истины. */
+    if (Number(res.cashback_tar) > 0) addCashback(Number(res.cashback_tar));
 
     renderBot(thinking, res.response || '(пустой ответ)');
     thinking.appendChild(receiptBlock(res));
@@ -762,6 +780,81 @@ async function refreshBalance() {
 }
 
 $('refreshBal').addEventListener('click', refreshBalance);
+
+/* ---------- Свой ключ провайдера (Tier 6, BYOK) ----------
+ * Ключ лежит ТОЛЬКО в localStorage этого устройства. На сервер он уходит
+ * единственным способом — заголовком X-Provider-Key на время одного
+ * запроса; в историю чата, в /chat/sync и в логи он не попадает.
+ * Это не удобство, а условие: ключ — деньги владельца.
+ */
+const LS_BYOK = 'tarnet.byok.key';
+const LS_CASHBACK = 'tarnet.byok.cashback';
+
+function byokKey() {
+  try {
+    /* trim(): вставка из буфера часто тащит перевод строки или пробел.
+     * Провайдер ответил бы 401 на «правильный» ключ, и причина была бы
+     * невидима — поэтому чистим при чтении, а не при сохранении. */
+    return String(localStorage.getItem(LS_BYOK) || '').trim();
+  } catch (_e) { return ''; }
+}
+
+/* Маска вместо ключа: показывать сохранённый ключ целиком на экране
+ * незачем — достаточно убедиться, что он есть и какой он длины. */
+function byokMask(k) {
+  if (!k) return 'ключ не задан';
+  if (k.length <= 8) return `ключ …${k.slice(-2)} (${k.length} симв.)`;
+  return `ключ ${k.slice(0, 4)}…${k.slice(-4)} (${k.length} симв.)`;
+}
+
+function renderByokState() {
+  const k = byokKey();
+  const st = $('byokState');
+  if (st) st.textContent = byokMask(k);
+  const input = $('byokKey');
+  /* Поле остаётся пустым даже при сохранённом ключе: иначе ключ лежал бы
+   * в DOM и попал бы в любой снимок страницы. */
+  if (input && k) input.placeholder = 'ключ сохранён — введите новый, чтобы заменить';
+  const cb = $('cashbackVal');
+  if (cb) {
+    const v = Number(localStorage.getItem(LS_CASHBACK) || 0);
+    cb.textContent = v > 0 ? fmt(v) : '—';
+  }
+}
+
+function addCashback(tar) {
+  try {
+    const prev = Number(localStorage.getItem(LS_CASHBACK) || 0);
+    localStorage.setItem(LS_CASHBACK, String(prev + tar));
+  } catch (_e) { /* приватный режим: счётчик не переживёт перезагрузку */ }
+  renderByokState();
+}
+
+$('byokSave')?.addEventListener('click', () => {
+  const v = String($('byokKey')?.value || '').trim();
+  if (!v) {
+    $('byokState').textContent = 'введите ключ';
+    return;
+  }
+  try { localStorage.setItem(LS_BYOK, v); } catch (_e) {
+    $('byokState').textContent = 'браузер не дал сохранить ключ';
+    return;
+  }
+  if ($('byokKey')) $('byokKey').value = '';
+  renderByokState();
+});
+
+$('byokClear')?.addEventListener('click', () => {
+  try {
+    localStorage.removeItem(LS_BYOK);
+    localStorage.removeItem(LS_CASHBACK);
+  } catch (_e) { /* нечего чистить */ }
+  if ($('byokKey')) $('byokKey').value = '';
+  if ($('byokKey')) $('byokKey').placeholder = 'sk-...';
+  renderByokState();
+});
+
+renderByokState();
 
 /* ---------- Согласие на дистилляцию ----------
  * Чекбокс отражает состояние НА СЕРВЕРЕ, а не в localStorage: согласие —

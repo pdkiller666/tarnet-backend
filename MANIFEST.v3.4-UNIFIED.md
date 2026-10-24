@@ -1,7 +1,7 @@
 # 🌐 TARNET & SYNAPSE (SWARM-GRID CORE)
 # ЕДИНЫЙ ЭТАЛОННЫЙ СТАНДАРТ АРХИТЕКТУРЫ, ЭКОНОМИКИ И МАНИФЕСТ ПРОЕКТА
 **Версия:** 3.4-UNIFIED (Consensus Standard: Gemini + Qwen + OpenClaw)  
-**Дата:** 22 октября 2026 г. (ревизия 24.10.2026) | **Схема живого стенда:** `2.10.0-knowledge-loop-schema`  
+**Дата:** 22 октября 2026 г. (ревизия 24.10.2026) | **Сборка живого стенда:** `2.12.0-tier6-byok` (схема леджера — `2.1.0-dpouw`)  
 **Ревизия:** 22.10.2026 — сверка с кодом (6 расхождений устранены, см. Приложение Б) · **24.10.2026** — полный аудит: 5 расхождений (3 занижали проект, 2 завышали), см. Приложение Б.6  
 **Основатель и Главный Архитектор:** Илья Тарасов  
 
@@ -71,13 +71,13 @@
 
 ---
 
-## 4. ДЕЙСТВУЮЩЕЕ ЯДРО ФАЗЫ 1 (`2.10.0-knowledge-loop-schema`) — ЧТО РЕАЛЬНО РАБОТАЕТ В КОДЕ СЕГОДНЯ
+## 4. ДЕЙСТВУЮЩЕЕ ЯДРО ФАЗЫ 1 (`2.12.0-tier6-byok`) — ЧТО РЕАЛЬНО РАБОТАЕТ В КОДЕ СЕГОДНЯ
 
-Проверяется запросами к `localhost:3001` и прогоном `node test-dpouw.js --test` (**514 проверок, 0 провалов**) и `node test-mesh.js` (**25 проверок, 0 провалов**), итого **539**, снимок 24.10.2026. Флаг `--test` поднимает изолированный сервер на временной БД (`mktemp`) с отдельным `TARNET_SECRETS_DIR` и свободным портом: приёмка не требует запущенного стенда и не затрагивает его БД. Адреса и `actionId` уникальны по суффиксу `RUN`, поэтому прогон воспроизводим.
+Проверяется запросами к `localhost:3001` и прогоном `node test-dpouw.js --test` (**624 проверки, 0 провалов**) и `node test-mesh.js` (**25 проверок, 0 провалов**), итого **649**, снимок 24.10.2026. Флаг `--test` поднимает изолированный сервер на временной БД (`mktemp`) с отдельным `TARNET_SECRETS_DIR` и свободным портом: приёмка не требует запущенного стенда и не затрагивает его БД. Адреса и `actionId` уникальны по суффиксу `RUN`, поэтому прогон воспроизводим.
 
 ### 4.1. Матрица живой функциональности
 
-| Компонент | Статус `2.10.0-knowledge-loop-schema` | Проверка |
+| Компонент | Статус `2.12.0-tier6-byok` | Проверка |
 | :--- | :--- | :--- |
 | Реестр узлов, стейк, репутация | ✅ работает | `GET /nodes`, `POST /node` |
 | Антимонопольный роутинг `√stake × reputation` | ✅ работает | `routingWeight` в `POST /inference` |
@@ -103,7 +103,7 @@
 
 1. **Единица полезной работы (CWU):**
    $$W_i = N_{\text{tokens}} \times \kappa_{\text{tier}} \times \gamma_{\text{verify}}, \qquad \gamma \in \{0, 1\}$$
-   Расширение ($0.25N_{\text{in}} + 1.0N_{\text{out}}$ и доменный $\delta_{\text{domain}}$) — RFC Фазы 2, в `2.10.0-knowledge-loop-schema` не применяется, чтобы не искажать инвариант эмиссии.
+   Расширение ($0.25N_{\text{in}} + 1.0N_{\text{out}}$ и доменный $\delta_{\text{domain}}$) — RFC Фазы 2, в `2.12.0-tier6-byok` не применяется, чтобы не искажать инвариант эмиссии.
 
 2. **Двухпоточная награда (`Dual-Stream`):**
    $$\text{Reward}_i = \text{Fee\_Reward}_i + \text{Block\_Reward}_i$$
@@ -137,7 +137,7 @@
 **Фактическая структура чека (по `ledger.js` → `decorate()`), проверено `GET /receipt/:worker`:**
 
 ```typescript
-interface PoUWReceipt {          // ФАКТ: schema 2.10.0-knowledge-loop-schema
+interface PoUWReceipt {          // ФАКТ: build 2.12.0-tier6-byok
   seq: number;                   // глобальный монотонный счётчик
   workerId: string;              // дубль workerAddress для API
   workerAddress: string;
@@ -204,18 +204,18 @@ interface PoUWReceiptV2 {        // ЧАСТИЧНО: хеши есть, пол�
 
 ### Б.3. Сверка с живым стендом
 
-Замер `24.10.2026 08:00 MSK`, `localhost:3001` на боевом VPS (он же `https://v1107336.hosted-by-vdsina.com`), схема `2.10.0-knowledge-loop-schema`. Всё ниже — **снимок, а не константа**: в отчётах пересчитывать из `/summary`.
+Замер `24.10.2026 08:00 MSK`, `localhost:3001` на боевом VPS (он же `https://v1107336.hosted-by-vdsina.com`), сборка `2.12.0-tier6-byok` (схема `2.1.0-dpouw`). Всё ниже — **снимок, а не константа**: в отчётах пересчитывать из `/summary`.
 
 > **Сноска о среде замера.** `localhost:3001` — это стенд на VPS. Локальная dev-копия на машине агента слушает тот же порт, но у неё **другая база**: на момент замера там было `688` чеков и `37.925244 TAR` против боевых `702` и `50.237216`. Снимать цифры для документа с dev-копии нельзя — они уедут в отчёт как боевые.
 
 | Источник | Значение |
 | :--- | :--- |
 | `GET /config` | `tierWeights {nano:0.1, base:1, expert:4}` · `price {usdPer1MTokens:0.2, usdPerTar:20}` · `fee {protocol:0.05, burn:0.025, treasury:0.025, loraRoyalty:0.05}` · `decimals:6` · `minReceiptTokens:50` |
-| `GET /health` | `conservation {gross:50.615242, distributed:50.615242, delta:0, holds:true, inconsistentRows:0}` · эпоха `368` · `buildVersion 2.10.0-knowledge-loop-schema` · `active_workers: 0`, `llm_mode: deterministic_fallback` |
+| `GET /health` | `conservation {gross:50.615242, distributed:50.615242, delta:0, holds:true, inconsistentRows:0}` · эпоха `368` · `buildVersion 2.12.0-tier6-byok` · `active_workers: 0`, `llm_mode: deterministic_fallback` |
 | `GET /summary` | чеков `702` · воркеров `77` · CWU `729 193 477` · выплачено `50.237216 TAR` |
 | `GET /summary` | Fee `6.913912` (**13.8%**) · Block `43.323304` (**86.2%**) · сожжено `0.182363` · казна `0.182363` · settlements `17` |
 | `GET /adapters` | 3 фикстуры (`code` / `math` / `medical`), `totalLoraRoyaltyTar: 0.0133` |
-| Автотесты | `node test-dpouw.js --test` → **514 ✅ / 0 ❌** · `node test-mesh.js` → **25 ✅ / 0 ❌** — итого **539** (снимок 2026-10-24) |
+| Автотесты | `node test-dpouw.js --test` → **624 ✅ / 0 ❌** · `node test-mesh.js` → **25 ✅ / 0 ❌** — итого **649** (снимок 2026-10-24) |
 
 Доля эмиссии — не константа: `totalBlockRewardTar / totalRewardTar` из `/summary` в момент публикации (для доли оплаты — `totalFeeRewardTar / totalRewardTar`).
 
@@ -241,7 +241,7 @@ interface PoUWReceiptV2 {        // ЧАСТИЧНО: хеши есть, пол�
 | :--- | :--- | :--- | :--- |
 | 1 | Onion Routing — `[SPEC]`, «каталога `app/` нет» | `onion.js` 289 строк, RSA-OAEP + AES-256-GCM, 3 хопа; `app/` — полная PWA | 📉 занижал |
 | 2 | `prevReceiptHash` / `receiptHash` «в коде отсутствует (grep → 0)» | `dag-chain.js` есть, колонки пишутся, чек `#696` несёт реальные хеши при `payloadVersion: 2` | 📉 занижал |
-| 3 | Схема стенда `2.1.0-dpouw`, 369 проверок | `2.10.0-knowledge-loop-schema`, 539 проверок (514 + 25) | 📉 занижал |
+| 3 | Схема стенда `2.1.0-dpouw`, 369 проверок | `2.12.0-tier6-byok`, 649 проверок (624 + 25) | 📉 занижал |
 | 4 | Реальный LLM-инференс ✅ `source: live_llm` | `llm_mode: deterministic_fallback`, `active_workers: 0` | 📈 завышал |
 | 5 | Tier 5 / Tier 6 как часть архитектуры | в коде отсутствуют, `grep tier6\|orchestration\|byok` → 0 | 📈 завышал |
 

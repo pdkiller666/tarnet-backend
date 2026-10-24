@@ -151,10 +151,13 @@ function skip(name, reason) {
 }
 function section(t) { console.log(`\n${t}`); }
 
-async function apiAt(base, path, method = 'GET', body) {
+async function apiAt(base, path, method = 'GET', body, extraHeaders) {
   const res = await fetch(base + path, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    headers: {
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+      ...(extraHeaders || {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   let json = null;
@@ -164,9 +167,13 @@ async function apiAt(base, path, method = 'GET', body) {
 }
 
 /* Приёмка идёт против основного сервера; apiAt нужен там, где проверяется
- * второй сервер с другим окружением. */
-async function api(path, method = 'GET', body) {
-  return apiAt(BASE, path, method, body);
+ * второй сервер с другим окружением.
+ *
+ * extraHeaders — для запросов, у которых смысл в заголовке: Tier 6 берёт
+ * ключ провайдера только из X-Provider-Key, и без этой опции такой запрос
+ * невозможно проверить в принципе. */
+async function api(path, method = 'GET', body, extraHeaders) {
+  return apiAt(BASE, path, method, body, extraHeaders);
 }
 
 /* Уникальный суффикс прогона: адреса и actionId не должны пересекаться с
@@ -2238,19 +2245,20 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     unknownM.status === 400 && unknownM.body?.error === 'unknown_model',
     { status: unknownM.status, error: unknownM.body?.error });
 
-  /* --- платная внешняя модель: 501 и training_allowed: false ---
-   * 501, а не 402: для тира 6 нет кода вообще, и «пополни казну — и
-   * заработает» было бы ложью. */
+  /* --- платная внешняя модель: 401 без ключа -------------
+   * Раньше здесь стояло 501 «кода нет вообще». Теперь код есть, и без
+   * X-Provider-Key ответ другой: 401 до любого сетевого вызова. Ожидать
+   * 501 значило бы закрепить тестом отсутствие фичи. */
   const paidM = await api('/inference', 'POST', {
-    prompt: 'proprietary model probe', modelId: 'openai/gpt-4o',
+    prompt: 'proprietary model probe', modelId: 'openai/gpt-4o', tier: 6,
   });
-  ok('платный modelId тира 6 → 501', paidM.status === 501, paidM.status);
-  ok('501 про тир 6 называет BYOK',
-    /Tier 6/.test(String(paidM.body?.error ?? '')) && /BYOK/.test(String(paidM.body?.error ?? '')),
-    paidM.body?.error);
-  /* Решение модели об обучении не зависит от того, подключена она или нет. */
-  ok('training_allowed: false для proprietary gpt-4o',
-    paidM.body?.training_allowed === false, paidM.body?.training_allowed);
+  ok('tier 6 без ключа → 401', paidM.status === 401, paidM.status);
+  ok('401 требует BYOK и говорит про настройки PWA',
+    paidM.body?.error === 'AUTH_MISSING_KEY' && paidM.body?.byok_required === true,
+    { error: paidM.body?.error, byok: paidM.body?.byok_required });
+  ok('401 не содержит training_allowed: false как приговор модели',
+    paidM.body?.training_allowed === undefined || paidM.body?.training_allowed === false,
+    paidM.body?.training_allowed);
 
   /* --- 402 reserve_insufficient ---
    * Нужна платная модель тира ≤ 3, которой в боевом каталоге нет. Фикстура
@@ -3738,6 +3746,273 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       const good = String(san('<a href="https://example.com">ok</a>'));
       ok('28.4 https-ссылка сохранена', /href="https:\/\/example\.com"/.test(good), good);
       ok('28.4 rel=noopener проставлен', /rel="noopener noreferrer"/.test(good), good);
+    }
+  }
+
+  /* ===== 29. Tier 6: BYOK + кэшбэк =====
+   * Юнит-уровень с моком global.fetch (сеть в тестах недопустима: тест
+   * приёмки не должен зависеть от доступности OpenRouter), плюс HTTP-ворота
+   * против живого сервера. */
+  section('29. Tier 6 BYOK: провайдер, ошибки, кэшбэк, инвариант');
+  {
+    const realFetch = global.fetch;
+
+    /* 29.1 Ключ обязателен: без него — 401 и НИ ОДНОГО сетевого вызова.
+     * Счётчик вызовов доказывает, что отказ произошёл до сети, а не после. */
+    let fetchCalls = 0;
+    global.fetch = async () => { fetchCalls += 1; throw new Error('should not be called'); };
+    let noKeyErr = null;
+    try {
+      await LLM.callExternalProvider({ provider: 'openrouter', modelId: 'openrouter/qwen3-coder', prompt: 'hi' });
+    } catch (e) { noKeyErr = e; }
+    ok('29.1 без ключа → 401 AUTH_MISSING_KEY',
+      noKeyErr?.status === 401 && noKeyErr?.code === 'AUTH_MISSING_KEY',
+      { status: noKeyErr?.status, code: noKeyErr?.code });
+    ok('29.1 отказ без ключа не трогает сеть', fetchCalls === 0, fetchCalls);
+
+    /* 29.2 Успешный вызов: ключ уходит в Authorization, префикс роутера
+     * срезан, текст и usage разобраны. */
+    let seenUrl = null, seenInit = null;
+    global.fetch = async (url, init) => {
+      seenUrl = String(url); seenInit = init;
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          model: 'qwen3-coder',
+          choices: [{ message: { content: 'готовый ответ' } }],
+          usage: { total_tokens: 42 },
+        }),
+        text: async () => '',
+      };
+    };
+    const good = await LLM.callExternalProvider({
+      provider: 'openrouter', modelId: 'openrouter/qwen3-coder', prompt: 'hi', byokKey: 'sk-user-key',
+    });
+    ok('29.2 успех → текст ответа', good.text === 'готовый ответ', good.text);
+    ok('29.2 usage взято от провайдера', good.usageTokens === 42 && good.usageSource === 'provider', good.usageTokens);
+    ok('29.2 ключ ушёл в Authorization: Bearer',
+      /^Bearer sk-user-key$/.test(String(seenInit?.headers?.Authorization)), seenInit?.headers?.Authorization ? 'present' : 'missing');
+    ok('29.2 префикс роутера срезан из model',
+      JSON.parse(seenInit.body).model === 'qwen3-coder', JSON.parse(seenInit.body).model);
+    ok('29.2 запрос имеет signal (таймаут 30с)',
+      Boolean(seenInit?.signal) && LLM.TIER6_TIMEOUT_MS === 30000, Boolean(seenInit?.signal));
+
+    /* 29.3 401 провайдера → PROVIDER_AUTH_FAILED, а не 500: клиенту надо
+     * знать, что дело в его ключе. */
+    global.fetch = async () => ({ ok: false, status: 401, text: async () => 'bad key', json: async () => ({}) });
+    let authErr = null;
+    try { await LLM.callExternalProvider({ provider: 'groq', modelId: 'groq/llama-3.3-70b', prompt: 'x', byokKey: 'k' }); }
+    catch (e) { authErr = e; }
+    ok('29.3 401 провайдера → PROVIDER_AUTH_FAILED/401',
+      authErr?.code === 'PROVIDER_AUTH_FAILED' && authErr?.status === 401,
+      { code: authErr?.code, status: authErr?.status });
+
+    /* 29.4 429 → PROVIDER_RATE_LIMIT: отдельный код, чтобы клиент показал
+     * «лимит», а не «ошибка сервера». */
+    global.fetch = async () => ({ ok: false, status: 429, text: async () => 'rate', json: async () => ({}) });
+    let rateErr = null;
+    try { await LLM.callExternalProvider({ provider: 'groq', modelId: 'groq/x', prompt: 'x', byokKey: 'k' }); }
+    catch (e) { rateErr = e; }
+    ok('29.4 429 → PROVIDER_RATE_LIMIT',
+      rateErr?.code === 'PROVIDER_RATE_LIMIT' && rateErr?.status === 429,
+      { code: rateErr?.code, status: rateErr?.status });
+
+    /* 29.5 TimeoutError от AbortSignal → 504 PROVIDER_TIMEOUT, а не 502:
+     * 504 говорит «провайдер не успел», 502 — «сломался». */
+    global.fetch = async () => { const e = new Error('aborted'); e.name = 'TimeoutError'; throw e; };
+    let toErr = null;
+    try { await LLM.callExternalProvider({ provider: 'openai', modelId: 'openai/gpt-4o', prompt: 'x', byokKey: 'k' }); }
+    catch (e) { toErr = e; }
+    ok('29.5 TimeoutError → PROVIDER_TIMEOUT/504',
+      toErr?.code === 'PROVIDER_TIMEOUT' && toErr?.status === 504,
+      { code: toErr?.code, status: toErr?.status });
+
+    /* 29.6 Gemini: ключ в заголовке, НЕ в строке запроса. Ключ в ?key=
+     * попал бы в логи прокси и историю. */
+    let gemUrl = null, gemHeaders = null;
+    global.fetch = async (url, init) => {
+      gemUrl = String(url); gemHeaders = init.headers;
+      return {
+        ok: true, status: 200,
+        json: async () => ({ candidates: [{ content: { parts: [{ text: 'га' }] } }], usageMetadata: { totalTokenCount: 7 } }),
+        text: async () => '',
+      };
+    };
+    const gem = await LLM.callExternalProvider({ provider: 'gemini', modelId: 'gemini/gemini-1.5-flash', prompt: 'x', byokKey: 'g-key' });
+    ok('29.6 gemini: ключ в x-goog-api-key', gemHeaders?.['x-goog-api-key'] === 'g-key', Boolean(gemHeaders?.['x-goog-api-key']));
+    ok('29.6 gemini: ключа НЕТ в URL', !/[?&]key=/.test(gemUrl || ''), (gemUrl || '').replace(/g-key/g, '<KEY>'));
+    ok('29.6 gemini: текст и usage разобраны', gem.text === 'га' && gem.usageTokens === 7, gem.usageTokens);
+
+    /* 29.7 Неизвестный провайдер — 400, а не попытка угадать. */
+    let provErr = null;
+    try { await LLM.callExternalProvider({ provider: 'nope', modelId: 'nope/x', prompt: 'x', byokKey: 'k' }); }
+    catch (e) { provErr = e; }
+    ok('29.7 неизвестный провайдер → 400 UNSUPPORTED_PROVIDER',
+      provErr?.status === 400 && provErr?.code === 'UNSUPPORTED_PROVIDER', provErr?.code);
+
+    /* 29.8 providerForModel: провайдер выводится из modelId, чтобы клиент
+     * не мог прислать пару provider=groq / model=openrouter/... */
+    ok('29.8 providerForModel: openrouter/groq/openai/gemini',
+      LLM.providerForModel('openrouter/a') === 'openrouter' &&
+      LLM.providerForModel('groq/b') === 'groq' &&
+      LLM.providerForModel('openai/c') === 'openai' &&
+      LLM.providerForModel('gemini/d') === 'gemini', 'ok');
+
+    global.fetch = realFetch;
+
+    /* 29.9 Арифметика кэшбэка — КОНТРАКТ ИНВАРИАНТА, а не пересказ ТЗ.
+     * ТЗ просило 0.0005 комиссии + 0.0001 кэшбэка при сплите 50/50, и эти
+     * три числа дают delta = +0.0001. Проверяем, что реализация держит ноль. */
+    const { TIER6 } = require('./config');
+    const fee = TIER6.ORCHESTRATION_FEE_TAR;
+    const cb = TIER6.CASHBACK_TAR;
+    const rest = fee - cb;
+    const burn = rest / 2;
+    const treas = rest - burn;
+    ok('29.9 кэшбэк + burn + treasury === комиссия (delta 0)',
+      Math.abs((cb + burn + treas) - fee) < 1e-9,
+      { fee, cb, burn: Number(burn.toFixed(6)), treas: Number(treas.toFixed(6)), delta: (cb + burn + treas) - fee });
+    ok('29.9 кэшбэк равен 0.0001 TAR', Math.abs(cb - 0.0001) < 1e-12, cb);
+    ok('29.9 комиссия равна 0.0005 TAR', Math.abs(fee - 0.0005) < 1e-12, fee);
+
+    /* 29.10 HTTP: PII блокируется ДО сети и до проверки ключа. Порядок
+     * важен: с ключом и с PII клиент должен увидеть PII_BLOCKED, а не 200. */
+    const piiRes = await api('/inference', 'POST', {
+      prompt: 'Меня зовут Иван Петров, карта 4111 1111 1111 1111, почта ivan@example.com',
+      modelId: 'openrouter/qwen3-coder', tier: 6,
+    }, { 'X-Provider-Key': 'sk-should-not-be-used' });
+    ok('29.10 PII в промпте → 422 PII_BLOCKED',
+      piiRes.status === 422 && piiRes.body?.error === 'PII_BLOCKED',
+      { status: piiRes.status, error: piiRes.body?.error });
+    ok('29.10 PII-отказ называет порог 0.95',
+      piiRes.body?.required_confidence === 0.95, piiRes.body?.required_confidence);
+
+    /* 29.11 Инвариант Tier 6 виден в /health и держится. */
+    const h6 = (await api('/health')).body;
+    ok('29.11 /health отдаёт conservationTier6',
+      Boolean(h6?.conservationTier6) && typeof h6.conservationTier6.holds === 'boolean',
+      h6?.conservationTier6?.calls);
+    ok('29.11 инвариант Tier 6 держится (delta 0)',
+      h6?.conservationTier6?.delta === 0 && h6?.conservationTier6?.holds === true,
+      { delta: h6?.conservationTier6?.delta, holds: h6?.conservationTier6?.holds });
+    ok('29.11 основной инвариант не сломан вызовами Tier 6',
+      h6?.conservation?.delta === 0 && h6?.conservation?.holds === true,
+      { delta: h6?.conservation?.delta, holds: h6?.conservation?.holds });
+
+    /* 29.12 /p2p/status отдаёт publicUrl и честный флаг announced_public.
+     * Localhost допустим, но он должен быть ПОМЕЧЕН, а не выдан за реальный. */
+    const p2pSt = await api('/p2p/status');
+    ok('29.12 /p2p/status отдаёт listenHost и publicUrl',
+      Boolean(p2pSt.body?.listenHost) && Boolean(p2pSt.body?.publicUrl),
+      { listenHost: p2pSt.body?.listenHost, publicUrl: p2pSt.body?.publicUrl });
+    ok('29.12 announced_public false на loopback',
+      p2pSt.body?.announced_public === false, p2pSt.body?.announced_public);
+  }
+
+  /* ===== 29.13 Tier 6: УСПЕШНЫЙ путь по HTTP =====
+   * Всё выше проверяло арифметику и отказы. Самая дорогая ветка — ответ
+   * провайдера → списание → кэшбэк в баланс клиента → burn/treasury →
+   * запись в tier6_calls — до сих пор не исполнялась ни разу: ошибка в ней
+   * не видна ни одним предыдущим тестом, а деньги в ней двигаются по-настоящему.
+   * Провайдер поднимается на loopback: выходить в сеть приёмка не имеет права. */
+  {
+    const http = require('http');
+    const provPort = await freePort();
+    let provHits = 0;
+    let seenAuth = null;
+    const fakeProvider = http.createServer((req, res) => {
+      provHits += 1;
+      seenAuth = req.headers.authorization || null;
+      let raw = '';
+      req.on('data', (d) => { raw += d; });
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          model: 'qwen3-coder',
+          choices: [{ message: { content: 'ответ фейкового провайдера' } }],
+          usage: { total_tokens: 33 },
+        }));
+      });
+    });
+    await new Promise((r) => fakeProvider.listen(provPort, '127.0.0.1', r));
+
+    /* Отказ на не-loopback проверяется ДО удачного пути: подмена адреса не
+     * должна становиться способом увести ключ пользователя на чужой хост.
+     * Если бы шов молча принимал любой URL, проверка ниже упала бы, а не
+     * сходила в сеть — guard стоит перед fetch. */
+    let badOverride = null;
+    process.env.TARNET_TIER6_ENDPOINT = 'https://evil.example.com/v1/chat';
+    try {
+      await LLM.callExternalProvider({ provider: 'openrouter', modelId: 'openrouter/x', prompt: 'p', byokKey: 'k' });
+    } catch (e) { badOverride = e; }
+    delete process.env.TARNET_TIER6_ENDPOINT;
+    ok('29.13 не-loopback подмена адреса провайдера запрещена',
+      badOverride?.code === 'BAD_ENDPOINT_OVERRIDE', { code: badOverride?.code });
+
+    const t6 = await spawnServer({
+      TARNET_TIER6_ENDPOINT: `http://127.0.0.1:${provPort}/v1/chat/completions`,
+    });
+    try {
+      const t6client = '0x' + ('t6c' + RUN).padEnd(40, '0');
+      const before = (await apiAt(t6.base, '/health')).body?.conservationTier6;
+
+      /* Шесть вызовов, а не один: кэшбэк 0.0001 за вызов копится в баланс,
+       * и только с пятого накопленного вызова клиент способен оплатить
+       * комиссию 0.0005. Так проверяются ОБЕ ветки — emission и client —
+       * без единого обходного эндпоинта пополнения, которого в API нет. */
+      const calls = [];
+      for (let i = 0; i < 6; i += 1) {
+        calls.push(await apiAt(t6.base, '/inference', 'POST', {
+          prompt: `тест кэшбэка номер ${i}`,
+          modelId: 'openrouter/qwen3-coder',
+          clientAddress: t6client,
+          tier: 6,
+        }, { 'X-Provider-Key': 'sk-test-key' }));
+      }
+      const last = calls[calls.length - 1];
+
+      ok('29.13 провайдер ответил → 200 external_api',
+        last.status === 200 && last.body?.source === 'external_api',
+        { status: last.status, source: last.body?.source, err: last.body?.error });
+      ok('29.13 ответ провайдера дошёл до клиента',
+        last.body?.response === 'ответ фейкового провайдера', last.body?.response);
+      ok('29.13 ключ ушёл провайдеру в Authorization: Bearer',
+        seenAuth === 'Bearer sk-test-key', seenAuth ? 'present' : 'missing');
+      ok('29.13 провайдер получил ровно 6 запросов', provHits === 6, provHits);
+      ok('29.13 кэшбэк в ответе равен 0.0001 TAR',
+        Math.abs(Number(last.body?.cashback_tar) - 0.0001) < 1e-12, last.body?.cashback_tar);
+      ok('29.13 delta одного вызова = 0',
+        Number(last.body?.economics?.delta) === 0, last.body?.economics?.delta);
+      ok('29.13 usage взят от провайдера, а не оценён',
+        last.body?.tokens_used === 33 && last.body?.tokens_source === 'provider',
+        { tokens: last.body?.tokens_used, source: last.body?.tokens_source });
+
+      /* Деньги в БД, а не только в ответе: кэшбэк обязан быть зачислен. */
+      const bal = await apiAt(t6.base, `/balance/${t6client}`);
+      ok('29.13 кэшбэк реально зачислен на баланс клиента',
+        Math.abs(Number(bal.body?.balanceTar) - 0.0001) < 1e-9, bal.body?.balanceTar);
+      ok('29.13 вызов без баланса помечен funded_by: emission',
+        calls[0].body?.funded_by === 'emission', calls[0].body?.funded_by);
+      ok('29.13 накопленный кэшбэк оплатил комиссию → funded_by: client',
+        last.body?.funded_by === 'client', last.body?.funded_by);
+
+      const after = (await apiAt(t6.base, '/health')).body?.conservationTier6;
+      ok('29.13 tier6_calls выросла ровно на 6',
+        Number(after?.calls) - Number(before?.calls) === 6,
+        { before: before?.calls, after: after?.calls });
+      ok('29.13 комиссия за 6 вызовов = 0.003 TAR',
+        Math.abs(Number(after?.gross) - Number(before?.gross) - 0.003) < 1e-6,
+        { before: before?.gross, after: after?.gross });
+      ok('29.13 инвариант Tier 6 держится после реальных вызовов',
+        after?.holds === true && Number(after?.delta) === 0,
+        { delta: after?.delta, holds: after?.holds, bad: after?.inconsistentRows });
+      ok('29.13 смешанное финансирование видно в /health',
+        Number(after?.fundedByClient) - Number(before?.fundedByClient) === 1 &&
+        Number(after?.fundedByEmission) - Number(before?.fundedByEmission) === 5,
+        { client: after?.fundedByClient, emission: after?.fundedByEmission });
+    } finally {
+      t6.stop();
+      await new Promise((r) => fakeProvider.close(r));
     }
   }
 
