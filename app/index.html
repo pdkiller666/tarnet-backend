@@ -40,6 +40,7 @@
 <nav class="tabs" role="tablist">
   <button class="tab active" role="tab" data-tab="chat" aria-selected="true">💬 Synapse Chat</button>
   <button class="tab" role="tab" data-tab="devices" aria-selected="false">📱 Мои устройства</button>
+  <button class="tab" role="tab" data-tab="agents" aria-selected="false">🤖 Агенты</button>
 </nav>
 
 <main>
@@ -119,8 +120,103 @@
       <div class="log" id="nanoLog"></div>
     </div>
   </section>
+
+  <!-- ================= АГЕНТЫ (Волна 5) ================= -->
+  <section id="tab-agents" class="panel" hidden>
+    <!-- Ключ выводится в браузере: мастер-энтропия не уходит на сервер.
+         Форма показывается, пока ключа на устройстве нет. -->
+    <div class="card" id="agentSetup" hidden>
+      <h2>Создать TarNet ID</h2>
+      <p class="dim">Агенты привязаны к аккаунту TarNet ID. Ключ выводится
+        <strong>на этом устройстве</strong> из мастер-энтропии — на сервер уходит только публичный ключ.</p>
+      <label class="field">
+        <span>Мастер-энтропия (hex, ≥ 16 байт)</span>
+        <textarea id="entropyInput" rows="2" placeholder="32 байта hex — например, 64 символа 0-9a-f" autocomplete="off" spellcheck="false"></textarea>
+      </label>
+      <div class="row">
+        <button id="genEntropy" class="ghost small" type="button">🎲 Сгенерировать</button>
+        <button id="createIdBtn" class="btn small" type="button">Создать ID</button>
+      </div>
+      <p class="hint">Энтропия сохраняется в localStorage этого браузера: без неё
+        HITL-подпись требовала бы вводить фразу на каждое подтверждение. Это
+        компромисс стенда, а не боевая схема хранения.</p>
+    </div>
+
+    <div id="agentMain" hidden>
+      <div class="card">
+        <h2>Баланс агентов</h2>
+        <div id="agentBalance"><span class="dim">—</span></div>
+        <p class="mono dim tiny" id="agentIdLine">TarNet ID: —</p>
+        <div class="row">
+          <button id="agentRefresh" class="ghost small" type="button">Обновить</button>
+          <button id="forgetKey" class="ghost small" type="button">Забыть ключ</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>+ Создать агента</h2>
+        <form id="agentCreateForm">
+          <label class="field">
+            <span>Роль</span>
+            <select id="agentRole">
+              <option value="general">general</option>
+              <option value="coder">coder</option>
+              <option value="researcher">researcher</option>
+            </select>
+          </label>
+          <p class="dim tiny" style="margin:12px 0 4px">Разрешённые инструменты</p>
+          <div id="agentTools" class="tool-list">
+            <p class="dim tiny">загружаю каталог…</p>
+          </div>
+          <button type="submit" class="btn small">Создать агента</button>
+        </form>
+        <!-- Умолчание сервера, а не выдумка UI: POST /agents не принимает
+             лимиты в теле и ставит их из config.js. -->
+        <p class="hint">Лимиты ставит сервер: 5000 токенов на задачу,
+          50000 в день, порог подтверждения 2000. Форма их не переопределяет —
+          <code>POST /agents</code> принимает только роль и инструменты.</p>
+      </div>
+
+      <div class="card">
+        <h2>Мои агенты</h2>
+        <div id="agentList"><div class="empty">загружаю…</div></div>
+        <p class="hint" id="agentStatus"></p>
+      </div>
+    </div>
+
+    <!-- Экран запуска задачи -->
+    <div class="card" id="agentRunPanel" hidden>
+      <h2>Запуск задачи · <span class="mono" id="runAgentId">—</span></h2>
+      <label class="field">
+        <span>Промпт</span>
+        <textarea id="runPrompt" rows="3" placeholder="Что должен сделать агент?" maxlength="65536"></textarea>
+      </label>
+      <label class="field">
+        <span>Максимум токенов</span>
+        <input id="runMaxTokens" type="number" value="512" min="1" max="5000" inputmode="numeric">
+      </label>
+      <p class="dim tiny" style="margin:12px 0 4px">Инструменты (только разрешённые агенту)</p>
+      <div id="runTools" class="tool-list"></div>
+      <div class="row">
+        <button id="runSubmit" class="btn small" type="button">▶ Запустить задачу</button>
+        <button id="runClose" class="ghost small" type="button">Закрыть</button>
+      </div>
+      <div class="log" id="runLog"></div>
+    </div>
+  </section>
 </main>
 
 <script src="/app/app.js"></script>
+<script src="/app/agents.js"></script>
+<!-- HITL: подтверждение траты выше порога. Вне <section>, потому что это
+     fixed-слой поверх любой вкладки, а не часть панели. -->
+<div class="hitl-modal" id="hitlModal" hidden role="dialog" aria-modal="true" aria-labelledby="hitlTitle">
+  <h2 id="hitlTitle">Требуется подтверждение</h2>
+  <p id="hitlText"></p>
+  <div class="row">
+    <button id="hitlApprove" class="btn small">Подтвердить ✍️</button>
+    <button id="hitlCancel" class="ghost small">Отменить</button>
+  </div>
+</div>
 </body>
 </html>

@@ -76,7 +76,12 @@ document.querySelectorAll('.tab').forEach((tab) => {
     const name = tab.dataset.tab;
     $('tab-chat').hidden = name !== 'chat';
     $('tab-devices').hidden = name !== 'devices';
+    /* Панель агентов есть в разметке всегда; её содержимым владеет
+     * agents.js. Прячем здесь, а событием ниже сообщаем, что пора грузить
+     * данные — иначе вкладка открывалась бы пустой до первого клика. */
+    if ($('tab-agents')) $('tab-agents').hidden = name !== 'agents';
     if (name === 'devices') refreshBalance();
+    document.dispatchEvent(new CustomEvent('tarnet:tab', { detail: name }));
   });
 });
 

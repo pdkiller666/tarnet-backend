@@ -2638,9 +2638,214 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('21.5 без userId список подтверждений → 400',
     (await api('/agents/approvals')).status === 400);
 
+  /* ================= Волна 5: UI агентов ================= */
+  section('22. Волна 5: UI агентов (вкладка, баланс, подпись в браузере)');
+
+  /* ---------- 22.1: GET /tools в форме, которую ждёт UI ---------- */
+  const uiToolsRes = await api('/tools');
+  const uiToolList = uiToolsRes.body?.tools || [];
+  ok('22.1 GET /tools отдаёт непустой каталог',
+    uiToolsRes.status === 200 && uiToolList.length >= 3,
+    { status: uiToolsRes.status, count: uiToolList.length });
+  /* isAvailable обязан быть настоящим boolean: SQLite отдаёт 0/1, и
+   * чекбокс инструмента по truthy-единице выглядел бы доступным всегда. */
+  ok('22.1 isAvailable — boolean, а не 0/1',
+    uiToolList.every((t) => typeof t.isAvailable === 'boolean'),
+    uiToolList.map((t) => [t.toolId, typeof t.isAvailable]));
+  ok('22.1 у каждого инструмента есть toolId и costPerCallTar',
+    uiToolList.every((t) => t.toolId && typeof t.costPerCallTar === 'number'));
+
+  /* ---------- 22.2: GET /agents отдаёт данные для прогресс-бара ----------
+   * Без spendToday UI не может показать «использовано / лимит»: он видел бы
+   * только потолок. Поля добавлены в этой волне и проверяются как контракт. */
+  const uiAgentsRes = await api(`/agents?userId=${wave4OwnerAddr}`);
+  const uiAgentRow = (uiAgentsRes.body?.agents || []).find((a) => a.agentId === wave4AgentId);
+  ok('22.2 GET /agents отдаёт агента владельца',
+    uiAgentsRes.status === 200 && Boolean(uiAgentRow),
+    { status: uiAgentsRes.status, count: uiAgentsRes.body?.count });
+  ok('22.2 отдан spendToday (расход за сегодня)',
+    uiAgentRow && typeof uiAgentRow.spendToday?.spentTokens === 'number',
+    uiAgentRow?.spendToday);
+  ok('22.2 отдан heldTokens (занято незавершёнными задачами)',
+    uiAgentRow && typeof uiAgentRow.heldTokens === 'number', uiAgentRow?.heldTokens);
+  /* Лимиты приходят в токенах: в TAR они были бы неотличимы от нуля. */
+  ok('22.2 лимиты отданы в токенах, а не в TAR',
+    uiAgentRow?.wallet?.maxPerTaskTokens === 5000
+    && uiAgentRow?.wallet?.dailyLimitTokens === 50000,
+    uiAgentRow?.wallet);
+
+  /* ---------- 22.3: браузер воспроизводит ключи и подпись ----------
+   * Это главная проверка Волны 5. HITL-подпись должна ставиться в браузере,
+   * а ключа владельца (seed) на сервере нет. Значит клиент обязан вывести
+   * ТОТ ЖЕ ключ из энтропии через WebCrypto: HKDF-SHA256 + Ed25519, с теми
+   * же info-метками и DER-префиксами RFC 8410, что в identity.js.
+   *
+   * Проверяем побайтово: seed, pubkey, адрес и подпись, которую принимает
+   * серверный verifyWithPubkey. Если хоть один шаг разойдётся, подпись из
+   * PWA получит 400 signature_rejected — и это всплывёт здесь, а не у Ильи
+   * на экране. */
+  const wc = crypto.webcrypto.subtle;
+  const uiEntropyHex = idCrypto.randomBytes(32).toString('hex');
+  const uiIkm = Buffer.from(uiEntropyHex, 'hex');
+  const serverKeys = tarIdentity.deriveTarNetKeys(uiEntropyHex);
+
+  const hkdfBase = await wc.importKey('raw', uiIkm, 'HKDF', false, ['deriveBits']);
+  const browserSeed = new Uint8Array(await wc.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0),
+      info: new TextEncoder().encode('tarnet-wallet-v1') },
+    hkdfBase, 256));
+  ok('22.3 WebCrypto выводит тот же seed, что identity.js',
+    Buffer.from(browserSeed).toString('hex') === Buffer.from(serverKeys.wallet.priv).toString('hex'),
+    'HKDF-SHA256 с info=tarnet-wallet-v1');
+
+  const pkcs8 = Buffer.concat([
+    Buffer.from('302e020100300506032b657004220420', 'hex'), Buffer.from(browserSeed)]);
+  const browserPriv = await wc.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, true, ['sign']);
+  /* Публичный ключ берётся из JWK: exportKey('spki') на ПРИВАТНОМ ключе
+   * бросает NotSupportedError (проверено запуском), и это неочевидная
+   * ловушка для клиентского кода. */
+  const browserJwk = await wc.exportKey('jwk', browserPriv);
+  const browserPubHex = Buffer.from(browserJwk.x, 'base64url').toString('hex');
+  ok('22.3 WebCrypto выводит тот же pubkey',
+    browserPubHex === Buffer.from(serverKeys.wallet.pub).toString('hex'), browserPubHex.slice(0, 16));
+
+  const browserSpki = Buffer.concat([
+    Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(browserPubHex, 'hex')]);
+  const browserAddr = '0x' + Buffer.from(
+    await wc.digest('SHA-256', browserSpki)).toString('hex').slice(0, 40);
+  ok('22.3 WebCrypto считает тот же адрес TarNet ID',
+    browserAddr === serverKeys.wallet.address, browserAddr);
+
+  /* ---------- 22.4: сквозная подпись HITL из «браузера» ----------
+   * Берём реальное ожидающее подтверждение и подписываем его так, как это
+   * сделает agents.js: строкой signPayload от сервера, ключом из WebCrypto. */
+  const hitlOwnerEntropy = idCrypto.randomBytes(32).toString('hex');
+  const hitlOwnerKeys = tarIdentity.deriveTarNetKeys(hitlOwnerEntropy);
+  const hitlOwner = await api('/id/register', 'POST', {
+    pubkey: Buffer.from(hitlOwnerKeys.wallet.pub).toString('hex'),
+  });
+  const hitlOwnerAddr = hitlOwner.body?.address;
+
+  const hitlAgent = await api('/agents', 'POST', {
+    userId: hitlOwnerAddr,
+    pubkey: Buffer.from(
+      crypto.generateKeyPairSync('ed25519').publicKey.export({ format: 'jwk' }).x,
+      'base64url').toString('hex'),
+    role: 'general',
+    allowedTools: ['calculator'],
+  });
+  const hitlAgentId = hitlAgent.body?.agentId;
+
+  const hitlAsk = await api('/inference', 'POST', {
+    prompt: 'дорогая задача из UI',
+    agentId: hitlAgentId,
+    clientAddress: hitlOwnerAddr,
+    maxTokens: 2500,
+    tier: 'base',
+    workerAddress: wave4Worker,
+    actionId: runId('ui-hitl'),
+  });
+  ok('22.4 задача выше порога → 202 approval_required',
+    hitlAsk.status === 202 && hitlAsk.body?.error === 'approval_required',
+    { status: hitlAsk.status, error: hitlAsk.body?.error });
+
+  /* Строку подписи берём у сервера — ровно как agents.js. Собирать её в
+   * клиенте по кускам значило бы дублировать контракт формата. */
+  const apList = await api(`/agents/approvals?userId=${hitlOwnerAddr}`);
+  const pendingAp = (apList.body?.approvals || []).find(
+    (a) => a.approvalId === hitlAsk.body?.approvalId);
+  ok('22.4 GET /agents/approvals отдаёт готовый signPayload',
+    typeof pendingAp?.signPayload === 'string' && pendingAp.signPayload.startsWith('approve:v1:'),
+    pendingAp?.signPayload?.slice(0, 24));
+
+  /* Подпись ставится WebCrypto-ключом этого же владельца. */
+  const hitlHkdf = await wc.importKey('raw', Buffer.from(hitlOwnerEntropy, 'hex'),
+    'HKDF', false, ['deriveBits']);
+  const hitlSeed = new Uint8Array(await wc.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0),
+      info: new TextEncoder().encode('tarnet-wallet-v1') },
+    hitlHkdf, 256));
+  const hitlPriv = await wc.importKey('pkcs8',
+    Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), Buffer.from(hitlSeed)]),
+    { name: 'Ed25519' }, true, ['sign']);
+  const hitlSig = Buffer.from(await wc.sign({ name: 'Ed25519' }, hitlPriv,
+    Buffer.from(pendingAp.signPayload, 'utf8'))).toString('base64');
+
+  const hitlApprove = await api('/agents/approve', 'POST', {
+    approvalId: hitlAsk.body?.approvalId,
+    decision: 'approve',
+    signature: hitlSig,
+  });
+  ok('22.4 подпись из WebCrypto принимается сервером',
+    hitlApprove.status === 200 && hitlApprove.body?.status === 'approved',
+    { status: hitlApprove.status, error: hitlApprove.body?.error });
+
+  /* ---------- 22.5: повтор с approvalId проходит ----------
+   * Модалка после подтверждения повторяет ТУ ЖЕ задачу. Если бы сервер не
+   * принял approvalId, UI показал бы «подтверждено» и не выполнил ничего. */
+  const hitlRun = await api('/inference', 'POST', {
+    prompt: 'дорогая задача из UI',
+    agentId: hitlAgentId,
+    clientAddress: hitlOwnerAddr,
+    maxTokens: 2500,
+    tier: 'base',
+    workerAddress: wave4Worker,
+    actionId: runId('ui-hitl-run'),
+    approvalId: hitlAsk.body?.approvalId,
+  });
+  ok('22.5 подтверждённая задача выполняется (не 202)',
+    hitlRun.status === 200, { status: hitlRun.status, error: hitlRun.body?.error });
+  ok('22.5 в ответе есть блок агента и approvalUsed',
+    hitlRun.body?.agent?.approvalUsed === hitlAsk.body?.approvalId,
+    { approvalUsed: hitlRun.body?.agent?.approvalUsed });
+
+  /* ---------- 22.6: отказ возвращает TAR ----------
+   * «Отменить» в модалке не должно ничего списывать: траты не было. */
+  const hitlAsk2 = await api('/inference', 'POST', {
+    prompt: 'вторая дорогая задача',
+    agentId: hitlAgentId,
+    clientAddress: hitlOwnerAddr,
+    maxTokens: 2500,
+    tier: 'base',
+    workerAddress: wave4Worker,
+    actionId: runId('ui-hitl2'),
+  });
+  const rejectAp = (await api(`/agents/approvals?userId=${hitlOwnerAddr}`))
+    .body?.approvals?.find((a) => a.approvalId === hitlAsk2.body?.approvalId);
+  const rejectSig = Buffer.from(await wc.sign({ name: 'Ed25519' }, hitlPriv,
+    Buffer.from(rejectAp.signPayload, 'utf8'))).toString('base64');
+  const rejected = await api('/agents/approve', 'POST', {
+    approvalId: hitlAsk2.body?.approvalId,
+    decision: 'reject',
+    signature: rejectSig,
+  });
+  ok('22.6 отмена подтверждения → status rejected',
+    rejected.status === 200 && rejected.body?.status === 'rejected',
+    { status: rejected.status, result: rejected.body?.status });
+  /* Резерв не создавался: отклонённая задача не занимает дневной лимит. */
+  ok('22.6 отклонённая задача ничего не заняла',
+    Number(hitlAsk2.body?.requestedTokens) === 2500
+    && rejected.body?.reservedTar === undefined,
+    'резерв создаётся только после approval');
+
+  /* ---------- 22.7: статика вкладки раздаётся ---------- */
+  for (const asset of ['/app/agents.js', '/app/index.html', '/app/styles.css']) {
+    const r = await fetch(BASE + asset);
+    ok(`22.7 ${asset} отдаётся (200)`, r.status === 200, r.status);
+  }
+  const agentsJs = await (await fetch(BASE + '/app/agents.js')).text();
+  ok('22.7 agents.js содержит подпись Ed25519 и вызов approve',
+    agentsJs.includes('Ed25519') && agentsJs.includes('/agents/approve'));
+  ok('22.7 agents.js НЕ отправляет мастер-энтропию на сервер',
+    !/masterEntropy\s*:/.test(agentsJs),
+    'энтропия остаётся на устройстве');
+  const indexHtml = await (await fetch(BASE + '/app/index.html')).text();
+  ok('22.7 в разметке есть вкладка «Агенты»',
+    indexHtml.includes('data-tab="agents"') && indexHtml.includes('id="hitlModal"'));
+
   /* Вся серия не должна была сдвинуть деньги. */
   const cfFinal = (await api('/health')).body;
-  ok('Волна 4 не сломала conservation (delta 0)',
+  ok('Волна 5 не сломала conservation (delta 0)',
     cfFinal.conservation.delta === 0 && cfFinal.conservation.holds === true,
     { delta: cfFinal.conservation.delta, holds: cfFinal.conservation.holds });
 

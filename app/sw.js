@@ -8,13 +8,17 @@
  * а старый кэш удаляется в activate. Без смены CACHE старая оболочка жила бы
  * вечно — classic stale-shell.
  */
-const CACHE = 'tarnet-app-v2';
+/* v3: добавлен agents.js. Версию поднимаем обязательно — при том же имени
+ * кэша браузер продолжил бы отдавать старую оболочку без вкладки «Агенты»,
+ * и «новая версия не появилась» выглядело бы как ошибка выкладки. */
+const CACHE = 'tarnet-app-v3';
 
 const ASSETS = [
   '/app/',
   '/app/index.html',
   '/app/styles.css',
   '/app/app.js',
+  '/app/agents.js',
   '/app/icon.svg',
   '/app/manifest.webmanifest',
 ];

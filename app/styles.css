@@ -335,3 +335,106 @@ pre.cmd {
 }
 .consent input[type="checkbox"]:disabled { cursor: progress; }
 .consent span { color: var(--text); }
+
+/* ================== Агенты (Волна 5) ==================
+ * Классы названы по спеке Gemini, но цвета взяты из переменных темы, а не
+ * захардкожены: иначе #1a1a1a и #00ff88 разошлись бы с остальным UI, а при
+ * смене --panel карточки остались бы чужими. */
+
+.agent-card {
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  margin-bottom: 10px;
+}
+
+.agent-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.tag {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+.tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.tag.muted { color: var(--muted); }
+
+/* ROI. Зелёный — только для положительного числа; отрицательный и «не
+ * учитывается» нельзя красить одинаково, иначе расход читается как прибыль. */
+.roi-positive { color: var(--ok); font-weight: 700; }
+.roi-negative { color: var(--danger); font-weight: 700; }
+
+.roi-row {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.roi-row > div { min-width: 96px; }
+
+/* Прогресс-бар дневного лимита. Цвет меняется на 70% и 90%, чтобы
+ * приближение к лимиту было видно до отказа, а не после. */
+.limit-progress-bg {
+  width: 100%;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+  margin: 8px 0 4px;
+}
+.limit-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+.limit-progress-fill.warn { background: var(--warn); }
+.limit-progress-fill.danger { background: var(--danger); }
+
+/* HITL-модалка. bottom:0 и фиксированное положение — решение принимается
+ * поверх любой вкладки: подтверждение может прийти, пока пользователь
+ * читает чат. */
+.hitl-modal {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  width: 100%;
+  background: var(--panel-2);
+  border-top: 1px solid var(--border);
+  padding: 20px;
+  border-radius: 12px 12px 0 0;
+  z-index: 100;
+  box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.55);
+}
+.hitl-modal[hidden] { display: none; }
+.hitl-modal h2 { margin: 0 0 8px; font-size: 16px; }
+.hitl-modal p { margin: 0 0 14px; font-size: 14px; }
+
+.tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.tiny { font-size: 12px; }
+.text-ok { color: var(--ok); }
+.text-warn { color: var(--warn); }
+.text-danger { color: var(--danger); }
+
+.btn.small, .ghost.small { padding: 7px 13px; font-size: 13px; }

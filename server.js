@@ -1720,8 +1720,12 @@ const RATE_LIMITS = {
 
 /* Пути, которые UI опрашивает постоянно. Статика вроде console.html идёт
  * тем же классом: иначе открытие страницы съедало бы бюджет записи. */
+/* `/agents` и `/agents/approvals` — чтение: вкладка «Агенты» опрашивает их
+ * при открытии, а список подтверждений — ещё и при показе модалки HITL.
+ * Без этой ветки оба шли бы классом strict (10/мин), и открытие вкладки
+ * вместе с проверкой подтверждений съедало бы бюджет записи целиком. */
 const RATE_READ_PATH =
-  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|p2p\/status|worker\/status|agents|tools)$/;
+  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|p2p\/status|worker\/status|agents(\/approvals)?|tools)$/;
 /* `/id/<pubkey>/balance` — чтение, а не запись: клиент опрашивает баланс так же
  * часто, как /balance/<addr>. Без этой ветки он упирался бы в 10/мин. */
 const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$|^\/id\/[0-9a-fA-F]{0,64}\/balance$/;
@@ -2188,6 +2192,14 @@ app.get('/agents', (req, res) => {
       status: a.status,
       allowedTools: parseJsonList(a.allowedTools),
       createdAt: a.createdAt,
+      /* Траты и зарезервированное — рядом с лимитами, а не отдельным
+       * эндпоинтом. Без них UI не может нарисовать прогресс-бар «сколько
+       * из лимита уже израсходовано»: клиент видел бы только потолок и
+       * гадал, сколько осталось. Считается по agent_spend за СЕГОДНЯ —
+       * та же функция, что проверяет лимит в /inference, поэтому бар и
+       * отказ всегда показывают одно и то же число. */
+      spendToday: agentSpendOf(a.agentId),
+      heldTokens: agentHeldTokens(a.agentId),
       wallet: a.maxPerTaskTokens === null ? null : {
         /* Лимиты в токенах — основная единица (Волна 4). TAR-эквиваленты
          * отдаются рядом для отображения, но НЕ хранятся: если бы они
