@@ -179,11 +179,15 @@ async function askCloud(prompt) {
     ? { url: 'https://api.groq.com/openai/v1/chat/completions', key: GROQ_KEY,
         model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', name: 'groq' }
     : { url: 'https://openrouter.ai/api/v1/chat/completions', key: OPENROUTER_KEY,
-        /* meta-llama/llama-3.3-70b-instruct:free больше НЕ бесплатна: OpenRouter
-         * отвечает 404 «This model is unavailable for free. The paid version
-         * is available now». Проверенные рабочие free-модели на 2026-10-22:
-         * minimax-m3.1-flash, nemotron-3.5-lightning, lfm-2.6b. */
-        model: process.env.OPENROUTER_MODEL || 'minimax/minimax-m3.1-flash:free', name: 'openrouter' };
+        /* Дефолт обязан быть моделью, которая БЕСПЛАТНА СЕЙЧАС. История:
+         * meta-llama-3.3-70b:free → 404 «unavailable for free»;
+         * minimax/minimax-m3.1-flash:free → 404 «free launch period ended
+         * on Oct 22, 2026» (проверено 2026-10-27). Каталог free-моделей
+         * OpenRouter меняется раз в несколько недель, поэтому дефолт — не
+         * вечная константа, а проверенная на дату модель. На 2026-10-27
+         * живой ответ даёт nvidia/nemotron-3.5-lightning:free; gemma-4 и
+         * lfm-2.5 в тот же прогон отдали 429 upstream. */
+        model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3.5-lightning:free', name: 'openrouter' };
 
   const res = await fetch(conf.url, {
     method: 'POST',
