@@ -181,6 +181,62 @@ else
   fi
 fi
 
+# ---------- 3.7 хроника проекта ----------
+# verify.sh проверяет дрейф, а не напоминает про гигиену, поэтому здесь
+# считаются ФАКТЫ, а не порог настроения.
+#
+# Что значит «хроника не старше кода»: последний коммит, тронувший
+# PROJECT-HISTORY.md, не должен оставлять за собой кодовые коммиты,
+# в которых есть изменение поведения сборки (buildVersion). Мелкие
+# правки тестов и текста в хронологию не входят по её же правилам (§7).
+#
+# Не блокирует деплой: TARNET_HISTORY_STRICT=1 делает проверку жёсткой.
+HISTORY_FILE="PROJECT-HISTORY.md"
+HISTORY_MAX_LAG="${TARNET_HISTORY_MAX_LAG:-5}"
+if [ ! -f "$HISTORY_FILE" ]; then
+  no "хроника проекта" "нет $HISTORY_FILE — вехи проекта нигде не записаны"
+else
+  HIST_COMMIT=$(git log -1 --format=%H -- "$HISTORY_FILE" 2>/dev/null)
+  if [ -z "$HIST_COMMIT" ]; then
+    no "хроника проекта" "$HISTORY_FILE ни разу не менялся в истории git"
+  else
+    HIST_SHORT=$(printf %.7s "$HIST_COMMIT")
+    HIST_WHEN=$(git log -1 --format='%ci' "$HIST_COMMIT" | cut -c1-16)
+
+    # Кодовые коммиты после последней правки хроники. Именно они —
+    # реальный дрейф: именно так накопилось 34 коммита за 25–28.10.
+    CODE_AFTER=$(git rev-list --count "${HIST_COMMIT}..HEAD" -- '*.js' '*.html' '*.css' '*.sh' deploy 2>/dev/null || echo 0)
+
+    # Смена версии сборки — это изменение поведения, которое нельзя
+    # не заметить: именно оно произошло между 24.10 и 28.10 (2.12.1 → 2.12.4).
+    #
+    # Сравниваем строки версий, а не грепаем дифф: первая редакция этой
+    # проверки искала `buildVersion` в server.js — и молча не находила ничего,
+    # потому что там `BUILD_VERSION` (другой регистр), а значение по умолчанию
+    # вообще живёт в package.json. Проверка выглядела рабочей и не работала.
+    VER_THEN=$(git show "${HIST_COMMIT}:package.json" 2>/dev/null \
+      | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' | head -1)
+    VER_NOW=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1)
+    VER_CHANGED=0
+    if [ -n "$VER_THEN" ] && [ -n "$VER_NOW" ] && [ "$VER_THEN" != "$VER_NOW" ]; then
+      VER_CHANGED=1
+    fi
+
+    if [ "$CODE_AFTER" -eq 0 ]; then
+      ok "хроника проекта" "$HIST_SHORT ($HIST_WHEN), кода после неё нет"
+    elif [ "$CODE_AFTER" -le "$HISTORY_MAX_LAG" ] && [ "$VER_CHANGED" -eq 0 ]; then
+      ok "хроника проекта" "$HIST_SHORT ($HIST_WHEN), $CODE_AFTER кодовых (порог $HISTORY_MAX_LAG), сборка не менялась"
+    else
+      if [ "$VER_CHANGED" -eq 1 ]; then
+        no "хроника проекта" "сборка $VER_THEN → $VER_NOW, а в $HIST_SHORT вехи нет"
+      else
+        no "хроника проекта" "$CODE_AFTER кодовых коммитов после $HIST_SHORT (порог $HISTORY_MAX_LAG)"
+      fi
+      printf '     └ допиши §1 в %s; осознанный пропуск — TARNET_HISTORY_MAX_LAG=999\n' "$HISTORY_FILE"
+    fi
+  fi
+fi
+
 # ---------- 4. сервис и эндпоинты ----------
 if [ "$VPS_ACTIVE" = "active" ]; then
   ok "systemd $SERVICE" "active"
