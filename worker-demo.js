@@ -462,7 +462,7 @@ async function main() {
 
 /* Экспорт для юнит-тестов: разрешение имён моделей проверяется без сети и
  * без запуска воркера. */
-module.exports = { normalizeModelName, resolveOllamaModel, ollamaTags, main };
+module.exports = { normalizeModelName, resolveOllamaModel, ollamaTags, generate, main };
 
 if (require.main === module) {
   main().catch((e) => {
