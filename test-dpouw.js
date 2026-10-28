@@ -4823,6 +4823,103 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
         len: batText.includes('if not "%ADDR:~42,1%"=="" goto fail_addr') });
   }
 
+  /* ===== 32. Tier 6 в списке моделей PWA =====
+   *
+   * История дефекта. Ключ провайдера сохранён, кнопка «сохранить» отвечала
+   * успехом, но в выпадающем списке «Модель» не было ни одной облачной
+   * строки: app.js фильтровал каталог как `provider === 'local' && tier <= 3`.
+   * Фильтр был НАМЕРЕННЫМ (обещание «промпт не уходит наружу»), и ломал он
+   * не только список: вместе с ключом app.js безусловно ставил body.tier='6'
+   * на КАЖДЫЙ запрос. Выбрать локальную модель с сохранённым ключом означало
+   * 400 TIER6_MODEL_REQUIRED — то есть чат не работал вовсе у всех, кто
+   * ввёл ключ.
+   *
+   * Проверяем три вещи: облачные видны только при ключе, тир следует за
+   * ВЫБРАННОЙ МОДЕЛЬЮ, а не за наличием ключа, и подпись контура не остаётся
+   * «промпт не уходит наружу» при выборе облачной модели.
+   */
+  console.log('\n32. Tier 6 в списке моделей PWA');
+  {
+    const appRes = await api('/app/app.js');
+    const appSrc = typeof appRes.body === 'string' ? appRes.body : '';
+    const htmlRes = await api('/app/index.html');
+    const htmlSrc = typeof htmlRes.body === 'string' ? htmlRes.body : '';
+
+    /* 32.1 Облачные модели показываются по наличию ключа, а не всегда.
+     * Ищем и сам фильтр по tier 6, и обращение к byokKey() в loadModels:
+     * без второго список всегда пуст, без первого — облако видно тем, кому
+     * оно гарантированно ответит 401. */
+    const loadModelsStart = appSrc.indexOf('async function loadModels');
+    const loadModelsBody = loadModelsStart < 0
+      ? ''
+      : appSrc.slice(loadModelsStart, loadModelsStart + 2600);
+    ok('32.1 loadModels фильтрует облачные модели по tier 6',
+      /tier\)\s*===\s*6/.test(loadModelsBody) || /tier\s*===\s*6/.test(loadModelsBody),
+      loadModelsBody ? 'фильтр найден' : 'loadModels не найден');
+    ok('32.1 показ облачных зависит от наличия ключа (byokKey)',
+      /byokKey\(\)/.test(loadModelsBody), loadModelsBody ? 'byokKey вызван' : 'нет');
+
+    /* 32.2 ГЛАВНЫЙ РЕГРЕСС. Тир обязан определяться выбранной моделью.
+     * Пока условие было `if (byok)`, любой запрос с сохранённым ключом
+     * уходил как tier 6 — включая локальные модели. */
+    ok('32.2 tier 6 отправляется по выбранной модели, а не по наличию ключа',
+      /selectedTier\s*===\s*6/.test(appSrc) && /byok\s*&&\s*selectedTier\s*===\s*6/.test(appSrc),
+      /selectedTier/.test(appSrc) ? 'условие по модели есть' : 'условие по модели ОТСУТСТВУЕТ');
+    /* Антипаттерн ровно в том виде, в котором он ломал чат. */
+    ok('32.2 нет отправки tier 6 по одному лишь факту ключа',
+      !/if\s*\(byok\)\s*\{\s*\n\s*body\.tier\s*=\s*'6'/.test(appSrc),
+      'старое условие не вернулось');
+
+    /* 32.3 Контур: подпись «промпт не уходит наружу» рядом с облачной
+     * моделью — ложь, и она должна переключаться вместе с выбором. */
+    ok('32.3 подпись контура синхронизируется с моделью',
+      /function syncContourToModel/.test(appSrc)
+      && /syncContourToModel\)/.test(appSrc),
+      /syncContourToModel/.test(appSrc) ? 'есть и подписана на change' : 'нет');
+    ok('32.3 в разметке есть контур cloud',
+      /<option value="cloud"/.test(htmlSrc), 'опция cloud в select#contour');
+    ok('32.3 в разметке есть пояснение к контуру',
+      /id="contourHint"/.test(htmlSrc), 'contourHint');
+
+    /* 32.4 После сохранения и удаления ключа список перерисовывается без
+     * перезагрузки: иначе ключ есть, а облака не видно до F5. */
+    ok('32.4 список моделей обновляется при сохранении/удалении ключа',
+      (appSrc.match(/loadModels\(\)/g) || []).length >= 3,
+      (appSrc.match(/loadModels\(\)/g) || []).length + ' вызовов');
+
+    /* 32.5 Серверная сторона: локальная модель с tier 6 обязана отклоняться
+     * ДО выбора воркера — 400 с внятным кодом, а не 500 и не зависание. */
+    const badTier = await api('/inference', 'POST', {
+      prompt: 'привет',
+      modelId: 'qwen2.5-coder:1.5b',
+      tier: '6',
+    }, { 'X-Provider-Key': 'sk-local-should-not-matter' });
+    ok('32.5 локальная модель + tier 6 → 400 TIER6_MODEL_REQUIRED',
+      badTier.status === 400 && badTier.body?.error === 'TIER6_MODEL_REQUIRED',
+      { status: badTier.status, error: badTier.body?.error });
+
+    /* 32.6 Контроль в обратную сторону: та же локальная модель БЕЗ tier 6
+     * не должна упираться в этот гейт. Именно этот случай ломался, когда
+     * клиент слал tier 6 из-за одного лишь сохранённого ключа.
+     * 503 (нет воркера) — нормальный ответ: значит гейт пропустил запрос. */
+    const okTier = await api('/inference', 'POST', {
+      prompt: 'привет',
+      modelId: 'qwen2.5-coder:1.5b',
+    }, { 'X-Provider-Key': 'sk-local-should-not-matter' });
+    ok('32.6 локальная модель без tier 6 не упирается в TIER6_MODEL_REQUIRED',
+      okTier.body?.error !== 'TIER6_MODEL_REQUIRED',
+      { status: okTier.status, error: okTier.body?.error ?? null });
+
+    /* 32.7 Кэш поднят: иначе телефон продолжит крутить старый app.js с
+     * фильтром tier <= 3, и правка не доедет. Ровно тот класс дефекта, что
+     * уже случался с баннером. */
+    const swRes = await api('/app/sw.js');
+    const swSrc = typeof swRes.body === 'string' ? swRes.body : '';
+    const cacheV = (swSrc.match(/const CACHE = 'tarnet-app-v(\d+)'/) || [])[1];
+    ok('32.7 кэш не ниже v11 (правка списка моделей дойдёт до клиента)',
+      Number(cacheV) >= 11, cacheV);
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

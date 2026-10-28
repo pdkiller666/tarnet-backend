@@ -86,9 +86,11 @@
           <span>Контур</span>
           <select id="contour">
             <option value="private">Private — промпт не уходит наружу</option>
+            <option value="cloud">Cloud — промпт уходит провайдеру по вашему ключу</option>
           </select>
         </label>
       </div>
+      <p class="hint tiny" id="contourHint">Промпт обрабатывается воркерами сети и не покидает её.</p>
     </div>
 
     <div id="chatLog" class="chat-log" aria-live="polite">

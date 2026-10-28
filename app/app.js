@@ -236,34 +236,87 @@ async function loadAdapters() {
 }
 
 /* ---------- Модели ----------
- * В каталоге лежат и внешние модели (tier 6, openai/openrouter). В селект
- * они не попадают: контур приватности заявлен как «промпт не уходит наружу»,
- * а выбор gpt-4o отправил бы промпт в чужой API — и подпись «Private» рядом
- * стала бы ложью. Внешние в текущем стенде всё равно отвечают 501.
+ * Правило показа: локальные (tier 1–3) видны всегда, облачные (tier 6) —
+ * только когда в браузере сохранён ключ провайдера. Без ключа облачный
+ * выбор гарантированно вернёт 401, и предлагать его значит врать.
+ *
+ * Контур приватности не прячем: локальная модель не выводит промпт за
+ * пределы сети, облачная отправляет его провайдеру по ключу владельца.
+ * Поэтому подпись «Контур» переключается вместе с моделью — оставлять
+ * «промпт не уходит наружу» рядом с gpt-4o нельзя.
  */
+const MODEL_INFO = new Map();   // modelId -> { tier, provider } по последнему /models
+
+/* Опция модели. Облачная помечается провайдером: человек должен видеть,
+ * кому уйдёт промпт, до отправки, а не из ответа 401. */
+function modelOption(m, isCloud) {
+  const o = document.createElement('option');
+  o.value = m.modelId;
+  const ctx = Number(m.contextWindow) >= 1000
+    ? ` · ${Math.round(Number(m.contextWindow) / 1000)}k`
+    : '';
+  o.textContent = isCloud
+    ? `${m.modelId} · Cloud/${m.provider}${ctx}`
+    : `${m.modelId}${ctx}${m.isFree ? ' · free' : ''}`;
+  return o;
+}
+
+/* Подпись контура обязана совпадать с тем, что реально произойдёт. */
+function syncContourToModel() {
+  const sel = $('model');
+  const contour = $('contour');
+  if (!sel || !contour) return;
+  const modelId = sel.value;
+  const info = modelId ? MODEL_INFO.get(modelId) : null;
+  const cloud = Boolean(info) && info.tier === 6;
+  contour.value = cloud ? 'cloud' : 'private';
+  const hint = $('contourHint');
+  if (hint) {
+    hint.textContent = cloud
+      ? `Промпт уйдёт провайдеру ${info.provider} по вашему ключу. Локальные воркеры не используются.`
+      : 'Промпт обрабатывается воркерами сети и не покидает её.';
+  }
+}
+
 async function loadModels() {
   const sel = $('model');
   if (!sel) return;
+  const prev = sel.value;
+  const hasKey = Boolean(byokKey());
   try {
     const data = await call('/models');
-    const list = (data && Array.isArray(data.models) ? data.models : [])
-      .filter((m) => m.provider === 'local' && Number(m.tier) <= 3);
+    const all = (data && Array.isArray(data.models) ? data.models : []);
+    const local = all.filter((m) => m.provider === 'local' && Number(m.tier) <= 3);
+    /* Облачные — только по ключу: без него сервер такой выбор отклонит. */
+    const cloud = hasKey
+      ? all.filter((m) => Number(m.tier) === 6 && m.isAvailable !== false)
+      : [];
+
+    MODEL_INFO.clear();
+    for (const m of [...local, ...cloud]) {
+      MODEL_INFO.set(m.modelId, { tier: Number(m.tier), provider: m.provider });
+    }
 
     sel.innerHTML = '<option value="">авто (базовая)</option>';
-    for (const m of list) {
-      const o = document.createElement('option');
-      o.value = m.modelId;
-      /* tier и контекст видимы: человек выбирает не имя, а возможность —
-       * «7b на 32k» против «1.5b на 128k» это разные ответы. */
-      const ctx = Number(m.contextWindow) >= 1000
-        ? ` · ${Math.round(Number(m.contextWindow) / 1000)}k`
-        : '';
-      o.textContent = `${m.modelId}${ctx}${m.isFree ? ' · free' : ''}`;
-      sel.appendChild(o);
+    if (local.length) {
+      const g = document.createElement('optgroup');
+      g.label = 'Локальные — в сети';
+      for (const m of local) g.appendChild(modelOption(m, false));
+      sel.appendChild(g);
     }
-    if (!list.length) {
-      sel.innerHTML = '<option value="">нет локальных моделей</option>';
+    if (cloud.length) {
+      const g = document.createElement('optgroup');
+      g.label = 'Облачные — ваш ключ, промпт уходит провайдеру';
+      for (const m of cloud) g.appendChild(modelOption(m, true));
+      sel.appendChild(g);
     }
+    if (!local.length && !cloud.length) {
+      sel.innerHTML = '<option value="">нет доступных моделей</option>';
+    }
+    /* Прежний выбор возвращаем, если он ещё существует: перерисовка после
+     * сохранения ключа не должна сбрасывать модель на «авто». */
+    if (prev && MODEL_INFO.has(prev)) sel.value = prev;
+    syncContourToModel();
   } catch (e) {
     sel.innerHTML = '<option value="">каталог недоступен</option>';
     console.warn('models:', e.message);
@@ -703,13 +756,20 @@ async function sendPrompt(prompt, opts = {}) {
     if (modelId) body.modelId = modelId;
 
     /* ===== Tier 6: свой ключ провайдера =====
-     * tier: 6 отправляется ТОЛЬКО когда ключ реально задан. Пустой ключ с
-     * tier: 6 дал бы 401 на каждый обычный вопрос — то есть выключил бы
-     * чат для всех, кто ключ не вводил. Заголовок собирается здесь же:
-     * он живёт ровно один запрос и не попадает ни в историю, ни в кэш. */
+     * tier: 6 отправляется только когда выбрана ОБЛАЧНАЯ модель.
+     *
+     * Раньше флагом служило наличие ключа — и с сохранённым ключом любой
+     * локальный запрос уходил как tier 6. Сервер отвечал
+     * 400 TIER6_MODEL_REQUIRED, то есть чат ломался целиком для всех, кто
+     * ключ ввёл. Ключ сам по себе не должен менять тир: он лишь разрешает
+     * показать облачные модели в списке.
+     *
+     * Заголовок живёт ровно один запрос и не попадает ни в историю, ни в
+     * кэш. Для локальной модели он не нужен вовсе. */
     const byok = byokKey();
     const reqOpts = { method: 'POST', body };
-    if (byok) {
+    const selectedTier = modelId ? MODEL_INFO.get(modelId)?.tier : null;
+    if (byok && selectedTier === 6) {
       body.tier = '6';
       reqOpts.headers = { 'X-Provider-Key': byok };
     }
@@ -928,6 +988,9 @@ $('byokSave')?.addEventListener('click', () => {
   }
   if ($('byokKey')) $('byokKey').value = '';
   renderByokState();
+  /* Список моделей зависит от наличия ключа: облачные появляются сразу
+   * после сохранения, без перезагрузки страницы. */
+  loadModels();
 });
 
 $('byokClear')?.addEventListener('click', () => {
@@ -938,7 +1001,14 @@ $('byokClear')?.addEventListener('click', () => {
   if ($('byokKey')) $('byokKey').value = '';
   if ($('byokKey')) $('byokKey').placeholder = 'sk-...';
   renderByokState();
+  /* Ключ убран — облачные модели обязаны исчезнуть из списка: иначе выбор
+   * останется, а запрос вернёт 401. */
+  loadModels();
 });
+
+/* Смена модели переключает подпись контура: приватность не должна
+ * оставаться заявленной при выборе облачной модели. */
+$('model')?.addEventListener('change', syncContourToModel);
 
 renderByokState();
 
