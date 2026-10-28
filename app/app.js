@@ -1370,6 +1370,79 @@ $('linkBtn')?.addEventListener('click', async () => {
 
 $('linkRefresh')?.addEventListener('click', refreshLinks);
 
+/* ---------- Перенос баланса со старого кошелька ----------
+ * Старый адрес ключа не имеет — доказать владение им нельзя в принципе.
+ * Поэтому подпись ставит НОВЫЙ адрес (текущий кошелёк этого браузера),
+ * и сервер видит, что получатель — реальный аккаунт с ключом. */
+function migrateExplain(st) {
+  switch (st.blockedReason) {
+    case 'ALREADY_MIGRATED': return `уже перенесён на ${st.claimedTo.slice(0, 10)}… (${st.claimedAt})`;
+    case 'OLD_HAS_KEY': return 'у этого адреса есть ключ — он живой, перенос закрыт';
+    case 'OLD_IS_ACCOUNT': return 'этот адрес зарегистрирован в TarNet ID — перенос закрыт';
+    case 'OLD_IS_DEVICE': return 'это адрес устройства — его заработок идёт владельцу привязки';
+    case 'NOTHING_TO_MIGRATE': return 'на этом адресе нет баланса';
+    default: return `к переносу: ${fmt(st.balanceTar)} TAR`;
+  }
+}
+
+async function checkMigration() {
+  const st = $('migrateState');
+  const raw = String($('migrateOld')?.value || '').trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(raw)) {
+    if (st) st.textContent = 'нужен адрес вида 0x + 40 hex-символов';
+    return null;
+  }
+  try {
+    const s = await call(`/migrate/status/${raw.toLowerCase()}`);
+    if (st) st.textContent = migrateExplain(s);
+    return s;
+  } catch (e) {
+    if (st) st.textContent = e.code === 'RATE_LIMIT' ? e.message : `не смог проверить: ${e.message}`;
+    return null;
+  }
+}
+
+$('migrateCheck')?.addEventListener('click', checkMigration);
+
+$('migrateBtn')?.addEventListener('click', async () => {
+  const st = $('migrateState');
+  const raw = String($('migrateOld')?.value || '').trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(raw)) {
+    if (st) st.textContent = 'нужен адрес вида 0x + 40 hex-символов';
+    return;
+  }
+  const oldAddress = raw.toLowerCase();
+
+  /* Самопроверка до запроса: без ключа подписи нет, и сервер ответит 403.
+   * Сказать об этом прямо честнее, чем выдать отказ сервера за ошибку ввода. */
+  if (!IDENTITY?.privKey) {
+    if (st) st.textContent = 'нет ключа подписи в этом браузере: перенос недоступен';
+    return;
+  }
+
+  try {
+    const nonce = makeNonce();
+    const signature = await signLink('migrate', ADDR, oldAddress, nonce);
+    if (!signature) {
+      if (st) st.textContent = 'не смог подписать запрос: перенос недоступен';
+      return;
+    }
+    const r = await call('/migrate/claim', {
+      method: 'POST',
+      body: { oldAddress, newAddress: ADDR, signature, nonce },
+    });
+    if (st) st.textContent = `перенесено ${fmt(r.migratedTar)} TAR · теперь на кошельке ${fmt(r.newBalanceTar)} TAR`;
+    if ($('migrateOld')) $('migrateOld').value = '';
+    /* Баланс изменился — перерисовываем, иначе на экране осталась бы
+     * старая цифра рядом с сообщением об успехе. */
+    await refreshBalance();
+  } catch (e) {
+    if (st) st.textContent = e.code === 'RATE_LIMIT'
+      ? e.message
+      : (e.data?.message || e.message || 'не получилось перенести');
+  }
+});
+
 /* ---------- Согласие на дистилляцию ----------
  * Чекбокс отражает состояние НА СЕРВЕРЕ, а не в localStorage: согласие —
  * юридический факт, и оно должно переживать смену устройства и чистку
@@ -1646,6 +1719,9 @@ $('copyAddr')?.addEventListener('click', copyWorkerAddress);
   }
 
   $('walletAddr').textContent = `кошелёк: ${ADDR}`;
+  /* Карточка переноса называет получателя явно, до нажатия: человек должен
+   * видеть, куда уйдёт сумма со старого адреса. */
+  if ($('migrateTo')) $('migrateTo').textContent = ADDR;
   /* Старый адрес не стираем молча: человек видел его на экране и мог
    * переписать баланс. Показываем один раз как справку. */
   if (LEGACY_ADDR && LEGACY_ADDR !== ADDR) {

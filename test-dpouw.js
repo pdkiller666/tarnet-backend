@@ -5603,6 +5603,227 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+  /* ===== 37. Клейм старого баланса =====
+   * Старые адреса создавались без ключа, и их баланс был заморожен.
+   * Проверяем и перенос, и все запреты вокруг него. */
+  console.log('\n37. Клейм старого баланса (Faucet Migration)');
+  {
+    const s37 = await spawnServer();
+    try {
+      const { DatabaseSync } = require('node:sqlite');
+      const idc37 = require('node:crypto');
+      const idn37 = require('./identity');
+
+      const dbW = (fn) => {
+        const sdb = new DatabaseSync(path.join(s37.dir, 'test.db'));
+        sdb.exec('PRAGMA busy_timeout = 3000;');
+        try { return fn(sdb); } finally { sdb.close(); }
+      };
+      const seedBal = (addr, tar) => dbW((sdb) => sdb
+        .prepare(`INSERT INTO balances (address, balanceTar, stakedTar, updatedAt)
+                  VALUES (?, ?, 0, ?)
+                  ON CONFLICT(address) DO UPDATE SET balanceTar = excluded.balanceTar`)
+        .run(addr, tar, new Date().toISOString()));
+      const balOf = (addr) => dbW((sdb) => {
+        const r = sdb.prepare('SELECT balanceTar FROM balances WHERE address = ?').get(addr);
+        return r ? Number(r.balanceTar) : 0;
+      });
+
+      /* Новый адрес — НАСТОЯЩИЙ ключ: подпись проверяется по publicKeyPem,
+       * и с выдуманным адресом проверять было бы нечего. */
+      const newKeys = idn37.deriveTarNetKeys(idc37.randomBytes(32));
+      const NEW = newKeys.wallet.address;
+      const OLD = '0x' + '5a'.repeat(20);
+      const OLD_KEY = '0x' + '5b'.repeat(20);
+      const OLD_DEV = '0x' + '5c'.repeat(20);
+      const OLD_EMPTY = '0x' + '5d'.repeat(20);
+      const OWNER_OF_DEV = '0x' + '5e'.repeat(20);
+
+      const regNew = await apiAt(s37.base, '/id/register', 'POST', {
+        pubkey: Buffer.from(newKeys.wallet.pub).toString('hex'),
+      });
+      ok('37.0 новый адрес зарегистрирован с ключом',
+        regNew.status === 200 && regNew.body?.address === NEW,
+        { status: regNew.status, address: regNew.body?.address });
+
+      /* Подпись ставит НОВЫЙ адрес над 'migrate:<new>:<old>:<nonce>'. */
+      const signed = (opts = {}) => {
+        const oldA = opts.old !== undefined ? opts.old : OLD;
+        const newA = opts.new !== undefined ? opts.new : NEW;
+        const nonce = opts.nonce !== undefined ? opts.nonce
+          : idc37.randomBytes(12).toString('base64url');
+        const payload = ['migrate', String(newA).toLowerCase(),
+          String(oldA).toLowerCase(), nonce].join(':');
+        const signature = opts.signature !== undefined ? opts.signature
+          : idn37.signWithSeed(opts.signSeed || newKeys.wallet.priv, payload);
+        const body = { oldAddress: oldA, newAddress: newA };
+        if (nonce !== null) body.nonce = nonce;
+        if (signature !== null) body.signature = signature;
+        return apiAt(s37.base, '/migrate/claim', 'POST', body);
+      };
+
+      /* Подготовка состояний до первого успеха. */
+      seedBal(OLD, 20);
+      seedBal(OLD_EMPTY, 0);
+      seedBal(OLD_DEV, 3);
+      dbW((sdb) => sdb.prepare(`INSERT INTO device_links (ownerAddress, deviceAddress, createdAt)
+        VALUES (?, ?, ?)`).run(OWNER_OF_DEV, OLD_DEV, new Date().toISOString()));
+      /* Живой аккаунт: адрес с публичным ключом — переносить с него нельзя. */
+      const liveKeys = idn37.deriveTarNetKeys(idc37.randomBytes(32));
+      dbW((sdb) => sdb.prepare('INSERT OR IGNORE INTO wallets (address, publicKeyPem) VALUES (?, ?)')
+        .run(OLD_KEY, idn37.rawPubToPem(liveKeys.wallet.pub)));
+      seedBal(OLD_KEY, 7);
+
+      /* --- отказы --- */
+      const badOld = await signed({ old: 'не-адрес' });
+      ok('37.1 кривой oldAddress → 400',
+        badOld.status === 400 && badOld.body?.error === 'invalid_address',
+        { status: badOld.status, error: badOld.body?.error });
+
+      const badNew = await signed({ new: '0xZZZ' });
+      ok('37.2 кривой newAddress → 400',
+        badNew.status === 400 && badNew.body?.error === 'invalid_address',
+        { status: badNew.status, error: badNew.body?.error });
+
+      const same = await signed({ old: NEW, new: NEW });
+      ok('37.3 old == new → 400 SAME_ADDRESS',
+        same.status === 400 && same.body?.error === 'SAME_ADDRESS',
+        { status: same.status, error: same.body?.error });
+
+      /* Без подписи перенос увёл бы чужой баланс: это дыра того же
+       * класса, что была у привязки устройств. */
+      const noSig = await apiAt(s37.base, '/migrate/claim', 'POST',
+        { oldAddress: OLD, newAddress: NEW });
+      ok('37.4 без подписи → 400 SIGNATURE_REQUIRED',
+        noSig.status === 400 && noSig.body?.error === 'SIGNATURE_REQUIRED',
+        { status: noSig.status, error: noSig.body?.error });
+
+      const badNonce = await signed({ nonce: 'x' });
+      ok('37.5 кривой nonce → 400 NONCE_INVALID',
+        badNonce.status === 400 && badNonce.body?.error === 'NONCE_INVALID',
+        { status: badNonce.status, error: badNonce.body?.error });
+
+      const stranger = idn37.deriveTarNetKeys(idc37.randomBytes(32)).wallet.priv;
+      const wrongKey = await signed({ signSeed: stranger });
+      ok('37.6 подпись чужим ключом → 403 DEVICE_NOT_OWNED',
+        wrongKey.status === 403 && wrongKey.body?.error === 'DEVICE_NOT_OWNED',
+        { status: wrongKey.status, error: wrongKey.body?.error });
+
+      /* Живые адреса защищены от переноса. */
+      const hasKey = await signed({ old: OLD_KEY });
+      ok('37.7 адрес с ключом → 403 OLD_HAS_KEY',
+        hasKey.status === 403 && hasKey.body?.error === 'OLD_HAS_KEY',
+        { status: hasKey.status, error: hasKey.body?.error });
+
+      const isDev = await signed({ old: OLD_DEV });
+      ok('37.8 адрес устройства → 403 OLD_IS_DEVICE',
+        isDev.status === 403 && isDev.body?.error === 'OLD_IS_DEVICE',
+        { status: isDev.status, error: isDev.body?.error });
+
+      const empty = await signed({ old: OLD_EMPTY });
+      ok('37.9 пустой адрес → 400 NOTHING_TO_MIGRATE',
+        empty.status === 400 && empty.body?.error === 'NOTHING_TO_MIGRATE',
+        { status: empty.status, error: empty.body?.error });
+
+      /* --- статус до нажатия: PWA решает, показывать ли кнопку --- */
+      const stFree = await apiAt(s37.base, `/migrate/status/${OLD_EMPTY}`);
+      ok('37.10 status пустого адреса: claimable false, NOTHING_TO_MIGRATE',
+        stFree.status === 200 && stFree.body?.claimable === false
+          && stFree.body?.blockedReason === 'NOTHING_TO_MIGRATE',
+        { status: stFree.status, body: stFree.body });
+
+      const stOk = await apiAt(s37.base, `/migrate/status/${OLD}`);
+      ok('37.11 status адреса с 20 TAR: claimable true, баланс 20',
+        stOk.status === 200 && stOk.body?.claimable === true
+          && Number(stOk.body?.balanceTar) === 20,
+        { status: stOk.status, body: stOk.body });
+
+      /* --- главный сценарий директивы: 20 TAR переводятся ровно --- */
+      const totalBefore = dbW((sdb) => Number(
+        sdb.prepare('SELECT COALESCE(SUM(balanceTar),0) AS s FROM balances').get().s));
+      const beforeNew = balOf(NEW);
+
+      const claimed = await signed({ old: OLD });
+      ok('37.12 перенос 20 TAR прошёл (200)',
+        claimed.status === 200 && Number(claimed.body?.migratedTar) === 20,
+        { status: claimed.status, body: claimed.body });
+
+      ok('37.13 старый адрес обнулён', balOf(OLD) === 0, balOf(OLD));
+      ok('37.14 новый адрес получил ровно 20 TAR',
+        balOf(NEW) === beforeNew + 20,
+        { before: beforeNew, after: balOf(NEW) });
+
+      /* Перенос — не эмиссия: сумма по всем адресам не меняется. */
+      const totalAfter = dbW((sdb) => Number(
+        sdb.prepare('SELECT COALESCE(SUM(balanceTar),0) AS s FROM balances').get().s));
+      ok('37.15 сумма по всем балансам не изменилась (не эмиссия)',
+        Math.abs(totalAfter - totalBefore) < 1e-9,
+        { before: totalBefore, after: totalAfter });
+
+      /* ОДНА строка реестра, а не debit+credit: пара задвоила бы оборот
+       * ровно так же, как это было у burn с плательщиком. */
+      const ledRows = dbW((sdb) => sdb.prepare(
+        "SELECT fromAddress, toAddress, amountTar FROM ledger_txs WHERE kind = 'migrate'").all());
+      ok('37.16 в реестре ровно одна строка migrate',
+        ledRows.length === 1, { rows: ledRows.length });
+      ok('37.17 строка реестра связывает старый адрес с новым',
+        ledRows[0] && String(ledRows[0].fromAddress).toLowerCase() === OLD
+          && String(ledRows[0].toAddress).toLowerCase() === NEW
+          && Math.abs(Number(ledRows[0].amountTar) - 20) < 1e-9,
+        ledRows[0]);
+
+      /* --- повторные попытки --- */
+      const again = await signed({ old: OLD });
+      ok('37.18 повторный перенос → 409 ALREADY_MIGRATED',
+        again.status === 409 && again.body?.error === 'ALREADY_MIGRATED',
+        { status: again.status, error: again.body?.error });
+
+      const stClaimed = await apiAt(s37.base, `/migrate/status/${OLD}`);
+      ok('37.19 status после переноса: claimable false, сумма из записи',
+        stClaimed.status === 200 && stClaimed.body?.claimable === false
+          && Number(stClaimed.body?.claimedTar) === 20
+          && String(stClaimed.body?.claimedTo).toLowerCase() === NEW,
+        stClaimed.body);
+
+      /* Nonce одноразовый и здесь. */
+      const nNonce = idc37.randomBytes(12).toString('base64url');
+      const reuseBody = (() => {
+        const payload = ['migrate', NEW.toLowerCase(), OLD_EMPTY.toLowerCase(), nNonce].join(':');
+        return { oldAddress: OLD_EMPTY, newAddress: NEW, nonce: nNonce,
+          signature: idn37.signWithSeed(newKeys.wallet.priv, payload) };
+      })();
+      const firstUse = await apiAt(s37.base, '/migrate/claim', 'POST', reuseBody);
+      const secondUse = await apiAt(s37.base, '/migrate/claim', 'POST', reuseBody);
+      ok('37.20 повтор nonce → 409 NONCE_REUSED',
+        firstUse.status === 400 && secondUse.status === 409
+          && secondUse.body?.error === 'NONCE_REUSED',
+        { first: firstUse.status, second: secondUse.status, error: secondUse.body?.error });
+
+      /* Инварианты не поехали от переноса. */
+      const h37 = (await apiAt(s37.base, '/health')).body;
+      ok('37.21 /health conservation: delta 0, holds true',
+        Number(h37?.conservation?.delta) === 0 && h37?.conservation?.holds === true,
+        h37?.conservation);
+
+      /* PWA: кнопка и карточка на месте, иначе «сделано» только на сервере. */
+      const pwaHtml = fs.readFileSync(path.join(__dirname, 'app', 'index.html'), 'utf8');
+      const pwaJs = fs.readFileSync(path.join(__dirname, 'app', 'app.js'), 'utf8');
+      ok('37.22 в PWA есть карточка переноса и кнопка',
+        /id="migrateCard"/.test(pwaHtml) && /id="migrateBtn"/.test(pwaHtml),
+        'нет migrateCard/migrateBtn в index.html');
+      ok('37.23 PWA подписывает перенос scope-ом migrate',
+        /signLink\('migrate'/.test(pwaJs), 'нет signLink(\'migrate\') в app.js');
+      ok('37.24 PWA зовёт /migrate/claim и /migrate/status',
+        /\/migrate\/claim/.test(pwaJs) && /\/migrate\/status/.test(pwaJs),
+        'нет вызовов /migrate/* в app.js');
+
+      const alive37 = await apiAt(s37.base, '/health');
+      ok('37.25 после всех путей переноса сервер ЖИВ', alive37.status === 200, alive37.status);
+    } finally {
+      s37.stop();
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

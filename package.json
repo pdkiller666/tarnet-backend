@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.12.8-device-link-signature",
+  "version": "2.12.9-migrate-claim",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

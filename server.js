@@ -468,6 +468,19 @@ CREATE TABLE IF NOT EXISTS device_link_nonces (
   usedAt        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_device_link_nonces_usedAt ON device_link_nonces (usedAt);
+
+/* Клейм старого баланса. PK по старому адресу — это и есть защита от
+ * повторного клейма: второй INSERT упадёт на PRIMARY KEY, а не перенесёт
+ * остаток дважды. Храним ещё и сумму: если перенос когда-нибудь придётся
+ * разбирать, в строке видно, сколько было и куда ушло. */
+CREATE TABLE IF NOT EXISTS balance_migrations (
+  oldAddress  TEXT PRIMARY KEY,
+  newAddress  TEXT NOT NULL,
+  amountTar   REAL NOT NULL,
+  txHash      TEXT,
+  claimedAt   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_balance_migrations_new ON balance_migrations (newAddress);
 `);
 
 /* ===== Tier 6: журнал вызовов внешних провайдеров =====
@@ -2350,7 +2363,7 @@ const RATE_READ_PATH =
   /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|p2p\/status|worker\/status|agents(\/approvals)?|tools)$/;
 /* `/id/<pubkey>/balance` — чтение, а не запись: клиент опрашивает баланс так же
  * часто, как /balance/<addr>. Без этой ветки он упирался бы в 10/мин. */
-const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$|^\/id\/[0-9a-fA-F]{0,64}\/balance$|^\/faucet\/status\/[^/]+$|^\/devices\/[^/]+$/;
+const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$|^\/id\/[0-9a-fA-F]{0,64}\/balance$|^\/faucet\/status\/[^/]+$|^\/devices\/[^/]+$|^\/migrate\/status\/[^/]+$/;
 const RATE_READ_ASSET = /\.(html|css|js|svg|webmanifest|png|ico|woff2?)$/;
 /* Оболочки UI: `/` и `/app/` — это HTML-контейнеры без расширения, без этой
  * ветки открытие консоли списывалось бы с бюджета записи (10/мин).
@@ -2848,6 +2861,193 @@ app.get('/faucet/status/:address', (req, res) => {
     return res.status(400).json({ error: 'invalid_address' });
   }
   res.json({ address, ...faucetState(address) });
+});
+
+/* ===== Клейм старого баланса (Faucet Migration) =====
+ *
+ * ЗАЧЕМ: до появления настоящих ключей в PWA адрес выводился как 20 случайных
+ * байт, и приватного ключа к нему не существовало. Демо-начисления на таких
+ * адресах остались бы навсегда недоступными. Этот обработчик переносит их
+ * на новый адрес с ключом.
+ *
+ * ПОЧЕМУ НУЖНА ПОДПИСЬ, ХОТЯ ДИРЕКТИВА ЕЁ НЕ ТРЕБОВАЛА: без неё любой, кто
+ * впишет чужой старый адрес, уводит чужой баланс себе. Старый адрес не может
+ * доказать владение — ключа у него нет по определению. Поэтому доказывает
+ * НОВЫЙ адрес: владелец аккаунта подписывает «migrate:<новый>:<старый>:<nonce>»
+ * своим ключом. Это подтверждает, что получатель — реальный аккаунт, и не даёт
+ * подделать клейм с чужого имени. Защита чужого старого адреса остаётся
+ * неполной: проверить, что старый кошелёк «его», технически нельзя. Поэтому
+ * ниже стоит запрет на перенос адресов, у которых есть ключ или регистрация
+ * в tar_id — то есть живых аккаунтов, а не осиротевших демо-начислений.
+ */
+
+/* Сколько лежит на старом адресе и можно ли его вообще клеймить. Без записи,
+ * как /faucet/status: PWA надо решить до нажатия, показывать ли кнопку. */
+function migrationState(oldAddress) {
+  const bal = get('SELECT balanceTar FROM balances WHERE address = ?', [oldAddress]);
+  const balanceTar = Number((bal?.balanceTar ?? 0).toFixed(6));
+  const claimed = get('SELECT newAddress, amountTar, claimedAt FROM balance_migrations WHERE oldAddress = ?', [oldAddress]);
+  const hasKey = !!get('SELECT 1 AS ok FROM wallets WHERE address = ? AND publicKeyPem IS NOT NULL', [oldAddress]);
+  const registered = !!get('SELECT 1 AS ok FROM tar_id WHERE address = ?', [oldAddress]);
+  const linked = get('SELECT ownerAddress FROM device_links WHERE lower(deviceAddress) = ? LIMIT 1', [oldAddress]);
+  return {
+    oldAddress,
+    balanceTar,
+    claimed: !!claimed,
+    claimedTo: claimed ? claimed.newAddress : null,
+    claimedAt: claimed ? claimed.claimedAt : null,
+    /* Сумма именно из записи о клейме, а не с баланса: баланс старого
+     * адреса после переноса равен нулю, и по нему историю не прочитать. */
+    claimedTar: claimed ? Number(Number(claimed.amountTar).toFixed(6)) : null,
+    /* Причина, по которой перенос закрыт, названа заранее — чтобы PWA
+     * объясняла отказ, а не показывала кнопку, которая потом упадёт. */
+    blockedReason: claimed ? 'ALREADY_MIGRATED'
+      : hasKey ? 'OLD_HAS_KEY'
+      : registered ? 'OLD_IS_ACCOUNT'
+      : linked ? 'OLD_IS_DEVICE'
+      : balanceTar > 0 ? null : 'NOTHING_TO_MIGRATE',
+  };
+}
+
+app.get('/migrate/status/:oldAddress', (req, res) => {
+  const oldAddress = String(req.params.oldAddress || '').trim().toLowerCase();
+  if (!FAUCET_ADDR_RE.test(oldAddress)) {
+    return res.status(400).json({ error: 'invalid_address', message: 'Нужен адрес вида 0x + 40 hex-символов' });
+  }
+  const st = migrationState(oldAddress);
+  res.json({ ...st, claimable: st.blockedReason === null });
+});
+
+app.post('/migrate/claim', (req, res) => {
+  const body = req.body || {};
+  const oldAddress = String(body.oldAddress || '').trim().toLowerCase();
+  const newAddress = String(body.newAddress || '').trim().toLowerCase();
+
+  if (!FAUCET_ADDR_RE.test(oldAddress)) {
+    return res.status(400).json({ error: 'invalid_address', message: 'oldAddress: нужен адрес вида 0x + 40 hex-символов' });
+  }
+  if (!FAUCET_ADDR_RE.test(newAddress)) {
+    return res.status(400).json({ error: 'invalid_address', message: 'newAddress: нужен адрес вида 0x + 40 hex-символов' });
+  }
+  if (oldAddress === newAddress) {
+    /* Перенос на самого себя — не ошибка ввода, а способ обойти потолок:
+     * сюда бы вписали любой живой адрес и переписали ему баланс. */
+    return res.status(400).json({
+      error: 'SAME_ADDRESS',
+      message: 'oldAddress и newAddress совпадают — нужен два разных адреса',
+    });
+  }
+
+  /* Подпись проверяется ДО чтения баланса: иначе коды ответа служили бы
+   * разведкой того, у каких адресов есть деньги. Тот же scope-приём, что у
+   * привязки устройств: перехваченная подпись 'migrate' не подходит ни для
+   * link, ни для unlink. */
+  const auth = checkLinkSignature({ scope: 'migrate', owner: newAddress, device: oldAddress, body });
+  if (!auth.ok) {
+    return res.status(auth.status).json({
+      error: auth.code,
+      detail: auth.detail,
+      ...(auth.payload ? { payload: auth.payload } : {}),
+    });
+  }
+
+  const st = migrationState(oldAddress);
+  if (st.blockedReason === 'ALREADY_MIGRATED') {
+    return res.status(409).json({
+      error: 'ALREADY_MIGRATED',
+      message: `баланс этого адреса уже перенесён на ${st.claimedTo} (${st.claimedAt})`,
+      newAddress: st.claimedTo,
+      amountTar: st.claimedTar ?? undefined,
+    });
+  }
+  if (st.blockedReason === 'OLD_HAS_KEY') {
+    /* У адреса есть публичный ключ — это живой аккаунт, а не осиротевшее
+     * демо-начисление. Перенос отсюда был бы кражей с работающего кошелька. */
+    return res.status(403).json({
+      error: 'OLD_HAS_KEY',
+      message: 'у старого адреса есть ключ: он живой, а не осиротевший — перенос с него закрыт',
+    });
+  }
+  if (st.blockedReason === 'OLD_IS_ACCOUNT') {
+    return res.status(403).json({
+      error: 'OLD_IS_ACCOUNT',
+      message: 'старый адрес зарегистрирован в TarNet ID — перенос с живого аккаунта закрыт',
+    });
+  }
+  if (st.blockedReason === 'OLD_IS_DEVICE') {
+    /* Устройство, привязанное к другому аккаунту. Перенос увёл бы его
+     * заработок мимо владельца. */
+    return res.status(403).json({
+      error: 'OLD_IS_DEVICE',
+      message: 'этот адрес — устройство, привязанное к аккаунту; переносите его заработок через привязку, а не клеймом',
+    });
+  }
+  if (st.blockedReason === 'NOTHING_TO_MIGRATE') {
+    return res.status(400).json({
+      error: 'NOTHING_TO_MIGRATE',
+      message: 'на старом адресе нет положительного баланса',
+      balanceTar: 0,
+    });
+  }
+
+  const amount = st.balanceTar;
+
+  /* Одна транзакция: списание со старого, зачисление на новый и запись
+   * о клейме. Если любой шаг упадёт, откатится всё — иначе адрес остался
+   * бы с записью «перенесён», но без денег, и его уже нельзя было бы клеймить.
+   *
+   * ОДНА строка в ledger_txs, а не две. Пара debit+credit дала бы две строки
+   * «old → new» на одну и ту же сумму, и любой расчёт (SUM(to) − SUM(from))
+   * посчитал бы перенос дважды — ровно тот же дефект, что был у burn с
+   * плательщиком, найденный 28.10.
+   */
+  let txHash;
+  try {
+    txHash = tx(() => {
+      /* Перечитываем баланс внутри транзакции: между проверкой и списанием
+       * мог пройти запрос, и опираться на ранее прочитанное число нельзя. */
+      const fresh = get('SELECT balanceTar FROM balances WHERE address = ?', [oldAddress]);
+      const have = Number(fresh?.balanceTar ?? 0);
+      if (!(have > 0)) {
+        const e = new Error('NOTHING_TO_MIGRATE');
+        e.code = 'NOTHING_TO_MIGRATE';
+        throw e;
+      }
+      const move = round(have);
+      const now = new Date().toISOString();
+      const hash = '0x' + crypto.randomBytes(32).toString('hex');
+
+      run('UPDATE balances SET balanceTar = 0, updatedAt = ? WHERE address = ?', [now, oldAddress]);
+      run(`INSERT INTO balances (address, balanceTar, stakedTar, updatedAt) VALUES (?, ?, 0, ?)
+           ON CONFLICT(address) DO UPDATE SET balanceTar = balanceTar + excluded.balanceTar, updatedAt = excluded.updatedAt`,
+        [newAddress, move, now]);
+      run('INSERT INTO ledger_txs (txHash, actionId, kind, fromAddress, toAddress, amountTar) VALUES (?, ?, ?, ?, ?, ?)',
+        [hash, null, 'migrate', oldAddress, newAddress, move]);
+      run('INSERT INTO balance_migrations (oldAddress, newAddress, amountTar, txHash, claimedAt) VALUES (?, ?, ?, ?, ?)',
+        [oldAddress, newAddress, move, hash, now]);
+      return hash;
+    });
+  } catch (e) {
+    if (e.code === 'NOTHING_TO_MIGRATE') {
+      return res.status(400).json({ error: 'NOTHING_TO_MIGRATE', message: 'на старом адресе нет положительного баланса' });
+    }
+    /* Гонка двух одновременных клеймов: оба прошли проверку, второй упал
+     * на PRIMARY KEY. Это не ошибка сервера, а тот же отказ. */
+    if (/UNIQUE|PRIMARY KEY/i.test(String(e.message))) {
+      return res.status(409).json({ error: 'ALREADY_MIGRATED', message: 'баланс этого адреса уже перенесён' });
+    }
+    return res.status(500).json({ error: 'migration_failed', message: e.message });
+  }
+
+  const after = get('SELECT balanceTar FROM balances WHERE address = ?', [newAddress]);
+  res.json({
+    ok: true,
+    oldAddress,
+    newAddress,
+    migratedTar: amount,
+    newBalanceTar: Number((after?.balanceTar ?? 0).toFixed(6)),
+    txHash,
+  });
 });
 
 /* ===== TarNet ID =====
