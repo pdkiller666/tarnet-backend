@@ -1,15 +1,22 @@
 @echo off
 rem ============================================================
-rem  TarNet Worker - установка в один клик (Windows)
-rem  Адрес и сервер подставлены сервером при скачивании.
-rem  Аргументы не нужны: двойной клик и всё.
+rem  TarNet Worker - one-click installer (Windows)
+rem  Worker address and API URL are injected by the server.
+rem  No arguments needed: just double-click this file.
+rem
+rem  THIS FILE MUST STAY PURE ASCII AND CRLF.
+rem  1) Windows CMD splits batch files on CRLF. With LF-only line
+rem     endings the parser misses labels and runs following lines
+rem     together, producing errors like
+rem     "'$s.WorkingDirectory' is not recognized". That is a
+rem     line-ending bug, not a PowerShell quoting bug.
+rem  2) Cyrillic in UTF-8 is read by the console as OEM/CP866 and
+rem     turns into garbage. So every message here is English.
+rem  server.js normalizes this file to CRLF on the way out, and
+rem  tests check both invariants.
 rem ============================================================
 setlocal EnableDelayedExpansion
 title TarNet Worker
-
-rem Файл в UTF-8 (сервер отдаёт charset=utf-8), а консоль Windows по умолчанию
-rem читает .bat в OEM-кодировке — русский текст превращался бы в мусор.
-chcp 65001 >nul 2>nul
 
 set "ADDR=__TARNET_ADDR__"
 set "API=__TARNET_API__"
@@ -18,25 +25,24 @@ set "NODEV=v22.11.0"
 set "TARNET_DIR=%LOCALAPPDATA%\TarNet"
 set "SKIP_MODEL=0"
 
-rem ---------- проверка адреса ----------
-rem Адрес подставляет сервер при скачивании. Если его нет — файл скачали
-rem в обход PWA, переслали другому или он устарел. Запускать такой воркер
-rem нельзя: он сгенерирует СВОЙ кошелёк, работа уйдёт в чужой баланс, а
-rem человек будет смотреть на нулевой счёт и не понимать, почему.
-rem Проверяем длину и префикс; сами hex-символы проверит воркер — у него
-rem для этого точная регулярка и понятное сообщение.
+rem ---------- validate worker address ----------
+rem The server injects the address at download time. If it is
+rem missing, the file was saved from somewhere else, forwarded to
+rem another person, or is stale. Such a worker would generate its
+rem OWN wallet and the work would go to a different balance.
 if "%ADDR%"=="__TARNET_ADDR__" goto fail_addr
 if "%ADDR%"=="" goto fail_addr
 if not "%ADDR:~0,2%"=="0x" goto fail_addr
-rem 0x + 40 hex = 42 символа: 42-й должен отсутствовать, 41-й — быть.
+rem 0x + 40 hex chars = 42 characters total.
 if not "%ADDR:~42,1%"=="" goto fail_addr
 if "%ADDR:~41,1%"=="" goto fail_addr
+
 echo ============================================
-echo   TarNet Worker - установка
+echo   TarNet Worker - installation
 echo ============================================
-echo   кошелёк: %ADDR%
-echo   сервер:  %API%
-echo   папка:   %TARNET_DIR%
+echo   wallet: %ADDR%
+echo   server: %API%
+echo   folder: %TARNET_DIR%
 echo ============================================
 echo.
 
@@ -48,7 +54,7 @@ set "NODE_EXE="
 for /f "delims=" %%i in ('where node 2^>nul') do if not defined NODE_EXE set "NODE_EXE=%%i"
 if defined NODE_EXE goto have_node
 
-echo [1/4] Node.js не найден - скачиваю portable (34 МБ)...
+echo [1/4] Node.js not found - downloading portable build (34 MB)...
 set "ARCH=win-x64"
 if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "ARCH=win-arm64"
 set "NODE_NAME=node-%NODEV%-%ARCH%"
@@ -71,7 +77,7 @@ set "OLLAMA_EXE="
 for /f "delims=" %%i in ('where ollama 2^>nul') do if not defined OLLAMA_EXE set "OLLAMA_EXE=%%i"
 if defined OLLAMA_EXE goto have_ollama
 
-echo [2/4] Ollama не найден - скачиваю и ставлю тихо...
+echo [2/4] Ollama not found - downloading and installing silently...
 set "OLLAMA_SETUP=%TARNET_DIR%\OllamaSetup.exe"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://ollama.com/download/OllamaSetup.exe' -OutFile '%OLLAMA_SETUP%'"
 if not exist "%OLLAMA_SETUP%" goto no_ollama
@@ -86,7 +92,7 @@ if not defined OLLAMA_EXE goto no_ollama
 echo [2/4] Ollama: ok
 echo       %OLLAMA_EXE%
 
-rem ждём, пока локальный сервер Ollama поднимется (установщик запускает его сам)
+rem wait for the local Ollama server to come up (its installer starts it)
 set /a WAIT=0
 :wait_ollama
 curl.exe -s -f --max-time 2 -o NUL "http://127.0.0.1:11434/api/tags" >nul 2>nul
@@ -97,40 +103,40 @@ timeout /t 2 /nobreak >nul
 goto wait_ollama
 
 :ollama_ready
-echo [2/4] сервер Ollama отвечает
+echo [2/4] Ollama server responds
 goto model
 
 :no_ollama
 echo.
-echo   ВНИМАНИЕ: Ollama не установилась.
-echo   Воркер запустится, но будет отвечать заглушкой
-echo   (в /health это честно видно: llm_mode = deterministic_fallback).
-echo   Поставить вручную: https://ollama.com/download
+echo   WARNING: Ollama is not installed.
+echo   The worker will start but answer with a stub template.
+echo   This is visible honestly in /health: llm_mode = deterministic_fallback.
+echo   Install manually: https://ollama.com/download
 echo.
 set "SKIP_MODEL=1"
 
-rem ---------- 3/4 модель ----------
+rem ---------- 3/4 model ----------
 :model
 if "%SKIP_MODEL%"=="1" (
-  echo [3/4] модель пропущена
+  echo [3/4] model step skipped
   goto step4
 )
-echo [3/4] Модель %MODEL% (около 1 ГБ, это самая долгая часть)...
+echo [3/4] Model %MODEL% (about 1 GB, this is the slow part)...
 "%OLLAMA_EXE%" pull %MODEL%
 if errorlevel 1 (
-  echo       модель не скачалась - воркер пойдёт в режиме без модели
+  echo       model download failed - worker will run without a model
   set "SKIP_MODEL=1"
 )
 
-rem ---------- 4/4 воркер ----------
+rem ---------- 4/4 worker ----------
 :step4
-echo [4/4] Скачиваю воркер...
+echo [4/4] Downloading worker...
 set "WORKER_JS=%TARNET_DIR%\tarnet-worker.js"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%API%/download/worker.js' -OutFile '%WORKER_JS%'"
 if not exist "%WORKER_JS%" goto fail_worker
 
-rem Лаунчер на будущее: после перезагрузки ПК воркер можно поднять повторно,
-rem не проходя установку заново.
+rem Launcher for later: after a reboot the worker can be started
+rem again without repeating the whole installation.
 (
   echo @echo off
   echo setlocal
@@ -140,80 +146,82 @@ rem не проходя установку заново.
   echo start /min "" "%NODE_EXE%" "%WORKER_JS%"
 ) > "%TARNET_DIR%\start.cmd"
 
-rem ---------- ярлык на рабочем столе ----------
-rem Зачем: файлы установщика лежат в %LOCALAPPDATA%\TarNet, куда человек
-rem не пойдёт. Без ярлыка повторный запуск означает «найди папку, найди
-rem start.cmd» — на практике это «воркер больше не запущу».
+rem ---------- desktop shortcut ----------
+rem Files land in %LOCALAPPDATA%\TarNet, a folder nobody browses.
+rem Without a shortcut, restarting the worker means finding that
+rem folder and start.cmd by hand - in practice people just give up.
 rem
-rem Цель ярлыка — start.cmd, НЕ cmd.exe с worker.js: cmd не умеет
-rem исполнять .js, такой ярлык открывал бы окно с ошибкой. Запускает
-rem именно start.cmd, где уже прописаны node и переменные.
+rem The shortcut points at start.cmd, NOT at cmd.exe with worker.js:
+rem cmd cannot execute .js files, so such a shortcut would open a
+rem window with an error.
 rem
-rem Имя через base64, а не кириллицей в командной строке: .bat в UTF-8,
-rem а PowerShell получает аргументы в OEM-кодировке консоли — иначе
-rem на русской Windows имя пришло бы искажённым. Описание ярлыка —
-rem латиницей по той же причине.
+rem The name is plain ASCII (TarNet.lnk). A Cyrillic name would have
+rem to travel through the console code page, which is exactly the
+rem class of bug this rewrite removes.
 rem
-rem Рабочий стол берём через GetFolderPath, а не %USERPROFILE%\Desktop:
-rem при включённом OneDrive папка переадресована, и ярлык упал бы в
-rem невидимый «настоящий» Desktop.
+rem Desktop is resolved via GetFolderPath, not %USERPROFILE%\Desktop:
+rem with OneDrive enabled that folder is redirected elsewhere.
 rem
-rem Если ярлык не создался (политика запрещает COM, нет прав, антивирус),
-rem кладём его в папку TarNet и говорим путь вслух. Второй файл .bat не
-rem делаем: его кириллический путь пришлось бы писать в OEM-кодировке,
-rem то есть плодить ровно ту проблему, от которой уходим.
-set "LNKB64=0JfQsNC/0YPRgdGC0LjRgtGMIFRhck5ldC5sbms="
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$n=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%LNKB64%')); $dirs=@([Environment]::GetFolderPath('Desktop'),'%TARNET_DIR%'); foreach($d in $dirs){ try { $p=Join-Path $d $n; $ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut($p); $s.TargetPath='%TARNET_DIR%\start.cmd'; $s.WorkingDirectory='%TARNET_DIR%'; $s.Description='Start TarNet worker'; $s.Save(); Write-Output $p; exit 0 } catch { } } exit 1"
+rem If the shortcut cannot be created (policy blocks COM objects,
+rem no rights, antivirus), it falls back to the TarNet folder and
+rem the path is printed. Claiming a shortcut always appears would
+rem be a lie.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$d=[Environment]::GetFolderPath('Desktop'); $p=Join-Path $d 'TarNet.lnk'; try { $ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut($p); $s.TargetPath='%TARNET_DIR%\start.cmd'; $s.WorkingDirectory='%TARNET_DIR%'; $s.Description='Start TarNet worker'; $s.Save(); exit 0 } catch { exit 1 }"
 
-if errorlevel 1 (
-  echo   Ярлык создать не удалось. Запуск вручную: "%TARNET_DIR%\start.cmd"
-) else (
-  echo   Ярлык на рабочем столе: "Запустить TarNet"
-)
+if errorlevel 1 goto shortcut_fallback
+echo   Shortcut created on Desktop: TarNet
+goto shortcut_done
 
-echo [4/4] Запускаю воркер в фоне...
+:shortcut_fallback
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Join-Path '%TARNET_DIR%' 'TarNet.lnk'; try { $ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut($p); $s.TargetPath='%TARNET_DIR%\start.cmd'; $s.WorkingDirectory='%TARNET_DIR%'; $s.Save(); exit 0 } catch { exit 1 }"
+echo   Could not create a Desktop shortcut.
+echo   Run manually: "%TARNET_DIR%\start.cmd"
+
+:shortcut_done
+echo [4/4] Starting worker in background...
 start /min "" "%TARNET_DIR%\start.cmd"
 
 echo.
 echo ============================================
-echo   Готово. Воркер запущен в свёрнутом окне.
+echo   Done. The worker is running minimized.
 echo ============================================
-echo   Проверить: PWA, вкладка "Мои устройства".
-echo   Лог работы виден в этом окне воркера.
-echo   Запуск после перезагрузки: "%TARNET_DIR%\start.cmd"
+echo   Check it in the PWA, tab "My devices".
+echo   Logs appear in the worker window.
+echo   Start again later: "%TARNET_DIR%\start.cmd"
+echo   Or use the TarNet shortcut on your Desktop.
 echo.
 pause
 exit /b 0
 
-rem ---------- ошибки ----------
+rem ---------- errors ----------
 :fail_addr
 echo.
-echo   ОШИБКА: адрес воркера не передан или испорчен.
+echo   ERROR: worker address is missing or corrupted.
 echo.
-echo   получено: "%ADDR%"
-echo   ожидается: 0x и ровно 40 шестнадцатеричных символов.
+echo   got:      "%ADDR%"
+echo   expected: 0x followed by exactly 40 hex characters.
 echo.
-echo   Такой файл нельзя запускать: воркер создаст НОВЫЙ кошелёк, и ваша
-rem   работа уйдёт в чужой баланс.
+echo   Do not run this file: the worker would create a NEW wallet
+echo   and your work would go to somebody else's balance.
 echo.
-echo   Что делать: откройте TarNet PWA на телефоне, вкладка
-rem   "Мои устройства" - скачайте установщик заново.
+echo   Fix: open the TarNet PWA on your phone, go to the
+echo   "My devices" tab and download the installer again.
 echo.
 pause
 exit /b 2
 
 :fail_dir
-echo   ОШИБКА: не могу создать папку %TARNET_DIR%
+echo   ERROR: cannot create folder %TARNET_DIR%
 pause
 exit /b 1
 
 :fail_node
-echo   ОШИБКА: Node.js не скачался.
-echo   Проверьте интернет или поставьте Node вручную: https://nodejs.org
+echo   ERROR: Node.js download failed.
+echo   Check your connection or install Node manually: https://nodejs.org
 pause
 exit /b 1
 
 :fail_worker
-echo   ОШИБКА: воркер не скачался с %API%/download/worker.js
+echo   ERROR: worker download failed from %API%/download/worker.js
 pause
 exit /b 1

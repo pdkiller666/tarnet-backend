@@ -4612,7 +4612,7 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
-  section('31. Установщик: ярлык на рабочем столе (Windows)');
+  section('31. Установщик Windows: ASCII, CRLF, ярлык');
 
   /* Проверки идут по тому, что сервер реально отдаёт, а не по файлу шаблона:
    * подстановка адреса — часть контракта, и шаблон с живым плейсхолдером
@@ -4624,6 +4624,7 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     const ADDR31 = runAddress('d31');
     const bat = await apiAt(BASE, `/install/install.bat?addr=${ADDR31}`);
     const batText = typeof bat.body === 'string' ? bat.body : '';
+    const lines = batText.split('\n').map(l => l.replace(/\r$/, ''));
 
     ok('31.1 установщик отдаётся', bat.status === 200 && batText.length > 1000,
       { status: bat.status, bytes: batText.length });
@@ -4632,79 +4633,104 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       !batText.includes('__TARNET_ADDR__') && batText.includes(ADDR31),
       { hasPlaceholder: batText.includes('__TARNET_ADDR__') });
 
-    /* Файл в UTF-8, консоль Windows по умолчанию OEM — без chcp русский
-     * текст установщика превращается в мусор. */
-    ok('31.3 выставлена кодовая страница UTF-8', /chcp\s+65001/.test(batText));
+    /* ГЛАВНЫЙ инвариант после падения на живой Windows: файл чистый ASCII.
+     * Консоль читает .bat в OEM/CP866, и любая кириллица в UTF-8 станет
+     * кракозябрами — ровно это человек и увидел ('�вер:'). chcp 65001 не
+     * спасает: парсер уже разобрал строки. Поэтому только ASCII. */
+    const nonAscii = lines.filter(l => /[^\x00-\x7F]/.test(l));
+    ok('31.3 в файле нет ни одного не-ASCII байта',
+      nonAscii.length === 0,
+      { badLines: nonAscii.length, sample: nonAscii[0] && nonAscii[0].slice(0, 50) });
 
-    ok('31.4 ярлык на рабочем столе создаётся', batText.includes('LNKB64'));
+    /* ВТОРОЙ инвариант, и он же настоящая причина падения. CMD разбирает
+     * batch по CRLF. При LF-разделителях он склеивает соседние строки и
+     * выполняет куски PowerShell как команды DOS — отсюда
+     * "'$s.WorkingDirectory' is not recognized". Проверяем, что каждая
+     * строка (кроме хвоста после последнего перевода) кончается на CR. */
+    const badEol = lines.slice(0, -1).filter(l => !batText.includes(l + '\r\n'));
+    ok('31.4 каждая строка заканчивается CRLF, а не LF',
+      badEol.length === 0, { badLines: badEol.length, sample: badEol[0] && badEol[0].slice(0, 50) });
 
-    /* Ключевая проверка: цель ярлыка — start.cmd. Директива предлагала
-     * TargetPath = cmd.exe с worker.js в аргументах, но cmd не умеет
-     * исполнять .js — такой ярлык открывал бы окно с ошибкой. */
-    ok('31.5 цель ярлыка — start.cmd, а не cmd.exe с .js',
+    /* Третий: ни одна строка PowerShell не должна стоять без обёртки
+     * `powershell -Command "..."`. Именно так CMD пытается выполнить
+     * $s.TargetPath сам. Проверяем только исполняемые строки: в rem и echo
+     * знак $ — обычный текст. */
+    const codeLines = lines.filter(l => l.trim() &&
+      !/^\s*(rem\b|echo\b|:)/i.test(l));
+    const strayPs = codeLines.filter(l => /\$[A-Za-z_]/.test(l) &&
+      !/^\s*powershell\b/i.test(l));
+    ok('31.5 строки PowerShell обёрнуты в powershell -Command',
+      strayPs.length === 0,
+      { stray: strayPs.length, sample: strayPs[0] && strayPs[0].slice(0, 60) });
+
+    /* Цель ярлыка — start.cmd. Директива предлагала cmd.exe с worker.js,
+     * но cmd не исполняет .js: такой ярлык открывал бы окно с ошибкой. */
+    ok('31.6 цель ярлыка — start.cmd, а не cmd.exe с .js',
       /TargetPath='%TARNET_DIR%\\start\.cmd'/.test(batText) &&
-      !/TargetPath='.*cmd\.exe'/.test(batText));
+      !/TargetPath='.*cmd\.exe'/i.test(batText));
 
-    /* Имя ярлыка передаётся base64: .bat в UTF-8, а аргументы PowerShell
-     * приходят в OEM-кодировке консоли, и кириллица исказилась бы. */
-    const b64m = batText.match(/LNKB64=([A-Za-z0-9+/=]+)/);
-    const lnkName = b64m ? Buffer.from(b64m[1], 'base64').toString('utf8') : '';
-    ok('31.6 имя ярлыка декодируется в «Запустить TarNet.lnk»',
-      lnkName === 'Запустить TarNet.lnk', { got: lnkName });
+    ok('31.7 имя ярлыка латиницей — TarNet.lnk',
+      batText.includes("'TarNet.lnk'"), { has: batText.includes("'TarNet.lnk'") });
 
-    /* В командной строке PowerShell не должно быть сырой кириллицы:
-     * именно она ломается при OEM-кодировке. Описание и имя — латиница/base64. */
-    const psLine = batText.split('\n').find(l => l.includes('CreateShortcut')) || '';
-    ok('31.7 в строке PowerShell нет сырой кириллицы',
-      psLine.length > 0 && !/[А-Яа-яЁё]/.test(psLine),
-      { found: (psLine.match(/[А-Яа-яЁё]+/g) || []).slice(0, 3) });
-
-    /* start.cmd должен существовать ДО ярлыка: иначе ярлык на первом клике
-     * указывал бы в пустоту. */
+    /* start.cmd должен существовать ДО ярлыка: иначе первый клик по ярлыку
+     * указывал в пустоту. */
     const iStart = batText.indexOf('> "%TARNET_DIR%\\start.cmd"');
-    const iLnk = batText.indexOf('LNKB64=');
+    const iLnk = batText.indexOf("'TarNet.lnk'");
     ok('31.8 start.cmd создаётся раньше ярлыка',
       iStart > 0 && iLnk > iStart, { iStart, iLnk });
 
-    /* Запасной путь: если ярлык не создался (политика, OneDrive-профиль),
-     * он кладётся в папку TarNet, и это видно человеку. */
+    /* Запасной путь реальный, а не декоративный: при отказе COM ярлык
+     * кладётся в папку TarNet и путь печатается человеку. */
     ok('31.9 есть запасной путь при неудаче создания ярлыка',
-      batText.includes("'%TARNET_DIR%'") &&
-      batText.includes('Запуск вручную'));
+      batText.includes(':shortcut_fallback') &&
+      /Run manually: "%TARNET_DIR%\\start\.cmd"/.test(batText));
 
-    /* Рабочий стол берётся через GetFolderPath: при OneDrive папка
-     * переадресована, и %USERPROFILE%\Desktop указал бы не туда.
-     *
-     * Проверяем только исполняемые строки: комментарий rem объясняет,
+    /* Рабочий стол через GetFolderPath: при OneDrive папка переадресована.
+     * Проверяем только исполняемые строки — комментарий rem объясняет,
      * ПОЧЕМУ %USERPROFILE% не годится, и наивная проверка «нет нигде»
-     * падала бы на собственной документации — что и случилось. */
-    const batCode = batText.split('\n')
-      .filter(l => !/^\s*rem(\s|$)/i.test(l))
-      .join('\n');
+     * падала бы на собственной документации. */
     ok('31.10 рабочий стол через GetFolderPath, не %USERPROFILE%',
-      batCode.includes("GetFolderPath('Desktop')") &&
-      !/%USERPROFILE%\\Desktop/.test(batCode));
+      codeLines.some(l => l.includes("GetFolderPath('Desktop')")) &&
+      !codeLines.some(l => /%USERPROFILE%\\Desktop/i.test(l)));
+
+    /* Мой собственный дефект прошлой версии: в блоке :fail_addr две строки
+     * были `rem` вместо `echo`, и предупреждение «работа уйдёт в чужой
+     * баланс» никогда не печаталось. Теперь весь текст ошибки — echo. */
+    const failBody = batText.split(':fail_addr')[1].split(':fail_dir')[0];
+    const strayRem = failBody.split('\n')
+      .map(l => l.replace(/\r$/, '')).filter(l => l.trim())
+      .filter(l => /^rem\b/i.test(l.trim()));
+    ok('31.11 в тексте ошибки нет rem вместо echo',
+      strayRem.length === 0, { rems: strayRem.length });
 
     /* Без адреса установщик отдавать нельзя: воркер создаст свой кошелёк. */
     const noAddr = await apiAt(BASE, '/install/install.bat');
-    ok('31.11 без адреса → 400, файл не отдаётся', noAddr.status === 400, noAddr.status);
+    ok('31.12 без адреса → 400, файл не отдаётся', noAddr.status === 400, noAddr.status);
 
-    /* macOS: паритет по смыслу — лаунчер для повторного запуска. */
+    /* macOS: .command остаётся LF — там CRLF сломал бы shebang. */
     const sh = await apiAt(BASE, `/install/install.command?addr=${ADDR31}`);
     const shText = typeof sh.body === 'string' ? sh.body : '';
-    ok('31.12 .command тоже даёт лаунчер для повторного запуска',
-      sh.status === 200 && shText.includes('start.sh'), sh.status);
+    ok('31.13 .command даёт лаунчер и не получает CRLF',
+      sh.status === 200 && shText.includes('start.sh') && !shText.includes('\r'),
+      { status: sh.status, hasCR: shText.includes('\r') });
 
-    /* Текст в PWA: без него человек не узнает, что ярлык вообще появился. */
+    /* Текст в PWA: без него человек не узнает ни про ярлык, ни про то,
+     * почему мастер установки англоязычный. */
     const pwa = await apiAt(BASE, '/app/');
     const pwaText = typeof pwa.body === 'string' ? pwa.body : '';
-    ok('31.13 PWA сообщает про ярлык «Запустить TarNet»',
-      pwa.status === 200 && pwaText.includes('Запустить TarNet'),
-      { status: pwa.status, has: pwaText.includes('Запустить TarNet') });
+    ok('31.14 PWA сообщает про ярлык TarNet',
+      pwa.status === 200 && pwaText.includes('ярлык TarNet'),
+      { status: pwa.status, has: pwaText.includes('ярлык TarNet') });
 
     /* И честно про запасной путь: обещать ярлык безусловно — ложь. */
-    ok('31.14 PWA называет ручной путь запуска',
+    ok('31.15 PWA называет ручной путь запуска',
       pwaText.includes('start.cmd'), { has: pwaText.includes('start.cmd') });
+
+    /* Язык мастера объясняется человеку, а не умалчивается: иначе англоязычные
+     * подписи выглядят как небрежность. */
+    ok('31.16 PWA объясняет, почему установщик по-английски',
+      pwaText.includes('по-английски'),
+      { has: pwaText.includes('по-английски') });
   }
 
   console.log('\n' + '─'.repeat(50));

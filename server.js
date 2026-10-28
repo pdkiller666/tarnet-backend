@@ -2151,6 +2151,20 @@ function renderInstaller(templateName, addr) {
     .split('__TARNET_API__').join(INSTALL_PUBLIC_URL)
     .split('__TARNET_MODEL__').join(model);
 
+  /* .bat обязан уходить с CRLF. CMD разбирает batch-файлы по CRLF: при
+   * LF-разделителях он склеивает соседние строки, метки `:` и `goto`
+   * съезжают, и начинают выполняться куски PowerShell-команд как команды
+   * DOS — отсюда `'$s.WorkingDirectory' is not recognized` и кракозябры.
+   * Шаблон в репозитории хранится с LF (git, линукс), поэтому перевод
+   * делается здесь, на отдаче, а не хрупким .gitattributes.
+   * Повторный перевод безвреден: \r\n -> \r\r\n не получится, потому что
+   * сначала все CR убираются. */
+  /* Шаблон называется install.bat.tpl, поэтому проверка на `.bat$` не
+   * срабатывает — тест 31.4 поймал именно это: файл уходил с LF. */
+  if (/\.bat(\.tpl)?$/i.test(templateName)) {
+    text = text.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
+  }
+
   return text;
 }
 
