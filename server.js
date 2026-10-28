@@ -437,12 +437,17 @@ ensureColumn('worker_tasks', 'source', 'source TEXT');
  * сломали бы проверку «это точно моё устройство». Здесь связь — отдельная
  * сущность с датой, и её видно в одном месте.
  *
- * ОГРАНИЧЕНИЕ, КОТОРОЕ НАДО ЗНАТЬ (я его не скрываю): привязка не
- * аутентифицирована. В системе пока нет входа по подписи — ADDR в PWA это
- * демо-адрес из localStorage без приватного ключа. Значит любой, кто знает
- * адрес кошелька, может привязать его к себе. Защита появится вместе с
- * входом по подписи; до тех пор таблица честно называется «заявка», а не
- * «доказанное владение».
+ * АУТЕНТИФИКАЦИЯ (закрыто 28.10): привязка требует Ed25519-подписи владельца
+ * над канонической строкой `<scope>:<owner>:<device>:<nonce>`. Публичный ключ
+ * берётся из `wallets` по адресу владельца, nonce одноразовый (таблица
+ * `device_link_nonces`, TTL 10 минут). Поэтому «знаю адрес» больше не значит
+ * «могу привязать»: без приватного ключа подпись не собрать, а без подписи
+ * запрос отвергается с 403 DEVICE_NOT_OWNED.
+ *
+ * ЧЕГО ЭТО НЕ ДОКАЗЫВАЕТ: владение самим устройством. Владелец доказывает,
+ * что он владелец аккаунта, и заявляет устройство. Проверить, что ПК его,
+ * нельзя — у ПК свой кошелёк, и его ключа у аккаунта нет. Это ограничение
+ * модели, а не недоделка, и молчать о нём было бы хуже.
  */
 db.exec(`
 CREATE TABLE IF NOT EXISTS device_links (
@@ -452,6 +457,17 @@ CREATE TABLE IF NOT EXISTS device_links (
   PRIMARY KEY (ownerAddress, deviceAddress)
 );
 CREATE INDEX IF NOT EXISTS idx_device_links_device ON device_links (deviceAddress);
+
+/* Одноразовые nonce для подписи привязки. Отдельная таблица, а не колонка в
+ * device_links: nonce живёт минуты и к самой привязке не относится; держать
+ * его в строке привязки значило бы переписывать её на каждый повтор. */
+CREATE TABLE IF NOT EXISTS device_link_nonces (
+  nonce         TEXT PRIMARY KEY,
+  scope         TEXT NOT NULL,
+  ownerAddress  TEXT NOT NULL,
+  usedAt        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_link_nonces_usedAt ON device_link_nonces (usedAt);
 `);
 
 /* ===== Tier 6: журнал вызовов внешних провайдеров =====
@@ -2962,6 +2978,67 @@ app.get('/id/:pubkey/balance', (req, res) => {
  * это устройство». Перевод средств между кошельками без приватного ключа
  * невозможен, и делать вид, что привязка это умеет, было бы обманом.
  */
+/* ===== Подпись привязки устройства =====
+ * Каноническая строка фиксирована и повторяется на клиенте дословно:
+ *   <scope>:<ownerAddress>:<deviceAddress>:<nonce>
+ * где scope = 'link' для POST и 'unlink' для DELETE. Разные scope не дают
+ * переиспользовать подпись от привязки для отвязки чужого устройства.
+ *
+ * Возвращает {ok, status, code, detail}. ok=true — можно продолжать. */
+const LINK_NONCE_TTL_MS = 10 * 60 * 1000;
+const LINK_NONCE_RE = /^[A-Za-z0-9_-]{8,128}$/;
+
+function checkLinkSignature({ scope, owner, device, body }) {
+  const sig = body?.signature ?? body?.linkSignature;
+  const nonce = String(body?.nonce ?? '').trim();
+
+  if (!sig || !nonce) {
+    return {
+      ok: false, status: 400, code: 'SIGNATURE_REQUIRED',
+      detail: 'нужны поля signature и nonce: без подписи владельца привязка не принимается',
+    };
+  }
+  if (!LINK_NONCE_RE.test(nonce)) {
+    return {
+      ok: false, status: 400, code: 'NONCE_INVALID',
+      detail: 'nonce: 8–128 символов из [A-Za-z0-9_-]',
+    };
+  }
+
+  const w = get('SELECT publicKeyPem FROM wallets WHERE address = ?', [owner]);
+  if (!w || !w.publicKeyPem) {
+    /* Нет ключа — нечем проверить. Отказываем, а не пропускаем: иначе
+     * обходом проверки стало бы «не регистрировать публичный ключ». */
+    return {
+      ok: false, status: 403, code: 'DEVICE_NOT_OWNED',
+      detail: 'у адреса владельца нет публичного ключа: сначала POST /id/register',
+    };
+  }
+
+  const payload = [scope, owner, device, nonce].join(':');
+  if (!verifyPayload(payload, String(sig), w.publicKeyPem)) {
+    return {
+      ok: false, status: 403, code: 'DEVICE_NOT_OWNED', payload,
+      detail: 'подпись не сходится с публичным ключом владельца',
+    };
+  }
+
+  /* Nonce гасим ПОСЛЕ проверки подписи: иначе мусорный запрос сжигал бы
+   * честный nonce и мешал настоящему владельцу привязать устройство. */
+  const now = Date.now();
+  run('DELETE FROM device_link_nonces WHERE usedAt < ?', [now - LINK_NONCE_TTL_MS]);
+  try {
+    run(`INSERT INTO device_link_nonces (nonce, scope, ownerAddress, usedAt)
+         VALUES (?, ?, ?, ?)`, [nonce, scope, owner, now]);
+  } catch (_e) {
+    return {
+      ok: false, status: 409, code: 'NONCE_REUSED', payload,
+      detail: 'этот nonce уже использован: подпись одноразовая',
+    };
+  }
+  return { ok: true, payload };
+}
+
 app.post('/devices/link', (req, res) => {
   const body = req.body || {};
   const owner = String(body.ownerAddress || '').trim().toLowerCase();
@@ -2985,6 +3062,18 @@ app.post('/devices/link', (req, res) => {
     return res.status(400).json({
       error: 'SAME_ADDRESS',
       detail: 'адрес ПК совпадает с адресом аккаунта — вставьте адрес ПК, а не телефона',
+    });
+  }
+
+  /* Проверка владения — ДО поиска устройства в сети. Порядок принципиален:
+   * если сначала отвечать 404 DEVICE_UNKNOWN, то чужой человек по коду ответа
+   * узнаёт, какие адреса вообще существуют. Аутентификация идёт первой. */
+  const auth = checkLinkSignature({ scope: 'link', owner, device, body });
+  if (!auth.ok) {
+    return res.status(auth.status).json({
+      error: auth.code,
+      detail: auth.detail,
+      ...(auth.payload ? { payload: auth.payload } : {}),
     });
   }
 
@@ -3019,8 +3108,7 @@ app.post('/devices/link', (req, res) => {
   res.json({
     ok: true,
     ownerAddress: owner,
-    deviceAddress: device,
-    /* linkedAt — когда привязка появилась ВПЕРВЫЕ: повторный вызов не
+    deviceAddress: device,    /* linkedAt — когда привязка появилась ВПЕРВЫЕ: повторный вызов не
      * должен переписывать дату, иначе история устройства теряется. */
     linkedAt: prev ? prev.createdAt : now,
     created: !prev,
@@ -3066,6 +3154,19 @@ app.delete('/devices/link', (req, res) => {
   if (!INSTALL_ADDR_RE.test(owner) || !INSTALL_ADDR_RE.test(device)) {
     return res.status(400).json({ error: 'ownerAddress and deviceAddress required' });
   }
+
+  /* Отвязка требует СВОЕЙ подписи (scope 'unlink'). Общий scope с привязкой
+   * дал бы возможность отвязать чужое устройство, перехватив подпись от
+   * привязки: строка совпала бы, а смысл действия — нет. */
+  const auth = checkLinkSignature({ scope: 'unlink', owner, device, body });
+  if (!auth.ok) {
+    return res.status(auth.status).json({
+      error: auth.code,
+      detail: auth.detail,
+      ...(auth.payload ? { payload: auth.payload } : {}),
+    });
+  }
+
   const info = run('DELETE FROM device_links WHERE ownerAddress = ? AND deviceAddress = ?',
     [owner, device]);
   res.json({ ok: true, removed: Number(info.changes || 0) });

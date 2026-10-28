@@ -4521,12 +4521,44 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     const lp = await spawnServer();
     try {
       const { DatabaseSync } = require('node:sqlite');
-      const OWN = '0x' + '11'.repeat(20);
+      const idc = require('node:crypto');
+      const idn = require('./identity');
+
+      /* Владелец — НАСТОЯЩИЙ ключ, а не выдуманный адрес: сервер проверяет
+       * подпись по publicKeyPem из `wallets`, и без регистрации ключа
+       * привязка честно отвечает 403. Раньше здесь был '0x11…11', и
+       * проверка владения просто не могла существовать. */
+      const ownerKeys = idn.deriveTarNetKeys(idc.randomBytes(32));
+      const OWN = ownerKeys.wallet.address;
       const DEV = '0x' + '22'.repeat(20);
       const GHOST = '0x' + '33'.repeat(20);
       const linkUrl = '/devices/link';
-      const doLink = (owner, device) => apiAt(lp.base, linkUrl, 'POST',
-        { ownerAddress: owner, deviceAddress: device });
+
+      const ownerReg = await apiAt(lp.base, '/id/register', 'POST', {
+        pubkey: Buffer.from(ownerKeys.wallet.pub).toString('hex'),
+      });
+      ok('30.0 владелец зарегистрирован с публичным ключом (есть чем проверить)',
+        ownerReg.status === 200 && ownerReg.body?.address === OWN,
+        { status: ownerReg.status, address: ownerReg.body?.address, expected: OWN });
+
+      /* Каждый вызов — со СВЕЖИМ nonce: подпись одноразовая, и повтор с тем же
+       * nonce обязан получить 409, а не тихо пройти. */
+      const signedCall = (opts = {}) => {
+        const owner = opts.owner || OWN;
+        const device = opts.device || DEV;
+        const scope = opts.scope || 'link';
+        const nonce = opts.nonce !== undefined ? opts.nonce
+          : idc.randomBytes(12).toString('base64url');
+        const payload = [scope, String(owner).toLowerCase(),
+          String(device).toLowerCase(), nonce].join(':');
+        const signature = opts.signature !== undefined ? opts.signature
+          : idn.signWithSeed(opts.signSeed || ownerKeys.wallet.priv, payload);
+        const body = { ownerAddress: owner, deviceAddress: device };
+        if (nonce !== null) body.nonce = nonce;
+        if (signature !== null) body.signature = signature;
+        return apiAt(lp.base, linkUrl, opts.method || 'POST', body);
+      };
+      const doLink = (owner, device) => signedCall({ owner, device });
 
       /* --- отказы: до любого успеха --- */
       const badOwner = await doLink('0xZZZ', DEV);
@@ -4604,8 +4636,7 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
         { online: stale.body?.devices?.[0]?.online, ageMs: stale.body?.devices?.[0]?.lastSeenAgoMs });
 
       /* --- отвязка --- */
-      const del = await apiAt(lp.base, linkUrl, 'DELETE',
-        { ownerAddress: OWN, deviceAddress: DEV });
+      const del = await signedCall({ device: DEV, scope: 'unlink', method: 'DELETE' });
       ok('30.13 отвязка удаляет ровно одну запись',
         del.status === 200 && del.body?.removed === 1,
         { status: del.status, removed: del.body?.removed });
@@ -4629,8 +4660,87 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
         byReceipt.status === 200 && byReceipt.body?.created === true,
         { status: byReceipt.status, error: byReceipt.body?.error });
 
+      /* ===== Подпись привязки: проверка владения =====
+       * Раньше «знаю адрес» означало «могу привязать». Теперь нужна
+       * подпись Ed25519 от ключа владельца. */
+      const noSig = await apiAt(lp.base, linkUrl, 'POST',
+        { ownerAddress: OWN, deviceAddress: DEV });
+      ok('30.16 без подписи → 400 SIGNATURE_REQUIRED',
+        noSig.status === 400 && noSig.body?.error === 'SIGNATURE_REQUIRED',
+        { status: noSig.status, error: noSig.body?.error });
+
+      const noNonce = await signedCall({ device: DEV, nonce: null });
+      ok('30.17 подпись без nonce → 400 SIGNATURE_REQUIRED',
+        noNonce.status === 400 && noNonce.body?.error === 'SIGNATURE_REQUIRED',
+        { status: noNonce.status, error: noNonce.body?.error });
+
+      const badNonce = await signedCall({ device: DEV, nonce: 'short' });
+      ok('30.18 nonce короче 8 символов → 400 NONCE_INVALID',
+        badNonce.status === 400 && badNonce.body?.error === 'NONCE_INVALID',
+        { status: badNonce.status, error: badNonce.body?.error });
+
+      /* Сценарий атаки: адрес в теле чужой, подпись — от своего ключа. */
+      const strangerSeed = idn.deriveTarNetKeys(idc.randomBytes(32)).wallet.priv;
+      const wrongKey = await signedCall({ device: DEV, signSeed: strangerSeed });
+      ok('30.19 подпись чужим ключом → 403 DEVICE_NOT_OWNED',
+        wrongKey.status === 403 && wrongKey.body?.error === 'DEVICE_NOT_OWNED',
+        { status: wrongKey.status, error: wrongKey.body?.error });
+
+      const garbageSig = await signedCall({ device: DEV, signature: 'not-a-signature' });
+      ok('30.20 мусорная подпись → 403 DEVICE_NOT_OWNED',
+        garbageSig.status === 403 && garbageSig.body?.error === 'DEVICE_NOT_OWNED',
+        { status: garbageSig.status, error: garbageSig.body?.error });
+
+      /* Верный ключ, но подписано ДРУГОЕ устройство: строка не сходится. */
+      const mismatchNonce = idc.randomBytes(12).toString('base64url');
+      const sigForOther = idn.signWithSeed(ownerKeys.wallet.priv,
+        ['link', OWN.toLowerCase(), GHOST.toLowerCase(), mismatchNonce].join(':'));
+      const otherDevice = await apiAt(lp.base, linkUrl, 'POST', {
+        ownerAddress: OWN, deviceAddress: DEV, nonce: mismatchNonce, signature: sigForOther,
+      });
+      ok('30.21 подпись над другим устройством → 403',
+        otherDevice.status === 403 && otherDevice.body?.error === 'DEVICE_NOT_OWNED',
+        { status: otherDevice.status, error: otherDevice.body?.error });
+
+      /* Одноразовость: тот же nonce второй раз — 409, а не тихий успех. */
+      const reuseNonce = idc.randomBytes(12).toString('base64url');
+      const reuseSig = idn.signWithSeed(ownerKeys.wallet.priv,
+        ['link', OWN.toLowerCase(), DEV.toLowerCase(), reuseNonce].join(':'));
+      const firstUse = await apiAt(lp.base, linkUrl, 'POST', {
+        ownerAddress: OWN, deviceAddress: DEV, nonce: reuseNonce, signature: reuseSig,
+      });
+      const secondUse = await apiAt(lp.base, linkUrl, 'POST', {
+        ownerAddress: OWN, deviceAddress: DEV, nonce: reuseNonce, signature: reuseSig,
+      });
+      ok('30.22 повтор nonce → 409 NONCE_REUSED',
+        firstUse.status === 200 && secondUse.status === 409
+          && secondUse.body?.error === 'NONCE_REUSED',
+        { first: firstUse.status, second: secondUse.status, error: secondUse.body?.error });
+
+      /* Владелец без публичного ключа: проверять нечем, поэтому отказ. Иначе
+       * обходом проверки стало бы «не регистрировать ключ». */
+      const noKeyOwner = '0x' + '77'.repeat(20);
+      const noKeyNonce = idc.randomBytes(12).toString('base64url');
+      const noKey = await apiAt(lp.base, linkUrl, 'POST', {
+        ownerAddress: noKeyOwner, deviceAddress: DEV, nonce: noKeyNonce,
+        signature: idn.signWithSeed(ownerKeys.wallet.priv,
+          ['link', noKeyOwner, DEV.toLowerCase(), noKeyNonce].join(':')),
+      });
+      ok('30.23 владелец без публичного ключа → 403 DEVICE_NOT_OWNED',
+        noKey.status === 403 && noKey.body?.error === 'DEVICE_NOT_OWNED',
+        { status: noKey.status, error: noKey.body?.error });
+
+      /* Порядок ворот: подпись — ДО поиска устройства в сети. Неподписанный
+       * запрос к незнакомому адресу обязан получить 400, а не 404: иначе код
+       * ответа выдаёт, какие адреса вообще есть. */
+      const ghostUnsigned = await apiAt(lp.base, linkUrl, 'POST',
+        { ownerAddress: OWN, deviceAddress: '0x' + '99'.repeat(20) });
+      ok('30.24 порядок: неподписанный запрос к незнакомому адресу → 400, не 404',
+        ghostUnsigned.status === 400,
+        { status: ghostUnsigned.status, error: ghostUnsigned.body?.error });
+
       const alive = await apiAt(lp.base, '/health');
-      ok('30.16 после всех путей привязки сервер ЖИВ', alive.status === 200, alive.status);
+      ok('30.25 после всех путей привязки сервер ЖИВ', alive.status === 200, alive.status);
     } finally {
       lp.stop();
     }

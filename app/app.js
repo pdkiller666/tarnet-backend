@@ -12,23 +12,148 @@
 const $ = (id) => document.getElementById(id);
 const API = ''; // тот же origin: PWA раздаётся тем же сервером
 
-/* ---------- Постоянный адрес устройства ----------
- * Хранится в localStorage, чтобы баланс и накопленная работа не терялись
- * между перезагрузками. Это ДЕМО-адрес: приватного ключа у него нет, и
- * распоряжаться выплатами он не может — только принимать начисления.
- */
-function deviceAddress() {
-  let a = localStorage.getItem('tarnet.address');
+/* ---------- Личность устройства и ключ подписи ----------
+ * РАНЬШЕ адрес был 20 случайными байтами из localStorage — у него НЕ БЫЛО
+ * приватного ключа, и подписать что-либо от его имени было невозможно.
+ * Поэтому привязка устройства не могла быть аутентифицирована, и любой, кто
+ * знал адрес, привязывал его к себе.
+ *
+ * ТЕПЕРЬ адрес выводится из настоящего ключа Ed25519:
+ *     0x + sha256(SPKI-DER публичного ключа)[0..40]
+ * Это ТА ЖЕ формула, что в server.js и identity.js (сходимость проверена
+ * запуском: браузерный ключ → тот же адрес, подпись проходит серверный
+ * verifyPayload). Приватный ключ хранится ТОЛЬКО здесь, в localStorage, и на
+ * сервер не уходит: на сервер отправляется лишь публичный ключ.
+ *
+ * ЧЕГО ЭТО СТОИТ, и я это не скрываю: у адреса меняется значение, поэтом
+ * старый демо-адрес теряет роль текущего. Его баланс — демо-начисления,
+ * распоряжаться ими было нельзя и раньше (ключа не существовало). Старый
+ * адрес сохраняется отдельно, чтобы интерфейс мог его показать.
+ *
+ * Edge: WebCrypto Ed25519 есть не везде (Safari < 17). Тогда identity()
+ * возвращает null, и PWA работает в старом режиме «только чтение»: привязка
+ * с подписью недоступна, но остальное живо. Молча подсовывать фейковую
+ * подпись нельзя — это было бы хуже отсутствия функции. */
+const LS_IDENTITY = 'tarnet.identity.v1';
+const LS_LEGACY_ADDR = 'tarnet.address';
+
+function idToB64(buf) {
+  let s = '';
+  const b = new Uint8Array(buf);
+  for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+  return btoa(s);
+}
+function idFromB64(str) {
+  const s = atob(str);
+  const b = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
+  return b;
+}
+function idHex(bytes) {
+  return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+function idB64Url(bytes) {
+  return idToB64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/* Адрес из SPKI-DER — ровно как на сервере. Вынесено отдельно, чтобы
+ * сходимость можно было проверить одной функцией. */
+async function addressFromSpki(spkiDer) {
+  const digest = await crypto.subtle.digest('SHA-256', spkiDer);
+  return '0x' + idHex(digest).slice(0, 40);
+}
+
+let IDENTITY = null;      // { address, pubKey, privKey } — privKey только в памяти
+let ADDR = '';            // адрес аккаунта; заполняется после identity()
+let LEGACY_ADDR = null;   // старый демо-адрес, только для показа
+
+/** Загружает или создаёт личность устройства. Возвращает адрес или null. */
+async function ensureIdentity() {
+  try {
+    if (!crypto?.subtle) return null;
+
+    const saved = localStorage.getItem(LS_IDENTITY);
+    if (saved) {
+      const o = JSON.parse(saved);
+      const privKey = await crypto.subtle.importKey(
+        'pkcs8', idFromB64(o.priv), { name: 'Ed25519' }, false, ['sign'],
+      );
+      const pubSpki = idFromB64(o.pub);
+      /* Адрес пересчитываем, а не берём из записи: если формула когда-нибудь
+       * изменится, сохранённый адрес разойдётся с ключом, и подпись перестанет
+       * сходиться. Пересчёт делает хранилище проверяемым. */
+      const address = await addressFromSpki(pubSpki);
+      IDENTITY = { address, privKey, pubSpki };
+      if (address !== o.address) {
+        localStorage.setItem(LS_IDENTITY, JSON.stringify({ ...o, address }));
+      }
+      return address;
+    }
+
+    /* Новая личность. extractable=true нужен, чтобы сохранить ключ между
+     * перезагрузками; без этого PWA терял бы аккаунт при каждом обновлении. */
+    const kp = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+    const privDer = await crypto.subtle.exportKey('pkcs8', kp.privateKey);
+    const pubSpki = await crypto.subtle.exportKey('spki', kp.publicKey);
+    const rawPub = new Uint8Array(pubSpki).slice(new Uint8Array(pubSpki).length - 32);
+    const address = await addressFromSpki(pubSpki);
+
+    localStorage.setItem(LS_IDENTITY, JSON.stringify({
+      address, priv: idToB64(privDer), pub: idToB64(pubSpki), createdAt: new Date().toISOString(),
+    }));
+    IDENTITY = { address, privKey: kp.privateKey, pubSpki };
+
+    /* Регистрируем публичный ключ на сервере: без него сервер нечем проверять
+     * подпись и отвечает 403. Приватный ключ не отправляется никогда. */
+    try {
+      await call('/id/register', { method: 'POST', body: { pubkey: idHex(rawPub) } });
+    } catch (e) {
+      console.warn('публичный ключ не зарегистрирован:', e.message);
+    }
+    return address;
+  } catch (e) {
+    console.warn('identity недоступна:', e.message);
+    return null;
+  }
+}
+
+/** Подпись строки вида `scope:owner:device:nonce`. null — ключа нет. */
+async function signLink(scope, owner, device, nonce) {
+  if (!IDENTITY?.privKey) return null;
+  const payload = [scope, owner.toLowerCase(), device.toLowerCase(), nonce].join(':');
+  const sig = await crypto.subtle.sign(
+    { name: 'Ed25519' }, IDENTITY.privKey, new TextEncoder().encode(payload),
+  );
+  return idToB64(sig);
+}
+
+/* Старый демо-адрес — только на случай, когда WebCrypto Ed25519 недоступен
+ * (Safari < 17). Тогда PWA остаётся читалкой: подписи нет, привязка получит
+ * 403 от сервера. Возвращать фейковый ключ вместо неё было бы обманом. */
+function legacyDeviceAddress() {
+  let a = localStorage.getItem(LS_LEGACY_ADDR);
   if (!a || !/^0x[0-9a-f]{40}$/.test(a)) {
     const bytes = new Uint8Array(20);
     crypto.getRandomValues(bytes);
-    a = '0x' + [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
-    localStorage.setItem('tarnet.address', a);
+    a = '0x' + idHex(bytes);
+    localStorage.setItem(LS_LEGACY_ADDR, a);
   }
   return a;
 }
 
-const ADDR = deviceAddress();
+/** Новый одноразовый nonce. Формат совпадает с LINK_NONCE_RE на сервере. */
+function makeNonce() {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return idB64Url(b);
+}
+
+/* Старый демо-адрес сохраняем только для показа: молча стирать данные,
+ * которые человек видел на экране, нельзя. */
+(function rememberLegacy() {
+  const old = localStorage.getItem(LS_LEGACY_ADDR);
+  if (old && /^0x[0-9a-f]{40}$/.test(old)) LEGACY_ADDR = old;
+})();
 
 /* ---------- HTTP с человеческими ошибками ----------
  * 429 здесь не «ошибка сети», а рабочее состояние: лимит 10 запросов в
@@ -1188,9 +1313,14 @@ async function refreshLinks() {
 async function unlinkDevice(addr) {
   const st = $('linkState');
   try {
+    const target = String(addr || '').toLowerCase();
+    const nonce = makeNonce();
+    /* Подпись со scope 'unlink': сервер не примет её за подпись привязки,
+     * иначе перехваченная подпись отвязывала бы чужое устройство. */
+    const signature = await signLink('unlink', ADDR, target, nonce);
     await call('/devices/link', {
       method: 'DELETE',
-      body: { ownerAddress: ADDR, deviceAddress: addr },
+      body: { ownerAddress: ADDR, deviceAddress: target, signature, nonce },
     });
     if (st) st.textContent = 'ПК отвязан';
     await refreshLinks();
@@ -1214,9 +1344,18 @@ $('linkBtn')?.addEventListener('click', async () => {
     return;
   }
   try {
+    const device = raw.toLowerCase();
+    const nonce = makeNonce();
+    const signature = await signLink('link', ADDR, device, nonce);
+    if (!signature) {
+      /* Ключа нет — честно говорим об этом, а не шлём запрос без подписи:
+       * сервер ответил бы 400, и причина выглядела бы как ошибка ввода. */
+      if (st) st.textContent = 'нет ключа подписи в этом браузере: привязка недоступна';
+      return;
+    }
     const r = await call('/devices/link', {
       method: 'POST',
-      body: { ownerAddress: ADDR, deviceAddress: raw.toLowerCase() },
+      body: { ownerAddress: ADDR, deviceAddress: device, signature, nonce },
     });
     if (st) st.textContent = `привязан ${r.deviceAddress.slice(0, 10)}…`;
     if ($('linkAddr')) $('linkAddr').value = '';
@@ -1494,7 +1633,24 @@ $('copyAddr')?.addEventListener('click', copyWorkerAddress);
     });
   }
 
+  /* Личность и ключ подписи — ДО первого рендера. Без адреса запрос
+   * /balance/ ушёл бы на пустую строку и вернул 404 на глазах у человека. */
+  const freshAddr = await ensureIdentity();
+  if (freshAddr) {
+    ADDR = freshAddr;
+  } else {
+    /* WebCrypto Ed25519 нет: работаем как читалка на демо-адресе. Не молчим —
+     * причина нужна тем, кто будет разбирать «почему не привязывается». */
+    ADDR = legacyDeviceAddress();
+    console.warn('ключ подписи недоступен: привязка устройства будет отвергнута');
+  }
+
   $('walletAddr').textContent = `кошелёк: ${ADDR}`;
+  /* Старый адрес не стираем молча: человек видел его на экране и мог
+   * переписать баланс. Показываем один раз как справку. */
+  if (LEGACY_ADDR && LEGACY_ADDR !== ADDR) {
+    console.info(`прежний демо-адрес ${LEGACY_ADDR} заменён ключевым ${ADDR}`);
+  }
   renderWorkerHelp();
   startBannerPolling();
   /* Модели и адаптеры грузим параллельно: это два независимых запроса,
