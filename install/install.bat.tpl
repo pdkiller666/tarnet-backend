@@ -7,6 +7,10 @@ rem ============================================================
 setlocal EnableDelayedExpansion
 title TarNet Worker
 
+rem Файл в UTF-8 (сервер отдаёт charset=utf-8), а консоль Windows по умолчанию
+rem читает .bat в OEM-кодировке — русский текст превращался бы в мусор.
+chcp 65001 >nul 2>nul
+
 set "ADDR=__TARNET_ADDR__"
 set "API=__TARNET_API__"
 set "MODEL=__TARNET_MODEL__"
@@ -135,6 +139,37 @@ rem не проходя установку заново.
   echo set "TARNET_MODEL=%MODEL%"
   echo start /min "" "%NODE_EXE%" "%WORKER_JS%"
 ) > "%TARNET_DIR%\start.cmd"
+
+rem ---------- ярлык на рабочем столе ----------
+rem Зачем: файлы установщика лежат в %LOCALAPPDATA%\TarNet, куда человек
+rem не пойдёт. Без ярлыка повторный запуск означает «найди папку, найди
+rem start.cmd» — на практике это «воркер больше не запущу».
+rem
+rem Цель ярлыка — start.cmd, НЕ cmd.exe с worker.js: cmd не умеет
+rem исполнять .js, такой ярлык открывал бы окно с ошибкой. Запускает
+rem именно start.cmd, где уже прописаны node и переменные.
+rem
+rem Имя через base64, а не кириллицей в командной строке: .bat в UTF-8,
+rem а PowerShell получает аргументы в OEM-кодировке консоли — иначе
+rem на русской Windows имя пришло бы искажённым. Описание ярлыка —
+rem латиницей по той же причине.
+rem
+rem Рабочий стол берём через GetFolderPath, а не %USERPROFILE%\Desktop:
+rem при включённом OneDrive папка переадресована, и ярлык упал бы в
+rem невидимый «настоящий» Desktop.
+rem
+rem Если ярлык не создался (политика запрещает COM, нет прав, антивирус),
+rem кладём его в папку TarNet и говорим путь вслух. Второй файл .bat не
+rem делаем: его кириллический путь пришлось бы писать в OEM-кодировке,
+rem то есть плодить ровно ту проблему, от которой уходим.
+set "LNKB64=0JfQsNC/0YPRgdGC0LjRgtGMIFRhck5ldC5sbms="
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$n=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%LNKB64%')); $dirs=@([Environment]::GetFolderPath('Desktop'),'%TARNET_DIR%'); foreach($d in $dirs){ try { $p=Join-Path $d $n; $ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut($p); $s.TargetPath='%TARNET_DIR%\start.cmd'; $s.WorkingDirectory='%TARNET_DIR%'; $s.Description='Start TarNet worker'; $s.Save(); Write-Output $p; exit 0 } catch { } } exit 1"
+
+if errorlevel 1 (
+  echo   Ярлык создать не удалось. Запуск вручную: "%TARNET_DIR%\start.cmd"
+) else (
+  echo   Ярлык на рабочем столе: "Запустить TarNet"
+)
 
 echo [4/4] Запускаю воркер в фоне...
 start /min "" "%TARNET_DIR%\start.cmd"

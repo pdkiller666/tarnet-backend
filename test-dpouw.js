@@ -4612,6 +4612,101 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+  section('31. Установщик: ярлык на рабочем столе (Windows)');
+
+  /* Проверки идут по тому, что сервер реально отдаёт, а не по файлу шаблона:
+   * подстановка адреса — часть контракта, и шаблон с живым плейсхолдером
+   * означал бы, что человек получил неработающий файл. */
+  {
+    /* Тег обязан быть hex: runAddress приписывает его к адресу, а сервер
+     * проверяет 0x + ровно 40 hex. С 'i31' установщик отдавал 400, и это
+     * была ошибка теста, а не кода. */
+    const ADDR31 = runAddress('d31');
+    const bat = await apiAt(BASE, `/install/install.bat?addr=${ADDR31}`);
+    const batText = typeof bat.body === 'string' ? bat.body : '';
+
+    ok('31.1 установщик отдаётся', bat.status === 200 && batText.length > 1000,
+      { status: bat.status, bytes: batText.length });
+
+    ok('31.2 плейсхолдер адреса заменён на реальный',
+      !batText.includes('__TARNET_ADDR__') && batText.includes(ADDR31),
+      { hasPlaceholder: batText.includes('__TARNET_ADDR__') });
+
+    /* Файл в UTF-8, консоль Windows по умолчанию OEM — без chcp русский
+     * текст установщика превращается в мусор. */
+    ok('31.3 выставлена кодовая страница UTF-8', /chcp\s+65001/.test(batText));
+
+    ok('31.4 ярлык на рабочем столе создаётся', batText.includes('LNKB64'));
+
+    /* Ключевая проверка: цель ярлыка — start.cmd. Директива предлагала
+     * TargetPath = cmd.exe с worker.js в аргументах, но cmd не умеет
+     * исполнять .js — такой ярлык открывал бы окно с ошибкой. */
+    ok('31.5 цель ярлыка — start.cmd, а не cmd.exe с .js',
+      /TargetPath='%TARNET_DIR%\\start\.cmd'/.test(batText) &&
+      !/TargetPath='.*cmd\.exe'/.test(batText));
+
+    /* Имя ярлыка передаётся base64: .bat в UTF-8, а аргументы PowerShell
+     * приходят в OEM-кодировке консоли, и кириллица исказилась бы. */
+    const b64m = batText.match(/LNKB64=([A-Za-z0-9+/=]+)/);
+    const lnkName = b64m ? Buffer.from(b64m[1], 'base64').toString('utf8') : '';
+    ok('31.6 имя ярлыка декодируется в «Запустить TarNet.lnk»',
+      lnkName === 'Запустить TarNet.lnk', { got: lnkName });
+
+    /* В командной строке PowerShell не должно быть сырой кириллицы:
+     * именно она ломается при OEM-кодировке. Описание и имя — латиница/base64. */
+    const psLine = batText.split('\n').find(l => l.includes('CreateShortcut')) || '';
+    ok('31.7 в строке PowerShell нет сырой кириллицы',
+      psLine.length > 0 && !/[А-Яа-яЁё]/.test(psLine),
+      { found: (psLine.match(/[А-Яа-яЁё]+/g) || []).slice(0, 3) });
+
+    /* start.cmd должен существовать ДО ярлыка: иначе ярлык на первом клике
+     * указывал бы в пустоту. */
+    const iStart = batText.indexOf('> "%TARNET_DIR%\\start.cmd"');
+    const iLnk = batText.indexOf('LNKB64=');
+    ok('31.8 start.cmd создаётся раньше ярлыка',
+      iStart > 0 && iLnk > iStart, { iStart, iLnk });
+
+    /* Запасной путь: если ярлык не создался (политика, OneDrive-профиль),
+     * он кладётся в папку TarNet, и это видно человеку. */
+    ok('31.9 есть запасной путь при неудаче создания ярлыка',
+      batText.includes("'%TARNET_DIR%'") &&
+      batText.includes('Запуск вручную'));
+
+    /* Рабочий стол берётся через GetFolderPath: при OneDrive папка
+     * переадресована, и %USERPROFILE%\Desktop указал бы не туда.
+     *
+     * Проверяем только исполняемые строки: комментарий rem объясняет,
+     * ПОЧЕМУ %USERPROFILE% не годится, и наивная проверка «нет нигде»
+     * падала бы на собственной документации — что и случилось. */
+    const batCode = batText.split('\n')
+      .filter(l => !/^\s*rem(\s|$)/i.test(l))
+      .join('\n');
+    ok('31.10 рабочий стол через GetFolderPath, не %USERPROFILE%',
+      batCode.includes("GetFolderPath('Desktop')") &&
+      !/%USERPROFILE%\\Desktop/.test(batCode));
+
+    /* Без адреса установщик отдавать нельзя: воркер создаст свой кошелёк. */
+    const noAddr = await apiAt(BASE, '/install/install.bat');
+    ok('31.11 без адреса → 400, файл не отдаётся', noAddr.status === 400, noAddr.status);
+
+    /* macOS: паритет по смыслу — лаунчер для повторного запуска. */
+    const sh = await apiAt(BASE, `/install/install.command?addr=${ADDR31}`);
+    const shText = typeof sh.body === 'string' ? sh.body : '';
+    ok('31.12 .command тоже даёт лаунчер для повторного запуска',
+      sh.status === 200 && shText.includes('start.sh'), sh.status);
+
+    /* Текст в PWA: без него человек не узнает, что ярлык вообще появился. */
+    const pwa = await apiAt(BASE, '/app/');
+    const pwaText = typeof pwa.body === 'string' ? pwa.body : '';
+    ok('31.13 PWA сообщает про ярлык «Запустить TarNet»',
+      pwa.status === 200 && pwaText.includes('Запустить TarNet'),
+      { status: pwa.status, has: pwaText.includes('Запустить TarNet') });
+
+    /* И честно про запасной путь: обещать ярлык безусловно — ложь. */
+    ok('31.14 PWA называет ручной путь запуска',
+      pwaText.includes('start.cmd'), { has: pwaText.includes('start.cmd') });
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {
