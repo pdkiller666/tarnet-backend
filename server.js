@@ -471,6 +471,13 @@ db.exec(`CREATE TABLE IF NOT EXISTS tier6_receipts (
   clientAddress TEXT NOT NULL,
   usedAt TEXT NOT NULL
 )`);
+/* `callerAddress` (2.12.5) — кто ВЫЗВАЛ, отдельно от того, кто заплатил.
+ * Разделение обязательно: при оплате с кошелька владельца `clientAddress`
+ * хранит плательщика, и повторная отправка того же clientRequestId с
+ * устройства сравнивалась бы с чужим адресом — клиент получал бы 403
+ * RECEIPT_FOREIGN вместо честного 400 «чек уже погашен». У строк до 2.12.5
+ * колонка NULL: там вызвавший и плательщик совпадали. */
+ensureColumn('tier6_receipts', 'callerAddress', 'callerAddress TEXT');
 
 /* Журнал резервов: деньги, уже обещанные под вызов, но ещё не списанные.
  * `balances.reservedTar` показывает СУММУ, а тут лежит срок жизни каждой
@@ -1584,6 +1591,35 @@ function reserveTier6Fee(receiptId, clientAddress, amountTar, ttlMs) {
   return { ok: true, amountTar: amount, expiresAt };
 }
 
+/* ===== Tier 6: цепочка плательщиков =====
+ *
+ * Комиссию платит тот, у кого есть свободный остаток: сначала само
+ * устройство, затем владелец аккаунта из `device_links`. Почему так, а не
+ * «всегда владелец»: устройство — это ПК со своим кошельком, и пока на нём
+ * есть заработок, тратить его логичнее, чем деньги аккаунта.
+ *
+ * ПОЧЕМУ НЕ ЛЮБОЙ АДРЕС: владелец берётся ТОЛЬКО из существующей привязки.
+ * Иначе поле clientAddress стало бы способом списать с чужого кошелька —
+ * достаточно было бы вписать чужой адрес в запрос.
+ *
+ * Порядок владельцев — по дате привязки: при нескольких привязках одного
+ * устройства выбор не должен зависеть от порядка строк в индексе, иначе
+ * один и тот же запрос уходил бы то с одного кошелька, то с другого. */
+function tier6PayerChain(deviceAddress) {
+  const raw = String(deviceAddress || '').trim();
+  if (!raw) return [];
+  const deviceKey = raw.toLowerCase();
+  const owners = all(
+    `SELECT ownerAddress FROM device_links
+      WHERE lower(deviceAddress) = ?
+      ORDER BY createdAt ASC, ownerAddress ASC`, [deviceKey],
+  ).map((r) => String(r.ownerAddress).trim().toLowerCase())
+    .filter((a) => a && a !== deviceKey);
+  /* Адрес устройства оставляем как пришёл: баланс мог быть записан в его
+   * исходном регистре, и нормализация сломала бы поиск денег. */
+  return [raw, ...owners];
+}
+
 /* Успех: бронь превращается в расход. Сначала снимаем reservedTar, потом
  * debit — иначе debit увидит деньги, но они всё ещё обещаны. */
 function settleTier6Reserve(receiptId) {
@@ -1593,7 +1629,11 @@ function settleTier6Reserve(receiptId) {
   run(`UPDATE tier6_reserves SET state = 'settled' WHERE receiptId = ?`, [receiptId]);
   run(`UPDATE balances SET reservedTar = MAX(0, reservedTar - ?), updatedAt = ?
         WHERE address = ?`, [r.amountTar, new Date().toISOString(), r.clientAddress]);
-  return { ok: true, amountTar: Number(r.amountTar) };
+  /* clientAddress в ответе обязателен вызывающему: списывать надо с ТОГО,
+   * с кого забронировано. Раньше возвращалась только сумма, и смена
+   * плательщика (устройство → владелец) могла бы снять бронь с владельца,
+   * а debit выполнить по устройству. */
+  return { ok: true, amountTar: Number(r.amountTar), clientAddress: String(r.clientAddress) };
 }
 
 /* Неудача или TTL: деньги возвращаются в свободный остаток. Повторный
@@ -5010,7 +5050,14 @@ async function runInference(req, res) {
        * Клиент обязателен: комиссию платит он, а не протокол. Раньше без
        * баланса вызов помечался funded_by: emission — credit() без debit(),
        * то есть печать денег на каждом запросе. Теперь нет денег — нет
-       * вызова, и «эмиссии» в Tier 6 не существует как класса. */
+       * вызова, и «эмиссии» в Tier 6 не существует как класса.
+       *
+       * ПЛАТЕЛЬЩИК — не всегда тот, кто вызвал. PWA шлёт адрес УСТРОЙСТВА
+       * (случайный кошелёк из localStorage), а деньги обычно лежат на
+       * аккаунте TarNet ID. Поэтому при нехватке на устройстве комиссия
+       * уходит на владельца из `device_links` — иначе облачный контур
+       * недоступен на свежем ПК при полном балансе аккаунта (ровно так и
+       * возникал 402 INSUFFICIENT_FUNDS при 0.009995 TAR у владельца). */
       if (!tier6Client) {
         return res.status(402).json({
           error: 'CLIENT_REQUIRED',
@@ -5026,9 +5073,14 @@ async function runInference(req, res) {
        * включается (списать дважды по одному запросу нечего). */
       const idemKey = String(body.clientRequestId || req.get('x-request-id') || '').trim();
       const receiptId = idemKey || crypto.randomUUID();
-      const prevUse = get('SELECT clientAddress FROM tier6_receipts WHERE receiptId = ?', [receiptId]);
+      const prevUse = get('SELECT clientAddress, callerAddress FROM tier6_receipts WHERE receiptId = ?', [receiptId]);
       if (prevUse) {
-        const sameClient = String(prevUse.clientAddress) === String(tier6Client);
+        /* Сравниваем с ВЫЗВАВШИМ, а не с плательщиком: при оплате с кошелька
+         * владельца clientAddress — это владелец, и проверка «тот же клиент»
+         * по нему отдавала бы устройству 403 на его же повтор. У старых строк
+         * callerAddress NULL — там роли совпадали, берём clientAddress. */
+        const prevCaller = String(prevUse.callerAddress || prevUse.clientAddress);
+        const sameClient = prevCaller === String(tier6Client);
         return res.status(sameClient ? 400 : 403).json({
           error: sameClient ? 'RECEIPT_ALREADY_USED' : 'RECEIPT_FOREIGN',
           note: sameClient
@@ -5037,16 +5089,50 @@ async function runInference(req, res) {
           receipt_id: receiptId, tier: 6,
         });
       }
-      const reserve = reserveTier6Fee(receiptId, tier6Client, TIER6.ORCHESTRATION_FEE_TAR);
+      /* Платёж пробуем по цепочке: устройство → его владельцы из
+       * `device_links`. Бронь ставится на ПЕРВОМ, у кого хватает свободного
+       * остатка, и именно он списывается на settle. Так пустое устройство
+       * при полном владельце проходит ворота денег, а «все пусты» — по-прежнему
+       * 402, причём в ответе видно, у кого сколько было. */
+      const payerChain = tier6PayerChain(tier6Client);
+      let payer = null;
+      let reserve = { ok: false, reason: 'insufficient_balance' };
+      const payerAttempts = [];
+      for (const candidate of payerChain) {
+        const attempt = reserveTier6Fee(receiptId, candidate, TIER6.ORCHESTRATION_FEE_TAR);
+        if (attempt.ok) {
+          payer = candidate;
+          reserve = attempt;
+          break;
+        }
+        /* Чек уже забронирован (ретрай того же запроса) — дальше пробовать
+         * бессмысленно: это не нехватка денег, а повтор. */
+        if (attempt.reason === 'duplicate_receipt') { reserve = attempt; break; }
+        payerAttempts.push({
+          address: candidate,
+          available_tar: attempt.availableTar,
+          needed_tar: attempt.neededTar,
+        });
+        reserve = attempt;
+      }
       if (!reserve.ok) {
         return res.status(402).json({
           error: reserve.reason === 'insufficient_balance' ? 'INSUFFICIENT_FUNDS' : 'RESERVE_FAILED',
-          note: 'Недостаточно свободного баланса для комиссии Tier 6.',
-          needed_tar: reserve.neededTar,
+          note: payerAttempts.length > 1
+            ? 'Недостаточно свободного баланса ни у устройства, ни у владельца аккаунта для комиссии Tier 6.'
+            : 'Недостаточно свободного баланса для комиссии Tier 6.',
+          needed_tar: reserve.neededTar ?? TIER6.ORCHESTRATION_FEE_TAR,
           available_tar: reserve.availableTar,
+          /* Полная картина, а не первый отказ: иначе видно только устройство
+           * и остаётся неясным, смотрел ли сервер на владельца вообще. */
+          checked_payers: payerAttempts,
           modelId, tier: 6,
         });
       }
+      /* Кто заплатил: 'device' — сам вызвавший, 'owner' — владелец из привязки.
+       * Различие нужно и в ответе, и в журнале: «списали с аккаунта» — факт,
+       * который человек должен видеть, а не догадываться о нём. */
+      const payerIsOwner = payer !== tier6Client;
       /* Любой выход ниже без списания обязан снять бронь, иначе деньги
        * висят до TTL и клиент видит занятый баланс без причины. */
       const dropReserve = (why) => releaseTier6Reserve(receiptId, why);
@@ -5074,8 +5160,14 @@ async function runInference(req, res) {
           return res.status(401).json({
             error: e.code,
             note: 'Проверьте ваш API-ключ провайдера',
+            /* details — причина от адаптера: какой провайдер отказал и
+             * какой формат ключа он ждёт. Без этого поля клиент видел
+             * только PROVIDER_AUTH_FAILED и не мог понять, что вставил
+             * ключ не того провайдера. */
+            details: e.details || e.message,
             provider,
             modelId,
+            byok_required: e.code === 'AUTH_MISSING_KEY' || undefined,
             tier: 6,
           });
         }
@@ -5144,10 +5236,15 @@ async function runInference(req, res) {
           tx(() => {
             const settled = settleTier6Reserve(callId);
             if (!settled.ok) throw new Error('RESERVE_NOT_HELD');
-            const funding = debit(tier6Client, fee, 'spend', callId, TREASURY_ADDRESS);
+            /* Списываем с того, с кого забронировано, а не с вызвавшего:
+             * при платеже владельцем это разные адреса. */
+            const funding = debit(payer, fee, 'spend', callId, TREASURY_ADDRESS);
             if (!funding.charged) throw new Error('INSUFFICIENT_FUNDS_AT_SETTLE');
-            run(`INSERT INTO tier6_receipts (receiptId, clientAddress, usedAt) VALUES (?, ?, ?)`,
-              [callId, tier6Client, new Date().toISOString()]);
+            /* clientAddress — ФАКТИЧЕСКИЙ плательщик; callerAddress — кто
+             * вызвал. По этой паре видно и списание, и владельца запроса. */
+            run(`INSERT INTO tier6_receipts (receiptId, clientAddress, callerAddress, usedAt)
+                 VALUES (?, ?, ?, ?)`,
+              [callId, payer, tier6Client, new Date().toISOString()]);
           });
         } catch (e) {
           dropReserve('settle_failed');
@@ -5190,14 +5287,19 @@ async function runInference(req, res) {
                   blockRewardTar, cashbackTar, burnTar, treasuryTar, fundedBy,
                   trainingAllowed, createdAt)
                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
-            [callId, tier6Client, apiResult.provider, modelId,
+            /* clientAddress — ФАКТИЧЕСКИЙ плательщик, а не вызвавший: по этому
+             * полю потом считается, с каких кошельков уходили деньги. */
+            [callId, payer, apiResult.provider, modelId,
               apiResult.usageTokens, fee, cashback, burnTar, treasuryTar,
               fundedBy, trainingAllowed ? 1 : 0, new Date().toISOString()]);
-          if (cashback > 0 && tier6Client) {
-            credit(tier6Client, cashback, 'cashback', callId, TREASURY_ADDRESS);
+          /* Кэшбэк возвращается плательщику: если комиссию заплатил владелец
+           * аккаунта, возврат на устройство был бы подарком устройству из
+           * денег владельца. */
+          if (cashback > 0 && payer) {
+            credit(payer, cashback, 'cashback', callId, TREASURY_ADDRESS);
           }
           if (treasuryTar > 0) credit(TREASURY_ADDRESS, treasuryTar, 'treasury', callId, TREASURY_ADDRESS);
-          if (burnTar > 0) recordBurn(burnTar, callId, tier6Client || TREASURY_ADDRESS);
+          if (burnTar > 0) recordBurn(burnTar, callId, payer || TREASURY_ADDRESS);
         });
 
         return res.status(200).json({
@@ -5210,6 +5312,11 @@ async function runInference(req, res) {
           tokens_used: apiResult.usageTokens,
           tokens_source: apiResult.usageSource,
           funded_by: fundedBy,
+          /* Кто фактически заплатил. Клиент шлёт адрес устройства, но деньги
+           * могли уйти с кошелька владельца из `device_links`; без этого поля
+           * пользователь видел бы списание «из ниоткуда» на балансе аккаунта. */
+          paid_by: payerIsOwner ? 'owner' : 'device',
+          payer_address: payer,
           economics: {
             fee_gross_tar: fee,
             cashback_tar: cashback,

@@ -4920,6 +4920,286 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       Number(cacheV) >= 11, cacheV);
   }
 
+  /* ===== 33. Ключ и модель должны быть от одного провайдера =====
+   *
+   * История дефекта. Секция 32 научила список моделей зависеть от НАЛИЧИЯ
+   * ключа — и этого оказалось мало. С ключом OpenRouter человек видел в
+   * выпадающем списке openai/gpt-4o: фильтр проверял hasKey, но не
+   * спрашивал, ЧЕЙ ключ. Выбор такой строки гарантировал 401, потому что
+   * адаптер шёл на api.openai.com с ключом OpenRouter. Показать заведомо
+   * нерабочую модель хуже, чем не показать её вовсе.
+   *
+   * Вторая половина проблемы — немая ошибка. Ответ был
+   * {"error":"PROVIDER_AUTH_FAILED"}, и человек искал причину в балансе
+   * провайдера, лимитах и сети. Теперь сервер присылает details с именем
+   * провайдера и ожидаемым форматом ключа, а клиент показывает его в чате.
+   *
+   * Третье: проверка формата при сохранении. Ключ всё равно сохраняется —
+   * формат лишь эвристика, и запрет на сохранение незнакомого префикса
+   * сделал бы нового провайдера недоступным. Предупреждаем, но не мешаем.
+   */
+  console.log('\n33. Ключ и модель: совпадение провайдера, причина 401');
+  {
+    const appRes = await api('/app/app.js');
+    const appSrc = typeof appRes.body === 'string' ? appRes.body : '';
+    const htmlRes = await api('/app/index.html');
+    const htmlSrc = typeof htmlRes.body === 'string' ? htmlRes.body : '';
+    const cssRes = await api('/app/styles.css');
+    const cssSrc = typeof cssRes.body === 'string' ? cssRes.body : '';
+
+    /* 33.1 Провайдер ключа определяется по префиксу, и OpenRouter обязан
+     * проверяться ДО OpenAI: 'sk-or-v1-…' начинается на 'sk-', поэтому
+     * обратный порядок отнёс бы ключ OpenRouter к OpenAI — ровно та
+     * путаница, из-за которой всё и затевалось. */
+    const kpStart = appSrc.indexOf('function keyProvider');
+    const kpBody = kpStart < 0 ? '' : appSrc.slice(kpStart, kpStart + 700);
+    ok('33.1 keyProvider() определяет провайдера по префиксу ключа',
+      /function keyProvider/.test(appSrc) && /sk-or-v1-/.test(kpBody),
+      kpBody ? 'есть' : 'keyProvider не найден');
+    const orAt = kpBody.indexOf('sk-or-v1-');
+    const oaAt = kpBody.indexOf("'sk-'");
+    ok('33.1 OpenRouter проверяется раньше OpenAI (иначе sk-or-v1 → openai)',
+      orAt >= 0 && oaAt > orAt, { skOrV1: orAt, skPlain: oaAt });
+
+    /* 33.2 ГЛАВНЫЙ РЕГРЕСС. Список облачных фильтруется по провайдеру
+     * ключа, а не только по его наличию. */
+    const lmStart = appSrc.indexOf('async function loadModels');
+    const lmBody = lmStart < 0 ? '' : appSrc.slice(lmStart, lmStart + 3200);
+    ok('33.2 loadModels фильтрует облачные по провайдеру ключа',
+      /keyProvider\(\)/.test(lmBody) && /m\.provider\s*===\s*keyProv/.test(lmBody),
+      lmBody ? 'фильтр по keyProv есть' : 'loadModels не найден');
+
+    /* 33.3 Ключ неизвестного формата НЕ прячет облачные модели: провайдера
+     * по нему не определить, и угадывать за пользователя нельзя. */
+    ok('33.3 нераспознанный ключ не отсекает все облачные модели',
+      /\|\|\s*!keyProv/.test(lmBody) || /!keyProv\s*\|\|/.test(lmBody),
+      'условие «keyProv неизвестен → не фильтровать»');
+
+    /* 33.4 Сервер обязан назвать провайдера и формат ключа. Проверяем на
+     * живом стенде: фейковый ключ OpenRouter для модели OpenRouter даёт
+     * 401 с details, где есть имя провайдера и ожидаемый префикс.
+     * Допустим и 402: у синтетического адреса нет баланса, и тогда ворота
+     * денег закрываются раньше сети — это не дефект. */
+    const authFail = await api('/inference', 'POST', {
+      prompt: 'ping',
+      modelId: 'openrouter/qwen3-coder',
+      tier: '6',
+      clientAddress: `0x${'33'.repeat(20)}`,
+    }, { 'X-Provider-Key': 'sk-or-v1-not-a-real-key' });
+    const details = authFail.body?.details || '';
+    if (authFail.status === 401) {
+      ok('33.4 401 содержит details с именем провайдера',
+        /OpenRouter/i.test(details), details.slice(0, 120));
+      ok('33.4 details называет ожидаемый формат ключа',
+        /sk-or-v1-/.test(details), details.slice(0, 160));
+    } else {
+      ok('33.4 401 с details (ворота денег закрылись раньше сети)',
+        authFail.status === 402,
+        { status: authFail.status, error: authFail.body?.error });
+    }
+
+    /* 33.5 Клиент показывает details в чате, а не глотает его. Без этого
+     * серверная работа над текстом ошибки невидима пользователю. */
+    ok('33.5 чат показывает details из ответа сервера',
+      /data\.details/.test(appSrc) && /why\s*\?/.test(appSrc),
+      /data\.details/.test(appSrc) ? 'есть' : 'details не читается клиентом');
+
+    /* 33.6 Проверка формата при сохранении ключа: предупреждает, но не
+     * блокирует — ключ сохраняется в любом случае. */
+    ok('33.6 при сохранении ключа есть сверка с выбранной моделью',
+      /function checkKeyMatchesModel/.test(appSrc)
+      && /checkKeyMatchesModel\(v\)/.test(appSrc),
+      /checkKeyMatchesModel/.test(appSrc) ? 'есть и вызвана' : 'нет');
+    const warnAt = appSrc.indexOf('checkKeyMatchesModel(v)');
+    const setAt = appSrc.indexOf('localStorage.setItem(LS_BYOK, v)');
+    ok('33.6 предупреждение не блокирует сохранение ключа',
+      warnAt >= 0 && setAt > warnAt, { check: warnAt, save: setAt });
+
+    /* 33.7 В разметке есть место для предупреждения, в стилях — его вид.
+     * Иначе showByokWarn() пишет в никуда. */
+    ok('33.7 в разметке есть элемент byokWarn',
+      /id="byokWarn"/.test(htmlSrc), 'byokWarn');
+    ok('33.7 есть стиль .byok-warn и .error-bubble',
+      /\.byok-warn/.test(cssSrc) && /\.error-bubble/.test(cssSrc),
+      { byokWarn: /\.byok-warn/.test(cssSrc), errorBubble: /\.error-bubble/.test(cssSrc) });
+
+    /* 33.8 Кэш обязан быть выше 11: правки лежат в app.js, styles.css и
+     * index.html — то есть в кэшируемой оболочке. */
+    const swRes33 = await api('/app/sw.js');
+    const swSrc33 = typeof swRes33.body === 'string' ? swRes33.body : '';
+    const cacheV33 = (swSrc33.match(/const CACHE = 'tarnet-app-v(\d+)'/) || [])[1];
+    ok('33.8 кэш не ниже v12 (фильтр по провайдеру дойдёт до клиента)',
+      Number(cacheV33) >= 12, cacheV33);
+  }
+
+  /* ===== 34. Tier 6: плательщик — устройство или владелец аккаунта =====
+   *
+   * История дефекта. PWA шлёт `clientAddress: ADDR`, где ADDR — случайный
+   * кошелёк устройства из localStorage. Деньги же лежат на аккаунте TarNet ID,
+   * к которому устройство привязано через `device_links`. Сервер смотрел
+   * только на устройство и отдавал 402 INSUFFICIENT_FUNDS при 0.009995 TAR
+   * у владельца и 0.000163 TAR у устройства — то есть платный контур
+   * выглядел сломанным при живых деньгах на аккаунте.
+   *
+   * Проверяются два случая из задачи и два инварианта:
+   *   1. устройство пусто + владелец с деньгами → вызов проходит ворота;
+   *   2. устройство пусто + владелец пуст       → 402;
+   *   3. списание и кэшбэк идут по ФАКТИЧЕСКОМУ плательщику;
+   *   4. чужой кошелёк не становится плательщиком: владелец берётся только
+   *      из существующей привязки `device_links`.
+   */
+  console.log('\n34. Tier 6: комиссия — устройство или владелец из device_links');
+  {
+    const http = require('http');
+    const { DatabaseSync } = require('node:sqlite');
+    const provPort = await freePort();
+    const fakeProvider = http.createServer((req, res) => {
+      let raw = '';
+      req.on('data', (d) => { raw += d; });
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          model: 'qwen3-coder',
+          choices: [{ message: { content: 'ответ владельца' } }],
+          usage: { total_tokens: 21 },
+        }));
+      });
+    });
+    await new Promise((r) => fakeProvider.listen(provPort, '127.0.0.1', r));
+
+    const s34 = await spawnServer({
+      TARNET_TIER6_ENDPOINT: `http://127.0.0.1:${provPort}/v1/chat/completions`,
+    });
+    try {
+      /* Адреса только из hex: суффикс RUN содержит hex, но 'dw' в префиксе
+       * уже не hex — адрес не прошёл бы проверку формата, если бы она тут
+       * применялась. Оставляем чистый hex, чтобы тест падал на логике,
+       * а не на валидации. */
+      const DEV = '0x' + (RUN + 'de').padEnd(40, '0').slice(0, 40);
+      const OWN = '0x' + (RUN + 'a0').padEnd(40, '0').slice(0, 40);
+      const BOTH_EMPTY_DEV = '0x' + (RUN + 'd1').padEnd(40, '0').slice(0, 40);
+      const BOTH_EMPTY_OWN = '0x' + (RUN + 'a1').padEnd(40, '0').slice(0, 40);
+      const STRANGER = '0x' + (RUN + 'cf').padEnd(40, '0').slice(0, 40);
+
+      const dbWrite = (fn) => {
+        const sdb = new DatabaseSync(path.join(s34.dir, 'test.db'));
+        sdb.exec('PRAGMA busy_timeout = 3000;');
+        try { fn(sdb); } finally { sdb.close(); }
+      };
+      const seed = (addr, tar) => dbWrite((sdb) => sdb
+        .prepare(`INSERT INTO balances (address, balanceTar, stakedTar, reservedTar, updatedAt)
+                  VALUES (?, ?, 0, 0, ?)
+                  ON CONFLICT(address) DO UPDATE
+                    SET balanceTar = excluded.balanceTar`)
+        .run(addr, tar, new Date().toISOString()));
+      const link = (owner, device) => dbWrite((sdb) => sdb
+        .prepare(`INSERT OR REPLACE INTO device_links (ownerAddress, deviceAddress, createdAt)
+                  VALUES (?, ?, ?)`)
+        .run(owner, device, new Date().toISOString()));
+      const money = (addr) => dbWrite((sdb) => {
+        const row = sdb.prepare('SELECT balanceTar, reservedTar FROM balances WHERE address = ?').get(addr);
+        return { balanceTar: Number(row?.balanceTar ?? 0), reservedTar: Number(row?.reservedTar ?? 0) };
+      });
+      const callT6 = (addr, extra = {}) => apiAt(s34.base, '/inference', 'POST', {
+        prompt: 'кто платит',
+        modelId: 'openrouter/qwen3-coder',
+        clientAddress: addr,
+        tier: 6,
+        ...extra,
+      }, { 'X-Provider-Key': '***' });
+
+      /* --- 34.1 устройство пусто, владелец с деньгами → ворота пройдены --- */
+      link(OWN, DEV);
+      seed(OWN, 0.009995);
+      const byOwner = await callT6(DEV);
+      ok('34.1 пустое устройство + владелец с балансом → 200, не 402',
+        byOwner.status === 200,
+        { status: byOwner.status, error: byOwner.body?.error,
+          checked: byOwner.body?.checked_payers });
+      ok('34.1 в ответе видно, что заплатил владелец',
+        byOwner.body?.paid_by === 'owner' && byOwner.body?.payer_address === OWN,
+        { paid_by: byOwner.body?.paid_by, payer: byOwner.body?.payer_address });
+      ok('34.1 инвариант вызова сохранён (cashback + burn + treasury === fee)',
+        Number(byOwner.body?.economics?.delta) === 0, byOwner.body?.economics?.delta);
+
+      /* Деньги: нетто −0.0004 у владельца, у устройства — ноль. Второе не
+       * менее важно первого: иначе списание ушло бы не с того кошелька. */
+      const ownerAfter = money(OWN);
+      const devAfter = money(DEV);
+      ok('34.1 списано с владельца ровно 0.0004 TAR нетто',
+        Math.abs((0.009995 - ownerAfter.balanceTar) - 0.0004) < 1e-9, ownerAfter.balanceTar);
+      ok('34.1 у устройства баланс не изменился',
+        devAfter.balanceTar === 0 && devAfter.reservedTar === 0, devAfter);
+      ok('34.1 резерв владельца освобождён',
+        ownerAfter.reservedTar === 0, ownerAfter.reservedTar);
+
+      /* --- 34.2 фактический плательщик записан в журнал --- */
+      const receipts34 = dbWrite((sdb) => sdb
+        .prepare(`SELECT clientAddress, callerAddress FROM tier6_receipts
+                  WHERE callerAddress = ? ORDER BY usedAt DESC LIMIT 1`).get(DEV));
+      ok('34.2 чек помнит и плательщика, и вызвавшего',
+        receipts34?.clientAddress === OWN && receipts34?.callerAddress === DEV,
+        receipts34 || 'чек не найден');
+
+      const lastCall = dbWrite((sdb) => sdb
+        .prepare(`SELECT clientAddress, fundedBy FROM tier6_calls
+                  ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get());
+      ok('34.2 tier6_calls.clientAddress = адрес владельца',
+        lastCall?.clientAddress === OWN, lastCall);
+
+      /* --- 34.3 повтор того же чека с устройства не даёт 403 -----------
+       * Пока чек хранил только плательщика, повтор с устройства сравнивался
+       * с адресом владельца и отдавал RECEIPT_FOREIGN вместо «чек уже
+       * погашен». Для клиента это выглядит как «ваш чек чужой». */
+      const idem = 'owner-pay-' + RUN;
+      const firstIdem = await callT6(DEV, { clientRequestId: idem });
+      const dupIdem = await callT6(DEV, { clientRequestId: idem });
+      ok('34.3 повтор с устройства → 400 RECEIPT_ALREADY_USED, не 403',
+        firstIdem.status === 200 && dupIdem.status === 400
+          && dupIdem.body?.error === 'RECEIPT_ALREADY_USED',
+        { first: firstIdem.status, dup: dupIdem.status, error: dupIdem.body?.error });
+
+      /* --- 34.4 оба пусты → 402 --------------------------------------- */
+      link(BOTH_EMPTY_OWN, BOTH_EMPTY_DEV);
+      const bothEmpty = await callT6(BOTH_EMPTY_DEV);
+      ok('34.4 пустое устройство + пустой владелец → 402 INSUFFICIENT_FUNDS',
+        bothEmpty.status === 402 && bothEmpty.body?.error === 'INSUFFICIENT_FUNDS',
+        { status: bothEmpty.status, error: bothEmpty.body?.error });
+      /* В ответе должны быть ОБА кандидата: иначе непонятно, смотрел ли
+       * сервер на владельца вообще. */
+      const checked = bothEmpty.body?.checked_payers || [];
+      ok('34.4 402 перечисляет проверенных плательщиков (устройство и владелец)',
+        checked.length === 2
+          && checked.some((c) => c.address === BOTH_EMPTY_DEV)
+          && checked.some((c) => c.address === BOTH_EMPTY_OWN),
+        checked);
+
+      /* --- 34.5 чужой кошелёк плательщиком не становится ----------------
+       * Ключевой инвариант: списать можно только с того, кто привязан.
+       * STRANGER в device_links не состоит и денег у него нет — если бы
+       * сервер брал владельца не из привязки, а из запроса, он бы нашёл
+       * баланс у OWN и списал с него по чужому clientAddress. */
+      seed(STRANGER, 0);
+      const stranger = await callT6(STRANGER);
+      ok('34.5 непривязанное устройство с нулём → 402, чужой кошелёк не тронут',
+        stranger.status === 402 && stranger.body?.error === 'INSUFFICIENT_FUNDS',
+        { status: stranger.status, error: stranger.body?.error });
+      const ownerUntouched = money(OWN);
+      ok('34.5 баланс владельца от чужого запроса не изменился',
+        Math.abs(ownerUntouched.balanceTar - ownerAfter.balanceTar) < 1e-12,
+        { before: ownerAfter.balanceTar, after: ownerUntouched.balanceTar });
+
+      /* --- 34.6 экономика контура целиком ------------------------------ */
+      const cons34 = (await apiAt(s34.base, '/health')).body?.conservationTier6;
+      ok('34.6 инвариант Tier 6 держится после платежей владельцем',
+        cons34?.holds === true && Number(cons34?.delta) === 0,
+        { delta: cons34?.delta, holds: cons34?.holds, bad: cons34?.inconsistentRows });
+    } finally {
+      s34.stop();
+      await new Promise((r) => fakeProvider.close(r));
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

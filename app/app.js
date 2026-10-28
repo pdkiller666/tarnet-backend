@@ -287,9 +287,21 @@ async function loadModels() {
     const data = await call('/models');
     const all = (data && Array.isArray(data.models) ? data.models : []);
     const local = all.filter((m) => m.provider === 'local' && Number(m.tier) <= 3);
-    /* Облачные — только по ключу: без него сервер такой выбор отклонит. */
+    /* Облачные — только по ключу: без него сервер такой выбор отклонит.
+     *
+     * И только те, чей провайдер совпадает с провайдером СОХРАНЁННОГО
+     * ключа. Раньше условием было одно наличие ключа, и человек с ключом
+     * OpenRouter видел в списке openai/gpt-4o. Выбор такой строки гарантировал
+     * 401: адаптер шёл на api.openai.com с ключом OpenRouter. Показать
+     * модель, которая заведомо не сработает, — хуже, чем не показать её.
+     *
+     * Ключ неизвестного формата облачных не прячет: провайдера по нему не
+     * определить, и угадывать за пользователя нельзя. Такой ключ либо
+     * сработает, либо получит 401 с внятной причиной в details. */
+    const keyProv = keyProvider();
     const cloud = hasKey
-      ? all.filter((m) => Number(m.tier) === 6 && m.isAvailable !== false)
+      ? all.filter((m) => Number(m.tier) === 6 && m.isAvailable !== false
+          && (!keyProv || m.provider === keyProv))
       : [];
 
     MODEL_INFO.clear();
@@ -306,11 +318,19 @@ async function loadModels() {
     }
     if (cloud.length) {
       const g = document.createElement('optgroup');
-      g.label = 'Облачные — ваш ключ, промпт уходит провайдеру';
+      /* Провайдер в подписи группы, а не только в строке модели: человек
+       * должен видеть, чьим ключом платит, до отправки промпта. */
+      const label = keyProv ? PROVIDER_TITLE[keyProv] || keyProv : 'облако';
+      g.label = `Облачные (${label}) — ваш ключ, промпт уходит провайдеру`;
       for (const m of cloud) g.appendChild(modelOption(m, true));
       sel.appendChild(g);
     }
-    if (!local.length && !cloud.length) {
+    /* Ключ есть, но моделей под него в каталоге нет — это не «нет моделей»,
+     * а несовпадение ключа и каталога. Молчаливое «нет доступных моделей»
+     * отправило бы человека искать проблему в сети. */
+    if (!local.length && !cloud.length && hasKey && keyProv) {
+      sel.innerHTML = `<option value="">нет облачных моделей для ключа ${PROVIDER_TITLE[keyProv] || keyProv}</option>`;
+    } else if (!local.length && !cloud.length) {
       sel.innerHTML = '<option value="">нет доступных моделей</option>';
     }
     /* Прежний выбор возвращаем, если он ещё существует: перерисовка после
@@ -798,7 +818,15 @@ async function sendPrompt(prompt, opts = {}) {
     }
   } catch (e) {
     const b = thinking.querySelector('.bubble');
-    if (b) b.textContent = `Ошибка: ${e.message}`;
+    if (b) {
+      /* details с сервера — человеческая причина, а не код. Голое
+       * «PROVIDER_AUTH_FAILED» не говорит, ЧТО не так с ключом: человек
+       * идёт проверять баланс провайдера, лимиты и сеть. Причина от
+       * адаптера называет провайдера и ожидаемый формат ключа. */
+      const why = e.data && typeof e.data.details === 'string' ? e.data.details : '';
+      b.textContent = why ? `Ошибка: ${e.message}\n${why}` : `Ошибка: ${e.message}`;
+      b.classList.add('error-bubble');
+    }
   } finally {
     chatBusy = false;
     btn.disabled = false;
@@ -945,6 +973,33 @@ function byokKey() {
   } catch (_e) { return ''; }
 }
 
+/* Провайдер по префиксу ключа. Список моделей фильтруется по нему, чтобы
+ * человек с ключом OpenRouter не выбирал gpt-4o и не получал 401.
+ *
+ * Порядок проверок важен: 'sk-or-v1-' начинается на 'sk-', поэтому
+ * OpenRouter проверяется ДО OpenAI. Обратный порядок отнёс бы ключ
+ * OpenRouter к OpenAI — ровно та путаница, из-за которой всё и затевалось.
+ *
+ * null означает «формат неизвестен», и это не ошибка: у провайдера может
+ * появиться новый префикс. Такой ключ не прячет облачные модели — угадывать
+ * за пользователя нельзя, а 401 теперь приходит с причиной в details. */
+function keyProvider() {
+  const k = byokKey();
+  if (!k) return null;
+  if (k.startsWith('sk-or-v1-')) return 'openrouter';
+  if (k.startsWith('gsk_')) return 'groq';
+  if (k.startsWith('AIza')) return 'gemini';
+  if (k.startsWith('sk-')) return 'openai';
+  return null;
+}
+
+const PROVIDER_TITLE = {
+  openrouter: 'OpenRouter',
+  openai: 'OpenAI',
+  groq: 'Groq',
+  gemini: 'Google Gemini',
+};
+
 /* Маска вместо ключа: показывать сохранённый ключ целиком на экране
  * незачем — достаточно убедиться, что он есть и какой он длины. */
 function byokMask(k) {
@@ -976,18 +1031,80 @@ function addCashback(tar) {
   renderByokState();
 }
 
+/* Ожидаемый префикс — только для текста подсказки. Объявлен ДО функции,
+ * которая его читает: обратный порядок работал бы лишь потому, что вызов
+ * идёт из обработчика события, и держался бы на невидимой зависимости. */
+const KEY_PREFIX_HINT = {
+  openrouter: 'sk-or-v1-',
+  openai: 'sk-',
+  groq: 'gsk_',
+  gemini: 'AIza',
+};
+
+/* Проверка формата ключа против выбранной модели. Не блокирует сохранение:
+ * формат — эвристика, а провайдер может завести новый префикс, и запрет
+ * на сохранение незнакомого ключа сделал бы новинку недоступной. Задача
+ * проверки — сказать ДО запроса, что ключ и модель из разных миров, чтобы
+ * человек не искал причину 401 в тарифах и сети. */
+function checkKeyMatchesModel(rawKey) {
+  const sel = $('model');
+  const modelId = sel ? sel.value : '';
+  const info = modelId ? MODEL_INFO.get(modelId) : null;
+  if (!info || info.tier !== 6) return '';
+
+  const k = String(rawKey || '').trim();
+  if (!k) return '';
+  /* Провайдер по ключу — той же логикой, что и в keyProvider(), но для
+   * ещё не сохранённого значения: keyProvider() читает localStorage. */
+  const keyProv = k.startsWith('sk-or-v1-') ? 'openrouter'
+    : (k.startsWith('gsk_') ? 'groq'
+    : (k.startsWith('AIza') ? 'gemini'
+    : (k.startsWith('sk-') ? 'openai' : null)));
+
+  const want = info.provider;
+  /* Незнакомый формат не сравниваем: сравнение с null дало бы ложное
+   * «ключ не подойдёт» на любом новом префиксе провайдера. */
+  if (!keyProv) {
+    return `Формат ключа не распознан. Для модели ${modelId} ожидается ключ `
+      + `${PROVIDER_TITLE[want] || want} начиная с «${KEY_PREFIX_HINT[want] || '…'}».`;
+  }
+  if (keyProv === want) return '';
+
+  return `Выбранная модель — ${PROVIDER_TITLE[want] || want}, а ключ похож на `
+    + `${PROVIDER_TITLE[keyProv] || keyProv}. Ключ не подойдёт: провайдер ответит 401. `
+    + `Выберите модель ${PROVIDER_TITLE[keyProv] || keyProv} или вставьте ключ `
+    + `${PROVIDER_TITLE[want] || want}.`;
+}
+
+function showByokWarn(text) {
+  const el = $('byokWarn');
+  if (!el) return;
+  if (text) {
+    el.textContent = `⚠️ ${text}`;
+    el.hidden = false;
+  } else {
+    el.textContent = '';
+    el.hidden = true;
+  }
+}
+
 $('byokSave')?.addEventListener('click', () => {
   const v = String($('byokKey')?.value || '').trim();
   if (!v) {
     $('byokState').textContent = 'введите ключ';
     return;
   }
+  /* Предупреждение считаем ДО сохранения, но ключ всё равно сохраняем:
+   * человек вправе поменять модель после, и терять вставленный ключ из-за
+   * догадки о его формате нельзя. */
+  const mismatch = checkKeyMatchesModel(v);
   try { localStorage.setItem(LS_BYOK, v); } catch (_e) {
     $('byokState').textContent = 'браузер не дал сохранить ключ';
     return;
   }
   if ($('byokKey')) $('byokKey').value = '';
   renderByokState();
+  showByokWarn(mismatch);
   /* Список моделей зависит от наличия ключа: облачные появляются сразу
    * после сохранения, без перезагрузки страницы. */
   loadModels();
@@ -1000,6 +1117,7 @@ $('byokClear')?.addEventListener('click', () => {
   } catch (_e) { /* нечего чистить */ }
   if ($('byokKey')) $('byokKey').value = '';
   if ($('byokKey')) $('byokKey').placeholder = 'sk-...';
+  showByokWarn('');
   renderByokState();
   /* Ключ убран — облачные модели обязаны исчезнуть из списка: иначе выбор
    * останется, а запрос вернёт 401. */

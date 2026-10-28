@@ -206,6 +206,40 @@ function tier6Error(message, { status = 502, code = 'PROVIDER_ERROR' } = {}) {
   return err;
 }
 
+/* Ожидаемый формат ключа по провайдеру. Нужен ТОЛЬКО для текста ошибки:
+ * человек, вставивший ключ OpenAI в модель OpenRouter, получает 401 от
+ * провайдера без единого слова о том, что именно не так, и ищет причину
+ * в тарифах, лимитах и сети. Ключ в подсказку не попадает ни одним
+ * символом — это деньги владельца, а не диагностическая строка. */
+const KEY_PREFIX = {
+  openrouter: 'sk-or-v1-',
+  openai: 'sk-',
+  groq: 'gsk_',
+  gemini: 'AIza',
+};
+
+const PROVIDER_TITLE = {
+  openrouter: 'OpenRouter',
+  openai: 'OpenAI',
+  groq: 'Groq',
+  gemini: 'Google Gemini',
+};
+
+/* Причина отказа 401/403 человеческим языком. Две разные ситуации, которые
+ * провайдер различает только кодом: ключ не от него и ключ просрочен или
+ * отозван. Разделять их по телу ответа нельзя — формат тела у каждого свой
+ * и меняется без предупреждения. */
+function authHint(provider, httpStatus) {
+  const name = PROVIDER_TITLE[provider] || provider;
+  const want = KEY_PREFIX[provider];
+  const verb = httpStatus === 403
+    ? 'отклонил ключ (403)'
+    : 'не принял ключ (401)';
+  if (!want) return `${name} ${verb}. Проверьте API-ключ в настройках PWA.`;
+  return `${name} ${verb}. Ключ должен быть от ${name} и начинаться на «${want}». `
+    + 'Если ключ другого провайдера — выберите модель этого провайдера.';
+}
+
 /* Один вызов одного провайдера ключом пользователя. Бросает ошибку с
  * .status/.code — решение о fallback принимает вызывающий (server.js), а не
  * этот модуль: только он знает, есть ли живой локальный воркер. */
@@ -281,8 +315,17 @@ async function callExternalProvider({ provider, modelId, prompt, maxTokens = 512
       (res.status === 429 ? 429 : (res.status >= 500 ? 502 : 400));
     const code = res.status === 401 || res.status === 403 ? 'PROVIDER_AUTH_FAILED' :
       (res.status === 429 ? 'PROVIDER_RATE_LIMIT' : 'PROVIDER_HTTP_ERROR');
-    throw tier6Error(`Provider ${prov} HTTP ${res.status}${detail ? `: ${detail.slice(0, 160)}` : ''}`,
+    /* details — то, что человек прочтёт в чате вместо голого кода.
+     * Для 401/403 это подсказка про формат ключа; тело ответа провайдера
+     * оставляем рядом, но обрезанным: оно бывает длинным HTML-ом прокси. */
+    const details = code === 'PROVIDER_AUTH_FAILED'
+      ? authHint(prov, res.status)
+      : `Provider ${prov} HTTP ${res.status}${detail ? `: ${detail.slice(0, 160)}` : ''}`;
+    const err = tier6Error(`Provider ${prov} HTTP ${res.status}${detail ? `: ${detail.slice(0, 160)}` : ''}`,
       { status, code });
+    err.details = details;
+    err.providerHttpStatus = res.status;
+    throw err;
   }
 
   const data = await res.json().catch(() => ({}));
