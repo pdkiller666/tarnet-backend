@@ -877,7 +877,12 @@
     fetch(B + '/summary').then(function (r) { return r.json(); }).then(function (s) {
       $('sReward').textContent = fmt(s.totalRewardTar, 2);
       $('sJobs').textContent = fmt(s.receipts, 0);
-      $('sBurn').textContent = fmt(s.totalBurnedTar, 2);
+      /* Витрина показывает ВСЁ выведенное из оборота, а не только долю
+       * рабочих чеков: `totalBurnedTar` по контракту /summary — слагаемое
+       * из work_receipts, сжигание Tier 6 приходит отдельным полем. Сложить
+       * их здесь — единственный способ не занизить цифру на витрине. */
+      $('sBurn').textContent = fmt(
+        (Number(s.totalBurnedTar) || 0) + (Number(s.totalBurnedTier6Tar) || 0), 2);
 
       // Сколько реально заплатили заказчики: gross в TAR × курс.
       var paidUsd = (Number(s.totalFeeGrossTar) || 0) * ECO.usdPerTar;

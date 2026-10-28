@@ -4607,6 +4607,32 @@ app.get('/summary', (_req, res) => {
                       FROM work_receipts GROUP BY tier ORDER BY tier`);
   const settledCount = get('SELECT COUNT(*) AS c FROM onchain_settlements').c;
 
+  /* ===== Сжигание: ДВА источника, которые нельзя складывать молча =====
+   *
+   * Сожжённые TAR приходят из двух таблиц: рабочие чеки (`work_receipts`)
+   * и вызовы Tier 6 (`tier6_calls`). Раньше в ответе стояли рядом
+   * `totalBurnedTar` (только чеки) и `burnAddressBalanceTar` (оба), и на
+   * проде они расходились ровно на Tier 6: 0.185113 против 0.185313 при
+   * единственном вызове с burn 0.0002. Два соседних числа описывали разное
+   * множество операций, и читатель не мог этого увидеть.
+   *
+   * Почему НЕ складываем их в `totalBurnedTar`, как предлагал первый вариант:
+   * это поле стоит в одном ряду с `totalRewardTar`, `totalFeeGrossTar`,
+   * `totalTreasuryTar`, и все они считаются из `work_receipts`. Сделав из
+   * него гибрид, мы бы сломали именно ту согласованность ряда, ради которой
+   * он существует: `receiptsByTier` перестал бы складываться в итог, а
+   * `conservation.distributed` перестал бы с ним сходиться.
+   *
+   * Поэтому разница названа, а не спрятана: отдельное слагаемое
+   * `totalBurnedTier6Tar` и блок `burnAudit`, который сверяет сумму частей
+   * с балансом адреса сжигания. Тот же приём, что `conservation` против
+   * `conservationTier6` в /health. */
+  const tier6Burn = get('SELECT COALESCE(SUM(burnTar), 0) AS burn FROM tier6_calls');
+  const burnReceiptsTar = Number(Number(t.burn).toFixed(6));
+  const burnTier6Tar = Number(Number(tier6Burn?.burn ?? 0).toFixed(6));
+  const burnAddressTar = Number((burnt?.balanceTar ?? 0).toFixed(6));
+  const burnAccountedTar = Number((burnReceiptsTar + burnTier6Tar).toFixed(6));
+
   res.json({
     receipts: Number(t.receipts),
     workers: get('SELECT COUNT(DISTINCT workerAddress) AS c FROM work_receipts').c,
@@ -4615,11 +4641,28 @@ app.get('/summary', (_req, res) => {
     totalFeeRewardTar: Number(Number(t.fee).toFixed(6)),
     totalFeeGrossTar: Number(Number(t.feeGross).toFixed(6)),
     totalBlockRewardTar: Number(Number(t.block).toFixed(6)),
-    totalBurnedTar: Number(Number(t.burn).toFixed(6)),
+    /* Только рабочие чеки — в одном ряду с остальными total* из work_receipts.
+     * Чтобы получить ВСЁ сожжённое, сложи с `totalBurnedTier6Tar` или возьми
+     * `burnAudit.accountedTar`; сверка с балансом — там же. */
+    totalBurnedTar: burnReceiptsTar,
+    /* Отдельное слагаемое: внешние вызовы не пишут work_receipts, поэтому
+     * без этого поля их сжигание не видно ни в одном total*. */
+    totalBurnedTier6Tar: burnTier6Tar,
     totalTreasuryTar: Number(Number(t.treasury).toFixed(6)),
     totalLoraRoyaltyTar: Number(Number(t.royalty).toFixed(6)),
-    burnAddressBalanceTar: Number((burnt?.balanceTar ?? 0).toFixed(6)),
+    burnAddressBalanceTar: burnAddressTar,
     treasuryBalanceTar: Number((treas?.balanceTar ?? 0).toFixed(6)),
+    /* Сверка вместо надежды: сумма двух источников обязана совпасть с
+     * балансом адреса сжигания до 1e-6. Если разойдётся — значит появился
+     * третий путь сжигания, который не учтён ни в одной таблице. */
+    burnAudit: {
+      workReceiptsTar: burnReceiptsTar,
+      tier6Tar: burnTier6Tar,
+      accountedTar: burnAccountedTar,
+      addressBalanceTar: burnAddressTar,
+      delta: Number((burnAccountedTar - burnAddressTar).toFixed(6)),
+      holds: Math.abs(burnAccountedTar - burnAddressTar) < 1e-6,
+    },
     onchainSettlements: settledCount,
     /* Честная маркировка: записи в onchain_settlements созданы локально,
      * txHash — randomBytes(32). Пока это так, флаг не должен становиться

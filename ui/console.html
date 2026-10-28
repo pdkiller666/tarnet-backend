@@ -289,7 +289,11 @@ async function loadSummary() {
   const s = await api('/summary');
   $('mReward').textContent = fmt(s.totalRewardTar);
   $('mCwu').textContent = s.totalCwu.toLocaleString('en-US');
-  $('mBurn').textContent = tar(s.totalBurnedTar);
+  /* Оба источника: work_receipts и tier6_calls. `totalBurnedTar` в ответе —
+   * только чеки, поэтому без второго слагаемого консоль занижала бы
+   * сжигание на весь объём внешних вызовов. Детали — в s.burnAudit. */
+  $('mBurn').textContent = tar(
+    (Number(s.totalBurnedTar) || 0) + (Number(s.totalBurnedTier6Tar) || 0));
   $('mTreasury').textContent = tar(s.totalTreasuryTar);
   $('mLora').textContent = tar(s.totalLoraRoyaltyTar);
   $('mReceipts').textContent = s.receipts;

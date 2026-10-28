@@ -5345,6 +5345,154 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+  /* ===== 36. Отчётность сжигания: два источника названы, а не слиты =====
+   *
+   * История дефекта. В /summary рядом стояли `totalBurnedTar` (SUM(burnTar)
+   * по work_receipts) и `burnAddressBalanceTar` (баланс адреса сжигания,
+   * куда пишут ОБА пути — чеки и вызовы Tier 6). На проде 28.10 они
+   * расходились ровно на единственный вызов Tier 6: 0.185113 против
+   * 0.185313. Два соседних числа в одном ответе описывали разное множество
+   * операций, и по ответу этого было не увидеть.
+   *
+   * Проверяется контракт, выбранный осознанно (см. комментарий в /summary):
+   *   totalBurnedTar       — только work_receipts, в ряду остальных total*;
+   *   totalBurnedTier6Tar  — отдельное слагаемое для внешних вызовов;
+   *   burnAudit            — сверка суммы частей с балансом адреса.
+   *
+   * Почему не «просто сложить в totalBurnedTar»: тогда поле перестало бы
+   * складываться с receiptsByTier и с conservation.distributed, то есть
+   * сломалось бы ровно та согласованность ряда, ради которой оно есть.
+   */
+  console.log('\n36. Сжигание: totalBurnedTar и Tier 6 не слиты молча');
+  {
+    const http = require('http');
+    const { DatabaseSync } = require('node:sqlite');
+    const provPort = await freePort();
+    const fakeProvider = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          model: 'qwen3-coder',
+          choices: [{ message: { content: 'ответ для проверки отчётности' } }],
+          usage: { total_tokens: 23 },
+        }));
+      });
+    });
+    await new Promise((r) => fakeProvider.listen(provPort, '127.0.0.1', r));
+
+    const s36 = await spawnServer({
+      TARNET_TIER6_ENDPOINT: `http://127.0.0.1:${provPort}/v1/chat/completions`,
+    });
+    try {
+      const PAYER = '0x' + (RUN + 'b6').padEnd(40, '0').slice(0, 40);
+      const WORKER = '0x' + (RUN + 'w6').padEnd(40, '0').slice(0, 40);
+
+      const dbWrite36 = (fn) => {
+        const sdb = new DatabaseSync(path.join(s36.dir, 'test.db'));
+        sdb.exec('PRAGMA busy_timeout = 3000;');
+        try { return fn(sdb); } finally { sdb.close(); }
+      };
+      dbWrite36((sdb) => sdb
+        .prepare(`INSERT INTO balances (address, balanceTar, stakedTar, reservedTar, updatedAt)
+                  VALUES (?, ?, 0, 0, ?)
+                  ON CONFLICT(address) DO UPDATE SET balanceTar = excluded.balanceTar`)
+        .run(PAYER, 0.01, new Date().toISOString()));
+
+      const before = (await apiAt(s36.base, '/summary')).body;
+
+      /* --- 36.1 рабочий чек: попадает ИМЕННО в totalBurnedTar ---------- */
+      await apiAt(s36.base, '/node', 'POST', {
+        address: WORKER, stake: 50000, reputation: 0.9, isTeeAttested: true,
+      });
+      const work = await apiAt(s36.base, '/work', 'POST', {
+        tokens: 4000000, tier: 'base', response: ' burn reporting ',
+        workerAddress: WORKER, actionId: runId('burn36'),
+      });
+      ok('36.1 работа с чеком принята (201)',
+        work.status === 201 && work.body?.receipt, work.status);
+      const receiptBurn = Number(work.body?.receipt?.burnTar ?? 0);
+      ok('36.1 в чеке есть ненулевой burn', receiptBurn > 0, receiptBurn);
+
+      const afterWork = (await apiAt(s36.base, '/summary')).body;
+      ok('36.1 burn чека увеличил totalBurnedTar',
+        Math.abs((afterWork.totalBurnedTar - before.totalBurnedTar) - receiptBurn) < 1e-9,
+        { before: before.totalBurnedTar, after: afterWork.totalBurnedTar, receiptBurn });
+      ok('36.1 burn чека НЕ попал в totalBurnedTier6Tar',
+        Number(afterWork.totalBurnedTier6Tar) === 0, afterWork.totalBurnedTier6Tar);
+
+      /* --- 36.2 главный регресс: Tier 6 обязан быть виден отдельно ---- */
+      const call = await apiAt(s36.base, '/inference', 'POST', {
+        prompt: 'сколько сожгли этим вызовом',
+        modelId: 'openrouter/qwen3-coder',
+        clientAddress: PAYER,
+        tier: 6,
+      }, { 'X-Provider-Key': 'sk-test-key-36' });
+      ok('36.2 вызов Tier 6 прошёл (200 external_api)',
+        call.status === 200 && call.body?.source === 'external_api',
+        { status: call.status, error: call.body?.error });
+
+      const burnT6 = Number(call.body?.economics?.burn_tar ?? 0);
+      ok('36.2 сжигание Tier 6 равно 0.0002 TAR', Math.abs(burnT6 - 0.0002) < 1e-12, burnT6);
+
+      const after = (await apiAt(s36.base, '/summary')).body;
+
+      /* Именно этот дифф и был дефектом: totalBurnedTar не двигался, а
+       * баланс адреса сжигания рос. Теперь растёт totalBurnedTier6Tar. */
+      ok('36.2 totalBurnedTar от вызова Tier 6 НЕ меняется (только чеки)',
+        Math.abs(after.totalBurnedTar - afterWork.totalBurnedTar) < 1e-9,
+        { before: afterWork.totalBurnedTar, after: after.totalBurnedTar });
+      ok('36.2 totalBurnedTier6Tar вырос ровно на burn Tier 6',
+        Math.abs(after.totalBurnedTier6Tar - burnT6) < 1e-9,
+        { tier6: after.totalBurnedTier6Tar, burnT6 });
+      ok('36.2 burnAddressBalanceTar вырос на ту же величину',
+        Math.abs((after.burnAddressBalanceTar - afterWork.burnAddressBalanceTar) - burnT6) < 1e-9,
+        { before: afterWork.burnAddressBalanceTar, after: after.burnAddressBalanceTar, burnT6 });
+
+      /* --- 36.3 разрыв назван и объяснён ------------------------------ */
+      ok('36.3 totalBurnedTar + totalBurnedTier6Tar == burnAddressBalanceTar',
+        Math.abs((after.totalBurnedTar + after.totalBurnedTier6Tar) - after.burnAddressBalanceTar) < 1e-6,
+        {
+          workReceipts: after.totalBurnedTar,
+          tier6: after.totalBurnedTier6Tar,
+          addressBalance: after.burnAddressBalanceTar,
+        });
+      ok('36.3 burnAudit.holds true и delta 0',
+        after.burnAudit?.holds === true && Number(after.burnAudit?.delta) === 0,
+        after.burnAudit);
+      ok('36.3 burnAudit называет оба слагаемых отдельными полями',
+        Math.abs(Number(after.burnAudit?.workReceiptsTar) - after.totalBurnedTar) < 1e-9
+          && Math.abs(Number(after.burnAudit?.tier6Tar) - after.totalBurnedTier6Tar) < 1e-9,
+        after.burnAudit);
+
+      /* --- 36.4 инварианты не сломаны правкой отчётности -------------- */
+      ok('36.4 /summary conservation: delta 0, holds true',
+        Number(after.conservation?.delta) === 0 && after.conservation?.holds === true,
+        after.conservation);
+      const health36 = (await apiAt(s36.base, '/health')).body;
+      ok('36.4 /health conservation: delta 0, holds true',
+        Number(health36?.conservation?.delta) === 0 && health36?.conservation?.holds === true,
+        health36?.conservation);
+      ok('36.4 /health conservationTier6: delta 0, holds true',
+        Number(health36?.conservationTier6?.delta) === 0
+          && health36?.conservationTier6?.holds === true,
+        health36?.conservationTier6);
+
+      /* --- 36.5 витрина не занижает сжигание -------------------------- */
+      /* UI складывает оба слагаемых сам. Если он вернётся к одному полю,
+       * цифра на лендинге снова начнёт отставать от баланса адреса. */
+      const indexHtml = fs.readFileSync(path.join(__dirname, 'ui', 'index.html'), 'utf8');
+      const consoleHtml = fs.readFileSync(path.join(__dirname, 'ui', 'console.html'), 'utf8');
+      ok('36.5 лендинг складывает totalBurnedTar + totalBurnedTier6Tar',
+        /totalBurnedTier6Tar/.test(indexHtml), 'нет упоминания totalBurnedTier6Tar');
+      ok('36.5 консоль складывает totalBurnedTar + totalBurnedTier6Tar',
+        /totalBurnedTier6Tar/.test(consoleHtml), 'нет упоминания totalBurnedTier6Tar');
+    } finally {
+      s36.stop();
+      await new Promise((r) => fakeProvider.close(r));
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {
