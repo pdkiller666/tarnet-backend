@@ -5206,6 +5206,145 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+/* ===== 35. Атрибуция сжигания: burn не является списанием с плательщика =====
+   *
+   * История дефекта. `recordBurn` писала адрес плательщика (или воркера) в
+   * `fromAddress` строки `burn`, хотя деньги с него второй раз не уходили:
+   * комиссия уже списана строкой `spend`. Поймано на живой записи
+   * tier6_calls.id = 4f6270d5-23db-4e19-98f3-af7dbf7223f2 (28.10 17:03 MSK):
+   * приход 0.010395, расход по SUM(fromAddress) 0.000706, расчётный баланс
+   * 0.009689 — против фактических 0.009889 в `balances`. Расхождение ровно
+   * −0.0002, то есть весь burn-оборот чека.
+   *
+   * Проверяется то, что ломалось, и то, что ломать нельзя:
+   *   1. сумма `fromAddress` по плательщику минус сумма `toAddress` по нему
+   *      равна факту списания `fee − cashback` и НЕ включает burn;
+   *   2. у burn-строки fromAddress пуст, а toAddress — адрес сжигания;
+   *   3. монеты по-прежнему аккумулируются на адресе сжигания;
+   *   4. инварианты /health и /summary остаются с delta 0.
+   */
+  console.log('\n35. Сжигание не списывается с плательщика второй раз');
+  {
+    const http = require('http');
+    const { DatabaseSync } = require('node:sqlite');
+    const provPort = await freePort();
+    const fakeProvider = http.createServer((req, res) => {
+      let raw = '';
+      req.on('data', (d) => { raw += d; });
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          model: 'qwen3-coder',
+          choices: [{ message: { content: 'ответ для проверки burn' } }],
+          usage: { total_tokens: 17 },
+        }));
+      });
+    });
+    await new Promise((r) => fakeProvider.listen(provPort, '127.0.0.1', r));
+
+    const s35 = await spawnServer({
+      TARNET_TIER6_ENDPOINT: `http://127.0.0.1:${provPort}/v1/chat/completions`,
+    });
+    try {
+      /* Адрес — чистый hex: тест обязан падать на логике атрибуции, а не на
+       * проверке формата адреса. */
+      const PAYER = '0x' + (RUN + 'b5').padEnd(40, '0').slice(0, 40);
+
+      const dbWrite = (fn) => {
+        const sdb = new DatabaseSync(path.join(s35.dir, 'test.db'));
+        sdb.exec('PRAGMA busy_timeout = 3000;');
+        try { return fn(sdb); } finally { sdb.close(); }
+      };
+      dbWrite((sdb) => sdb
+        .prepare(`INSERT INTO balances (address, balanceTar, stakedTar, reservedTar, updatedAt)
+                  VALUES (?, ?, 0, 0, ?)
+                  ON CONFLICT(address) DO UPDATE SET balanceTar = excluded.balanceTar`)
+        .run(PAYER, 0.01, new Date().toISOString()));
+
+      const call = await apiAt(s35.base, '/inference', 'POST', {
+        prompt: 'сколько с меня списали',
+        modelId: 'openrouter/qwen3-coder',
+        clientAddress: PAYER,
+        tier: 6,
+      }, { 'X-Provider-Key': 'sk-test-key' });
+      ok('35.1 вызов Tier 6 прошёл (200 external_api)',
+        call.status === 200 && call.body?.source === 'external_api',
+        { status: call.status, error: call.body?.error });
+
+      const burnAddr = '0x' + 'dead'.repeat(10);
+      const sums = dbWrite((sdb) => ({
+        balance: Number(sdb.prepare('SELECT balanceTar FROM balances WHERE address = ?')
+          .get(PAYER)?.balanceTar ?? 0),
+        fromTotal: Number(sdb.prepare(
+          `SELECT COALESCE(SUM(amountTar), 0) AS s FROM ledger_txs WHERE fromAddress = ?`)
+          .get(PAYER)?.s ?? 0),
+        toTotal: Number(sdb.prepare(
+          `SELECT COALESCE(SUM(amountTar), 0) AS s FROM ledger_txs WHERE toAddress = ?`)
+          .get(PAYER)?.s ?? 0),
+        burnFrom: sdb.prepare(
+          `SELECT fromAddress, toAddress, amountTar FROM ledger_txs
+            WHERE kind = 'burn' ORDER BY id DESC LIMIT 1`).get(),
+        burnBalance: Number(sdb.prepare('SELECT balanceTar FROM balances WHERE address = ?')
+          .get(burnAddr)?.balanceTar ?? 0),
+        kinds: sdb.prepare(
+          `SELECT kind, COUNT(*) AS c FROM ledger_txs
+            WHERE fromAddress = ? OR toAddress = ? GROUP BY kind`).all(PAYER, PAYER),
+      }));
+
+      /* Комиссия и кэшбэк — из ответа сервера: тест не должен сам повторять
+       * формулу сплита, иначе он подтвердит свою же арифметику. */
+      const fee = Number(call.body?.economics?.fee_gross_tar);
+      const cashback = Number(call.body?.cashback_tar);
+      const burn = Number(call.body?.economics?.burn_tar);
+      const net = Number((sums.fromTotal - sums.toTotal).toFixed(6));
+
+      /* --- 35.2 ГЛАВНЫЙ РЕГРЕСС ---------------------------------------
+       * Нетто-расход плательщика по леджеру обязан совпасть с фактическим
+       * списанием: fee списано, cashback вернулся. Burn не участвует —
+       * раньше здесь было net = fee − cashback + burn, и баланс,
+       * восстановленный из истории, не сходился с `balances`. */
+      ok('35.2 расход плательщика по леджеру = fee − cashback (без burn)',
+        Math.abs(net - (fee - cashback)) < 1e-6,
+        { fromTotal: sums.fromTotal, toTotal: sums.toTotal, net,
+          expected: Number((fee - cashback).toFixed(6)), burn });
+      ok('35.2 расчётный баланс из леджера сходится с фактическим',
+        Math.abs((0.01 - net) - sums.balance) < 1e-6,
+        { fromLedger: Number((0.01 - net).toFixed(6)), inBalances: sums.balance });
+
+      /* --- 35.3 сама burn-строка -------------------------------------- */
+      ok('35.3 burn-строка без fromAddress (сжигание никого не дебетует)',
+        sums.burnFrom && sums.burnFrom.fromAddress === null,
+        sums.burnFrom || 'burn-строка не найдена');
+      ok('35.3 burn-строка адресована адресу сжигания',
+        sums.burnFrom?.toAddress === burnAddr, sums.burnFrom?.toAddress);
+      ok('35.3 сумма burn-строки равна сожжённой доле комиссии',
+        Math.abs(Number(sums.burnFrom?.amountTar) - burn) < 1e-9,
+        { row: sums.burnFrom?.amountTar, burned: burn });
+
+      /* --- 35.4 монеты всё ещё видны на адресе сжигания для аудита ---- */
+      ok('35.4 на адресе сжигания аккумулируется сожжённая сумма',
+        Math.abs(sums.burnBalance - burn) < 1e-9,
+        { balance: sums.burnBalance, burn });
+
+      /* --- 35.5 инварианты -------------------------------------------- */
+      const summary35 = (await apiAt(s35.base, '/summary')).body?.conservation;
+      ok('35.5 /summary conservation: delta 0, holds true',
+        Number(summary35?.delta) === 0 && summary35?.holds === true,
+        summary35);
+      const health35 = (await apiAt(s35.base, '/health')).body;
+      ok('35.5 /health conservationTier6: delta 0, holds true',
+        Number(health35?.conservationTier6?.delta) === 0
+          && health35?.conservationTier6?.holds === true,
+        health35?.conservationTier6);
+      ok('35.5 /health conservation: delta 0, holds true',
+        Number(health35?.conservation?.delta) === 0 && health35?.conservation?.holds === true,
+        health35?.conservation);
+    } finally {
+      s35.stop();
+      await new Promise((r) => fakeProvider.close(r));
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

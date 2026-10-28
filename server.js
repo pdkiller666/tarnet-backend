@@ -405,6 +405,30 @@ ensureColumn('ledger_txs', 'actionId', 'actionId TEXT');
  * выдаёт шаблон воркера за работу модели. */
 ensureColumn('worker_tasks', 'source', 'source TEXT');
 
+/* ===== Миграция: burn-строки без fromAddress =====
+ *
+ * recordBurn до этой правки писал адрес плательщика (или воркера) в
+ * fromAddress строки `burn`, хотя деньги с него второй раз не уходили:
+ * комиссия уже списана строкой `spend`. Из-за этого любой расчёт движения
+ * средств по адресу как SUM(toAddress) − SUM(fromAddress) завышал расход
+ * ровно на сумму сжигания — на живой записи 4f6270d5-23db-4e19-98f3-
+ * af7dbf7223f2 расчётный баланс был 0.009689 против фактических 0.009889.
+ *
+ * Тут зачищаются уже записанные строки: fromAddress = NULL. Только это
+ * поле и меняется — balances по адресу сжигания и сами суммы остаются, иначе
+ * мы бы переписали историю движения денег вместо исправления атрибуции.
+ *
+ * Идемпотентно по условию: повторный запуск находит 0 строк. */
+(function migrateBurnAttribution() {
+  const fixed = db.prepare(
+    `UPDATE ledger_txs SET fromAddress = NULL
+      WHERE kind = 'burn' AND fromAddress IS NOT NULL`,
+  ).run();
+  if (fixed.changes > 0) {
+    console.log(`🔥 ledger_txs: ${fixed.changes} burn-строк без двойного списания (fromAddress → NULL)`);
+  }
+})();
+
 /* ===== Device Pairing: привязка ПК к аккаунту TarNet ID =====
  *
  * ЗАЧЕМ ОТДЕЛЬНАЯ ТАБЛИЦА, А НЕ tar_id.device_id. Колонка `device_id` уже
@@ -1487,13 +1511,27 @@ function credit(address, amount, kind, actionId, fromAddress) {
 }
 
 /* Сжигание: баланса не создаёт (монеты выведены из оборота), но фиксируется
- * и в реестре, и отдельной строкой на адресе сжигания — для аудита суммы. */
-function recordBurn(amount, actionId, fromAddress) {
+ * и в реестре, и отдельной строкой на адресе сжигания — для аудита суммы.
+ *
+ * ПОЧЕМУ fromAddress ВСЕГДА NULL. Сжигание не двигает деньги с чьего-либо
+ * баланса: это доля уже списанной комиссии (строка `spend`), которую
+ * протокол не отдаёт никому. Раньше здесь подставлялся адрес плательщика —
+ * и любой расчёт движения средств по адресу (SUM(to) − SUM(from)) считал
+ * burn вторым списанием с него: при комиссии 0.0005 и burn 0.0002 расход
+ * выходил 0.0007 при фактических 0.0005. Поймано на живой записи
+ * tier6_calls.id = 4f6270d5-23db-4e19-98f3-af7dbf7223f2 (28.10 17:03 MSK):
+ * расчётный баланс 0.009689 против фактического 0.009889 в balances,
+ * расхождение ровно −0.0002, то есть весь burn-оборот.
+ *
+ * toAddress остаётся адресом сжигания: по нему /summary отдаёт
+ * burnAddressBalanceTar, и сумма выведенного из оборота должна быть видна
+ * отдельной строкой баланса. */
+function recordBurn(amount, actionId) {
   if (!(Number(amount) > 0)) return null;
   const txHash = '0x' + crypto.randomBytes(32).toString('hex');
   run(
     'INSERT INTO ledger_txs (txHash, actionId, kind, fromAddress, toAddress, amountTar) VALUES (?, ?, ?, ?, ?, ?)',
-    [txHash, actionId, 'burn', fromAddress || null, CONFIG.BURN_ADDRESS, round(amount)],
+    [txHash, actionId, 'burn', null, CONFIG.BURN_ADDRESS, round(amount)],
   );
   run(
     `INSERT INTO balances (address, balanceTar, stakedTar, updatedAt) VALUES (?, ?, 0, ?)
@@ -2030,7 +2068,10 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
     if (settled.royaltyTotal > 0 && adapter) {
       credit(adapter.address, settled.royaltyTotal, 'royalty', id, workerAddress);
     }
-    if (settled.burnTotal > 0) recordBurn(settled.burnTotal, id, workerAddress);
+    /* fromAddress у burn смысла не имеет: gross уже списан строкой `spend`,
+     * сжигание — распределение этой же комиссии, а не второе движение
+     * с баланса воркера. Подробности — в recordBurn. */
+    if (settled.burnTotal > 0) recordBurn(settled.burnTotal, id);
 
     bumpEpoch(dbx, epoch, {
       emissionTar,
@@ -5299,7 +5340,10 @@ async function runInference(req, res) {
             credit(payer, cashback, 'cashback', callId, TREASURY_ADDRESS);
           }
           if (treasuryTar > 0) credit(TREASURY_ADDRESS, treasuryTar, 'treasury', callId, TREASURY_ADDRESS);
-          if (burnTar > 0) recordBurn(burnTar, callId, payer || TREASURY_ADDRESS);
+          /* Burn пишется без fromAddress: комиссия уже списана строкой
+           * `spend` с плательщика, и повторное указание его адреса в строке
+           * сжигания удваивало расход в любом расчёте вида SUM(to)−SUM(from). */
+          if (burnTar > 0) recordBurn(burnTar, callId);
         });
 
         return res.status(200).json({
