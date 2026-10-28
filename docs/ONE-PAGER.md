@@ -45,7 +45,7 @@
 3. **P2P только на localhost.** Три узла маршрута слушают `ws://127.0.0.1`, `announced_public: false`. Криптография настоящая (RSA-OAEP + AES-256-GCM, 3 хопа), распределённости нет.
 4. **Обучение не идёт.** Knowledge Loop: `phase: 2.5 [SPEC / ROADMAP]`, `training.implemented: false`, причина — нужен GPU. Адаптеры в статусе `pending_gpu`.
 5. **Токен пока без опоры в спросе.** **90.27%** награды — эмиссия (65.098459 TAR) против **9.73%** из комиссий (7.018435 TAR). На 1 TAR платного спроса приходится **9.28 TAR** напечатанных. Это главная незакрытая проблема экономики.
-6. **Tier 6 с настоящим ключом не проверен.** `tier6_calls: 0` — успешного вызова с реальным ключом провайдера ещё не было, проверены только отказы и арифметика.
+6. **Tier 6 проверен одной сделкой.** `tier6_calls: 1` — 28.10 17:03 MSK прошёл успешный вызов с живым ключом OpenRouter (`fee 0.0005 = cashback 0.0001 + burn 0.0002 + treasury 0.0002`, `funded_by: client`, `delta: 0`). Выборка из одного запроса не показывает поведение под нагрузкой: лимиты провайдера, параллельные резервы и TTL на реальном трафике не проверялись.
 
 **Аудит 8 компонентов видения:** **2 ✅ / 3 ⚠️ / 3 ❌ (~44%)** по методике `docs/VISION-8-COMPONENTS.md` (✅ = 1, ⚠️ = 0.5). Не ~62%: 62.5% выходит, только если ⚠️ считать полным ✅.
 
@@ -95,7 +95,7 @@
 3. **P2P is localhost-only.** Three route nodes listen on `ws://127.0.0.1`, `announced_public: false`. The cryptography is real (RSA-OAEP + AES-256-GCM, 3 hops); the distribution is not there.
 4. **Training is not running.** Knowledge Loop: `phase: 2.5 [SPEC / ROADMAP]`, `training.implemented: false`, blocked on GPU. Adapters sit in `pending_gpu`.
 5. **The token has no demand floor yet.** **90.27%** of rewards are emission (65.098459 TAR) against **9.73%** from fees (7.018435 TAR). Every 1 TAR of paid demand carries **9.28 TAR** printed. This is the main unsolved problem of the economy.
-6. **Tier 6 has not been exercised with a real key.** `tier6_calls: 0` — no successful call with a live provider key has happened yet; only rejections and arithmetic are verified.
+6. **Tier 6 has been exercised exactly once.** `tier6_calls: 1` — one successful call with a live OpenRouter key on 28 Oct 17:03 MSK (`fee 0.0005 = cashback 0.0001 + burn 0.0002 + treasury 0.0002`, `funded_by: client`, `delta: 0`). A single request says nothing about behaviour under load: provider rate limits, concurrent reserves and TTL on real traffic are unverified.
 
 **Eight-component vision audit:** **2 ✅ / 3 ⚠️ / 3 ❌ (~44%)** per the `docs/VISION-8-COMPONENTS.md` methodology (✅ = 1, ⚠️ = 0.5). Not ~62%: 62.5% only appears if ⚠️ is counted as full ✅.
 
@@ -112,6 +112,6 @@
 - **Не писать «72.12 TAR распределено» без уточнения.** Это выплаты воркерам; оборот леджера 72.500420.
 - **Не писать «сети нет / `active_workers: 0`».** Это устарело 28.10: `llm_mode: worker`, воркер онлайн, сквозной тест пройден.
 - **Не ставить старые снимки как текущие.** 705/78/56.55 — снимок 24.10; 716/83/72.12 — снимок 28.10 16:30.
-- **Не писать «Tier 6 работает с реальным ключом».** `tier6_calls: 0`. Проверены ворота и арифметика, не успешный вызов.
+- **Не писать «Tier 6 работает под нагрузкой».** `tier6_calls: 1` — одна сделка с живым ключом. Говорить можно про «вызов проходит и арифметика сходится», нельзя — про поток, лимиты и параллельные резервы.
 - **Не писать «713 тестов»** без «+25 mesh» — иначе теряется часть приёмки.
 - **Источники для перепроверки:** `GET /health`, `/summary`, `/config`, `/worker/status`, `/knowledge/status`, `/p2p/status`.

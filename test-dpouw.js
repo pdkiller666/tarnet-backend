@@ -5084,7 +5084,9 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       const dbWrite = (fn) => {
         const sdb = new DatabaseSync(path.join(s34.dir, 'test.db'));
         sdb.exec('PRAGMA busy_timeout = 3000;');
-        try { fn(sdb); } finally { sdb.close(); }
+        /* Возвращаем результат fn: часть хелперов ниже читает данные
+         * (баланс, чек), и без return они получали бы undefined. */
+        try { return fn(sdb); } finally { sdb.close(); }
       };
       const seed = (addr, tar) => dbWrite((sdb) => sdb
         .prepare(`INSERT INTO balances (address, balanceTar, stakedTar, reservedTar, updatedAt)
@@ -5180,14 +5182,18 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
        * сервер брал владельца не из привязки, а из запроса, он бы нашёл
        * баланс у OWN и списал с него по чужому clientAddress. */
       seed(STRANGER, 0);
+      /* Замер берём ПЕРЕД вызовом: между `ownerAfter` и здесь уже прошёл
+       * легитимный платёж 34.3, и сравнение с устаревшим значением засчитало
+       * бы его как «чужой запрос списал с владельца». */
+      const ownerBeforeStranger = money(OWN);
       const stranger = await callT6(STRANGER);
       ok('34.5 непривязанное устройство с нулём → 402, чужой кошелёк не тронут',
         stranger.status === 402 && stranger.body?.error === 'INSUFFICIENT_FUNDS',
         { status: stranger.status, error: stranger.body?.error });
       const ownerUntouched = money(OWN);
       ok('34.5 баланс владельца от чужого запроса не изменился',
-        Math.abs(ownerUntouched.balanceTar - ownerAfter.balanceTar) < 1e-12,
-        { before: ownerAfter.balanceTar, after: ownerUntouched.balanceTar });
+        Math.abs(ownerUntouched.balanceTar - ownerBeforeStranger.balanceTar) < 1e-12,
+        { before: ownerBeforeStranger.balanceTar, after: ownerUntouched.balanceTar });
 
       /* --- 34.6 экономика контура целиком ------------------------------ */
       const cons34 = (await apiAt(s34.base, '/health')).body?.conservationTier6;
