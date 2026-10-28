@@ -215,6 +215,34 @@
       </div>
     </div>
 
+    <!-- ===== Привязка существующего ПК =====
+         Зачем: если воркер запустили без адреса (или скачали старый файл),
+         он создал СВОЙ кошелёк, и PWA писала «ваш ПК не среди них».
+         Здесь этот адрес привязывается к аккаунту без переустановки.
+
+         Честная оговорка в тексте, а не только в коде: вход по подписи
+         ещё не сделан, поэтому привязка — заявка, а не доказанное владение.
+         Прятать это в интерфейсе значило бы обещать защиту, которой нет. -->
+    <div class="card" id="linkCard">
+      <div class="card-head">
+        <h2>Привязать существующий ПК</h2>
+        <span class="chip">Device Pairing</span>
+      </div>
+      <p class="dim tiny">
+        Если воркер уже запущен, но PWA его не видит — вставьте адрес из окна
+        воркера (строка «адрес: 0x…») или из <code>%LOCALAPPDATA%\TarNet\start.cmd</code>.
+      </p>
+      <label class="consent" for="linkAddr"><span>Адрес ПК</span></label>
+      <input type="text" id="linkAddr" autocomplete="off" spellcheck="false"
+             placeholder="0x..." aria-label="Адрес кошелька ПК">
+      <div class="row">
+        <button id="linkBtn" class="btn">Привязать</button>
+        <button id="linkRefresh" class="btn ghost">Обновить список</button>
+      </div>
+      <p class="mono dim tiny addr-line" id="linkState">—</p>
+      <div id="linkedList"></div>
+    </div>
+
     <!-- ===== Свой ключ провайдера (Tier 6, BYOK) =====
          Ключ живёт ТОЛЬКО в localStorage этого устройства и уходит на сервер
          исключительно заголовком X-Provider-Key на время запроса. Сервер его

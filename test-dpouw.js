@@ -4488,6 +4488,130 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+  console.log('\n30. Device Pairing — привязка существующего ПК');
+  {
+    /* Зачем эта секция: привязка заводится ровно для случая «воркер уже
+     * работает, но своим кошельком». Проверяем не только happy path, но и
+     * то, что мусорный адрес не привязывается: зелёный баннер над
+     * несуществующим устройством хуже, чем его отсутствие. */
+    const lp = await spawnServer();
+    try {
+      const { DatabaseSync } = require('node:sqlite');
+      const OWN = '0x' + '11'.repeat(20);
+      const DEV = '0x' + '22'.repeat(20);
+      const GHOST = '0x' + '33'.repeat(20);
+      const linkUrl = '/devices/link';
+      const doLink = (owner, device) => apiAt(lp.base, linkUrl, 'POST',
+        { ownerAddress: owner, deviceAddress: device });
+
+      /* --- отказы: до любого успеха --- */
+      const badOwner = await doLink('0xZZZ', DEV);
+      ok('30.1 кривой ownerAddress → 400',
+        badOwner.status === 400 && badOwner.body?.error === 'ownerAddress invalid',
+        { status: badOwner.status, error: badOwner.body?.error });
+
+      const badDev = await doLink(OWN, 'не-адрес');
+      ok('30.2 кривой deviceAddress → 400',
+        badDev.status === 400 && badDev.body?.error === 'deviceAddress invalid',
+        { status: badDev.status, error: badDev.body?.error });
+
+      const same = await doLink(OWN, OWN);
+      ok('30.3 адрес ПК = адрес аккаунта → 400 SAME_ADDRESS',
+        same.status === 400 && same.body?.error === 'SAME_ADDRESS',
+        { status: same.status, error: same.body?.error });
+
+      /* Несуществующее устройство: привязать нечего, и «успех» здесь
+       * означал бы зелёный баннер над пустотой. */
+      const ghost = await doLink(OWN, GHOST);
+      ok('30.4 адрес без следа в сети → 404 DEVICE_UNKNOWN',
+        ghost.status === 404 && ghost.body?.error === 'DEVICE_UNKNOWN',
+        { status: ghost.status, error: ghost.body?.error });
+
+      /* --- след устройства: воркер отметился --- */
+      const sdb = new DatabaseSync(path.join(lp.dir, 'test.db'));
+      sdb.exec('PRAGMA busy_timeout = 3000;');
+      sdb.prepare(`INSERT OR REPLACE INTO worker_presence
+                     (workerAddress, model, lastSeenAt, polls)
+                   VALUES (?, ?, ?, ?)`)
+        .run(DEV, 'qwen2.5-coder:1.5b', Date.now(), 7);
+      sdb.close();
+
+      const first = await doLink(OWN, DEV);
+      ok('30.5 след есть → привязка 200, created: true',
+        first.status === 200 && first.body?.created === true,
+        { status: first.status, created: first.body?.created });
+      ok('30.6 адрес в ответе нормализован в нижний регистр',
+        first.body?.deviceAddress === DEV.toLowerCase(), first.body?.deviceAddress);
+
+      /* Идемпотентность: повтор не должен плодить строки и ПЕРЕПИСЫВАТЬ
+       * дату первой привязки — иначе история устройства теряется.
+       * Эта проверка поймала реальный дефект: сравнение «сохранённое != now»
+       * истинно всегда, и повторный вызов рапортовал created: true. */
+      const again = await doLink(OWN, DEV);
+      ok('30.7 повторная привязка идемпотентна (created: false)',
+        again.status === 200 && again.body?.created === false,
+        { status: again.status, created: again.body?.created });
+      ok('30.8 дата первой привязки не переписана',
+        again.body?.linkedAt === first.body?.linkedAt,
+        { first: first.body?.linkedAt, again: again.body?.linkedAt });
+
+      const list = await apiAt(lp.base, `/devices/${OWN}`);
+      ok('30.9 список привязанных: count 1, устройство online',
+        list.status === 200 && list.body?.count === 1 && list.body?.devices?.[0]?.online === true,
+        { status: list.status, count: list.body?.count, online: list.body?.devices?.[0]?.online });
+      ok('30.10 в списке имя модели, а не только адрес',
+        list.body?.devices?.[0]?.model === 'qwen2.5-coder:1.5b',
+        list.body?.devices?.[0]?.model);
+
+      const badList = await apiAt(lp.base, '/devices/0xZZZ');
+      ok('30.11 список по кривому адресу → 400',
+        badList.status === 400, badList.status);
+
+      /* Свежесть: молчащий дольше минуты воркер не должен считаться живым,
+       * иначе баннер «Ваш ПК в сети» врёт после выключения ПК. */
+      const sdb2 = new DatabaseSync(path.join(lp.dir, 'test.db'));
+      sdb2.exec('PRAGMA busy_timeout = 3000;');
+      sdb2.prepare('UPDATE worker_presence SET lastSeenAt = ? WHERE workerAddress = ?')
+        .run(Date.now() - 120000, DEV);
+      sdb2.close();
+      const stale = await apiAt(lp.base, `/devices/${OWN}`);
+      ok('30.12 воркер молчит 2 мин → online: false',
+        stale.body?.devices?.[0]?.online === false,
+        { online: stale.body?.devices?.[0]?.online, ageMs: stale.body?.devices?.[0]?.lastSeenAgoMs });
+
+      /* --- отвязка --- */
+      const del = await apiAt(lp.base, linkUrl, 'DELETE',
+        { ownerAddress: OWN, deviceAddress: DEV });
+      ok('30.13 отвязка удаляет ровно одну запись',
+        del.status === 200 && del.body?.removed === 1,
+        { status: del.status, removed: del.body?.removed });
+
+      const empty = await apiAt(lp.base, `/devices/${OWN}`);
+      ok('30.14 после отвязки список пуст',
+        empty.status === 200 && empty.body?.count === 0, empty.body?.count);
+
+      /* Привязка по одному чеку: воркер мог работать до появления
+       * worker_presence, и отказывать такому ПК незачем. */
+      const RECEIPT_ONLY = '0x' + '44'.repeat(20);
+      const sdb3 = new DatabaseSync(path.join(lp.dir, 'test.db'));
+      sdb3.exec('PRAGMA busy_timeout = 3000;');
+      sdb3.prepare(`INSERT INTO work_receipts
+                      (workerAddress, tier, rewardTar, cwu, actionId, timestamp, demo)
+                    VALUES (?, 'base', 0.000001, 1, ?, ?, 0)`)
+        .run(RECEIPT_ONLY, 'pair-test-' + Date.now(), Date.now());
+      sdb3.close();
+      const byReceipt = await doLink(OWN, RECEIPT_ONLY);
+      ok('30.15 адрес с чеком, но без presence, привязывается',
+        byReceipt.status === 200 && byReceipt.body?.created === true,
+        { status: byReceipt.status, error: byReceipt.body?.error });
+
+      const alive = await apiAt(lp.base, '/health');
+      ok('30.16 после всех путей привязки сервер ЖИВ', alive.status === 200, alive.status);
+    } finally {
+      lp.stop();
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

@@ -405,6 +405,31 @@ ensureColumn('ledger_txs', 'actionId', 'actionId TEXT');
  * выдаёт шаблон воркера за работу модели. */
 ensureColumn('worker_tasks', 'source', 'source TEXT');
 
+/* ===== Device Pairing: привязка ПК к аккаунту TarNet ID =====
+ *
+ * ЗАЧЕМ ОТДЕЛЬНАЯ ТАБЛИЦА, А НЕ tar_id.device_id. Колонка `device_id` уже
+ * занята и содержит идентификатор, выведенный из мастер-энтропии. Туда
+ * нельзя положить адрес кошелька ПК: два разных смысла в одной колонке
+ * сломали бы проверку «это точно моё устройство». Здесь связь — отдельная
+ * сущность с датой, и её видно в одном месте.
+ *
+ * ОГРАНИЧЕНИЕ, КОТОРОЕ НАДО ЗНАТЬ (я его не скрываю): привязка не
+ * аутентифицирована. В системе пока нет входа по подписи — ADDR в PWA это
+ * демо-адрес из localStorage без приватного ключа. Значит любой, кто знает
+ * адрес кошелька, может привязать его к себе. Защита появится вместе с
+ * входом по подписи; до тех пор таблица честно называется «заявка», а не
+ * «доказанное владение».
+ */
+db.exec(`
+CREATE TABLE IF NOT EXISTS device_links (
+  ownerAddress  TEXT NOT NULL,
+  deviceAddress TEXT NOT NULL,
+  createdAt     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (ownerAddress, deviceAddress)
+);
+CREATE INDEX IF NOT EXISTS idx_device_links_device ON device_links (deviceAddress);
+`);
+
 /* ===== Tier 6: журнал вызовов внешних провайдеров =====
  * ПОЧЕМУ ОТДЕЛЬНАЯ ТАБЛИЦА, А НЕ work_receipts: у внешнего API нет
  * локального воркера, и синтетический адрес раздул бы COUNT(DISTINCT
@@ -2214,7 +2239,7 @@ const RATE_READ_PATH =
   /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|p2p\/status|worker\/status|agents(\/approvals)?|tools)$/;
 /* `/id/<pubkey>/balance` — чтение, а не запись: клиент опрашивает баланс так же
  * часто, как /balance/<addr>. Без этой ветки он упирался бы в 10/мин. */
-const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$|^\/id\/[0-9a-fA-F]{0,64}\/balance$|^\/faucet\/status\/[^/]+$/;
+const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$|^\/id\/[0-9a-fA-F]{0,64}\/balance$|^\/faucet\/status\/[^/]+$|^\/devices\/[^/]+$/;
 const RATE_READ_ASSET = /\.(html|css|js|svg|webmanifest|png|ico|woff2?)$/;
 /* Оболочки UI: `/` и `/app/` — это HTML-контейнеры без расширения, без этой
  * ветки открытие консоли списывалось бы с бюджета записи (10/мин).
@@ -2828,6 +2853,127 @@ app.get('/id/:pubkey/balance', (req, res) => {
     stakedTar: b ? Number(b.stakedTar.toFixed(6)) : 0,
     updatedAt: b ? b.updatedAt : null,
   });
+});
+
+/* ===== Device Pairing: привязка существующего ПК к TarNet ID =====
+ *
+ * ЗАЧЕМ: человек запустил воркер без адреса (или файл устарел), воркер
+ * создал СВОЙ кошелёк, работа считается, а PWA пишет «ваш ПК не среди них».
+ * Раньше единственным выходом было переустанавливать воркер. Здесь адрес
+ * уже работающего ПК просто привязывается к аккаунту.
+ *
+ * ЧЕГО ЭТОТ ЭНДПОИНТ НЕ ДЕЛАЕТ: он не переводит деньги и не сливает балансы.
+ * Баланс ПК остаётся на адресе ПК — меняется только ответ на вопрос «моё ли
+ * это устройство». Перевод средств между кошельками без приватного ключа
+ * невозможен, и делать вид, что привязка это умеет, было бы обманом.
+ */
+app.post('/devices/link', (req, res) => {
+  const body = req.body || {};
+  const owner = String(body.ownerAddress || '').trim().toLowerCase();
+  const device = String(body.deviceAddress || '').trim().toLowerCase();
+
+  if (!INSTALL_ADDR_RE.test(owner)) {
+    return res.status(400).json({
+      error: 'ownerAddress invalid',
+      detail: 'адрес аккаунта: 0x и ровно 40 hex-символов',
+    });
+  }
+  if (!INSTALL_ADDR_RE.test(device)) {
+    return res.status(400).json({
+      error: 'deviceAddress invalid',
+      detail: 'адрес ПК: 0x и ровно 40 hex-символов',
+    });
+  }
+  if (owner === device) {
+    /* Привязка устройства к самому себе бессмысленна и, что важнее, маскирует
+     * ошибку ввода: человек вставил свой же адрес и ждёт, что появится ПК. */
+    return res.status(400).json({
+      error: 'SAME_ADDRESS',
+      detail: 'адрес ПК совпадает с адресом аккаунта — вставьте адрес ПК, а не телефона',
+    });
+  }
+
+  /* Устройство должно быть известно сети: привязка несуществующего адреса
+   * дала бы зелёный баннер над пустотой. Требуем след — присутствие воркера
+   * или хотя бы один чек. */
+  const seen = get('SELECT 1 AS ok FROM worker_presence WHERE lower(workerAddress) = ?', [device])
+    || get('SELECT 1 AS ok FROM work_receipts WHERE lower(workerAddress) = ? LIMIT 1', [device])
+    || get('SELECT 1 AS ok FROM nodes WHERE lower(address) = ?', [device]);
+
+  if (!seen) {
+    return res.status(404).json({
+      error: 'DEVICE_UNKNOWN',
+      detail: 'этот адрес ещё не появлялся в сети: запустите воркер и повторите',
+      deviceAddress: device,
+    });
+  }
+
+  /* Существование проверяем ДО вставки, а не после по сравнению дат:
+   * `now` каждый раз новый, поэтому сравнение «сохранённое != now» истинно
+   * всегда, и повторная привязка рапортовала created: true. Проверено
+   * на живом стенде — первый вызов отдавал false, второй true. */
+  const prev = get(`SELECT createdAt FROM device_links
+                    WHERE ownerAddress = ? AND deviceAddress = ?`, [owner, device]);
+  const now = new Date().toISOString();
+
+  if (!prev) {
+    run(`INSERT INTO device_links (ownerAddress, deviceAddress, createdAt)
+         VALUES (?, ?, ?)`, [owner, device, now]);
+  }
+
+  res.json({
+    ok: true,
+    ownerAddress: owner,
+    deviceAddress: device,
+    /* linkedAt — когда привязка появилась ВПЕРВЫЕ: повторный вызов не
+     * должен переписывать дату, иначе история устройства теряется. */
+    linkedAt: prev ? prev.createdAt : now,
+    created: !prev,
+  });
+});
+
+app.get('/devices/:owner', (req, res) => {
+  const owner = String(req.params.owner || '').trim().toLowerCase();
+  if (!INSTALL_ADDR_RE.test(owner)) {
+    return res.status(400).json({ error: 'ownerAddress invalid' });
+  }
+
+  /* Живость считаем здесь, а не на клиенте: PWA получила бы список адресов
+   * и ей пришлось бы самой ходить в /worker/status, повторяя логику
+   * сопоставления. Один источник — этот ответ. */
+  const rows = all(`SELECT deviceAddress, createdAt FROM device_links
+                    WHERE ownerAddress = ? ORDER BY createdAt ASC`, [owner]);
+
+  const now = Date.now();
+  const devices = rows.map((r) => {
+    const p = get('SELECT model, lastSeenAt, polls FROM worker_presence WHERE lower(workerAddress) = ?',
+      [String(r.deviceAddress).toLowerCase()]);
+    const ageMs = p ? Math.max(0, now - Number(p.lastSeenAt)) : null;
+    return {
+      deviceAddress: r.deviceAddress,
+      linkedAt: r.createdAt,
+      /* 60 с — тот же порог, что у /worker/status: воркер опрашивает сервер
+       * раз в секунду, и минута молчания означает, что он не работает. */
+      online: ageMs !== null && ageMs < 60000,
+      lastSeenAgoMs: ageMs,
+      model: p ? p.model : null,
+      polls: p ? Number(p.polls) : 0,
+    };
+  });
+
+  res.json({ ownerAddress: owner, count: devices.length, devices });
+});
+
+app.delete('/devices/link', (req, res) => {
+  const body = req.body || {};
+  const owner = String(body.ownerAddress || '').trim().toLowerCase();
+  const device = String(body.deviceAddress || '').trim().toLowerCase();
+  if (!INSTALL_ADDR_RE.test(owner) || !INSTALL_ADDR_RE.test(device)) {
+    return res.status(400).json({ error: 'ownerAddress and deviceAddress required' });
+  }
+  const info = run('DELETE FROM device_links WHERE ownerAddress = ? AND deviceAddress = ?',
+    [owner, device]);
+  res.json({ ok: true, removed: Number(info.changes || 0) });
 });
 
 /* ===== Agent Foundation (Волна 3) — только каркас =====

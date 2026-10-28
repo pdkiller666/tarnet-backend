@@ -149,6 +149,26 @@ async function refreshWorkerBanner() {
     const me = ADDR.toLowerCase();
     mine = list.some((w) => String(w.workerAddress).toLowerCase() === me);
     model = (list.find((w) => w.model) || {}).model || null;
+
+    /* Привязанные ПК тоже «свои». Без этого шага Device Pairing был бы
+     * мёртвым механизмом: адрес привязан, сервер о нём знает, а баннер
+     * продолжал бы писать «ваш ПК не среди них» — ровно то, от чего
+     * привязку и делали. */
+    if (!mine) {
+      try {
+        const links = await call(`/devices/${ADDR}`);
+        const linked = (links.devices || [])
+          .filter((d) => d.online)
+          .map((d) => String(d.deviceAddress).toLowerCase());
+        if (linked.length) {
+          mine = list.some((w) => linked.includes(String(w.workerAddress).toLowerCase()));
+        }
+      } catch (_e) {
+        /* Список привязок не критичен для статуса сети: сеть уже жива,
+         * и падать в «неизвестно» из-за него было бы хуже, чем показать
+         * менее точный баннер. */
+      }
+    }
   } catch (e) {
     /* Имя модели не критично: статус важнее. Баннер уже знает, что сеть жива. */
   }
@@ -921,6 +941,107 @@ $('byokClear')?.addEventListener('click', () => {
 });
 
 renderByokState();
+
+/* ---------- Привязка существующего ПК (Device Pairing) ----------
+ * Зачем: воркер, запущенный без адреса, создаёт СВОЙ кошелёк. Работа
+ * считается, но PWA честно писала «ваш ПК не среди них». Раньше помогал
+ * только перезапуск с правильным адресом; теперь адрес работающего ПК
+ * привязывается к аккаунту как есть.
+ *
+ * Список читаем с сервера, а не из localStorage: привязка должна
+ * переживать смену браузера и чистку памяти. Здесь хранится только
+ * ничего не значащий кеш, и он не используется как источник истины.
+ */
+function linkRow(d) {
+  const dot = d.online ? '🟢' : '⚪';
+  const seen = d.online ? 'в сети'
+    : (d.lastSeenAgoMs === null ? 'не появлялся' : `молчит ${Math.round(d.lastSeenAgoMs / 1000)} с`);
+  const model = d.model ? ` · ${d.model}` : '';
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.style.alignItems = 'center';
+
+  const label = document.createElement('p');
+  label.className = 'mono dim tiny addr-line';
+  label.style.margin = '0';
+  /* textContent, а не innerHTML: адрес приходит с сервера, и вставка его
+   * как разметки позволила бы подсунуть тег вместо hex. */
+  label.textContent = `${dot} ${d.deviceAddress.slice(0, 10)}…${d.deviceAddress.slice(-6)} — ${seen}${model}`;
+  label.title = d.deviceAddress;
+
+  const un = document.createElement('button');
+  un.className = 'ghost small';
+  un.textContent = 'Отвязать';
+  un.addEventListener('click', () => unlinkDevice(d.deviceAddress));
+
+  row.appendChild(label);
+  row.appendChild(un);
+  return row;
+}
+
+async function refreshLinks() {
+  const box = $('linkedList');
+  const st = $('linkState');
+  if (!box) return;
+  try {
+    const r = await call(`/devices/${ADDR}`);
+    box.textContent = '';
+    if (!r.count) {
+      if (st) st.textContent = 'привязанных ПК нет';
+      return;
+    }
+    if (st) st.textContent = `привязано ПК: ${r.count}`;
+    r.devices.forEach((d) => box.appendChild(linkRow(d)));
+  } catch (e) {
+    if (st) st.textContent = e.code === 'RATE_LIMIT' ? e.message : `не смог прочитать список: ${e.message}`;
+  }
+}
+
+async function unlinkDevice(addr) {
+  const st = $('linkState');
+  try {
+    await call('/devices/link', {
+      method: 'DELETE',
+      body: { ownerAddress: ADDR, deviceAddress: addr },
+    });
+    if (st) st.textContent = 'ПК отвязан';
+    await refreshLinks();
+    /* Баннер пересчитываем сразу: иначе он ещё минуту утверждал бы, что
+     * ПК «свой», хотя привязку только что сняли. */
+    refreshWorkerBanner();
+  } catch (e) {
+    if (st) st.textContent = `не смог отвязать: ${e.message}`;
+  }
+}
+
+$('linkBtn')?.addEventListener('click', async () => {
+  const st = $('linkState');
+  const raw = String($('linkAddr')?.value || '').trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(raw)) {
+    if (st) st.textContent = 'нужен адрес вида 0x + 40 hex-символов';
+    return;
+  }
+  if (raw.toLowerCase() === ADDR.toLowerCase()) {
+    if (st) st.textContent = 'это адрес вашего телефона — вставьте адрес ПК';
+    return;
+  }
+  try {
+    const r = await call('/devices/link', {
+      method: 'POST',
+      body: { ownerAddress: ADDR, deviceAddress: raw.toLowerCase() },
+    });
+    if (st) st.textContent = `привязан ${r.deviceAddress.slice(0, 10)}…`;
+    if ($('linkAddr')) $('linkAddr').value = '';
+    await refreshLinks();
+    refreshWorkerBanner();
+  } catch (e) {
+    /* Тексты сервера уже человеческие: показываем их, подменяя только
+     * лимит запросов — он не про привязку, и человеку нужен таймаут. */
+    if (st) st.textContent = e.code === 'RATE_LIMIT' ? e.message : (e.message || 'не получилось привязать');
+  }
+});
+
+$('linkRefresh')?.addEventListener('click', refreshLinks);
 
 /* ---------- Согласие на дистилляцию ----------
  * Чекбокс отражает состояние НА СЕРВЕРЕ, а не в localStorage: согласие —
