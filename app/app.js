@@ -179,7 +179,7 @@ async function refreshWorkerBanner() {
 
   const modelPart = model ? ` Модель: ${model}.` : '';
   if (mine) {
-    text.textContent = `✅ Ваш ПК в сети.${modelPart}`;
+    text.textContent = `✅ Сеть активна. Ваш ПК обрабатывает задачи.${modelPart}`;
   } else {
     /* Живая модель есть, но это не ПК пользователя: сказать «ваш ПК в сети»
      * значило бы соврать, а сказать «не в сети» — скрыть, что демо-обработчик

@@ -33,10 +33,19 @@
  * и index.html, то есть снова в кэшируемой оболочке: без поднятия имени
  * установленные PWA получили бы новый JS со старым CSS.
  *
- * v9: алиасы .text-error / .text-info и токен --info (Задача 4 директивы).
- * Снова styles.css — значит снова bump: v8 к этому моменту уже разошёлся
- * по установленным клиентам. */
-const CACHE = 'tarnet-app-v9';
+ * v10: КРИТИЧНЫЙ фикс доставки. В v9 стратегия была cache-first без
+ * ревалидации: раз файл попал в кэш, он оттуда отдавался ВСЕГДА, пока
+ * кто-то вручную не поднимет CACHE. Из-за этого app.js с логикой
+ * `/devices/` (коммит e36c238, 28 окт) не дошёл до телефона: оболочка
+ * осталась от 24 окт, и баннер продолжал писать «ваш ПК не среди них»
+ * при живом привязанном ПК. Сервер был прав всё это время.
+ *
+ * Лечим причину, а не симптом: оболочка теперь
+ * stale-while-revalidate — отдаём из кэша сразу (офлайн жив), но фоном
+ * тянем свежее и кладём в кэш. Следующая загрузка берёт новые байты.
+ * Версию поднимаем всё равно: у клиентов уже лежит v9 с отравленным
+ * app.js, и без смены имени кэша он никуда не денется. */
+const CACHE = 'tarnet-app-v10';
 
 const ASSETS = [
   '/app/',
@@ -98,14 +107,31 @@ self.addEventListener('fetch', (event) => {
 
   event.respondWith(
     caches.match(req).then((hit) => {
-      if (hit) return hit;
-      return fetch(req).then((res) => {
-        if (res && res.ok) {
-          const copy = res.clone();
-          caches.open(CACHE).then((cache) => cache.put(req, copy)).catch(() => {});
-        }
-        return res;
-      }).catch(() => caches.match('/app/index.html'));
+      /* stale-while-revalidate: свежий ответ забираем В ФОНЕ и обновляем
+       * кэш, но не заставляем человека ждать сеть. Отдать из кэша и
+       * промолчать было бы прежним багом: файл обновится на сервере, а
+       * клиент продолжит крутить старую копию месяцами.
+       *
+       * fetch идёт с cache:'reload' — иначе HTTP-кэш браузера вернул бы
+       * тот же старый файл, и ревалидация была бы фиктивной. */
+      const refresh = fetch(req, { cache: 'reload' })
+        .then((res) => {
+          if (res && res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE)
+              .then((cache) => cache.put(req, copy))
+              .catch(() => {});
+          }
+          return res;
+        })
+        .catch(() => null);
+
+      if (hit) {
+        /* Фон обновляется, ответ отдаётся сразу. */
+        event.waitUntil(refresh);
+        return hit;
+      }
+      return refresh.then((res) => res || caches.match('/app/index.html'));
     }),
   );
 });
