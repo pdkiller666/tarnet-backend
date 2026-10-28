@@ -4731,6 +4731,72 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     ok('31.16 PWA объясняет, почему установщик по-английски',
       pwaText.includes('по-английски'),
       { has: pwaText.includes('по-английски') });
+
+    /* РЕГРЕСС на баг, убивший установщик у человека целиком.
+     *
+     * Сервер заменяет КАЖДОЕ вхождение плейсхолдера, включая копию внутри
+     * самой проверки. В шаблоне стояло:
+     *     if "%ADDR%"=="__TARNET_ADDR__" goto fail_addr
+     * после подстановки это превращалось в
+     *     if "%ADDR%"=="0x648f..." goto fail_addr
+     * — сравнение адреса с самим собой. Условие истинно ВСЕГДА, goto
+     * срабатывает всегда, и установщик падает с 'address is missing or
+     * corrupted' у каждого, включая владельца правильного адреса.
+     *
+     * Проверка ловит именно САМОСРАВНЕНИЕ, а не отсутствие строки: сама по
+     * себе строка-проверка законна, незаконно сравнивать ADDR с его же
+     * значением. Тестов было 16 в секции, и ни одна не заметила: все смотрели
+     * на формат файла, а не на исполнимость логики. */
+    const selfCmpBat = lines.filter(l => {
+      const t = l.trim();
+      return /^if\s+"%ADDR%"=="0x[0-9a-fA-F]{40}"/i.test(t);
+    });
+    ok('31.17 в .bat нет сравнения ADDR с самим собой',
+      selfCmpBat.length === 0,
+      { found: selfCmpBat.length, sample: selfCmpBat[0] && selfCmpBat[0].trim().slice(0, 70) });
+
+    /* То же для macOS: там плейсхолдер тоже стоял в сравнении, и
+     * `[ "$ADDR" = "__TARNET_ADDR__" ]` после подстановки становилось
+     * `[ "$ADDR" = "0x..." ]` — всегда истина, pause_exit 2 на старте. */
+    const shLines = shText.split('\n');
+    const selfCmpSh = shLines.filter(l => {
+      const t = l.trim();
+      return /\[\s*"?\$ADDR"?\s*=\s*"0x[0-9a-fA-F]{40}"/.test(t);
+    });
+    ok('31.18 в .command нет сравнения ADDR с самим собой',
+      selfCmpSh.length === 0,
+      { found: selfCmpSh.length, sample: selfCmpSh[0] && selfCmpSh[0].trim().slice(0, 70) });
+
+    /* Шаблон не должен содержать ПЛЕЙСХОЛДЕР в исполняемой проверке: именно
+     * это делает самосравнение возможным. Комментарий с объяснением шаблона
+     * допустим, а код — нет. Проверяем исходники, а не отдачу, потому что
+     * баг живёт в шаблоне и рендер его только маскирует. */
+    const tplBat = fs.readFileSync(path.join(__dirname, 'install/install.bat.tpl'), 'utf8');
+    const tplSh = fs.readFileSync(path.join(__dirname, 'install/install.command.tpl'), 'utf8');
+    const tplBatBad = tplBat.split('\n')
+      .filter(l => !/^\s*(rem|::)/i.test(l) && /ADDR/.test(l) && /__TARNET_ADDR__/.test(l))
+      /* Строка присваивания — единственное законное место плейсхолдера:
+       * сервер обязан его заменить именно здесь. Баг в том, что плейсхолдер
+       * попадает в СРАВНЕНИЕ, поэтому присваивание исключаем явно. */
+      .filter(l => !/^\s*set\s+"ADDR=/i.test(l));
+    const tplShBad = tplSh.split('\n')
+      .filter(l => !/^\s*#/.test(l) && /ADDR/.test(l) && /__TARNET_ADDR__/.test(l))
+      .filter(l => !/^\s*ADDR="__TARNET_ADDR__"\s*$/.test(l));
+    ok('31.19 плейсхолдер не остался в исполняемой проверке шаблонов',
+      tplBatBad.length === 0 && tplShBad.length === 0,
+      { bat: tplBatBad.length, sh: tplShBad.length,
+        sample: (tplBatBad[0] || tplShBad[0] || '').trim().slice(0, 60) });
+
+    /* Проверки на пустоту и формат обязаны ОСТАТЬСЯ: без них файл, отредакти-
+     * рованный руками, молча создаст новый кошелёк и работа уйдёт в чужой
+     * баланс. Убрать блок целиком было бы лечением хуже болезни. */
+    ok('31.20 проверки на пустоту и формат 0x/длина сохранены',
+      batText.includes('if "%ADDR%"=="" goto fail_addr')
+      && batText.includes('if not "%ADDR:~0,2%"=="0x" goto fail_addr')
+      && batText.includes('if not "%ADDR:~42,1%"=="" goto fail_addr'),
+      { empty: batText.includes('if "%ADDR%"=="" goto fail_addr'),
+        prefix: batText.includes(':~0,2%'),
+        len: batText.includes('if not "%ADDR:~42,1%"=="" goto fail_addr') });
   }
 
   console.log('\n' + '─'.repeat(50));

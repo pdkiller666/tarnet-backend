@@ -26,11 +26,18 @@ set "TARNET_DIR=%LOCALAPPDATA%\TarNet"
 set "SKIP_MODEL=0"
 
 rem ---------- validate worker address ----------
-rem The server injects the address at download time. If it is
-rem missing, the file was saved from somewhere else, forwarded to
-rem another person, or is stale. Such a worker would generate its
-rem OWN wallet and the work would go to a different balance.
-if "%ADDR%"=="__TARNET_ADDR__" goto fail_addr
+rem The server injects the address at download time and answers HTTP 400
+rem when it is missing or malformed, so a downloaded file always carries a
+rem real address. An empty value here means the file was edited or truncated.
+rem Such a worker would generate its OWN wallet and the work would go to a
+rem different balance, so refuse to run.
+rem
+rem NEVER compare ADDR against the server placeholder token. The server
+rem replaces EVERY occurrence of that token, including the copy inside the
+rem guard, so the guard ends up comparing the address with itself: it is
+rem always true and the installer dies on start for every user. The empty
+rem and length checks below are enough, because the server already rejects
+rem a bad address before anyone can download the file.
 if "%ADDR%"=="" goto fail_addr
 if not "%ADDR:~0,2%"=="0x" goto fail_addr
 rem 0x + 40 hex chars = 42 characters total.
