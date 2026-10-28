@@ -965,6 +965,12 @@ CREATE TABLE IF NOT EXISTS approvals (
 (function seedModelRegistry() {
   const rows = [
     ['deepseek-r1-distill-1.5b', 'local', 1, 32768, 0, 0, -1, -1, 'reasoning,distill', 2, 1, 1, 'mit', 1, null],
+    /* Дефолтная модель воркера. Записана в каталог именно так, как её
+     * объявляет Ollama (`qwen2.5-coder:1.5b`), а не через дефис: иначе
+     * `POST /inference` с этой моделью отвечал 400 unknown_model, хотя
+     * воркер считал ею же. Это НЕ алиас `qwen2.5-coder-7b` — другая модель
+     * (1.5B против 7B), поэтому отдельная строка, а не синоним. */
+    ['qwen2.5-coder:1.5b', 'local', 1, 32768, 0, 0, -1, -1, 'code,agentic', 1, 1, 1, 'apache-2.0', 1, null],
     ['qwen2.5-coder-7b', 'local', 2, 32768, 0, 0, -1, -1, 'code,agentic', 8, 1, 1, 'apache-2.0', 1, null],
     ['openrouter/qwen3-coder', 'openrouter', 6, 262144, 0, 0, 20, 200, 'code,long-context', 0, 1, 1, 'apache-2.0', 1, 'https://openrouter.ai/models'],
     ['openai/gpt-4o', 'openai', 6, 128000, 0.125, 2.5, 30, 500, 'general,vision', 0, 0, 1, 'proprietary', 0, 'https://openai.com/policies/terms-of-use'],
@@ -5385,8 +5391,13 @@ async function runInference(req, res) {
     try {
       /* modelId имеет приоритет над body.model: клиент назвал модель из
        * каталога, и воркер должен получить именно её имя, а не свободную
-       * строку. Иначе выбор из реестра ничего бы не значил. */
-      const w = await enqueueWorkerTask({ prompt, model: body.model || modelId || null, tier });
+       * строку. Иначе выбор из реестра ничего бы не значил.
+       *
+       * Комментарий здесь был правдой, а код — нет: стояло `body.model ||
+       * modelId`, то есть свободная строка перебивала выбор из каталога.
+       * Порядок восстановлен, и на нём держится приёмочный тест «два разных
+       * modelId дают два разных model в ответе». */
+      const w = await enqueueWorkerTask({ prompt, model: modelId || body.model || null, tier });
       result = {
         source: 'live_llm',
         provider: 'home_worker',

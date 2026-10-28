@@ -2086,7 +2086,13 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('GET /models отвечает 200', modelsRes.status === 200, modelsRes.status);
   const models = modelsRes.body?.models;
   ok('/models отдаёт массив', Array.isArray(models), typeof models);
-  ok('/models отдаёт ровно 4 модели', models?.length === 4, models?.length);
+  /* Число моделей — не константа: каталог растёт (добавлена дефолтная модель
+   * воркера `qwen2.5-coder:1.5b`). Проверяем состав, а не длину: жёсткая
+   * четвёрка ломалась бы при каждом законном расширении реестра. */
+  ok('/models отдаёт непустой каталог', Array.isArray(models) && models.length >= 4, models?.length);
+  ok('каталог содержит дефолтную модель воркера qwen2.5-coder:1.5b',
+    (models ?? []).some(m => m.modelId === 'qwen2.5-coder:1.5b'),
+    (models ?? []).map(m => m.modelId));
   ok('count совпадает с длиной массива',
     modelsRes.body?.count === models?.length, modelsRes.body?.count);
 
@@ -2236,6 +2242,98 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('training_allowed: true для локальной apache-2.0',
     ansV2.body?.training_allowed === true, ansV2.body?.training_allowed);
   ok('domain определён как code', ansV2.body?.domain === 'code', ansV2.body?.domain);
+
+  /* ============================================================
+   * ПРИЁМКА ДИРЕКТИВЫ: modelId управляет моделью воркера
+   * ============================================================
+   * Дефект был: воркер игнорировал model и считал своей OLLAMA_MODEL, из-за
+   * чего два разных modelId давали одинаковый ответ и одинаковое поле model.
+   * Здесь проверяется та половина контракта, которую видит сервер: имя модели
+   * доезжает до задачи, а ответ несёт именно его. Что воркер его ПРИМЕНИЛ,
+   * доказывает отдельный тест самого воркера (resolveOllamaModel ниже). */
+  const wNm = runAddress('nm');
+  await api('/node', 'POST', { address: wNm, stake: 30000, reputation: 0.8 });
+  await api(`/worker/poll?workerAddress=${wNm}&model=qwen2.5-coder-7b&heartbeat=1`);
+
+  /* Две задачи подряд с разными modelId. Сдаём их по очереди, потому что
+   * очередь отдаёт по одной: параллельные запросы забрали бы друг у друга
+   * задачу и проверили бы не то. */
+  const twoModelIds = ['qwen2.5-coder-7b', 'deepseek-r1-distill-1.5b'];
+  const seenModels = [];
+  for (const mid of twoModelIds) {
+    const infl = api('/inference', 'POST', {
+      prompt: `модель ${mid}: два плюс два`, modelId: mid, workerAddress: wNm,
+    });
+    let t = null;
+    for (let i = 0; i < 60 && !t; i++) {
+      const p = await api(`/worker/poll?workerAddress=${wNm}&model=${mid}`);
+      if (p.body?.task) t = p.body.task;
+      else await new Promise((r) => setTimeout(r, 100));
+    }
+    seenModels.push(t?.model ?? null);
+    if (t) {
+      await api('/worker/submit', 'POST', {
+        taskId: t.taskId, workerAddress: wNm, response: `ответ ${mid}`,
+        source: 'live_llm', model: mid, usage: { completion_tokens: 4 },
+      });
+    }
+    const ans = await infl;
+    ok(`modelId ${mid}: ответ несёт model_id ${mid}`,
+      ans.body?.model_id === mid, ans.body?.model_id);
+  }
+  ok('два разных modelId дали ДВА РАЗНЫХ model в задаче воркера',
+    seenModels.length === 2 && seenModels[0] !== seenModels[1],
+    seenModels);
+  ok('задача воркера несёт ровно те имена, что выбрал клиент',
+    seenModels[0] === twoModelIds[0] && seenModels[1] === twoModelIds[1],
+    seenModels);
+
+  /* modelId из каталога перебивает свободную строку body.model: иначе выбор
+   * в интерфейсе ничего не значит, и воркер получает чужое имя. */
+  const prioInfl = api('/inference', 'POST', {
+    prompt: 'приоритет modelId', modelId: 'qwen2.5-coder-7b',
+    model: 'свободная-строка', workerAddress: wNm,
+  });
+  let prioTask = null;
+  for (let i = 0; i < 60 && !prioTask; i++) {
+    const p = await api(`/worker/poll?workerAddress=${wNm}&model=qwen2.5-coder-7b`);
+    if (p.body?.task) prioTask = p.body.task;
+    else await new Promise((r) => setTimeout(r, 100));
+  }
+  ok('modelId приоритетнее свободной строки body.model',
+    prioTask?.model === 'qwen2.5-coder-7b', prioTask?.model);
+  if (prioTask) {
+    await api('/worker/submit', 'POST', {
+      taskId: prioTask.taskId, workerAddress: wNm, response: 'ok',
+      source: 'live_llm', model: 'qwen2.5-coder-7b', usage: { completion_tokens: 1 },
+    });
+  }
+  await prioInfl;
+
+  /* Дефолтная модель воркера обязана приниматься сервером: раньше запрос с
+   * ней получал 400 unknown_model, хотя воркер считал ею же.
+   * Задачу забираем и сдаём — иначе проверка ждала бы таймаут воркера. */
+  const wDefaultInfl = api('/inference', 'POST', {
+    prompt: 'дефолтная модель воркера', modelId: 'qwen2.5-coder:1.5b',
+    workerAddress: wNm,
+  });
+  let wDefTask = null;
+  for (let i = 0; i < 60 && !wDefTask; i++) {
+    const p = await api(`/worker/poll?workerAddress=${wNm}&model=qwen2.5-coder:1.5b`);
+    if (p.body?.task) wDefTask = p.body.task;
+    else await new Promise((r) => setTimeout(r, 100));
+  }
+  if (wDefTask) {
+    await api('/worker/submit', 'POST', {
+      taskId: wDefTask.taskId, workerAddress: wNm, response: 'ok',
+      source: 'live_llm', model: 'qwen2.5-coder:1.5b', usage: { completion_tokens: 1 },
+    });
+  }
+  const wDefault = await wDefaultInfl;
+  ok('modelId qwen2.5-coder:1.5b из каталога → не 400',
+    wDefault.status !== 400, { status: wDefault.status, error: wDefault.body?.error });
+  ok('qwen2.5-coder:1.5b доехал до воркера как model задачи',
+    wDefTask?.model === 'qwen2.5-coder:1.5b', wDefTask?.model);
 
   /* --- неизвестная модель: 400, а не тихий откат на base --- */
   const unknownM = await api('/inference', 'POST', {

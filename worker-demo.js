@@ -34,6 +34,51 @@ const OLLAMA = (process.env.OLLAMA_URL || 'http://127.0.0.1:11434').replace(/\/+
 const GROQ_KEY = process.env.GROQ_API_KEY || '';
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || '';
 
+/* ---------- Пространства имён моделей ----------
+ * Клиент выбирает модель из каталога /models и шлёт modelId; сервер кладёт его
+ * в задачу как task.model. Воркер обязан считать ИМЕННО эту модель — иначе
+ * выбор в интерфейсе ничего не значит, что и было дефектом.
+ *
+ * Ловушка: каталог и Ollama называют одну модель по-разному —
+ * `qwen2.5-coder-7b` против `qwen2.5-coder:7b`. Угадывать теги нельзя,
+ * поэтому имя резолвится по фактическому списку /api/tags. Приведение
+ * `:`/`-`/`_` к пустоте делает оба написания сравнимыми без таблиц-догадок:
+ * `qwen25coder7b` === `qwen25coder7b`. */
+function normalizeModelName(s) {
+  return String(s || '').toLowerCase().replace(/[:\-_.]/g, '');
+}
+
+let ollamaTagsCache = null;
+async function ollamaTags() {
+  if (ollamaTagsCache) return ollamaTagsCache;
+  try {
+    const res = await fetch(`${OLLAMA}/api/tags`, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) return [];
+    const j = await res.json();
+    ollamaTagsCache = (Array.isArray(j.models) ? j.models : [])
+      .map((m) => m && m.name).filter(Boolean);
+    return ollamaTagsCache;
+  } catch (_e) {
+    return [];
+  }
+}
+
+/* Запрошенное имя → реальный тег Ollama. Не найдено — отдаём запрошенное
+ * как есть: пусть Ollama сама скажет, что такой модели нет, вместо тихой
+ * подмены на чужую модель. */
+async function resolveOllamaModel(requested) {
+  if (!requested) return MODEL;
+  const want = normalizeModelName(requested);
+  const tags = await ollamaTags();
+  const hit = tags.find((t) => normalizeModelName(t) === want);
+  if (hit) return hit;
+  /* Модель без тега в каталоге (`qwen2.5-coder-7b`) при единственном
+   * подходящем теге у Ollama: сверяем по базовому имени. */
+  const base = want.replace(/latest$/, '');
+  const loose = tags.find((t) => normalizeModelName(t).replace(/latest$/, '') === base);
+  return loose || String(requested);
+}
+
 const log = (...a) => console.log(`[${new Date().toLocaleTimeString('ru-RU')}]`, ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -144,12 +189,15 @@ async function register() {
 }
 
 /* ---------- 1. Ollama на этом ПК ---------- */
-async function askOllama(prompt) {
+async function askOllama(prompt, requestedModel) {
+  /* Модель из задачи имеет приоритет над OLLAMA_MODEL: клиент выбрал её в
+   * каталоге, и подменять её своей значило бы врать в ответе. */
+  const model = await resolveOllamaModel(requestedModel);
   const res = await fetch(`${OLLAMA}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: MODEL,
+      model,
       stream: false,
       messages: [
         { role: 'system', content: 'Ты полезный ассистент. Отвечай кратко и по существу.' },
@@ -168,16 +216,21 @@ async function askOllama(prompt) {
   const prompt_tokens = j.prompt_eval_count || Math.ceil(prompt.length / 4);
   const completion_tokens = j.eval_count || Math.ceil(response.length / 4);
   return {
-    response, source: 'ollama',
+    response, source: 'ollama', model,
     usage: { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
   };
 }
 
-/* ---------- 2. Облачный API по ключу ---------- */
-async function askCloud(prompt) {
+/* ---------- 2. Облачный API по ключу ----------
+ * Модель из задачи применяется только если она адресована ЭТОМУ провайдеру:
+ * `openrouter/qwen3-coder` для OpenRouter. Имя локальной модели
+ * (`qwen2.5-coder-7b`) провайдеру не принадлежит, и отправка его в облако
+ * дала бы 404 «model not found» вместо ответа. В таком случае честно
+ * считаем дефолтом и объявляем в ответе именно то, что запустили. */
+async function askCloud(prompt, requestedModel) {
   const conf = GROQ_KEY
     ? { url: 'https://api.groq.com/openai/v1/chat/completions', key: GROQ_KEY,
-        model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', name: 'groq' }
+        model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', name: 'groq', prefix: 'groq/' }
     : { url: 'https://openrouter.ai/api/v1/chat/completions', key: OPENROUTER_KEY,
         /* Дефолт обязан быть моделью, которая БЕСПЛАТНА СЕЙЧАС. История:
          * meta-llama-3.3-70b:free → 404 «unavailable for free»;
@@ -187,13 +240,19 @@ async function askCloud(prompt) {
          * вечная константа, а проверенная на дату модель. На 2026-10-27
          * живой ответ даёт nvidia/nemotron-3.5-lightning:free; gemma-4 и
          * lfm-2.5 в тот же прогон отдали 429 upstream. */
-        model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3.5-lightning:free', name: 'openrouter' };
+        model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3.5-lightning:free', name: 'openrouter', prefix: 'openrouter/' };
+
+  /* Снимаем префикс роутера: 'openrouter/qwen3-coder' → 'qwen3-coder'. */
+  const asked = typeof requestedModel === 'string' && requestedModel.startsWith(conf.prefix)
+    ? requestedModel.slice(conf.prefix.length)
+    : null;
+  const model = asked || conf.model;
 
   const res = await fetch(conf.url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${conf.key}` },
     body: JSON.stringify({
-      model: conf.model,
+      model,
       messages: [
         { role: 'system', content: 'Ты полезный ассистент. Отвечай кратко и по существу.' },
         { role: 'user', content: prompt },
@@ -210,7 +269,9 @@ async function askCloud(prompt) {
   const prompt_tokens = u.prompt_tokens || Math.ceil(prompt.length / 4);
   const completion_tokens = u.completion_tokens || Math.ceil(response.length / 4);
   return {
-    response, source: conf.name,
+    /* Объявляем РЕАЛЬНО запущенную модель: если провайдер ответил не тем
+     * именем, что просили, отчёт обязан это показать, а не повторить запрос. */
+    response, source: conf.name, model,
     usage: { prompt_tokens, completion_tokens, total_tokens: u.total_tokens || prompt_tokens + completion_tokens },
   };
 }
@@ -231,10 +292,10 @@ function askFallback(prompt) {
 
 let ollamaDead = false;
 
-async function generate(prompt) {
+async function generate(prompt, requestedModel) {
   if (!ollamaDead) {
     try {
-      return await askOllama(prompt);
+      return await askOllama(prompt, requestedModel);
     } catch (e) {
       /* Ollama может быть просто не запущен — это нормально. Запоминаем,
        * чтобы не ждать таймаут на каждой задаче. */
@@ -244,7 +305,7 @@ async function generate(prompt) {
   }
   if (GROQ_KEY || OPENROUTER_KEY) {
     try {
-      return await askCloud(prompt);
+      return await askCloud(prompt, requestedModel);
     } catch (e) {
       log(`облачный API не ответил (${e.message})`);
     }
@@ -324,7 +385,10 @@ async function pollOnce() {
   const pulse = setInterval(heartbeat, 7000);
   let gen;
   try {
-    gen = await generate(prompt);
+    /* task.model — имя модели, которую выбрал клиент из каталога. Именно оно
+     * уходит в бэкенд; MODEL остаётся только fallback'ом для совместимости
+     * со старым сервером, который поле model не заполнял. */
+    gen = await generate(prompt, task.model || null);
   } finally {
     clearInterval(pulse);
   }
@@ -343,7 +407,10 @@ async function pollOnce() {
      * модели от шаблона этого же воркера (model_unavailable). */
     source: gen.source,
     // model обязателен: сервер отклоняет результат без него.
-    model: gen.source === 'ollama' ? MODEL : (gen.source === 'groq' ? (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile') : MODEL),
+    /* Объявляем ту модель, которую бэкенд реально запустил (gen.model), а не
+     * ту, что просили: сервер по этому полю пишет отчёт, и расхождение
+     * «просили 7b, считали 1.5b» должно быть видно, а не замазано. */
+    model: gen.model || MODEL,
   });
 
   if (sub.ok) {
@@ -354,7 +421,11 @@ async function pollOnce() {
   }
 }
 
-(async () => {
+/* Главный цикл запускается только при прямом вызове файла. Без этого guard'а
+ * `require('./worker-demo.js')` из теста начинал бы опрос сервера и
+ * регистрировал узел — то есть проверка функций имела бы побочный эффект
+ * в виде живого воркера на стенде. */
+async function main() {
   console.log('');
   console.log('  TarNet worker');
   console.log(`  сервер:  ${API}`);
@@ -387,4 +458,15 @@ async function pollOnce() {
     }
     await sleep(POLL_MS);
   }
-})();
+}
+
+/* Экспорт для юнит-тестов: разрешение имён моделей проверяется без сети и
+ * без запуска воркера. */
+module.exports = { normalizeModelName, resolveOllamaModel, ollamaTags, main };
+
+if (require.main === module) {
+  main().catch((e) => {
+    console.error(`воркер упал: ${e.message}`);
+    process.exit(1);
+  });
+}
