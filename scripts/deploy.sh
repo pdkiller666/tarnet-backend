@@ -34,10 +34,24 @@ HEALTH_LOCAL="http://127.0.0.1:3001/health"
 PUBLIC_URL="${TARNET_PUBLIC_URL:-https://v1107336.hosted-by-vdsina.com}"
 MSG="${1:-}"
 
+# Флаг в позиционном аргументе — это почти всегда ошибка вызова, а не сообщение
+# коммита. 2026-10-28 я запустил `deploy.sh --dry-run`: режима такого нет, флаг
+# молча стал сообщением коммита, и скрипт честно закоммитил, запушил и раскатал
+# тестовое дерево на прод. Отказываемся сразу — цена ошибки здесь слишком высока.
+case "$MSG" in
+  -*) 
+    printf 'ОТКАЗ: аргумент «%s» похож на флаг, а не на сообщение коммита.\n' "$MSG" >&2
+    printf 'У deploy.sh нет режима --dry-run: он всегда коммитит, пушит и раскатывает.\n' >&2
+    printf 'Использование: %s ["сообщение коммита"]\n' "$(basename "$0")" >&2
+    printf 'Проверить без деплоя: bash scripts/verify.sh\n' >&2
+    exit 2 ;;
+esac
+
 SSH_OPTS=(-i "$SSH_KEY" -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
 TOKEN=""
 
 info() { printf '\n== %s\n' "$*"; }
+warn() { printf '\033[33m⚠️  %s\033[0m\n' "$*"; }
 mask() { sed -e "s|${TOKEN:-__none__}|<token>|g"; }
 die()  { printf '\nПРОВАЛ: %s\n' "$*" >&2; exit 1; }
 
@@ -84,6 +98,46 @@ else
 fi
 LOCAL_HEAD=$(git rev-parse HEAD)
 printf 'локальный HEAD: %s\n' "$LOCAL_HEAD"
+
+# ---------- 1.5. хроника проекта ----------
+# Проверка, что PROJECT-HISTORY.md не отстал от кода. Только предупреждение,
+# деплой не блокирует — и вот почему это осознанно.
+#
+# За один рабочий день накапливается до шести кодовых коммитов, которые хроника
+# и не должна описывать поштучно: она ведёт вехи, а не git log. Проверено на
+# истории 24–28.10 — сама хроника обновлялась 5 раз, кодовых коммитов за это
+# время было 34. Требование «обнови в каждом коммите» превратилось бы в шум,
+# проверку бы отключили, и разрыв в 4 дня повторился бы.
+#
+# Порог подобран по факту: 3 кодовых коммита после последней правки хроники —
+# это уже реальное отставание, а не рабочий ритм. TARNET_HISTORY_STRICT=1
+# делает проверку блокирующей для CI.
+HISTORY_FILE="PROJECT-HISTORY.md"
+HISTORY_THRESHOLD="${TARNET_HISTORY_THRESHOLD:-3}"
+CODE_PATHS=('*.js' '*.html' '*.css' '*.sh' 'deploy')
+if [ -f "$HISTORY_FILE" ]; then
+  HIST_COMMIT=$(git log -1 --format=%H -- "$HISTORY_FILE" 2>/dev/null)
+  if [ -n "$HIST_COMMIT" ]; then
+    CODE_AFTER=$(git rev-list --count "${HIST_COMMIT}..HEAD" -- "${CODE_PATHS[@]}" 2>/dev/null || echo 0)
+    HEAD_CODE=$(git show --name-only --format= HEAD -- "${CODE_PATHS[@]}" 2>/dev/null | grep -c . || true)
+    HEAD_HIST=$(git show --name-only --format= HEAD -- "$HISTORY_FILE" 2>/dev/null | grep -c . || true)
+
+    if [ "$CODE_AFTER" -ge "$HISTORY_THRESHOLD" ]; then
+      if [ "$HEAD_CODE" -gt 0 ] && [ "$HEAD_HIST" -eq 0 ]; then
+        warn "код изменился, а хроника нет: $CODE_AFTER кодовых коммитов после $(printf %.7s "$HIST_COMMIT")"
+      else
+        warn "хроника отстаёт: $CODE_AFTER кодовых коммитов после $(printf %.7s "$HIST_COMMIT")"
+      fi
+      warn "допиши веху в $HISTORY_FILE или задеплой осознанно: TARNET_HISTORY_THRESHOLD=999"
+      if [ "${TARNET_HISTORY_STRICT:-0}" = "1" ]; then
+        die "строгий режим: $HISTORY_FILE не обновлён после кода"
+      fi
+    else
+      printf 'хроника: %s, отставание %s кодовых коммитов (порог %s)\n' \
+        "$(printf %.7s "$HIST_COMMIT")" "$CODE_AFTER" "$HISTORY_THRESHOLD"
+    fi
+  fi
+fi
 
 # ---------- 2. GitHub ----------
 [ -r "$GH_CREDS" ] || die "нет credential-файла $GH_CREDS"
