@@ -4512,6 +4512,157 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+  section('29A. Tier 6: расширенные провайдеры и честный 501');
+  {
+    /* Зачем эта секция: каталог вырос с 5 моделей до 18, и без проверок
+     * «строка в каталоге» легко принять за «вызов работает». Здесь
+     * разделены три состояния: работает (deepseek/mistral), объявлен но
+     * не реализован (yandex/gigachat → 501), и локальная модель с похожим
+     * именем, которую облачный префикс не должен перехватывать. */
+    const realFetch0 = global.fetch;
+    try {
+      const P = LLM.PROVIDER_ENDPOINTS;
+
+      /* 29A.1–29A.6 Адреса провайдеров. Проверяем хост, а не всю строку:
+       * смысл в том, что запрос уйдёт именно этому провайдеру. */
+      const hostOf = (p) => { try { return new URL(P[p]).hostname; } catch (_e) { return null; } };
+      ok('29A.1 deepseek → api.deepseek.com', hostOf('deepseek') === 'api.deepseek.com', hostOf('deepseek'));
+      ok('29A.2 together → api.together.xyz', hostOf('together') === 'api.together.xyz', hostOf('together'));
+      ok('29A.3 fireworks → api.fireworks.ai', hostOf('fireworks') === 'api.fireworks.ai', hostOf('fireworks'));
+      ok('29A.4 mistral → api.mistral.ai', hostOf('mistral') === 'api.mistral.ai', hostOf('mistral'));
+      ok('29A.5 yandex → llm.api.cloud.yandex.net', hostOf('yandex') === 'llm.api.cloud.yandex.net', hostOf('yandex'));
+      ok('29A.6 gigachat → sberbank', /sberbank/.test(hostOf('gigachat') || ''), hostOf('gigachat'));
+
+      /* 29A.7 Всего провайдеров 10: 8 OpenAI-совместимых + 2 спецформата. */
+      ok('29A.7 в PROVIDER_ENDPOINTS 10 провайдеров',
+        Object.keys(P).length === 10, Object.keys(P).length);
+
+      /* 29A.8 Префикс modelId резолвится в провайдера для всех новых. */
+      const prefixes = ['deepseek', 'together', 'fireworks', 'mistral', 'yandex', 'gigachat'];
+      const wrong = prefixes.filter((p) => LLM.providerForModel(`${p}/m`) !== p);
+      ok('29A.8 providerForModel знает все 6 новых префиксов',
+        wrong.length === 0, wrong);
+
+      /* 29A.9 Локальная deepseek-r1-distill НЕ должна уехать на api.deepseek.com:
+       * имя начинается на deepseek, но provider у неё local. Широкое правило
+       * «начинается на deepseek → облако» сломало бы локальный инференс. */
+      ok('29A.9 локальная deepseek-r1-distill не перехватывается облаком',
+        LLM.providerForModel('deepseek-r1-distill-1.5b') === null,
+        LLM.providerForModel('deepseek-r1-distill-1.5b'));
+
+      /* 29A.10–29A.13 Yandex/GigaChat: 501 ДО сети и ДО проверки ключа.
+       * Счётчик вызовов доказывает, что до сети дело не дошло. */
+      let netCalls = 0;
+      global.fetch = async () => { netCalls += 1; throw new Error('network must not be touched'); };
+
+      let yErr = null;
+      try { await LLM.callExternalProvider({ provider: 'yandex', modelId: 'yandex/yandexgpt-lite', prompt: 'x', byokKey: 'k' }); }
+      catch (e) { yErr = e; }
+      ok('29A.10 yandex → 501 PROVIDER_NOT_IMPLEMENTED',
+        yErr?.status === 501 && yErr?.code === 'PROVIDER_NOT_IMPLEMENTED',
+        { status: yErr?.status, code: yErr?.code });
+      ok('29A.11 yandex: в тексте есть [SPEC Phase 2.5]',
+        /\[SPEC Phase 2\.5\]/.test(yErr?.message || ''), (yErr?.message || '').slice(0, 60));
+
+      let gErr = null;
+      try { await LLM.callExternalProvider({ provider: 'gigachat', modelId: 'gigachat/gigachat-lite', prompt: 'x', byokKey: 'k' }); }
+      catch (e) { gErr = e; }
+      ok('29A.12 gigachat → 501 PROVIDER_NOT_IMPLEMENTED',
+        gErr?.status === 501 && gErr?.code === 'PROVIDER_NOT_IMPLEMENTED',
+        { status: gErr?.status, code: gErr?.code });
+
+      /* 29A.13 Без ключа тот же вызов обязан быть 501, а не 401:
+       * адаптера нет вовсе, и «вставьте ключ» вводило бы в заблуждение. */
+      let yNoKey = null;
+      try { await LLM.callExternalProvider({ provider: 'yandex', modelId: 'yandex/yandexgpt-lite', prompt: 'x' }); }
+      catch (e) { yNoKey = e; }
+      ok('29A.13 yandex без ключа → 501, а не 401',
+        yNoKey?.status === 501, { status: yNoKey?.status, code: yNoKey?.code });
+      ok('29A.14 ни один из 501-путей не тронул сеть', netCalls === 0, netCalls);
+
+      /* 29A.15–29A.17 DeepSeek — рабочий провайдер: ключ в Bearer,
+       * префикс роутера срезан, текст разобран. */
+      let dsUrl = null, dsInit = null;
+      global.fetch = async (url, init) => {
+        dsUrl = String(url); dsInit = init;
+        return {
+          ok: true, status: 200,
+          json: async () => ({ model: 'deepseek-chat', choices: [{ message: { content: 'ответ' } }], usage: { total_tokens: 11 } }),
+          text: async () => '',
+        };
+      };
+      const ds = await LLM.callExternalProvider({ provider: 'deepseek', modelId: 'deepseek/deepseek-chat', prompt: 'x', byokKey: 'sk-user' });
+      ok('29A.15 deepseek идёт на api.deepseek.com',
+        /^https:\/\/api\.deepseek\.com\/v1\/chat\/completions$/.test(dsUrl || ''), dsUrl);
+      ok('29A.16 deepseek: ключ пользователя в Bearer',
+        dsInit?.headers?.Authorization === 'Bearer sk-user', Boolean(dsInit?.headers?.Authorization));
+      const dsBody = JSON.parse(dsInit?.body || '{}');
+      ok('29A.17 deepseek: префикс роутера срезан из model',
+        dsBody.model === 'deepseek-chat', dsBody.model);
+      ok('29A.18 deepseek: текст ответа и usage разобраны',
+        ds.text === 'ответ' && ds.usageTokens === 11, { text: ds.text, usage: ds.usageTokens });
+
+      /* 29A.19 Mistral — тот же OpenAI-совместимый путь, без особого кода. */
+      let msUrl = null;
+      global.fetch = async (url) => {
+        msUrl = String(url);
+        return {
+          ok: true, status: 200,
+          json: async () => ({ choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 3 } }),
+          text: async () => '',
+        };
+      };
+      const ms = await LLM.callExternalProvider({ provider: 'mistral', modelId: 'mistral/mistral-large', prompt: 'x', byokKey: 'mk' });
+      ok('29A.19 mistral → api.mistral.ai и ответ разобран',
+        /api\.mistral\.ai/.test(msUrl || '') && ms.text === 'ok', { url: msUrl, text: ms.text });
+
+      /* 29A.20 providerFromUrl опознаёт новые хосты по URL. */
+      ok('29A.20 providerFromUrl знает новые хосты',
+        LLM.providerFromUrl('https://api.together.xyz/v1/chat/completions') === 'together' &&
+        LLM.providerFromUrl('https://api.fireworks.ai/x') === 'fireworks' &&
+        LLM.providerFromUrl('https://gigachat.devices.sberbank.ru/api/v1') === 'gigachat',
+        'ok');
+    } finally {
+      global.fetch = realFetch0;
+    }
+
+    /* 29A.21–29A.26 Каталог и HTTP-ворота на живом сервере. */
+    const srv = await spawnServer();
+    try {
+      const cat = await apiAt(srv.base, '/models');
+      const list = cat.body?.models || [];
+      ok('29A.21 /models → 200', cat.status === 200, cat.status);
+      ok('29A.22 в каталоге не меньше 15 моделей', list.length >= 15, list.length);
+
+      const provs = [...new Set(list.map((m) => m.provider))];
+      ok('29A.23 в каталоге не меньше 9 провайдеров', provs.length >= 9, provs.length);
+      ok('29A.24 yandex и gigachat есть в каталоге',
+        provs.includes('yandex') && provs.includes('gigachat'), provs);
+
+      /* 29A.25 Tier 6 — не меньше 15 облачных строк. */
+      ok('29A.25 облачных (tier 6) моделей не меньше 15',
+        list.filter((m) => Number(m.tier) === 6).length >= 15,
+        list.filter((m) => Number(m.tier) === 6).length);
+
+      /* 29A.26 Без ключа облачная модель — 401, до любого списания. */
+      const noKey = await apiAt(srv.base, '/inference', 'POST', {
+        modelId: 'deepseek/deepseek-chat', prompt: 'hi', tier: '6',
+        clientAddress: '0x' + '55'.repeat(20),
+      });
+      ok('29A.26 /inference deepseek без ключа → 401 AUTH_MISSING_KEY',
+        noKey.status === 401 && noKey.body?.error === 'AUTH_MISSING_KEY',
+        { status: noKey.status, error: noKey.body?.error });
+
+      /* 29A.27 Инвариант сохранения не сдвинулся от расширения каталога. */
+      const s2 = await apiAt(srv.base, '/summary');
+      ok('29A.27 расширение каталога не сломало conservation (delta 0)',
+        Number(s2.body?.conservation?.delta) === 0 && s2.body?.conservation?.holds === true,
+        s2.body?.conservation);
+    } finally {
+      srv.stop();
+    }
+  }
+
   console.log('\n30. Device Pairing — привязка существующего ПК');
   {
     /* Зачем эта секция: привязка заводится ровно для случая «воркер уже
@@ -5076,14 +5227,14 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     const lmStart = appSrc.indexOf('async function loadModels');
     const lmBody = lmStart < 0 ? '' : appSrc.slice(lmStart, lmStart + 3200);
     ok('33.2 loadModels фильтрует облачные по провайдеру ключа',
-      /keyProvider\(\)/.test(lmBody) && /m\.provider\s*===\s*keyProv/.test(lmBody),
-      lmBody ? 'фильтр по keyProv есть' : 'loadModels не найден');
+      /keyProviders\(\)/.test(lmBody) && /keyProvs\.includes\(m\.provider\)/.test(lmBody),
+      lmBody ? 'фильтр по keyProvs есть' : 'loadModels не найден');
 
     /* 33.3 Ключ неизвестного формата НЕ прячет облачные модели: провайдера
      * по нему не определить, и угадывать за пользователя нельзя. */
     ok('33.3 нераспознанный ключ не отсекает все облачные модели',
-      /\|\|\s*!keyProv/.test(lmBody) || /!keyProv\s*\|\|/.test(lmBody),
-      'условие «keyProv неизвестен → не фильтровать»');
+      /!keyProvs\.length/.test(lmBody),
+      'условие «keyProvs пуст → не фильтровать»');
 
     /* 33.4 Сервер обязан назвать провайдера и формат ключа. Проверяем на
      * живом стенде: фейковый ключ OpenRouter для модели OpenRouter даёт

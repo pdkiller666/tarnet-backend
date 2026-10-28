@@ -1059,6 +1059,33 @@ CREATE TABLE IF NOT EXISTS approvals (
     ['qwen2.5-coder-7b', 'local', 2, 32768, 0, 0, -1, -1, 'code,agentic', 8, 1, 1, 'apache-2.0', 1, null],
     ['openrouter/qwen3-coder', 'openrouter', 6, 262144, 0, 0, 20, 200, 'code,long-context', 0, 1, 1, 'apache-2.0', 1, 'https://openrouter.ai/models'],
     ['openai/gpt-4o', 'openai', 6, 128000, 0.125, 2.5, 30, 500, 'general,vision', 0, 0, 1, 'proprietary', 0, 'https://openai.com/policies/terms-of-use'],
+      /* ===== Волна 8: расширенный Tier 6 =====
+       *
+       * ПОЧЕМУ costPer1M=0 У ВСЕХ НОВЫХ СТРОК: это BYOK-модели, платит
+       * владелец ключа напрямую провайдеру, не протокол. При costPer1M>0
+       * срабатывает ворота USD-резерва (server.js:5752), и клиент без
+       * депозита не получил бы вызов вообще. Ноль здесь означает
+       * «протокол не берёт денег за доступ», а не «провайдер бесплатен».
+       *
+       * allowsTraining — решение по лицензии, а не удобство:
+       *   MIT / Apache-2.0 → 1, проприетарные API → 0.
+       * У Yandex/GigaChat стоит isAvailable=1, чтобы каталог /models был
+       * полным, но вызов отвечает 501: адаптера нет (TIER6_NOT_IMPLEMENTED
+       * в llm-adapter.js). Каталог ≠ работающий вызов, и это разделено
+       * явно, чтобы не выдавать наличие строки за поддержку. */
+      ['deepseek/deepseek-chat', 'deepseek', 6, 131072, 0, 0, 60, 10000, 'general,code,reasoning', 0, 1, 1, 'mit', 1, 'https://api-docs.deepseek.com/'],
+      ['deepseek/deepseek-reasoner', 'deepseek', 6, 131072, 0, 0, 60, 10000, 'reasoning,math', 0, 1, 1, 'mit', 1, 'https://api-docs.deepseek.com/'],
+      ['deepseek/deepseek-coder', 'deepseek', 6, 131072, 0, 0, 60, 10000, 'code', 0, 1, 1, 'mit', 1, 'https://api-docs.deepseek.com/'],
+      ['yandex/yandexgpt-lite', 'yandex', 6, 8192, 0, 0, -1, -1, 'general', 0, 0, 1, 'proprietary', 0, 'https://yandex.cloud/ru/docs/legal/terms'],
+      ['yandex/yandexgpt-pro', 'yandex', 6, 8192, 0, 0, -1, -1, 'general,reasoning', 0, 0, 1, 'proprietary', 0, 'https://yandex.cloud/ru/docs/legal/terms'],
+      ['gigachat/gigachat-lite', 'gigachat', 6, 8192, 0, 0, -1, -1, 'general', 0, 0, 1, 'proprietary', 0, 'https://developers.sber.ru/docs/ru/gigachat/api/overview'],
+      ['gigachat/gigachat-pro', 'gigachat', 6, 8192, 0, 0, -1, -1, 'general,reasoning', 0, 0, 1, 'proprietary', 0, 'https://developers.sber.ru/docs/ru/gigachat/api/overview'],
+      ['together/llama-3.3-70b', 'together', 6, 131072, 0, 0, 60, 1000, 'general,reasoning', 0, 1, 1, 'llama-3.3-community', 0, 'https://www.together.ai/terms-of-service'],
+      ['together/qwen-2.5-72b', 'together', 6, 32768, 0, 0, 60, 1000, 'general,code', 0, 1, 1, 'apache-2.0', 1, 'https://www.together.ai/terms-of-service'],
+      ['fireworks/llama-3.3-70b', 'fireworks', 6, 131072, 0, 0, 60, 1000, 'general,reasoning', 0, 1, 1, 'llama-3.3-community', 0, 'https://fireworks.ai/terms-of-service'],
+      ['fireworks/mixtral-8x22b', 'fireworks', 6, 65536, 0, 0, 60, 1000, 'general,code', 0, 1, 1, 'apache-2.0', 1, 'https://fireworks.ai/terms-of-service'],
+      ['mistral/mistral-large', 'mistral', 6, 131072, 0, 0, 60, 1000, 'general,reasoning', 0, 1, 1, 'proprietary', 0, 'https://mistral.ai/terms/'],
+      ['mistral/mistral-codestral', 'mistral', 6, 262144, 0, 0, 60, 1000, 'code', 0, 1, 1, 'proprietary', 0, 'https://mistral.ai/terms/'],
   ];
   const stmt = db.prepare(`INSERT OR IGNORE INTO model_registry
     (modelId, provider, tier, contextWindow, costPer1M, reserveRequiredUsd,

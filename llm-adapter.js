@@ -81,6 +81,11 @@ function providerFromUrl(rawUrl) {
   if (host.includes('groq')) return 'groq';
   if (host.includes('googleapis') || host.includes('generativelanguage')) return 'gemini';
   if (host.includes('deepseek')) return 'deepseek';
+  if (host.includes('together')) return 'together';
+  if (host.includes('fireworks')) return 'fireworks';
+  if (host.includes('mistral')) return 'mistral';
+  if (host.includes('yandex')) return 'yandex';
+  if (host.includes('sberbank') || host.includes('gigachat')) return 'gigachat';
   if (host.includes('openai.com')) return 'openai';
   return 'custom';
 }
@@ -159,6 +164,34 @@ const PROVIDER_ENDPOINTS = {
   groq: 'https://api.groq.com/openai/v1/chat/completions',
   openai: 'https://api.openai.com/v1/chat/completions',
   gemini: 'https://generativelanguage.googleapis.com/v1beta/models',
+  /* OpenAI-совместимые: тело запроса и форма ответа те же, что у Groq и
+   * OpenRouter, поэтому идут в общую ветку ниже без отдельного кода.
+   * Отдельная функция на каждого провайдера была бы копией одной и той же
+   * fetch-обёртки, и первая же правка формата разошлась бы между копиями. */
+  deepseek: 'https://api.deepseek.com/v1/chat/completions',
+  together: 'https://api.together.xyz/v1/chat/completions',
+  fireworks: 'https://api.fireworks.ai/inference/v1/chat/completions',
+  mistral: 'https://api.mistral.ai/v1/chat/completions',
+  /* НЕ OpenAI-совместимые: у Yandex свой конверт (modelUri + completionOptions),
+   * у GigaChat — OAuth-токен и поле `messages` с другим ответом. Адреса
+   * записаны для документации; вызов до сети не доходит — 501 ниже. */
+  yandex: 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion',
+  gigachat: 'https://gigachat.devices.sberbank.ru/api/v1/chat/completions',
+};
+
+/* Провайдеры, объявленные в каталоге, но не реализованные.
+ *
+ * ПОЧЕМУ 501, А НЕ МОЛЧАЛИВЫЙ ФОЛБЭК НА ЛОКАЛЬНЫЙ ВОРКЕР: клиент выбрал
+ * конкретную модель и ждёт ответа именно от неё. Тихо посчитать локально —
+ * значит выдать чужой ответ за GigaChat. 501 говорит правду: адаптера нет.
+ *
+ * Текст намеренно содержит «[SPEC Phase 2.5]» — тот же маркер, что у FIAT
+ * и BYOK-оплаты, чтобы обещание нельзя было принять за работающую функцию. */
+const TIER6_NOT_IMPLEMENTED = {
+  yandex: 'YandexGPT: адаптер [SPEC Phase 2.5]. Формат запроса не OpenAI-совместим '
+    + '(modelUri + completionOptions), iam-токен и folderId не поддерживаются.',
+  gigachat: 'GigaChat: адаптер [SPEC Phase 2.5]. Нужен OAuth-обмен client_secret '
+    + 'на access_token и своя схема ответа — этого контура в сборке нет.',
 };
 
 /* Подмена адреса провайдера — ТОЛЬКО для приёмки, у которой нет права
@@ -196,6 +229,16 @@ function providerForModel(modelId) {
   if (prefix === 'groq') return 'groq';
   if (prefix === 'openai') return 'openai';
   if (prefix === 'google' || prefix === 'gemini') return 'gemini';
+  if (prefix === 'deepseek') return 'deepseek';
+  if (prefix === 'together') return 'together';
+  if (prefix === 'fireworks') return 'fireworks';
+  if (prefix === 'mistral') return 'mistral';
+  if (prefix === 'yandex') return 'yandex';
+  if (prefix === 'gigachat') return 'gigachat';
+  /* Голый префикс `deepseek-` НЕ маппится намеренно: в каталоге уже есть
+   * локальная `deepseek-r1-distill-1.5b` с provider='local'. Широкое правило
+   * «начинается на deepseek → облако» увело бы локальную модель на
+   * api.deepseek.com. Для облачных моделей провайдер берётся из реестра. */
   return null;
 }
 
@@ -216,6 +259,7 @@ const KEY_PREFIX = {
   openai: 'sk-',
   groq: 'gsk_',
   gemini: 'AIza',
+  deepseek: 'sk-',
 };
 
 const PROVIDER_TITLE = {
@@ -223,6 +267,12 @@ const PROVIDER_TITLE = {
   openai: 'OpenAI',
   groq: 'Groq',
   gemini: 'Google Gemini',
+  deepseek: 'DeepSeek',
+  together: 'Together AI',
+  fireworks: 'Fireworks AI',
+  mistral: 'Mistral AI',
+  yandex: 'YandexGPT',
+  gigachat: 'GigaChat',
 };
 
 /* Причина отказа 401/403 человеческим языком. Две разные ситуации, которые
@@ -248,13 +298,23 @@ async function callExternalProvider({ provider, modelId, prompt, maxTokens = 512
   if (!PROVIDER_ENDPOINTS[prov]) {
     throw tier6Error(`UNSUPPORTED_PROVIDER: ${prov || '(empty)'}`, { status: 400, code: 'UNSUPPORTED_PROVIDER' });
   }
+  /* Отказ ДО проверки ключа: адаптера нет вовсе, и с ключом он не появится.
+   * Если поставить это после 401, человек без ключа получит «вставьте ключ»,
+   * вставит его и только тогда узнает, что вызов невозможен в принципе. */
+  if (TIER6_NOT_IMPLEMENTED[prov]) {
+    const err = tier6Error(TIER6_NOT_IMPLEMENTED[prov], { status: 501, code: 'PROVIDER_NOT_IMPLEMENTED' });
+    err.details = TIER6_NOT_IMPLEMENTED[prov];
+    err.implemented = false;
+    throw err;
+  }
   const key = typeof byokKey === 'string' ? byokKey.trim() : '';
   if (!key) {
     throw tier6Error('Вставьте ключ в настройках PWA', { status: 401, code: 'AUTH_MISSING_KEY' });
   }
 
   /* Убираем внутренний префикс роутера: 'openrouter/qwen3-coder' → 'qwen3-coder'. */
-  const cleanModel = String(modelId || '').replace(/^(openrouter|groq|openai|google|gemini)\//, '');
+  const cleanModel = String(modelId || '').replace(
+    /^(openrouter|groq|openai|google|gemini|deepseek|together|fireworks|mistral|yandex|gigachat)\//, '');
   const signal = AbortSignal.timeout(TIER6_TIMEOUT_MS);
 
   /* Адрес резолвится ДО try: отказ guard'а на не-loopback — это осознанный

@@ -380,9 +380,14 @@ function modelOption(m, isCloud) {
   const ctx = Number(m.contextWindow) >= 1000
     ? ` · ${Math.round(Number(m.contextWindow) / 1000)}k`
     : '';
+  /* Провайдер и лицензия в самой строке, а не только в подписи группы:
+   * в группе из нескольких моделей человек должен видеть, чей ключ ему
+   * нужен и можно ли гнать эту модель в дистилляцию, не открывая /models. */
+  const prov = PROVIDER_TITLE[m.provider] || m.provider;
+  const lic = m.license ? ` · ${m.license}` : '';
   o.textContent = isCloud
-    ? `${m.modelId} · Cloud/${m.provider}${ctx}`
-    : `${m.modelId}${ctx}${m.isFree ? ' · free' : ''}`;
+    ? `${m.modelId} · ${prov}${ctx}${lic}${m.allowsTraining ? ' · можно учить' : ' · только инференс'}`
+    : `${m.modelId}${ctx}${m.isFree ? ' · free' : ''}${lic}`;
   return o;
 }
 
@@ -423,10 +428,14 @@ async function loadModels() {
      * Ключ неизвестного формата облачных не прячет: провайдера по нему не
      * определить, и угадывать за пользователя нельзя. Такой ключ либо
      * сработает, либо получит 401 с внятной причиной в details. */
-    const keyProv = keyProvider();
+    /* Фильтр по МАССИВУ провайдеров, а не по одному: ключ `sk-` принадлежит
+     * либо OpenAI, либо DeepSeek, и различить их по префиксу нельзя. При
+     * сравнении с одним провайдером половина рабочих моделей исчезла бы из
+     * списка, и человек решил бы, что каталог пуст. */
+    const keyProvs = keyProviders();
     const cloud = hasKey
       ? all.filter((m) => Number(m.tier) === 6 && m.isAvailable !== false
-          && (!keyProv || m.provider === keyProv))
+          && (!keyProvs.length || keyProvs.includes(m.provider)))
       : [];
 
     MODEL_INFO.clear();
@@ -442,19 +451,30 @@ async function loadModels() {
       sel.appendChild(g);
     }
     if (cloud.length) {
-      const g = document.createElement('optgroup');
-      /* Провайдер в подписи группы, а не только в строке модели: человек
-       * должен видеть, чьим ключом платит, до отправки промпта. */
-      const label = keyProv ? PROVIDER_TITLE[keyProv] || keyProv : 'облако';
-      g.label = `Облачные (${label}) — ваш ключ, промпт уходит провайдеру`;
-      for (const m of cloud) g.appendChild(modelOption(m, true));
-      sel.appendChild(g);
+      /* Группировка по семействам провайдеров. Провайдер в подписи группы, а не
+       * только в строке модели: человек должен видеть, чьим ключом платит, до
+       * отправки промпта. Группа создаётся только если в ней есть модели —
+       * пустой optgroup рисовал бы заголовок без содержимого. */
+      for (const grp of CLOUD_GROUPS) {
+        const rows = cloud.filter((m) => grp.providers.includes(m.provider));
+        if (!rows.length) continue;
+        const g = document.createElement('optgroup');
+        g.label = grp.label;
+        for (const m of rows) g.appendChild(modelOption(m, true));
+        sel.appendChild(g);
+      }
+      /* Способ оплаты один на все облачные группы — подпись внизу списка,
+       * чтобы не повторять «ваш ключ» в каждой из четырёх групп. */
+      const payg = document.createElement('optgroup');
+      payg.label = 'Все облачные — оплата вашим ключом, промпт уходит провайдеру';
+      sel.appendChild(payg);
     }
     /* Ключ есть, но моделей под него в каталоге нет — это не «нет моделей»,
      * а несовпадение ключа и каталога. Молчаливое «нет доступных моделей»
      * отправило бы человека искать проблему в сети. */
-    if (!local.length && !cloud.length && hasKey && keyProv) {
-      sel.innerHTML = `<option value="">нет облачных моделей для ключа ${PROVIDER_TITLE[keyProv] || keyProv}</option>`;
+    if (!local.length && !cloud.length && hasKey && keyProvs.length) {
+      const names = keyProvs.map((p) => PROVIDER_TITLE[p] || p).join(' / ');
+      sel.innerHTML = `<option value="">нет облачных моделей для ключа ${names}</option>`;
     } else if (!local.length && !cloud.length) {
       sel.innerHTML = '<option value="">нет доступных моделей</option>';
     }
@@ -1114,8 +1134,23 @@ function keyProvider() {
   if (k.startsWith('sk-or-v1-')) return 'openrouter';
   if (k.startsWith('gsk_')) return 'groq';
   if (k.startsWith('AIza')) return 'gemini';
-  if (k.startsWith('sk-')) return 'openai';
+  /* Ключи OpenAI и DeepSeek начинаются одинаково — на `sk-`. Отличить их по
+   * префиксу невозможно, и угадывать нельзя: ошибка либо скрыла бы рабочие
+   * модели, либо показала заведомо нерабочие. Поэтому для `sk-` возвращается
+   * метка неопределённости, а не конкретный провайдер. */
+  if (k.startsWith('sk-')) return 'ambiguous';
   return null;
+}
+
+/* Какие провайдеры совместимы с сохранённым ключом. Возвращает массив:
+ * для неоднозначного `sk-` их два, для остальных — один. Пустой массив
+ * означает «провайдера по ключу не определить» — тогда показываем всех,
+ * и пусть решает сам провайдер. */
+function keyProviders() {
+  const p = keyProvider();
+  if (!p) return [];
+  if (p === 'ambiguous') return ['openai', 'deepseek'];
+  return [p];
 }
 
 const PROVIDER_TITLE = {
@@ -1123,7 +1158,28 @@ const PROVIDER_TITLE = {
   openai: 'OpenAI',
   groq: 'Groq',
   gemini: 'Google Gemini',
+  deepseek: 'DeepSeek',
+  together: 'Together',
+  fireworks: 'Fireworks',
+  mistral: 'Mistral',
+  yandex: 'YandexGPT',
+  gigachat: 'GigaChat',
 };
+
+/* Группы облачных моделей. Порядок групп — порядок в выпадающем списке:
+ * сначала те, что работают, последними — российские, у которых вызов
+ * отвечает 501. Модель без адаптера всё равно показана: человек должен
+ * увидеть, что она есть в каталоге, и получить внятный отказ, а не
+ * гадать, почему её нет. */
+const CLOUD_GROUPS = [
+  { label: 'Облачные — DeepSeek', providers: ['deepseek'] },
+  { label: 'Облачные — OpenRouter / Groq / Gemini / OpenAI',
+    providers: ['openrouter', 'groq', 'gemini', 'openai'] },
+  { label: 'Облачные — Агрегаторы (Together / Fireworks / Mistral)',
+    providers: ['together', 'fireworks', 'mistral'] },
+  { label: 'Облачные — Российские (YandexGPT / GigaChat) — 501',
+    providers: ['yandex', 'gigachat'] },
+];
 
 /* Маска вместо ключа: показывать сохранённый ключ целиком на экране
  * незачем — достаточно убедиться, что он есть и какой он длины. */
@@ -1180,11 +1236,17 @@ function checkKeyMatchesModel(rawKey) {
   const k = String(rawKey || '').trim();
   if (!k) return '';
   /* Провайдер по ключу — той же логикой, что и в keyProvider(), но для
-   * ещё не сохранённого значения: keyProvider() читает localStorage. */
+   * ещё не сохранённого значения: keyProvider() читает localStorage.
+   *
+   * `sk-` неоднозначен: так начинаются ключи и OpenAI, и DeepSeek. Раньше
+   * здесь возвращался 'openai', и человек с ключом DeepSeek получал ложное
+   * «выбрана модель DeepSeek, а ключ от OpenAI» на верной паре модель+ключ.
+   * Ложное предупреждение хуже его отсутствия: оно учит не читать
+   * предупреждения. */
   const keyProv = k.startsWith('sk-or-v1-') ? 'openrouter'
     : (k.startsWith('gsk_') ? 'groq'
     : (k.startsWith('AIza') ? 'gemini'
-    : (k.startsWith('sk-') ? 'openai' : null)));
+    : (k.startsWith('sk-') ? 'ambiguous' : null)));
 
   const want = info.provider;
   /* Незнакомый формат не сравниваем: сравнение с null дало бы ложное
@@ -1194,10 +1256,19 @@ function checkKeyMatchesModel(rawKey) {
       + `${PROVIDER_TITLE[want] || want} начиная с «${KEY_PREFIX_HINT[want] || '…'}».`;
   }
   if (keyProv === want) return '';
+  /* `sk-` годится и OpenAI, и DeepSeek — предупреждать не о чем. */
+  if (keyProv === 'ambiguous' && (want === 'openai' || want === 'deepseek')) return '';
+
+  /* В тексте не должно быть внутреннего служебного слова 'ambiguous'.
+   * PROVIDER_TITLE его не содержит, и `|| keyProv` вывел бы его как есть
+   * в русское предложение. Подставляем человеческое название пары. */
+  const keyName = keyProv === 'ambiguous'
+    ? 'OpenAI или DeepSeek'
+    : (PROVIDER_TITLE[keyProv] || keyProv);
 
   return `Выбранная модель — ${PROVIDER_TITLE[want] || want}, а ключ похож на `
-    + `${PROVIDER_TITLE[keyProv] || keyProv}. Ключ не подойдёт: провайдер ответит 401. `
-    + `Выберите модель ${PROVIDER_TITLE[keyProv] || keyProv} или вставьте ключ `
+    + `${keyName}. Ключ не подойдёт: провайдер ответит 401. `
+    + `Выберите модель ${keyName} или вставьте ключ `
     + `${PROVIDER_TITLE[want] || want}.`;
 }
 

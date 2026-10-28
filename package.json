@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.12.9-migrate-claim",
+  "version": "2.13.1-tier6-providers",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {
