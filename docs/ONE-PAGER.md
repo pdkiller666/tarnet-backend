@@ -34,7 +34,7 @@
 - Комиссия протокола 5%, из неё burn 2.5%, казна 2.5%, роялти LoRA 5%.
 - Проверка: `GET /config`.
 
-**Tier 6 (BYOK) — новый слой экономики.** Пользователь вставляет свой ключ провайдера (OpenRouter / Gemini / Groq), вызов идёт напрямую от него, протокол берёт комиссию **0.0005 TAR** и возвращает **кэшбэк 0.0001 TAR**. Остаток комиссии делится 50/50 между сжиганием и казной. Инвариант Tier 6 сходится в ноль. Ворота проверены на живом проде в правильном порядке: нет модели → `400`, нет ключа → `401` **до** любого сетевого вызова, нет денег → `402`, отказ провайдера → `401 PROVIDER_AUTH_FAILED` с именем провайдера.
+**Tier 6 (BYOK) — новый слой экономики.** Пользователь вставляет свой ключ провайдера (OpenRouter / OpenAI), вызов идёт напрямую от него, протокол берёт комиссию **0.0005 TAR** и возвращает **кэшбэк 0.0001 TAR**. Остаток комиссии делится 50/50 между сжиганием и казной. Инвариант Tier 6 сходится в ноль. Ворота проверены на живом проде в правильном порядке: нет модели → `400`, нет ключа → `401` **до** любого сетевого вызова, нет денег → `402`, отказ провайдера → `401 PROVIDER_AUTH_FAILED` с именем провайдера.
 
 **Что показывает инвариант сохранения.** Выплаты воркерам (72.116894) плюс сожжённое (0.185113), казна (0.185113) и роялти (0.013300) дают ровно 72.500420 — оборот леджера. Расхождение нулевое на 716 чеках. Это не декларация, а проверяемое тождество: любой может пересчитать его из двух публичных endpoint'ов.
 
@@ -84,7 +84,7 @@
 - Protocol fee 5%, split into burn 2.5%, treasury 2.5%, LoRA royalty 5%.
 - Verification: `GET /config`.
 
-**Tier 6 (BYOK) — a new economic layer.** A user supplies their own provider key (OpenRouter / Gemini / Groq), the call goes out on their account, the protocol charges a **0.0005 TAR** fee and returns a **0.0001 TAR** cashback. The remainder splits 50/50 between burn and treasury. The Tier 6 invariant sums to zero. Gates were verified on live production in the correct order: no model → `400`, no key → `401` **before** any network call, no funds → `402`, provider rejection → `401 PROVIDER_AUTH_FAILED` naming the provider.
+**Tier 6 (BYOK) — a new economic layer.** A user supplies their own provider key (OpenRouter / OpenAI), the call goes out on their account, the protocol charges a **0.0005 TAR** fee and returns a **0.0001 TAR** cashback. The remainder splits 50/50 between burn and treasury. The Tier 6 invariant sums to zero. Gates were verified on live production in the correct order: no model → `400`, no key → `401` **before** any network call, no funds → `402`, provider rejection → `401 PROVIDER_AUTH_FAILED` naming the provider.
 
 **What the conservation invariant shows.** Worker payouts (72.116894) plus burned (0.185113), treasury (0.185113) and royalties (0.013300) equal exactly 72.500420 — the ledger's turnover. Zero discrepancy across 716 receipts. This is not a claim but a checkable identity: anyone can recompute it from two public endpoints.
 
