@@ -482,6 +482,10 @@ async function loadModels() {
      * сохранения ключа не должна сбрасывать модель на «авто». */
     if (prev && MODEL_INFO.has(prev)) sel.value = prev;
     syncContourToModel();
+    /* Подпись PII-индикатора зависит от выбранной модели, а она могла
+     * смениться вместе с каталогом: без этого вызова плашка говорила бы
+     * про локальный путь после переключения на облачную модель. */
+    updateShield();
   } catch (e) {
     sel.innerHTML = '<option value="">каталог недоступен</option>';
     console.warn('models:', e.message);
@@ -796,6 +800,7 @@ async function loadChatHistory() {
     if (m.role === 'bot') renderBot(w, m.text);
     else addActions(w, { role: 'user', text: m.text });
   }
+  renderHistoryList();
   return msgs.length;
 }
 
@@ -939,13 +944,25 @@ async function sendPrompt(prompt, opts = {}) {
       reqOpts.headers = { 'X-Provider-Key': byok };
     }
 
+    /* Время меряем здесь, на клиенте, и только вокруг запроса. В теле
+     * /inference поля длительности нет: подставить «420 мс» из макета значило
+     * бы показать измерение, которого не было. */
+    const t0 = performance.now();
     const res = await call('/inference', reqOpts);
+    const elapsedMs = Math.round(performance.now() - t0);
 
     /* Кэшбэк показываем из ответа сервера, а не пересчитываем на клиенте:
      * арифметика денег должна иметь один источник истины. */
     if (Number(res.cashback_tar) > 0) addCashback(Number(res.cashback_tar));
 
     renderBot(thinking, res.response || '(пустой ответ)');
+
+    /* Трасса идёт НАД текстом ответа: сначала «как это сделано», потом сам
+     * ответ. Вставляем перед .bubble, а не в конец — иначе блок уезжал бы под
+     * чек, и связь «эта плашка про этот ответ» терялась бы. */
+    const bubbleEl = thinking.querySelector('.bubble');
+    if (bubbleEl) thinking.insertBefore(traceBox(res, elapsedMs), bubbleEl);
+
     thinking.appendChild(receiptBlock(res));
 
     /* Кнопка «Повторить» под ответом: промпт берём из запроса, а не из
@@ -1030,6 +1047,10 @@ async function refreshBalance() {
       $('balanceVal').textContent = '—';
     }
   }
+  /* Сайдбар читает УЖЕ отрисованное значение, а не ходит в /balance второй
+   * раз: две цифры из двух запросов на одном экране могут разойтись, и
+   * человек увидит два разных баланса сразу. */
+  syncSidebar();
 }
 
 $('refreshBal').addEventListener('click', refreshBalance);
@@ -1758,6 +1779,438 @@ async function copyWorkerAddress() {
 }
 
 $('copyAddr')?.addEventListener('click', copyWorkerAddress);
+
+/* ==========================================================================
+   SYNAPSE WORKSPACE v3 — логика шелла
+   --------------------------------------------------------------------------
+   Всё ниже — надстройка над уже существующими функциями: ни одна из них не
+   переписана. Переключение разделов идёт через click() по той же кнопке .tab,
+   а не через второй независимый обработчик: две реализации одного состояния
+   расходятся на первой же правке.
+
+   Чего здесь СОЗНАТЕЛЬНО нет:
+     • «P2P Onion (3 прыжка)» над каждым ответом. onion.js участвует только в
+       POST /inference/onion; в обычном /inference его нет. Нарисовать три
+       прыжка над ответом значило бы показать шифрование, которого в этом
+       пути не было.
+     • «PII: 99% Safe» над локальным ответом. Классификатор вызывается только
+       на облачной ветке (server.js, перед callExternal). Для локального Роя
+       он не запускался, и процент был бы выдуман.
+     • «420 мс» из макета. В ответе /inference нет поля длительности; время
+       измеряется на клиенте вокруг запроса и подаётся как измеренное.
+   ========================================================================== */
+
+/* ---------- Сайдбар ---------- */
+
+function openSidebar() {
+  $('sidebar')?.classList.add('open');
+  if ($('sidebarBackdrop')) $('sidebarBackdrop').hidden = false;
+}
+function closeSidebar() {
+  $('sidebar')?.classList.remove('open');
+  if ($('sidebarBackdrop')) $('sidebarBackdrop').hidden = true;
+}
+$('sidebarOpen')?.addEventListener('click', openSidebar);
+$('sidebarClose')?.addEventListener('click', closeSidebar);
+$('sidebarBackdrop')?.addEventListener('click', closeSidebar);
+
+/* Раздел выбирается кликом по настоящей кнопке .tab: обработчик один,
+   и подсветка не может разойтись с содержимым. */
+function goToTab(name) {
+  const btn = document.querySelector(`.tab[data-tab="${name}"]`);
+  if (btn) btn.click();
+  closeSidebar();
+}
+
+document.querySelectorAll('.bento[data-goto]').forEach((card) => {
+  card.addEventListener('click', () => goToTab(card.dataset.goto));
+});
+
+/* ---------- Новый диалог ----------
+ * Пустое состояние снимаем копией при загрузке: собрать его заново кодом
+ * значило бы держать вторую копию разметки, которая разъедется с первой.
+ *
+ * Ограничение, которое лучше назвать вслух: тред в chat-sync один на
+ * устройство (chat_thread_id === ADDR), поэтому кнопка очищает ЭКРАН, а не
+ * создаёт вторую ветку истории. После перезагрузки история вернётся. */
+const EMPTY_STATE_HTML = $('chatLog') ? $('chatLog').innerHTML : '';
+
+function newDialog() {
+  const logEl = $('chatLog');
+  if (!logEl) return;
+  logEl.innerHTML = EMPTY_STATE_HTML;
+  bindSuggestions(logEl);
+  bindBento(logEl);
+  renderHistoryList();
+  $('prompt')?.focus();
+  closeSidebar();
+}
+$('newChatBtn')?.addEventListener('click', newDialog);
+
+/* Подсказки и Bento пересоздаются вместе с пустым состоянием, поэтому
+   обработчики навешиваются функцией, а не один раз при загрузке. */
+function bindSuggestions(root) {
+  root.querySelectorAll('.suggest').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const p = $('prompt');
+      p.value = btn.dataset.prompt || btn.textContent.trim();
+      p.focus();
+      autoGrow(p);
+    });
+  });
+}
+
+function bindBento(root) {
+  root.querySelectorAll('.bento').forEach((card) => {
+    if (card.dataset.goto) {
+      card.addEventListener('click', () => goToTab(card.dataset.goto));
+    } else if (card.dataset.prompt) {
+      card.addEventListener('click', () => {
+        const p = $('prompt');
+        p.value = card.dataset.prompt;
+        p.focus();
+        autoGrow(p);
+      });
+    }
+  });
+}
+
+/* ---------- История в сайдбаре ----------
+ * Показываем ровно то, что есть: один тред устройства и число сообщений в
+ * нём. Список из выдуманных «диалогов» выглядел бы богаче и был бы ложью. */
+function renderHistoryList() {
+  const box = $('chatHistory');
+  if (!box) return;
+  const n = $('chatLog') ? $('chatLog').querySelectorAll('.msg').length : 0;
+  if (!n) {
+    box.innerHTML = '<div class="chat-history-empty">пока пусто</div>';
+    return;
+  }
+  box.innerHTML = '';
+  const item = document.createElement('button');
+  item.type = 'button';
+  item.className = 'chat-history-item';
+  item.innerHTML = `<span aria-hidden="true">🔒</span> Текущий диалог · ${n}`;
+  item.addEventListener('click', () => { goToTab('chat'); });
+  box.appendChild(item);
+}
+
+/* ---------- Режимы в омнибоксе ----------
+ * Пилюля не отправляет tier 6 сама по себе — она лишь выбирает раздел или
+ * контур. Тир по-прежнему определяется ВЫБРАННОЙ МОДЕЛЬЮ (тест 32.2), иначе
+ * вернулся бы дефект «ключ есть → каждый запрос уходит как tier 6». */
+document.querySelectorAll('.pill').forEach((pill) => {
+  pill.addEventListener('click', () => {
+    document.querySelectorAll('.pill').forEach((p) => p.classList.toggle('active', p === pill));
+    const mode = pill.dataset.mode;
+    if (mode === 'byok') {
+      /* Своему ключу нужен раздел, где он вводится. Модель выбирается там же:
+       * без облачной модели ключ ни на что не влияет. */
+      goToTab('devices');
+      $('byokKey')?.focus();
+    } else if (mode === 'agent') {
+      goToTab('agents');
+    } else {
+      goToTab('chat');
+      if ($('model') && MODEL_INFO.get($('model').value)?.tier === 6) {
+        /* Остались на облачной модели: честно сообщаем, что режим «Рой»
+         * к ней не относится, вместо тихой подмены выбора. */
+        $('chatHint').textContent = 'Выбрана облачная модель — запрос уйдёт провайдеру, а не в Рой.';
+      }
+    }
+  });
+});
+
+/* ---------- Индикатор PII ----------
+ * Подпись зависит от выбранной модели, потому что защита разная:
+ *   локальная — промпт не покидает сеть вовсе, PII-фильтр не запускается;
+ *   облачная  — промпт уходит провайдеру, и классификатор обязан отработать.
+ * Одна зелёная плашка на оба случая утверждала бы больше, чем есть. */
+function updateShield() {
+  const el = $('piiShield');
+  if (!el) return;
+  const id = $('model')?.value;
+  const cloud = id ? MODEL_INFO.get(id)?.tier === 6 : false;
+  el.textContent = cloud ? '🛡️ PII-фильтр перед отправкой' : '🛡️ Промпт не уходит наружу';
+  el.title = cloud
+    ? 'Классификатор PII срабатывает до выхода промпта во внешний API'
+    : 'Локальные модели обрабатывают промпт внутри сети TarNet';
+}
+$('model')?.addEventListener('change', updateShield);
+updateShield();
+
+/* ---------- Тоггл дистилляции ----------
+ * Это тот же флаг согласия, что галочка в разделе устройств, а не второй
+ * переключатель: два независимых флага на одно разрешение разошлись бы, и
+ * человек не знал бы, какой из них настоящий. */
+const distill = $('distillToggle');
+if (distill) {
+  distill.addEventListener('change', () => {
+    const box = $('consentBox');
+    if (!box) return;
+    box.checked = distill.checked;
+    saveConsent(distill.checked);
+  });
+}
+
+/* ---------- Панель артефактов ---------- */
+
+function openDrawer(pane) {
+  const d = $('artifactDrawer');
+  if (!d) return;
+  d.hidden = false;
+  d.classList.add('open');
+  document.querySelector('.app-shell')?.classList.add('drawer-open');
+  if (pane) selectDrawerPane(pane);
+}
+function closeDrawer() {
+  const d = $('artifactDrawer');
+  if (!d) return;
+  d.classList.remove('open');
+  d.hidden = true;
+  document.querySelector('.app-shell')?.classList.remove('drawer-open');
+}
+function selectDrawerPane(name) {
+  document.querySelectorAll('.drawer-tab').forEach((t) => {
+    const on = t.dataset.drawer === name;
+    t.classList.toggle('active', on);
+    t.setAttribute('aria-selected', String(on));
+  });
+  if ($('artifactPane')) $('artifactPane').hidden = name !== 'artifact';
+  if ($('inspectorPane')) $('inspectorPane').hidden = name !== 'inspector';
+}
+document.querySelectorAll('.drawer-tab').forEach((t) => {
+  t.addEventListener('click', () => selectDrawerPane(t.dataset.drawer));
+});
+$('artifactToggle')?.addEventListener('click', () => {
+  const d = $('artifactDrawer');
+  if (d && !d.hidden) closeDrawer(); else openDrawer('artifact');
+});
+$('artifactClose')?.addEventListener('click', closeDrawer);
+
+/* Артефакт = блок кода из ответа. Кнопка «В Canvas» появляется только у
+   блоков длиннее 15 строк: для двухстрочного примера панель на 420px
+   отнимала бы место у диалога без пользы. */
+function showArtifact(code, lang) {
+  const pane = $('artifactPane');
+  if (!pane) return;
+  pane.innerHTML = '';
+
+  const actions = document.createElement('div');
+  actions.className = 'artifact-actions';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.className = 'btn small';
+  copyBtn.textContent = 'Копировать';
+  copyBtn.addEventListener('click', async () => {
+    try { await copyText(code); copyBtn.textContent = '✓ Скопировано'; }
+    catch (_e) { copyBtn.textContent = 'Не удалось'; }
+    setTimeout(() => { copyBtn.textContent = 'Копировать'; }, 1600);
+  });
+
+  const dlBtn = document.createElement('button');
+  dlBtn.type = 'button';
+  dlBtn.className = 'ghost small';
+  dlBtn.textContent = 'Скачать файл';
+  dlBtn.addEventListener('click', () => {
+    const blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `synapse-artifact.${lang || 'txt'}`;
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  actions.appendChild(copyBtn);
+  actions.appendChild(dlBtn);
+  pane.appendChild(actions);
+
+  const pre = document.createElement('pre');
+  pre.className = 'cmd';
+  const codeEl = document.createElement('code');
+  codeEl.textContent = code;
+  pre.appendChild(codeEl);
+  pane.appendChild(pre);
+
+  if (typeof hljs !== 'undefined' && lang) {
+    try { hljs.highlightElement(codeEl); } catch (_e) { /* язык не поддержан */ }
+  }
+  openDrawer('artifact');
+}
+
+/* Кнопка «В Canvas» добавляется наблюдателем, а не правкой decorateCode:
+   тот уже вызывается из renderBot и из истории, и вторая точка вызова
+   ломала бы порядок «сначала разметка, потом подсветка». */
+const canvasObserver = new MutationObserver((records) => {
+  for (const rec of records) {
+    for (const node of rec.addedNodes) {
+      if (node.nodeType !== 1) continue;
+      const pres = node.matches?.('pre') ? [node] : [...(node.querySelectorAll?.('pre') || [])];
+      for (const pre of pres) {
+        if (pre.dataset.canvasReady === '1') continue;
+        const codeEl = pre.querySelector('code');
+        const code = (codeEl || pre).textContent || '';
+        if (code.split('\n').length <= 15) continue;
+        pre.dataset.canvasReady = '1';
+        const lang = [...(codeEl?.classList || [])].find((c) => c.startsWith('language-'))?.slice(9) || '';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'code-copy code-canvas';
+        btn.textContent = 'В Canvas';
+        btn.style.right = '96px';
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          showArtifact(code, lang);
+        });
+        (pre.parentElement && pre.parentElement.classList.contains('code-wrap') ? pre.parentElement : pre).appendChild(btn);
+      }
+    }
+  }
+});
+if ($('chatLog')) {
+  canvasObserver.observe($('chatLog'), { childList: true, subtree: true });
+}
+
+/* ---------- Трасса под ответом ----------
+ * Строится ТОЛЬКО из полей ответа. Каждое поле здесь либо пришло с сервера,
+ * либо измерено на клиенте вокруг запроса. Ни одного декоративного числа. */
+function traceBox(res, ms) {
+  const det = document.createElement('details');
+  det.className = 'swarm-trace-box';
+
+  const isFallback = res.source === 'deterministic_fallback' || res.emulated === true;
+  const isCloud = !isFallback && Boolean(res.provider);
+  const modelName = res.model || res.model_id || '—';
+
+  /* Заголовок отвечает на вопрос «что со мной сейчас произошло», без
+     обещаний о криптографии, которой в этом пути не было. */
+  let head;
+  if (isCloud) head = `🔑 Внешний API (${esc(res.provider)}) · ${esc(modelName)} · ${ms} мс`;
+  else if (isFallback) head = `🧪 Демо-ответ — модель не подключена · ${ms} мс`;
+  else head = `🖥 Локальный воркер · ${esc(modelName)} · ${ms} мс`;
+
+  const sum = document.createElement('summary');
+  sum.innerHTML = `<span>${head}</span>`;
+  det.appendChild(sum);
+
+  const body = document.createElement('div');
+  body.className = 'trace-body';
+
+  /* Цепочка узлов. Для облака в ней есть PII-фильтр: классификатор
+     вызывается на этой ветке обязательно (server.js, перед callExternal).
+     Для локального пути фильтра нет — и в цепочке его тоже нет. */
+  const chain = document.createElement('div');
+  chain.className = 'trace-chain';
+  const node = (text, cls = '') => `<span class="trace-node ${cls}">${esc(text)}</span>`;
+  const arrow = '<span class="trace-arrow">➔</span>';
+  if (isCloud) {
+    chain.innerHTML = node('📱 Клиент') + arrow + node('🛡️ PII-фильтр') + arrow + node(`☁️ ${res.provider}`, 'worker');
+  } else if (isFallback) {
+    chain.innerHTML = node('📱 Клиент') + arrow + node('🧪 шаблон сервера', 'worker');
+  } else {
+    chain.innerHTML = node('📱 Клиент') + arrow + node(`🧠 Воркер ${short(res.workerAddress || '')}`, 'worker');
+  }
+  body.appendChild(chain);
+
+  const row = (label, value) => {
+    const el = document.createElement('div');
+    el.className = 'trace-row';
+    el.innerHTML = `<span>${esc(label)}</span><b>${esc(value)}</b>`;
+    return el;
+  };
+
+  /* routing.mode приходит с сервера ('weighted'); в демо-ответе он тоже
+     есть, поэтому показываем как есть, а не прячем. */
+  if (res.routing && res.routing.mode) body.appendChild(row('маршрут', res.routing.mode));
+  if (res.model_tier != null) body.appendChild(row('уровень', String(res.model_tier)));
+  if (res.tokensGenerated != null) body.appendChild(row('токенов', String(res.tokensGenerated)));
+  if (res.workerAddress) body.appendChild(row('воркер', short(res.workerAddress)));
+  if (isCloud && res.payment && res.payment.amountTar != null) {
+    body.appendChild(row('списано', `${fmt(res.payment.amountTar)} TAR`));
+  }
+  if (res.fallback_reason) {
+    const why = FALLBACK_REASONS[res.fallback_reason] || res.fallback_reason;
+    const el = row('причина', why);
+    el.querySelector('b')?.classList.add('trace-warn');
+    body.appendChild(el);
+  }
+
+  det.appendChild(body);
+  return det;
+}
+
+/* ---------- Синхронизация сайдбара ----------
+ * Читает уже отрисованные значения. Дублировать запросы к /balance ради
+ * второй цифры на том же экране — лишний трафик и второй источник истины. */
+const P2P_TEXT = {
+  online: 'P2P в сети',
+  offline: 'P2P офлайн',
+  unknown: 'P2P: нет данных',
+};
+let p2pChecked = false;
+
+async function syncP2P() {
+  const dot = $('p2pDot');
+  const text = $('p2pText');
+  if (!dot || !text) return;
+  try {
+    const s = await call('/p2p/status');
+    const nodes = Array.isArray(s.routeNodes) ? s.routeNodes.length : 0;
+    dot.className = `dot ${s.ok && nodes ? 'on' : 'off'}`;
+    text.textContent = s.ok && nodes ? `${P2P_TEXT.online} · ${nodes} узла` : P2P_TEXT.offline;
+  } catch (_e) {
+    dot.className = 'dot';
+    text.textContent = P2P_TEXT.unknown;
+  }
+  p2pChecked = true;
+}
+
+function syncSidebar() {
+  const addrEl = $('sidebarAddr');
+  if (addrEl && ADDR) addrEl.textContent = short(ADDR);
+
+  const balEl = $('sidebarBalance');
+  const src = $('balanceVal');
+  if (balEl && src) balEl.textContent = src.textContent;
+
+  /* Кнопка faucet в сайдбаре появляется только на пустом балансе: на
+     ненулевом она предлагала бы эмиссию тому, кому она не нужна. */
+  const pill = $('sidebarFaucet');
+  const btn = $('faucetBtn');
+  if (pill && btn) {
+    const zero = String(src?.textContent || '').trim().startsWith('0.');
+    pill.hidden = !(zero && !btn.disabled);
+  }
+}
+setInterval(syncSidebar, 1500);
+
+$('sidebarFaucet')?.addEventListener('click', async () => {
+  await claimFaucet();
+  syncSidebar();
+});
+
+$('copyWallet')?.addEventListener('click', async () => {
+  if (!ADDR) return;
+  try {
+    await copyText(ADDR);
+    $('sidebarAddr').textContent = '✓ скопировано';
+    setTimeout(() => syncSidebar(), 1400);
+  } catch (_e) {
+    /* Копирование запрещено — адрес виден в строке, человек выделит сам. */
+  }
+});
+
+/* Активный .tab после клика в сайдбаре: на телефоне панель должна
+   закрываться сама, иначе она закрывает только что открытый раздел. */
+document.querySelectorAll('.tab').forEach((t) => {
+  t.addEventListener('click', () => { if (window.innerWidth < 1024) closeSidebar(); });
+});
+
+bindBento(document);
+renderHistoryList();
+syncP2P();
 
 /* ---------- Старт ---------- */
 (async () => {

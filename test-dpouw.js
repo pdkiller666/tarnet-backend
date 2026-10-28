@@ -5975,6 +5975,338 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+  /* ---------- 38. Synapse Workspace v3: шелл, Bento, трасса, артефакты ----------
+   * Проверяем две вещи разом: что новые элементы ЕСТЬ, и что они не утверждают
+   * лишнего. Второе важнее первого: интерфейс, который рисует «P2P Onion
+   * (3 прыжка)» над ответом обычного /inference, врёт убедительнее, чем
+   * отсутствующий блок — потому что выглядит как доказательство.
+   */
+  console.log('\n38. Synapse Workspace v3 — редизайн /app/');
+  {
+    const html = fs.readFileSync(path.join(__dirname, 'app', 'index.html'), 'utf8');
+    const appSrc = fs.readFileSync(path.join(__dirname, 'app', 'app.js'), 'utf8');
+    const css = fs.readFileSync(path.join(__dirname, 'app', 'styles.css'), 'utf8');
+    const swSrc = fs.readFileSync(path.join(__dirname, 'app', 'sw.js'), 'utf8');
+
+    /* Комментарии вырезаем перед проверками 38.6: в них я объясняю, ЧЕГО в
+     * интерфейсе нет («не рисуем 3 прыжка», «нет 420 мс»), и проверка на
+     * отсутствие ловила бы само объяснение. Тот же приём, что в 26.1, где по
+     * этой же причине вырезаются комментарии перед поиском opacity: 0.
+     * Строки-комментарии отсекаем только там, где «//» не часть URL. */
+    const appCode = appSrc
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+    /* --- 38.1 Трёхколоночный шелл --- */
+    ok('38.1 есть сайдбар aside.synapse-sidebar',
+      /<aside[^>]*class="synapse-sidebar"/.test(html));
+    ok('38.1 есть центральная сцена main.synapse-stage',
+      /<main[^>]*class="synapse-stage"/.test(html));
+    ok('38.1 есть панель артефактов aside.artifact-drawer',
+      /<aside[^>]*class="artifact-drawer"/.test(html));
+    ok('38.1 шелл объявлен как grid в CSS',
+      /\.app-shell\s*\{[^}]*display:\s*grid/.test(css));
+    ok('38.1 панель открывается третьей колонкой, а не занимает место всегда',
+      /\.app-shell\.drawer-open\s*\{[^}]*grid-template-columns/.test(css));
+
+    /* --- 38.2 Обратная совместимость: старые ID на месте ---
+     * Редизайн не должен требовать переписывания agents.js и тестов. */
+    const KEEP_IDS = [
+      'chatLog', 'chatForm', 'prompt', 'sendBtn', 'chatHint', 'adapter', 'model',
+      'contour', 'contourHint', 'workerBanner', 'workerBannerText', 'workerHowto',
+      'workerCard', 'balanceVal', 'walletAddr', 'faucetBtn', 'faucetState',
+      'refreshBal', 'consentBox', 'consentState', 'byokKey', 'byokSave',
+      'byokClear', 'byokState', 'byokWarn', 'cashbackVal', 'linkCard', 'linkAddr',
+      'linkBtn', 'linkRefresh', 'linkState', 'linkedList', 'migrateCard',
+      'migrateTo', 'migrateOld', 'migrateCheck', 'migrateBtn', 'migrateState',
+      'nanoBtn', 'nanoAddr', 'nanoLog', 'agentSetup', 'entropyInput',
+      'genEntropy', 'createIdBtn', 'agentMain', 'agentBalance', 'agentIdLine',
+      'agentRefresh', 'forgetKey', 'agentCreateForm', 'agentRole', 'agentTools',
+      'agentList', 'agentStatus', 'agentRunPanel', 'runAgentId', 'runPrompt',
+      'runMaxTokens', 'runTools', 'runSubmit', 'runClose', 'runLog',
+      'hitlModal', 'hitlTitle', 'hitlText', 'hitlApprove', 'hitlCancel',
+      'installBtn', 'modeLine', 'copyAddr', 'copyHint', 'dlWin', 'dlMac',
+      'dlHint', 'shortcutHint', 'workerAddr', 'runCmdPosix', 'runCmdWin',
+    ];
+    const lost = KEEP_IDS.filter((id) => !new RegExp(`id="${id}"`).test(html));
+    ok('38.2 все старые ID сохранены (agents.js и тесты не оторваны)',
+      lost.length === 0, lost);
+
+    /* --- 38.3 Омнибокс и пилюли режимов --- */
+    ok('38.3 омнибокс объявлен class="omnibox"',
+      /class="[^"]*omnibox[^"]*"/.test(html));
+    ok('38.3 есть авто-растущая textarea',
+      /<textarea id="prompt"[^>]*rows="1"/.test(html));
+    for (const mode of ['private', 'byok', 'agent']) {
+      ok(`38.3 пилюля режима ${mode} есть в разметке`,
+        new RegExp(`class="pill[^"]*"[^>]*data-mode="${mode}"`).test(html),
+        null);
+    }
+    ok('38.3 тоггл дистилляции связан с галочкой согласия',
+      /distillToggle/.test(html) && /distill\s*\.\s*addEventListener|distill\.addEventListener/.test(appSrc),
+      'нет обработчика distillToggle');
+
+    /* --- 38.4 Zero-state Bento --- */
+    ok('38.4 есть Bento-сетка .bento-grid', /class="bento-grid"/.test(html));
+    const bentoCards = (html.match(/class="bento"/g) || []).length;
+    ok('38.4 четыре Bento-плитки', bentoCards === 4, bentoCards);
+    ok('38.4 .bento-grid есть в CSS', /\.bento-grid\s*\{/.test(css));
+
+    /* --- 38.5 Трасса под ответом --- */
+    ok('38.5 CSS определяет .swarm-trace-box', /\.swarm-trace-box\s*\{/.test(css));
+    ok('38.5 app.js строит трассу функцией traceBox',
+      /function traceBox\(/.test(appSrc));
+    ok('38.5 трасса вставляется в сообщение', /insertBefore\(traceBox\(/.test(appSrc));
+
+    /* --- 38.6 ЧЕСТНОСТЬ: чего в трассе быть не должно ---
+     * Эти три проверки — обратные. Они падают, если кто-то вернёт в интерфейс
+     * красивую, но не подтверждённую картинку:
+     *   • onion.js работает только в POST /inference/onion, а не в /inference;
+     *   • piiClassifier вызывается только на облачной ветке;
+     *   • длительность запроса сервер не отдаёт — её нельзя взять из макета.
+     */
+    ok('38.6 трасса НЕ обещает onion-прыжки над обычным ответом',
+      !/3\s*прыжк/i.test(appCode) && !/Relay\s*#?\d/i.test(appCode),
+      'найдено упоминание прыжков/релеев в коде app.js');
+    ok('38.6 трасса НЕ обещает процент PII над локальным ответом',
+      !/99\s*%\s*(Safe|чисто|Чисто)/i.test(appCode),
+      'найдено «99%» в коде app.js');
+    ok('38.6 трасса НЕ содержит зашитых миллисекунд из макета',
+      !/420\s*мс/.test(appCode), 'найдено «420 мс» в коде app.js');
+    ok('38.6 длительность измеряется на клиенте вокруг запроса',
+      /performance\.now\(\)/.test(appSrc), 'нет performance.now() в app.js');
+
+    /* --- 38.7 HITL-карточка --- */
+    ok('38.7 HITL-модалка сохранена (id=hitlModal)',
+      /id="hitlModal"/.test(html) && /id="hitlApprove"/.test(html));
+    ok('38.7 HITL-кнопки подписи и отмены на месте',
+      /id="hitlCancel"/.test(html));
+
+    /* --- 38.8 Панель артефактов --- */
+    ok('38.8 у панели две вкладки: артефакт и инспектор',
+      /data-drawer="artifact"/.test(html) && /data-drawer="inspector"/.test(html));
+    ok('38.8 app.js открывает артефакт функцией showArtifact',
+      /function showArtifact\(/.test(appSrc));
+    ok('38.8 кнопка «В Canvas» только для кода длиннее 15 строк',
+      /split\('\\n'\)\.length\s*<=\s*15/.test(appSrc),
+      'нет порога 15 строк');
+
+    /* --- 38.9 CSS-токены и [hidden] --- */
+    ok('38.9 [hidden] по-прежнему с !important',
+      /\[hidden\]\s*\{[^}]*display:\s*none\s*!important/.test(css));
+    for (const token of ['--accent-emerald', '--accent-cyan', '--accent-violet', '--accent-amber']) {
+      ok(`38.9 токен ${token} объявлен`, new RegExp(`${token}\\s*:`).test(css));
+    }
+
+    /* --- 38.10 Мобильная адаптация --- */
+    ok('38.10 сайдбар становится drawer на <1024px',
+      /@media\s*\(max-width:\s*1023px\)[\s\S]{0,400}\.synapse-sidebar[\s\S]{0,300}translateX\(-100%\)/.test(css));
+    ok('38.10 панель артефактов тоже уезжает в drawer',
+      /@media\s*\(max-width:\s*1023px\)[\s\S]{0,900}\.artifact-drawer[\s\S]{0,300}translateX\(100%\)/.test(css));
+    ok('38.10 омнибокс учитывает safe-area на мобильном',
+      /env\(safe-area-inset-bottom\)/.test(css));
+
+    /* --- 38.11 Кэш поднят: без этого правка не доедет до телефона ---
+     * Тот же класс дефекта, что уже случался с баннером воркера. */
+    const cacheV = (swSrc.match(/const CACHE = 'tarnet-app-v(\d+)'/) || [])[1];
+    ok('38.11 кэш не ниже v13 (редизайн дойдёт до клиента)',
+      cacheV && Number(cacheV) >= 13, cacheV);
+    ok('38.11 sw.js кэширует все локальные ассеты оболочки',
+      /'\/app\/app\.js'/.test(swSrc) && /'\/app\/styles\.css'/.test(swSrc));
+
+    /* --- 38.12 Страница реально отдаётся и ссылки целы --- */
+    const served = await api('/app/index.html');
+    const servedHtml = typeof served.body === 'string' ? served.body : '';
+    ok('38.12 /app/index.html отдаётся 200', served.status === 200, served.status);
+    ok('38.12 в отданной разметке есть шелл',
+      servedHtml.includes('synapse-sidebar') && servedHtml.includes('synapse-stage'));
+    ok('38.12 vendor подключён ДО app.js (рендер не сломается)',
+      servedHtml.indexOf('/app/vendor/marked.min.js') < servedHtml.indexOf('/app/app.js'));
+
+    /* --- 38.13 Трасса не теряет честную причину демо-режима ---
+     * В демо-режиме плашка обязана называть причину, иначе она выглядит как
+     * обычная телеметрия живого инференса. */
+    ok('38.13 трасса показывает fallback_reason',
+      /res\.fallback_reason/.test(appSrc));
+    ok('38.13 трасса различает облачный и локальный путь',
+      /isCloud/.test(appSrc) && /isFallback/.test(appSrc));
+  }
+
+  /* ---------- 39. Адаптив: телефон → планшет → ПК ----------
+   * Проверяем не «есть ли media-запросы» (они есть всегда), а то, что
+   * каждый диапазон закрывает свою поломку: тач-цели на телефоне, зум
+   * iOS, ландшафт, узкий ноутбук и читаемую длину строки на большом
+   * мониторе. И обратное: что в CSS нет правил для классов, которых
+   * нет в разметке — мёртвое правило выглядит как поддержка, не будучи ей.
+   */
+  console.log('\n39. Адаптив под устройства');
+  {
+    const css = fs.readFileSync(path.join(__dirname, 'app', 'styles.css'), 'utf8');
+    const html = fs.readFileSync(path.join(__dirname, 'app', 'index.html'), 'utf8');
+    const appSrc = fs.readFileSync(path.join(__dirname, 'app', 'app.js'), 'utf8');
+    const cssNoComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+    /* --- 39.1 Viewport с вырезом экрана --- */
+    ok('39.1 viewport-fit=cover (safe-area реально работает)',
+      /name="viewport"[^>]*viewport-fit=cover/.test(html));
+
+    /* --- 39.2 Диапазоны покрыты --- */
+    const mq = (re) => re.test(cssNoComments);
+    ok('39.2 телефон: max-width 768px', mq(/@media\s*\(max-width:\s*768px\)/));
+    ok('39.2 узкий телефон: max-width 420px', mq(/@media\s*\(max-width:\s*420px\)/));
+    ok('39.2 планшет: 768–1023px', mq(/@media\s*\(min-width:\s*768px\)\s*and\s*\(max-width:\s*1023px\)/));
+    ok('39.2 узкий ноутбук: 1024–1279px',
+      mq(/@media\s*\(min-width:\s*1024px\)\s*and\s*\(max-width:\s*1279px\)/));
+    ok('39.2 большой монитор: min-width 1600px', mq(/@media\s*\(min-width:\s*1600px\)/));
+    ok('39.2 ландшафт телефона по высоте',
+      mq(/@media\s*\(max-height:\s*500px\)\s*and\s*\(orientation:\s*landscape\)/));
+
+    /* --- 39.3 Три опоры адаптива ---
+     * Сайдбар и панель артефактов уезжают в drawer до 1024px, иначе сцене
+     * остаётся меньше 400px и таблицы в ответе ломаются по буквам. */
+    const drawerBlock = (cssNoComments.match(/@media\s*\(max-width:\s*1023px\)\s*\{[\s\S]*?\n\}/) || [''])[0];
+    ok('39.3 сайдбар уезжает за левый край', /\.synapse-sidebar[\s\S]*?translateX\(-100%\)/.test(drawerBlock));
+    ok('39.3 панель артефактов уезжает за правый край',
+      /\.artifact-drawer[\s\S]*?translateX\(100%\)/.test(drawerBlock));
+    ok('39.3 шелл на узком экране — одна колонка',
+      /\.app-shell[\s\S]{0,200}grid-template-columns:\s*minmax\(0,\s*1fr\)/.test(drawerBlock));
+
+    /* --- 39.4 Тач-цели ---
+     * 44px — минимум Apple/Google. Прежние icon-btn были 34px: палец
+     * промахивался, и кнопка казалась сломанной. */
+    ok('39.4 токен --tap объявлен', /--tap:\s*44px/.test(cssNoComments));
+    const phoneBlock = (cssNoComments.match(/@media\s*\(max-width:\s*768px\)\s*\{[\s\S]*?\n\}/) || [''])[0];
+    ok('39.4 icon-btn растянут до тач-цели',
+      /\.icon-btn\s*\{[^}]*width:\s*var\(--tap\)/.test(phoneBlock));
+
+    /* --- 39.5 iOS: без автозума при фокусе ---
+     * Это не косметика: при шрифте <16px Safari зумит страницу на фокусе,
+     * и вернуться к масштабу можно только щипком. */
+    ok('39.5 поля на телефоне не меньше 16px',
+      /textarea[^{]*\{[^}]*font-size:\s*16px/.test(phoneBlock),
+      'нет font-size:16px для textarea на телефоне');
+
+    /* --- 39.6 safe-area --- */
+    ok('39.6 омнибокс учитывает нижний вырез',
+      /env\(safe-area-inset-bottom\)/.test(phoneBlock));
+    ok('39.6 сайдбар учитывает верхний вырез',
+      /env\(safe-area-inset-top\)/.test(cssNoComments));
+
+    /* --- 39.7 Ландшафт: Bento не съедает экран --- */
+    const landBlock = (cssNoComments.match(/@media\s*\(max-height:\s*500px\)[^{]*\{[\s\S]*?\n\}/) || [''])[0];
+    ok('39.7 в ландшафте Bento скрыт', /\.bento-grid\s*\{[^}]*display:\s*none/.test(landBlock));
+
+    /* --- 39.8 Большой монитор: длина строки ограничена ---
+     * Строка шире ~90 знаков теряет начало при чтении. */
+    ok('39.8 на 1600px+ сцена расширяется умеренно',
+      /@media\s*\(min-width:\s*1600px\)[\s\S]{0,160}--stage-max:\s*9\d\dpx/.test(cssNoComments));
+    ok('39.8 --stage-max остаётся в разумных пределах',
+      (() => {
+        const vals = [...cssNoComments.matchAll(/--stage-max:\s*(\d+)px/g)].map((m) => Number(m[1]));
+        return vals.length > 0 && vals.every((v) => v >= 700 && v <= 1100);
+      })());
+
+    /* --- 39.9 Тач без наведения --- */
+    ok('39.9 при hover:none кнопки под ответом видны сразу',
+      /@media\s*\(hover:\s*none\)[\s\S]{0,300}\.msg-actions\s*\{\s*opacity:\s*1/.test(cssNoComments));
+
+    /* --- 39.10 МЁРТВЫХ ПРАВИЛ НЕТ ---
+     * Обратная проверка: селектор класса, которого нет ни в разметке, ни
+     * в скриптах, — это обещание стиля без элемента. Такое правило прошло бы
+     * любой тест «есть ли media-запрос» и не изменило бы ничего на экране.
+     *
+     * Два ограничения, без которых проверка врёт:
+     *  1) из CSS надо вырезать url(...) — иначе xmlns='http://www.w3.org/2000/svg'
+     *     в data-URI читается как класс .org и даёт ложный мёртвый класс;
+     *  2) смотреть надо ВСЕ файлы, а не только index.html и app.js: часть
+     *     разметки собирается в agents.js шаблонными строками (agent-card,
+     *     text-warn), и по одному app.js они выглядели мёртвыми. */
+    const cssForClasses = cssNoComments.replace(/url\([^)]*\)/g, ' ');
+    const cssClasses = new Set();
+    for (const m of cssForClasses.matchAll(/\.([a-z][a-z0-9-]{2,})/g)) cssClasses.add(m[1]);
+
+    /* Корпус: вся разметка и все скрипты оболочки, включая шаблонные строки. */
+    const shellFiles = ['app.js', 'agents.js'];
+    const htmlFiles = [path.join('app', 'index.html')];
+    let corpus = html;
+    for (const f of shellFiles) {
+      const p = path.join(__dirname, 'app', f);
+      if (fs.existsSync(p)) corpus += '\n' + fs.readFileSync(p, 'utf8');
+    }
+    for (const f of ['console.html', 'index.html']) {
+      const p = path.join(__dirname, 'ui', f);
+      if (fs.existsSync(p)) corpus += '\n' + fs.readFileSync(p, 'utf8');
+    }
+
+    /* Классы, которые ставят не мы или ставят по частям: проверять их
+     * по разметке бессмысленно. */
+    const EXEMPT = new Set([
+      'hljs', 'language', 'line-numbers', 'no-scrollbar', 'drawer-open', 'open',
+      'active', 'hidden', 'ready', 'loading', 'ok', 'warn', 'err', 'bot', 'user',
+      'on', 'off', 'error', 'success', 'danger', 'info', 'primary', 'ghost',
+      'small', 'large', 'compact', 'wide', 'narrow', 'left', 'right', 'center',
+      'top', 'bottom', 'show', 'visible', 'selected', 'disabled', 'busy', 'idle',
+      'msg', 'panel', 'field', 'hint', 'banner', 'badge', 'chip', 'card', 'row',
+      'col', 'grid', 'wrap', 'inner', 'outer', 'body', 'head', 'foot', 'list',
+      'item', 'label', 'value', 'icon', 'text', 'title', 'meta', 'link', 'btn',
+      'box', 'bar', 'dot', 'num', 'name', 'desc', 'note', 'line', 'code', 'pre',
+      'mono', 'muted', 'strong', 'tiny', 'mini', 'big', 'full', 'half', 'split',
+      'fade', 'slide', 'spin', 'pulse', 'glow', 'shadow', 'border', 'accent',
+      'emerald', 'cyan', 'violet', 'amber', 'svg', 'png', 'css', 'js', 'html',
+      /* Алиасы из контракта теста 26.3: в шаблонах их пока никто не создаёт,
+       * но сам класс объявлен осознанно, чтобы правило не пришлось возвращать. */
+      'text-error', 'text-info',
+    ]);
+
+    const dead = [...cssClasses].filter((c) => {
+      if (EXEMPT.has(c)) return false;
+      /* Класс живёт, если встречается как отдельное слово где угодно в
+       * разметке или скриптах: так ловятся и class="a b", и classList.add,
+       * и шаблонные строки с innerHTML. */
+      return !new RegExp(`(^|[^a-z0-9-])${c}([^a-z0-9-]|$)`).test(corpus);
+    });
+    ok('39.10 в CSS нет правил для несуществующих классов',
+      dead.length === 0, dead.slice(0, 12));
+
+    /* --- 39.11 Обязательные токены объявлены ---
+     * --radius-md использовался в .bento, но не был объявлен: плитка
+     * получала невалидный радиус и скруглялась по умолчанию в 0. */
+    for (const t of ['--radius', '--radius-sm', '--radius-xs', '--radius-md', '--tap',
+      '--sidebar-w', '--drawer-w', '--stage-max']) {
+      ok(`39.11 токен ${t} объявлен`, new RegExp(`${t}\\s*:`).test(cssNoComments));
+    }
+    const usedTokens = [...new Set([...cssNoComments.matchAll(/var\((--[a-z0-9-]+)/g)].map((m) => m[1]))];
+    const declared = new Set([...cssNoComments.matchAll(/(--[a-z0-9-]+)\s*:/g)].map((m) => m[1]));
+    const undeclared = usedTokens.filter((t) => !declared.has(t));
+    ok('39.11 все используемые var() объявлены', undeclared.length === 0, undeclared);
+
+    /* --- 39.12 Сетка Bento деградирует, а не ломается --- */
+    ok('39.12 Bento на планшете — 2 колонки',
+      /@media\s*\(min-width:\s*768px\)\s*and\s*\(max-width:\s*1023px\)[\s\S]{0,200}\.bento-grid\s*\{[^}]*repeat\(2/.test(cssNoComments));
+    ok('39.12 Bento на узком телефоне — 1 колонка',
+      /@media\s*\(max-width:\s*420px\)[\s\S]{0,160}\.bento-grid\s*\{[^}]*1fr/.test(cssNoComments));
+
+    /* --- 39.13 Код и таблицы не растягивают пузырь --- */
+    ok('39.13 таблица в ответе скроллится, а не рвёт строки',
+      /\.msg\.bot \.bubble table\s*\{[^}]*overflow-x:\s*auto/.test(cssNoComments));
+    ok('39.13 блок кода скроллится внутри себя',
+      /\.code-wrap > pre\s*\{[^}]*overflow-x:\s*auto/.test(cssNoComments));
+
+    /* --- 39.14 Узкий ноутбук: панель не отжимает сцену ---
+     * 260 + 420 = 680px на панели; при 1024px сцене осталось бы ~340px. */
+    const narrowBlock = (cssNoComments.match(/@media\s*\(min-width:\s*1024px\)\s*and\s*\(max-width:\s*1279px\)\s*\{[\s\S]*?\n\}/) || [''])[0];
+    ok('39.14 до 1280px панель артефактов накрывает сцену',
+      /\.artifact-drawer[\s\S]{0,300}position:\s*fixed/.test(narrowBlock));
+
+    /* --- 39.15 Страница отдаётся с новым CSS --- */
+    const servedCss = await api('/app/styles.css');
+    const servedBody = typeof servedCss.body === 'string' ? servedCss.body : '';
+    ok('39.15 /app/styles.css отдаётся 200', servedCss.status === 200, servedCss.status);
+    ok('39.15 в отданном CSS есть адаптив под ландшафт',
+      servedBody.includes('orientation: landscape'));
+    ok('39.15 в отданном CSS есть тач-цель', servedBody.includes('--tap'));
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

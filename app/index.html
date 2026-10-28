@@ -4,427 +4,525 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>TarNet — Synapse</title>
-<meta name="theme-color" content="#08090d">
+<meta name="theme-color" content="#090a0f">
 <meta name="description" content="TarNet: приватный инференс на распределённой сети">
 <link rel="manifest" href="/app/manifest.webmanifest">
 <link rel="icon" href="/app/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/app/icon.svg">
 <link rel="stylesheet" href="/app/styles.css">
 <!-- Тема подсветки лежит локально: внешних CDN в PWA нет и быть не должно,
-     иначе оффлайн-режим и приватность ломаются одним правилом. -->
+     иначе офлайн-режим и приватность ломаются одним правилом. -->
 <link rel="stylesheet" href="/app/vendor/hljs-theme.css">
 </head>
 <body>
 
-<!-- ================= ШАПКА ================= -->
-<header class="top">
-  <div class="top-inner">
-    <div class="brand">
-      <span class="logo-wrap" aria-hidden="true">
-        <svg class="logo" viewBox="0 0 32 32">
-          <defs>
-            <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0" stop-color="currentColor" stop-opacity="1"/>
-              <stop offset="1" stop-color="currentColor" stop-opacity=".55"/>
-            </linearGradient>
-          </defs>
-          <circle cx="16" cy="16" r="12.5" fill="none" stroke="url(#lg)" stroke-width="1.6" opacity=".55"/>
-          <circle cx="16" cy="16" r="4.6" fill="currentColor"/>
-          <circle cx="16" cy="4" r="2.1" fill="currentColor"/>
-          <circle cx="28" cy="16" r="2.1" fill="currentColor"/>
-          <circle cx="16" cy="28" r="2.1" fill="currentColor" opacity=".6"/>
-          <circle cx="4" cy="16" r="2.1" fill="currentColor" opacity=".6"/>
-        </svg>
-      </span>
-      <div class="brand-text">
-        <h1>TarNet <span class="brand-sep">/</span> <span class="brand-sub">Synapse</span></h1>
-        <p class="sub" id="modeLine">проверяю режим…</p>
-      </div>
-    </div>
-    <button id="installBtn" class="ghost small" hidden>Установить</button>
-  </div>
-</header>
+<div class="app-shell">
 
-<!-- Статус воркера: виден до первого вопроса. Если ПК спит, ответы тихо
-     уходят в deterministic_fallback — пользователь должен знать это заранее,
-     а не догадываться по качеству ответа. -->
-<div id="workerBanner" class="banner" role="status" aria-live="polite" hidden>
-  <span id="workerBannerText"></span>
-  <button id="workerHowto" class="link" hidden>Инструкция по подключению</button>
-</div>
-
-<!-- ================= НАВИГАЦИЯ ================= -->
-<nav class="tabs" role="tablist" aria-label="Разделы приложения">
-  <button class="tab active" role="tab" data-tab="chat" aria-selected="true">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9.5 9.5 0 0 1-3.6-.7L3 21l1.9-4.7A8.4 8.4 0 0 1 12 3.1a8.4 8.4 0 0 1 9 8.4Z"/></svg>
-    <span>Synapse Chat</span>
-  </button>
-  <button class="tab" role="tab" data-tab="devices" aria-selected="false">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="14" height="11" rx="2"/><path d="M6 19h8"/><path d="M10 15v4"/><rect x="17.5" y="10" width="4" height="9" rx="1.2"/></svg>
-    <span>Мои устройства</span>
-  </button>
-  <button class="tab" role="tab" data-tab="agents" aria-selected="false">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="7.5" width="16" height="12" rx="3"/><path d="M12 3.5v4"/><circle cx="9" cy="13" r="1.1" fill="currentColor" stroke="none"/><circle cx="15" cy="13" r="1.1" fill="currentColor" stroke="none"/><path d="M9.5 16.5h5"/></svg>
-    <span>Агенты</span>
-  </button>
-</nav>
-
-<main>
-  <!-- ================= ЧАТ ================= -->
-  <section id="tab-chat" class="panel">
-    <div class="chat-head">
-      <div class="controls">
-        <label class="field">
-          <span>Адаптер</span>
-          <select id="adapter"><option value="">загружаю…</option></select>
-        </label>
-        <label class="field">
-          <span>Модель</span>
-          <select id="model"><option value="">авто (базовая)</option></select>
-        </label>
-        <label class="field">
-          <span>Контур</span>
-          <select id="contour">
-            <option value="private">Private — промпт не уходит наружу</option>
-            <option value="cloud">Cloud — промпт уходит провайдеру по вашему ключу</option>
-          </select>
-        </label>
-      </div>
-      <p class="hint tiny" id="contourHint">Промпт обрабатывается воркерами сети и не покидает её.</p>
-    </div>
-
-    <div id="chatLog" class="chat-log" aria-live="polite">
-      <div class="empty-chat">
-        <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M12 3v3.2"/><path d="M12 17.8V21"/><path d="M3 12h3.2"/><path d="M17.8 12H21"/>
-          <circle cx="12" cy="12" r="4.4"/>
-          <path d="M5.6 5.6l2.3 2.3"/><path d="M16.1 16.1l2.3 2.3"/><path d="M18.4 5.6l-2.3 2.3"/><path d="M7.9 16.1l-2.3 2.3"/>
-        </svg>
-        <p class="empty-title">Спросите что угодно</p>
-        <p class="empty-sub">Под каждым ответом появится подписанный чек — его можно проверить.</p>
-        <div class="suggest-wrap">
-          <button type="button" class="suggest" data-prompt="Объясни, как TarNet обеспечивает приватность промптов">Как работает приватность?</button>
-          <button type="button" class="suggest" data-prompt="Напиши функцию на JavaScript, которая считает SHA-256 через WebCrypto">Пример кода</button>
-          <button type="button" class="suggest" data-prompt="Чем отличается работа воркера от nano-узла?">Воркер и nano-узел</button>
+  <!-- ================= ЛЕВЫЙ САЙДБАР ================= -->
+  <aside class="synapse-sidebar" id="sidebar" aria-label="Навигация">
+    <div class="sidebar-head">
+      <div class="brand">
+        <span class="logo-wrap" aria-hidden="true">
+          <svg class="logo" viewBox="0 0 32 32">
+            <defs>
+              <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="currentColor" stop-opacity="1"/>
+                <stop offset="1" stop-color="currentColor" stop-opacity=".55"/>
+              </linearGradient>
+            </defs>
+            <circle cx="16" cy="16" r="12.5" fill="none" stroke="url(#lg)" stroke-width="1.6" opacity=".55"/>
+            <circle cx="16" cy="16" r="4.6" fill="currentColor"/>
+            <circle cx="16" cy="4" r="2.1" fill="currentColor"/>
+            <circle cx="28" cy="16" r="2.1" fill="currentColor"/>
+            <circle cx="16" cy="28" r="2.1" fill="currentColor" opacity=".6"/>
+            <circle cx="4" cy="16" r="2.1" fill="currentColor" opacity=".6"/>
+          </svg>
+        </span>
+        <div class="brand-text">
+          <h1>TarNet <span class="brand-sep">/</span> <span class="brand-sub">Synapse</span></h1>
+          <p class="sub" id="modeLine">проверяю режим…</p>
         </div>
       </div>
+      <button type="button" class="icon-btn sidebar-close" id="sidebarClose" aria-label="Закрыть панель">✕</button>
     </div>
 
-    <form id="chatForm" class="composer">
-      <div class="composer-box">
-        <textarea id="prompt" rows="1" placeholder="Спросите Synapse…" maxlength="65536" aria-label="Запрос"></textarea>
-        <button type="submit" id="sendBtn" aria-label="Отправить">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
-        </button>
-      </div>
-      <p class="hint" id="chatHint"></p>
-      <p class="composer-note">Enter — отправить · Shift+Enter — новая строка</p>
-    </form>
-  </section>
+    <button type="button" class="new-chat-btn" id="newChatBtn">
+      <span aria-hidden="true">＋</span> Новый диалог
+    </button>
 
-  <!-- ================= УСТРОЙСТВА ================= -->
-  <section id="tab-devices" class="panel" hidden>
-    <div class="card card-balance">
-      <div class="card-head">
-        <h2>Баланс</h2>
-        <button id="refreshBal" class="ghost small">Обновить</button>
-      </div>
-      <p class="balance"><span id="balanceVal">—</span> <span class="unit">TAR</span></p>
-      <p class="mono dim addr-line" id="walletAddr">кошелёк: —</p>
+    <nav class="tabs sidebar-nav" role="tablist" aria-label="Разделы приложения">
+      <button class="tab active" role="tab" data-tab="chat" aria-selected="true">
+        <span aria-hidden="true">💬</span><span class="tab-label">Synapse Chat</span>
+      </button>
+      <button class="tab" role="tab" data-tab="devices" aria-selected="false">
+        <span aria-hidden="true">🖥️</span><span class="tab-label">Мои узлы &amp; BYOK</span>
+      </button>
+      <button class="tab" role="tab" data-tab="agents" aria-selected="false">
+        <span aria-hidden="true">🤖</span><span class="tab-label">Агенты</span>
+      </button>
+    </nav>
 
-      <!-- ===== Faucet =====
-           Зачем кнопка: Tier 6 требует баланс (402 на пустом кошельке),
-           а публичного пополнения нет. Без неё новый PWA не может
-           сделать ни одного вызова. Текст сразу говорит, что это
-           эмиссия, а не заработок — иначе 0.01 TAR легко принять
-           за награду за работу. -->
-      <div class="faucet-row">
-        <button id="faucetBtn" class="btn ghost small">Получить 0.01 TAR (тест)</button>
-        <span class="hint tiny" id="faucetState">тестовые деньги для комиссии Tier 6</span>
+    <div class="sidebar-section">
+      <p class="sidebar-label">История</p>
+      <!-- Список тредов. Тред один — он привязан к адресу устройства
+           (chat_thread_id === ADDR), поэтому выдумывать «папки» и «проекты»
+           здесь было бы имитацией функции, которой нет. -->
+      <div class="chat-history" id="chatHistory">
+        <div class="chat-history-empty">пока пусто</div>
       </div>
     </div>
 
-    <div class="card">
-      <div class="card-head">
-        <h2>Приватность</h2>
-        <span class="chip">по умолчанию выкл.</span>
-      </div>
-      <label class="consent">
-        <input type="checkbox" id="consentBox">
-        <span>Разрешить использовать мои анонимизированные запросы для улучшения сети TarNet</span>
-      </label>
-      <p class="dim mono tiny" id="consentState">—</p>
+    <div class="sidebar-foot">
+      <button type="button" class="wallet-pill" id="copyWallet" title="Скопировать адрес">
+        <span class="mono" id="sidebarAddr">0x…</span>
+      </button>
+      <p class="sidebar-balance">Баланс: <strong id="sidebarBalance">—</strong> <span class="unit">TAR</span></p>
+      <button type="button" class="faucet-mini" id="sidebarFaucet" hidden>💧 Получить 0.01 TAR</button>
+      <p class="sidebar-status"><span class="dot" id="p2pDot"></span> <span id="p2pText">P2P</span></p>
     </div>
+  </aside>
 
-    <div class="card" id="workerCard">
-      <div class="card-head">
-        <h2>Воркер для ПК</h2>
-        <span class="chip chip-accent">режим worker</span>
-      </div>
-      <p class="dim">Скрипт забирает задачи, считает моделью на вашем ПК и возвращает результат.</p>
+  <div class="sidebar-backdrop" id="sidebarBackdrop" hidden></div>
 
-      <!-- ===== Установка в один клик =====
-           Адрес подставляется в скрипт на сервере, поэтому файл персонален.
-           Ссылки строятся в app.js: до появления ADDR подставлять нечего,
-           а статичный href с пустым addr вернул бы 400. -->
-      <div class="onboard">
-        <p class="onboard-title">Быстрый путь</p>
-        <p class="dim tiny onboard-desc">
-          Скачайте установщик и запустите двойным кликом — он сам поставит
-          Node.js и Ollama, скачает модель и запустит воркер. Ваш адрес уже внутри.
-        </p>
-        <div class="row">
-          <a class="btn" id="dlWin" href="#" download>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 18v2h16v-2"/></svg>
-            Windows (.bat)
-          </a>
-          <a class="btn ghost" id="dlMac" href="#" download>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 18v2h16v-2"/></svg>
-            macOS / Linux (.command)
-          </a>
-        </div>
-        <p class="hint" id="dlHint">
-          <strong>Windows</strong> — скачали, дважды кликнули, готово.<br>
-          <strong>macOS</strong> — браузер сохраняет файл без права на запуск и
-          помечает его карантином. Один раз перед запуском в Терминале:
-          <code>chmod +x ~/Downloads/install-tarnet-worker.command</code>,
-          потом правый клик → «Открыть». Обойти это кодом нельзя — так работает Gatekeeper.
-        </p>
-        <!-- ===== Ярлык для повторного запуска =====
-             Установщик кладёт файлы в %LOCALAPPDATA%\TarNet — папку, куда
-             человек не пойдёт. Без этой строки человек не знает ни где
-             воркер, ни как запустить его снова после закрытия окна.
-             Пишем и запасной путь: ярлык может не создаться (политика
-             запрещает COM, OneDrive-профиль), и тогда обещать его было бы
-             ложью.
-             Имя ярлыка — латиницей (TarNet), и сообщения установщика тоже
-             на английском: консоль Windows читает .bat в OEM-кодировке,
-             и кириллица там превращается в мусор. Это не забывчивость. -->
-        <p class="hint" id="shortcutHint">
-          <strong>После установки на рабочем столе появится ярлык TarNet.</strong>
-          Двойной клик запускает воркер снова — установщик повторно не нужен.
-          Мастер установки говорит по-английски: русский текст в консоли
-          Windows превращается в нечитаемые символы, поэтому подписи оставлены
-          латиницей, а вся эта инструкция — здесь.
-          Если ярлык создать не удалось (ограничения политики Windows),
-          запускайте вручную: <code>%LOCALAPPDATA%\TarNet\start.cmd</code>.
-          Закрытие окна PowerShell останавливает воркер — это ожидаемо, ярлык
-          поднимает его обратно.
-        </p>
-      </div>
+  <!-- ================= ЦЕНТРАЛЬНАЯ СЦЕНА ================= -->
+  <main class="synapse-stage">
 
-      <p class="dim tiny section-label">Или вручную — если предпочитаете контролировать каждый шаг</p>
-      <a class="ghost small" href="/download/worker.js" download>Скачать worker.js</a>
+    <header class="stage-header top">
+      <div class="top-inner">
+        <button type="button" class="icon-btn burger" id="sidebarOpen" aria-label="Открыть меню">☰</button>
 
-      <!-- Адрес показываем здесь, а не только в «Балансе»: именно его надо
-           скопировать в команду запуска. Без него воркер создаст свой
-           кошелёк, и начисления не попадут в этот баланс. -->
-      <div class="step">
-        <p class="step-num">Шаг 1</p>
-        <p class="dim tiny">Ваш адрес — тот же, что под балансом:</p>
-        <p class="mono addr-box" id="workerAddr">—</p>
-        <button id="copyAddr" class="ghost small">Скопировать адрес</button>
-        <p class="hint" id="copyHint"></p>
-      </div>
-
-      <div class="step">
-        <p class="step-num">Шаг 2</p>
-        <p class="dim tiny">Запустите воркер в терминале рядом со скачанным файлом — <strong>подставьте адрес из шага 1</strong>:</p>
-        <p class="dim tiny cmd-label">Linux / macOS</p>
-        <pre class="cmd" id="runCmdPosix">—</pre>
-        <p class="dim tiny cmd-label">Windows (cmd)</p>
-        <pre class="cmd" id="runCmdWin">—</pre>
-        <p class="hint">Без <code>WORKER_ADDRESS</code> воркер сгенерирует свой кошелёк: работа будет считаться, но деньги придут не сюда, и баланс останется нулевым.</p>
-      </div>
-    </div>
-
-    <!-- ===== Привязка существующего ПК =====
-         Зачем: если воркер запустили без адреса (или скачали старый файл),
-         он создал СВОЙ кошелёк, и PWA писала «ваш ПК не среди них».
-         Здесь этот адрес привязывается к аккаунту без переустановки.
-
-         Подпись есть с 2.12.8: привязка требует Ed25519-подпись владельца
-         над строкой link:owner:device:nonce и одноразовый nonce. Чего она
-         НЕ доказывает — владение самим ПК: у ПК свой кошелёк, и его ключа
-         у аккаунта нет. Это ограничение модели, а не недоделка. -->
-    <div class="card" id="linkCard">
-      <div class="card-head">
-        <h2>Привязать существующий ПК</h2>
-        <span class="chip">Device Pairing</span>
-      </div>
-      <p class="dim tiny">
-        Если воркер уже запущен, но PWA его не видит — вставьте адрес из окна
-        воркера (строка «адрес: 0x…») или из <code>%LOCALAPPDATA%\TarNet\start.cmd</code>.
-      </p>
-      <label class="consent" for="linkAddr"><span>Адрес ПК</span></label>
-      <input type="text" id="linkAddr" autocomplete="off" spellcheck="false"
-             placeholder="0x..." aria-label="Адрес кошелька ПК">
-      <div class="row">
-        <button id="linkBtn" class="btn">Привязать</button>
-        <button id="linkRefresh" class="btn ghost">Обновить список</button>
-      </div>
-      <p class="mono dim tiny addr-line" id="linkState">—</p>
-      <div id="linkedList"></div>
-    </div>
-
-    <!-- ===== Перенос баланса со старого кошелька =====
-         Зачем: до 2.12.8 адрес в PWA выводился как 20 случайных байт, и
-         приватного ключа к нему не существовало. Демо-начисления на таких
-         адресах были бы заморожены навсегда.
-
-         Подпись обязательна и подписывает НОВЫЙ адрес: старый ключа не имеет
-         по определению и доказать ничего не может. -->
-    <div class="card" id="migrateCard">
-      <div class="card-head">
-        <h2>Перенести баланс со старого кошелька</h2>
-        <span class="chip">Migration</span>
-      </div>
-      <p class="dim tiny">
-        Старые адреса создавались без ключа, и распоряжаться их балансом было
-        нельзя. Вставьте такой адрес — сумма перейдёт на текущий кошелёк
-        <code class="mono" id="migrateTo">—</code>.
-      </p>
-      <label class="consent" for="migrateOld"><span>Старый адрес</span></label>
-      <input type="text" id="migrateOld" autocomplete="off" spellcheck="false"
-             placeholder="0x..." aria-label="Старый адрес без ключа">
-      <div class="row">
-        <button id="migrateCheck" class="btn ghost">Проверить</button>
-        <button id="migrateBtn" class="btn">Перенести</button>
-      </div>
-      <p class="mono dim tiny addr-line" id="migrateState">—</p>
-    </div>
-
-    <!-- ===== Свой ключ провайдера (Tier 6, BYOK) =====
-         Ключ живёт ТОЛЬКО в localStorage этого устройства и уходит на сервер
-         исключительно заголовком X-Provider-Key на время запроса. Сервер его
-         не сохраняет и не пишет в логи: это обещание закреплено в
-         llm-adapter.js (нет loadSecretKey), а не только в тексте здесь. -->
-    <div class="card" id="byokCard">
-      <div class="card-head">
-        <h2>Ключ провайдера</h2>
-        <span class="chip">Tier 6</span>
-      </div>
-      <p class="dim tiny">
-        Свой ключ OpenRouter / OpenAI / Gemini / Groq. Запросы платите вы,
-        напрямую провайдеру. Ключ не покидает это устройство, кроме как
-        в заголовке одного запроса. Провайдер определяется выбранной моделью.
-      </p>
-      <label class="consent" for="byokKey">
-        <span>Ключ</span>
-      </label>
-      <input type="password" id="byokKey" autocomplete="off" spellcheck="false"
-             placeholder="sk-..." aria-label="Ключ провайдера">
-      <div class="row">
-        <button id="byokSave" class="btn">Сохранить ключ</button>
-        <button id="byokClear" class="btn ghost">Удалить</button>
-      </div>
-      <p class="mono dim tiny addr-line" id="byokState">ключ не задан</p>
-      <p class="byok-warn" id="byokWarn" hidden></p>
-      <p class="dim tiny">
-        Кэшбэк за последний запрос:
-        <strong id="cashbackVal">—</strong> TAR
-      </p>
-    </div>
-
-    <div class="card">
-      <div class="card-head">
-        <h2>Nano-node в браузере</h2>
-        <span class="chip">демо</span>
-      </div>
-      <p class="dim">Пока вкладка открыта, устройство раз в 10 секунд отправляет короткую работу. Токены копятся в <code>pending_work</code> — это демонстрация участия, а не полноценный инференс.</p>
-      <button id="nanoBtn" class="btn">Включить Nano-Node</button>
-      <p class="mono dim tiny addr-line" id="nanoAddr">—</p>
-      <div class="log" id="nanoLog"></div>
-    </div>
-  </section>
-
-  <!-- ================= АГЕНТЫ (Волна 5) ================= -->
-  <section id="tab-agents" class="panel" hidden>
-    <!-- Ключ выводится в браузере: мастер-энтропия не уходит на сервер.
-         Форма показывается, пока ключа на устройстве нет. -->
-    <div class="card" id="agentSetup" hidden>
-      <div class="card-head"><h2>Создать TarNet ID</h2></div>
-      <p class="dim">Агенты привязаны к аккаунту TarNet ID. Ключ выводится
-        <strong>на этом устройстве</strong> из мастер-энтропии — на сервер уходит только публичный ключ.</p>
-      <label class="field">
-        <span>Мастер-энтропия (hex, ≥ 16 байт)</span>
-        <textarea id="entropyInput" rows="2" placeholder="32 байта hex — например, 64 символа 0-9a-f" autocomplete="off" spellcheck="false"></textarea>
-      </label>
-      <div class="row">
-        <button id="genEntropy" class="ghost small" type="button">Сгенерировать</button>
-        <button id="createIdBtn" class="btn small" type="button">Создать ID</button>
-      </div>
-      <p class="hint">Энтропия сохраняется в localStorage этого браузера: без неё
-        HITL-подпись требовала бы вводить фразу на каждое подтверждение. Это
-        компромисс стенда, а не боевая схема хранения.</p>
-    </div>
-
-    <div id="agentMain" hidden>
-      <div class="card">
-        <div class="card-head"><h2>Баланс агентов</h2></div>
-        <div id="agentBalance"><span class="dim">—</span></div>
-        <p class="mono dim tiny addr-line" id="agentIdLine">TarNet ID: —</p>
-        <div class="row">
-          <button id="agentRefresh" class="ghost small" type="button">Обновить</button>
-          <button id="forgetKey" class="ghost small" type="button">Забыть ключ</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-head"><h2>Создать агента</h2></div>
-        <form id="agentCreateForm">
+        <div class="stage-controls">
           <label class="field">
-            <span>Роль</span>
-            <select id="agentRole">
-              <option value="general">general</option>
-              <option value="coder">coder</option>
-              <option value="researcher">researcher</option>
+            <span>Модель</span>
+            <select id="model"><option value="">авто (базовая)</option></select>
+          </label>
+          <label class="field">
+            <span>Адаптер</span>
+            <select id="adapter"><option value="">загружаю…</option></select>
+          </label>
+          <label class="field">
+            <span>Контур</span>
+            <select id="contour">
+              <option value="private">Private — промпт не уходит наружу</option>
+              <option value="cloud">Cloud — промпт уходит провайдеру по вашему ключу</option>
             </select>
           </label>
-          <p class="dim tiny section-label">Разрешённые инструменты</p>
-          <div id="agentTools" class="tool-list">
-            <p class="dim tiny">загружаю каталог…</p>
+        </div>
+
+        <div class="stage-right">
+          <span class="shield" id="piiShield" title="Классификатор PII срабатывает перед выходом промпта во внешний API">🛡️ PII Shield</span>
+          <button type="button" class="icon-btn" id="artifactToggle" aria-label="Панель артефактов" title="Артефакты">📄</button>
+          <button id="installBtn" class="ghost small" hidden>Установить</button>
+        </div>
+      </div>
+      <p class="hint tiny stage-hint" id="contourHint">Промпт обрабатывается воркерами сети и не покидает её.</p>
+    </header>
+
+    <!-- Статус воркера: виден до первого вопроса. Если ПК спит, ответы тихо
+         уходят в deterministic_fallback — пользователь должен знать это заранее,
+         а не догадываться по качеству ответа. -->
+    <div id="workerBanner" class="banner" role="status" aria-live="polite" hidden>
+      <span id="workerBannerText"></span>
+      <button id="workerHowto" class="link" hidden>Инструкция по подключению</button>
+    </div>
+
+    <div class="stage-scroll">
+
+      <!-- ================= ЧАТ ================= -->
+      <section id="tab-chat" class="panel">
+        <div id="chatLog" class="chat-log chat-stream" aria-live="polite">
+          <div class="empty-chat">
+            <p class="empty-title">Спросите что угодно</p>
+            <p class="empty-sub">Под каждым ответом появится подписанный чек — его можно проверить.</p>
+
+            <!-- Zero-state Bento: вместо пустого листа человек видит четыре
+                 реальных входа. Все четыре ведут в уже существующие места,
+                 ни одна плитка не обещает того, чего в сборке нет. -->
+            <div class="bento-grid">
+              <button type="button" class="bento" data-prompt="Напиши функцию на JavaScript, которая считает SHA-256 через WebCrypto">
+                <span class="bento-icon">💻</span>
+                <span class="bento-title">Код и отладка</span>
+                <span class="bento-sub">Локальные модели сети, Tier 1–3</span>
+              </button>
+              <button type="button" class="bento" data-goto="devices">
+                <span class="bento-icon">🔑</span>
+                <span class="bento-title">Свой ключ (BYOK)</span>
+                <span class="bento-sub">Платите провайдеру напрямую</span>
+              </button>
+              <button type="button" class="bento" data-goto="agents">
+                <span class="bento-icon">🤖</span>
+                <span class="bento-title">Суверенный агент</span>
+                <span class="bento-sub">Think → Act → Observe, с подписью</span>
+              </button>
+              <button type="button" class="bento" data-goto="devices">
+                <span class="bento-icon">⚡</span>
+                <span class="bento-title">Подключить ПК</span>
+                <span class="bento-sub">Воркер в один клик, заработок в TAR</span>
+              </button>
+            </div>
+
+            <div class="suggest-wrap">
+              <button type="button" class="suggest" data-prompt="Объясни, как TarNet обеспечивает приватность промптов">Как работает приватность?</button>
+              <button type="button" class="suggest" data-prompt="Чем отличается работа воркера от nano-узла?">Воркер и nano-узел</button>
+            </div>
           </div>
-          <button type="submit" class="btn small">Создать агента</button>
+        </div>
+
+        <!-- Плавающий омнибокс. Автовысота до 200px, Enter — отправить,
+             Shift+Enter — перенос. Пилюли переключают контур, но не
+             отправляют tier 6 сами по себе: тир выбирает МОДЕЛЬ. -->
+        <form id="chatForm" class="composer omnibox-container">
+          <div class="composer-box omnibox">
+            <textarea id="prompt" rows="1" placeholder="Спросите Synapse…" maxlength="65536" aria-label="Запрос"></textarea>
+
+            <div class="omnibox-bar">
+              <div class="mode-pills" role="group" aria-label="Режим запроса">
+                <button type="button" class="pill active" data-mode="private">🛡️ Рой</button>
+                <button type="button" class="pill" data-mode="byok">🔑 Свой ключ</button>
+                <button type="button" class="pill" data-mode="agent">🤖 Агент</button>
+              </div>
+
+              <label class="distill-toggle" title="Разрешить использовать обезличенные запросы для улучшения сети">
+                <input type="checkbox" id="distillToggle">
+                <span>🧬 Дистилляция</span>
+              </label>
+
+              <button type="submit" id="sendBtn" class="send-btn" aria-label="Отправить">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+              </button>
+            </div>
+          </div>
+          <p class="hint" id="chatHint"></p>
+          <p class="composer-note">Enter — отправить · Shift+Enter — новая строка</p>
         </form>
-        <!-- Умолчание сервера, а не выдумка UI: POST /agents не принимает
-             лимиты в теле и ставит их из config.js. -->
-        <p class="hint">Лимиты ставит сервер: 5000 токенов на задачу,
-          50000 в день, порог подтверждения 2000. Форма их не переопределяет —
-          <code>POST /agents</code> принимает только роль и инструменты.</p>
-      </div>
+      </section>
 
-      <div class="card">
-        <div class="card-head"><h2>Мои агенты</h2></div>
-        <div id="agentList"><div class="empty-list">загружаю…</div></div>
-        <p class="hint" id="agentStatus"></p>
+      <!-- ================= УСТРОЙСТВА ================= -->
+      <section id="tab-devices" class="panel" hidden>
+        <div class="card card-balance">
+          <div class="card-head">
+            <h2>Баланс</h2>
+            <button id="refreshBal" class="ghost small">Обновить</button>
+          </div>
+          <p class="balance"><span id="balanceVal">—</span> <span class="unit">TAR</span></p>
+          <p class="mono dim addr-line" id="walletAddr">кошелёк: —</p>
+
+          <!-- ===== Faucet =====
+               Зачем кнопка: Tier 6 требует баланс (402 на пустом кошельке),
+               а публичного пополнения нет. Без неё новый PWA не может
+               сделать ни одного вызова. Текст сразу говорит, что это
+               эмиссия, а не заработок — иначе 0.01 TAR легко принять
+               за награду за работу. -->
+          <div class="faucet-row">
+            <button id="faucetBtn" class="btn ghost small">Получить 0.01 TAR (тест)</button>
+            <span class="hint tiny" id="faucetState">тестовые деньги для комиссии Tier 6</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Приватность</h2>
+            <span class="chip">по умолчанию выкл.</span>
+          </div>
+          <label class="consent">
+            <input type="checkbox" id="consentBox">
+            <span>Разрешить использовать мои анонимизированные запросы для улучшения сети TarNet</span>
+          </label>
+          <p class="dim mono tiny" id="consentState">—</p>
+        </div>
+
+        <div class="card" id="workerCard">
+          <div class="card-head">
+            <h2>Воркер для ПК</h2>
+            <span class="chip chip-accent">режим worker</span>
+          </div>
+          <p class="dim">Скрипт забирает задачи, считает моделью на вашем ПК и возвращает результат.</p>
+
+          <!-- ===== Установка в один клик =====
+               Адрес подставляется в скрипт на сервере, поэтому файл персонален.
+               Ссылки строятся в app.js: до появления ADDR подставлять нечего,
+               а статичный href с пустым addr вернул бы 400. -->
+          <div class="onboard">
+            <p class="onboard-title">Быстрый путь</p>
+            <p class="dim tiny onboard-desc">
+              Скачайте установщик и запустите двойным кликом — он сам поставит
+              Node.js и Ollama, скачает модель и запустит воркер. Ваш адрес уже внутри.
+            </p>
+            <div class="row">
+              <a class="btn" id="dlWin" href="#" download>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 18v2h16v-2"/></svg>
+                Windows (.bat)
+              </a>
+              <a class="btn ghost" id="dlMac" href="#" download>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 18v2h16v-2"/></svg>
+                macOS / Linux (.command)
+              </a>
+            </div>
+            <p class="hint" id="dlHint">
+              <strong>Windows</strong> — скачали, дважды кликнули, готово.<br>
+              <strong>macOS</strong> — браузер сохраняет файл без права на запуск и
+              помечает его карантином. Один раз перед запуском в Терминале:
+              <code>chmod +x ~/Downloads/install-tarnet-worker.command</code>,
+              потом правый клик → «Открыть». Обойти это кодом нельзя — так работает Gatekeeper.
+            </p>
+            <!-- ===== Ярлык для повторного запуска =====
+                 Установщик кладёт файлы в %LOCALAPPDATA%\TarNet — папку, куда
+                 человек не пойдёт. Без этой строки человек не знает ни где
+                 воркер, ни как запустить его снова после закрытия окна.
+                 Пишем и запасной путь: ярлык может не создаться (политика
+                 запрещает COM, OneDrive-профиль), и тогда обещать его было бы
+                 ложью.
+                 Имя ярлыка — латиницей (TarNet), и сообщения установщика тоже
+                 на английском: консоль Windows читает .bat в OEM-кодировке,
+                 и кириллица там превращается в мусор. Это не забывчивость. -->
+            <p class="hint" id="shortcutHint">
+              <strong>После установки на рабочем столе появится ярлык TarNet.</strong>
+              Двойной клик запускает воркер снова — установщик повторно не нужен.
+              Мастер установки говорит по-английски: русский текст в консоли
+              Windows превращается в нечитаемые символы, поэтому подписи оставлены
+              латиницей, а вся эта инструкция — здесь.
+              Если ярлык создать не удалось (ограничения политики Windows),
+              запускайте вручную: <code>%LOCALAPPDATA%\TarNet\start.cmd</code>.
+              Закрытие окна PowerShell останавливает воркер — это ожидаемо, ярлык
+              поднимает его обратно.
+            </p>
+          </div>
+
+          <p class="dim tiny section-label">Или вручную — если предпочитаете контролировать каждый шаг</p>
+          <a class="ghost small" href="/download/worker.js" download>Скачать worker.js</a>
+
+          <!-- Адрес показываем здесь, а не только в «Балансе»: именно его надо
+               скопировать в команду запуска. Без него воркер создаст свой
+               кошелёк, и начисления не попадут в этот баланс. -->
+          <div class="step">
+            <p class="step-num">Шаг 1</p>
+            <p class="dim tiny">Ваш адрес — тот же, что под балансом:</p>
+            <p class="mono addr-box" id="workerAddr">—</p>
+            <button id="copyAddr" class="ghost small">Скопировать адрес</button>
+            <p class="hint" id="copyHint"></p>
+          </div>
+
+          <div class="step">
+            <p class="step-num">Шаг 2</p>
+            <p class="dim tiny">Запустите воркер в терминале рядом со скачанным файлом — <strong>подставьте адрес из шага 1</strong>:</p>
+            <p class="dim tiny cmd-label">Linux / macOS</p>
+            <pre class="cmd" id="runCmdPosix">—</pre>
+            <p class="dim tiny cmd-label">Windows (cmd)</p>
+            <pre class="cmd" id="runCmdWin">—</pre>
+            <p class="hint">Без <code>WORKER_ADDRESS</code> воркер сгенерирует свой кошелёк: работа будет считаться, но деньги придут не сюда, и баланс останется нулевым.</p>
+          </div>
+        </div>
+
+        <!-- ===== Привязка существующего ПК =====
+             Зачем: если воркер запустили без адреса (или скачали старый файл),
+             он создал СВОЙ кошелёк, и PWA писала «ваш ПК не среди них».
+             Здесь этот адрес привязывается к аккаунту без переустановки.
+
+             Подпись есть с 2.12.8: привязка требует Ed25519-подпись владельца
+             над строкой link:owner:device:nonce и одноразовый nonce. Чего она
+             НЕ доказывает — владение самим ПК: у ПК свой кошелёк, и его ключа
+             у аккаунта нет. Это ограничение модели, а не недоделка. -->
+        <div class="card" id="linkCard">
+          <div class="card-head">
+            <h2>Привязать существующий ПК</h2>
+            <span class="chip">Device Pairing</span>
+          </div>
+          <p class="dim tiny">
+            Если воркер уже запущен, но PWA его не видит — вставьте адрес из окна
+            воркера (строка «адрес: 0x…») или из <code>%LOCALAPPDATA%\TarNet\start.cmd</code>.
+          </p>
+          <label class="consent" for="linkAddr"><span>Адрес ПК</span></label>
+          <input type="text" id="linkAddr" autocomplete="off" spellcheck="false"
+                 placeholder="0x..." aria-label="Адрес кошелька ПК">
+          <div class="row">
+            <button id="linkBtn" class="btn">Привязать</button>
+            <button id="linkRefresh" class="btn ghost">Обновить список</button>
+          </div>
+          <p class="mono dim tiny addr-line" id="linkState">—</p>
+          <div id="linkedList"></div>
+        </div>
+
+        <!-- ===== Перенос баланса со старого кошелька =====
+             Зачем: до 2.12.8 адрес в PWA выводился как 20 случайных байт, и
+             приватного ключа к нему не существовало. Демо-начисления на таких
+             адресах были бы заморожены навсегда.
+
+             Подпись обязательна и подписывает НОВЫЙ адрес: старый ключа не имеет
+             по определению и доказать ничего не может. -->
+        <div class="card" id="migrateCard">
+          <div class="card-head">
+            <h2>Перенести баланс со старого кошелька</h2>
+            <span class="chip">Migration</span>
+          </div>
+          <p class="dim tiny">
+            Старые адреса создавались без ключа, и распоряжаться их балансом было
+            нельзя. Вставьте такой адрес — сумма перейдёт на текущий кошелёк
+            <code class="mono" id="migrateTo">—</code>.
+          </p>
+          <label class="consent" for="migrateOld"><span>Старый адрес</span></label>
+          <input type="text" id="migrateOld" autocomplete="off" spellcheck="false"
+                 placeholder="0x..." aria-label="Старый адрес без ключа">
+          <div class="row">
+            <button id="migrateCheck" class="btn ghost">Проверить</button>
+            <button id="migrateBtn" class="btn">Перенести</button>
+          </div>
+          <p class="mono dim tiny addr-line" id="migrateState">—</p>
+        </div>
+
+        <!-- ===== Свой ключ провайдера (Tier 6, BYOK) =====
+             Ключ живёт ТОЛЬКО в localStorage этого устройства и уходит на сервер
+             исключительно заголовком X-Provider-Key на время запроса. Сервер его
+             не сохраняет и не пишет в логи: это обещание закреплено в
+             llm-adapter.js (нет loadSecretKey), а не только в тексте здесь. -->
+        <div class="card" id="byokCard">
+          <div class="card-head">
+            <h2>Ключ провайдера</h2>
+            <span class="chip">Tier 6</span>
+          </div>
+          <p class="dim tiny">
+            Свой ключ OpenRouter / OpenAI / Gemini / Groq / DeepSeek. Запросы
+            платите вы, напрямую провайдеру. Ключ не покидает это устройство,
+            кроме как в заголовке одного запроса. Провайдер определяется
+            выбранной моделью.
+          </p>
+          <label class="consent" for="byokKey">
+            <span>Ключ</span>
+          </label>
+          <input type="password" id="byokKey" autocomplete="off" spellcheck="false"
+                 placeholder="sk-..." aria-label="Ключ провайдера">
+          <div class="row">
+            <button id="byokSave" class="btn">Сохранить ключ</button>
+            <button id="byokClear" class="btn ghost">Удалить</button>
+          </div>
+          <p class="mono dim tiny addr-line" id="byokState">ключ не задан</p>
+          <p class="byok-warn" id="byokWarn" hidden></p>
+          <p class="dim tiny">
+            Кэшбэк за последний запрос:
+            <strong id="cashbackVal">—</strong> TAR
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Nano-node в браузере</h2>
+            <span class="chip">демо</span>
+          </div>
+          <p class="dim">Пока вкладка открыта, устройство раз в 10 секунд отправляет короткую работу. Токены копятся в <code>pending_work</code> — это демонстрация участия, а не полноценный инференс.</p>
+          <button id="nanoBtn" class="btn">Включить Nano-Node</button>
+          <p class="mono dim tiny addr-line" id="nanoAddr">—</p>
+          <div class="log" id="nanoLog"></div>
+        </div>
+      </section>
+
+      <!-- ================= АГЕНТЫ (Волна 5) ================= -->
+      <section id="tab-agents" class="panel" hidden>
+        <!-- Ключ выводится в браузере: мастер-энтропия не уходит на сервер.
+             Форма показывается, пока ключа на устройстве нет. -->
+        <div class="card" id="agentSetup" hidden>
+          <div class="card-head"><h2>Создать TarNet ID</h2></div>
+          <p class="dim">Агенты привязаны к аккаунту TarNet ID. Ключ выводится
+            <strong>на этом устройстве</strong> из мастер-энтропии — на сервер уходит только публичный ключ.</p>
+          <label class="field">
+            <span>Мастер-энтропия (hex, ≥ 16 байт)</span>
+            <textarea id="entropyInput" rows="2" placeholder="32 байта hex — например, 64 символа 0-9a-f" autocomplete="off" spellcheck="false"></textarea>
+          </label>
+          <div class="row">
+            <button id="genEntropy" class="ghost small" type="button">Сгенерировать</button>
+            <button id="createIdBtn" class="btn small" type="button">Создать ID</button>
+          </div>
+          <p class="hint">Энтропия сохраняется в localStorage этого браузера: без неё
+            HITL-подпись требовала бы вводить фразу на каждое подтверждение. Это
+            компромисс стенда, а не боевая схема хранения.</p>
+        </div>
+
+        <div id="agentMain" hidden>
+          <div class="card">
+            <div class="card-head"><h2>Баланс агентов</h2></div>
+            <div id="agentBalance"><span class="dim">—</span></div>
+            <p class="mono dim tiny addr-line" id="agentIdLine">TarNet ID: —</p>
+            <div class="row">
+              <button id="agentRefresh" class="ghost small" type="button">Обновить</button>
+              <button id="forgetKey" class="ghost small" type="button">Забыть ключ</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h2>Создать агента</h2></div>
+            <form id="agentCreateForm">
+              <label class="field">
+                <span>Роль</span>
+                <select id="agentRole">
+                  <option value="general">general</option>
+                  <option value="coder">coder</option>
+                  <option value="researcher">researcher</option>
+                </select>
+              </label>
+              <p class="dim tiny section-label">Разрешённые инструменты</p>
+              <div id="agentTools" class="tool-list">
+                <p class="dim tiny">загружаю каталог…</p>
+              </div>
+              <button type="submit" class="btn small">Создать агента</button>
+            </form>
+            <!-- Умолчание сервера, а не выдумка UI: POST /agents не принимает
+                 лимиты в теле и ставит их из config.js. -->
+            <p class="hint">Лимиты ставит сервер: 5000 токенов на задачу,
+              50000 в день, порог подтверждения 2000. Форма их не переопределяет —
+              <code>POST /agents</code> принимает только роль и инструменты.</p>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h2>Мои агенты</h2></div>
+            <div id="agentList"><div class="empty-list">загружаю…</div></div>
+            <p class="hint" id="agentStatus"></p>
+          </div>
+        </div>
+
+        <!-- Экран запуска задачи -->
+        <div class="card" id="agentRunPanel" hidden>
+          <div class="card-head">
+            <h2>Запуск задачи</h2>
+            <span class="mono tiny dim" id="runAgentId">—</span>
+          </div>
+          <label class="field">
+            <span>Промпт</span>
+            <textarea id="runPrompt" rows="3" placeholder="Что должен сделать агент?" maxlength="65536"></textarea>
+          </label>
+          <label class="field">
+            <span>Максимум токенов</span>
+            <input id="runMaxTokens" type="number" value="512" min="1" max="5000" inputmode="numeric">
+          </label>
+          <p class="dim tiny section-label">Инструменты (только разрешённые агенту)</p>
+          <div id="runTools" class="tool-list"></div>
+          <div class="row">
+            <button id="runSubmit" class="btn small" type="button">Запустить задачу</button>
+            <button id="runClose" class="ghost small" type="button">Закрыть</button>
+          </div>
+          <div class="log" id="runLog"></div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <!-- ================= ПРАВАЯ ПАНЕЛЬ: АРТЕФАКТЫ ================= -->
+  <aside class="artifact-drawer" id="artifactDrawer" aria-label="Артефакты и инспектор" hidden>
+    <div class="drawer-head">
+      <div class="drawer-tabs" role="tablist">
+        <button type="button" class="drawer-tab active" role="tab" data-drawer="artifact" aria-selected="true">📄 Артефакт</button>
+        <button type="button" class="drawer-tab" role="tab" data-drawer="inspector" aria-selected="false">🔍 Inspector</button>
+      </div>
+      <button type="button" class="icon-btn" id="artifactClose" aria-label="Закрыть панель">✕</button>
+    </div>
+    <div class="drawer-body">
+      <div class="drawer-pane" id="artifactPane">
+        <p class="dim tiny">Здесь появится код из ответа. Открыть вручную — кнопка под блоком кода.</p>
+      </div>
+      <div class="drawer-pane" id="inspectorPane" hidden>
+        <p class="dim tiny">Здесь появятся шаги агента и данные чека.</p>
       </div>
     </div>
-
-    <!-- Экран запуска задачи -->
-    <div class="card" id="agentRunPanel" hidden>
-      <div class="card-head">
-        <h2>Запуск задачи</h2>
-        <span class="mono tiny dim" id="runAgentId">—</span>
-      </div>
-      <label class="field">
-        <span>Промпт</span>
-        <textarea id="runPrompt" rows="3" placeholder="Что должен сделать агент?" maxlength="65536"></textarea>
-      </label>
-      <label class="field">
-        <span>Максимум токенов</span>
-        <input id="runMaxTokens" type="number" value="512" min="1" max="5000" inputmode="numeric">
-      </label>
-      <p class="dim tiny section-label">Инструменты (только разрешённые агенту)</p>
-      <div id="runTools" class="tool-list"></div>
-      <div class="row">
-        <button id="runSubmit" class="btn small" type="button">Запустить задачу</button>
-        <button id="runClose" class="ghost small" type="button">Закрыть</button>
-      </div>
-      <div class="log" id="runLog"></div>
-    </div>
-  </section>
-</main>
+  </aside>
+</div>
 
 <!-- Вендорные библиотеки подключены ДО app.js: рендер markdown зависит от
      globalThis.marked, а подсветка — от hljs. Локальные копии в /app/vendor/,
