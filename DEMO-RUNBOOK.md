@@ -145,8 +145,26 @@ TARNET_API_URL=https://v1107336.hosted-by-vdsina.com node worker.js
 **не сверяйте его с числом из документа** — сверяйте с коммитом. Проверять так:
 `curl -s https://v1107336.hosted-by-vdsina.com/download/worker.js | sha256sum`
 и сравнить с `sha256` того же файла в репозитории. История чисел: 13430 →
-16509 → 19511 → 19925 (на `e1ad5ef`) → 25332 (после исправления `modelId`).
-Зависимостей нет, нужен Node 18+.
+16509 → 19511 → 19925 (на `e1ad5ef`) → 25342 (на `5427097`, после
+исправления `modelId`). Зависимостей нет, нужен Node 18+.
+
+**Селектор моделей работает только при `active_workers > 0`.** Выбор модели
+применяется воркером; в `deterministic_fallback` ответ формирует заглушка, и
+`model` в ответе будет `null`, хотя `model_id` вернётся тем, что просили.
+Поэтому перед показом селектора поднимите воркер и убедитесь, что в `/health`
+стоит `"llm_mode": "worker"`, `"active_workers": 1`. Иначе не обещайте выбор
+модели: он передаётся и валидируется, но не применяется.
+
+Проверка в одну команду (два разных `modelId` должны дать разные `model`):
+
+```bash
+for m in qwen2.5-coder-7b deepseek-r1-distill-1.5b; do
+  curl -s -X POST https://v1107336.hosted-by-vdsina.com/inference \
+    -H 'Content-Type: application/json' \
+    -d "{\"prompt\":\"test\",\"clientAddress\":\"$ADDR\",\"modelId\":\"$m\"}" \
+    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s);console.log(r.model_id,"→",r.model,"|",r.source)})'
+done
+```
 
 **Имена моделей воркера и каталога `/models` — синхронизировать при
 регистрации.** Воркер объявляет модель в `/worker/submit` и в пульсе, и это
