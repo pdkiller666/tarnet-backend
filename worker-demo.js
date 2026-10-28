@@ -277,7 +277,7 @@ async function askCloud(prompt, requestedModel) {
 }
 
 /* ---------- 3. Честный fallback ---------- */
-function askFallback(prompt) {
+function askFallback(prompt, errorCode) {
   const response =
     `Воркер получил запрос: «${String(prompt).slice(0, 160)}».\n\n` +
     'Модель на этом ПК не настроена, поэтому текст собран по шаблону. ' +
@@ -286,13 +286,29 @@ function askFallback(prompt) {
   const completion_tokens = Math.ceil(response.length / 4);
   return {
     response, source: 'deterministic_fallback',
+    /* Код причины уходит на сервер вместе с шаблоном: без него PWA знает
+     * только «модели нет», и человек идёт проверять модель вместо того,
+     * чтобы запустить Ollama. null — причина неизвестна, врать не будем. */
+    error: errorCode || null,
     usage: { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
   };
 }
 
 let ollamaDead = false;
 
+/* Отличаем «Ollama не запущена» от «Ollama ответила ошибкой». Лечатся они
+ * по-разному: первое — запустить программу, второе — смотреть её лог и
+ * модель. Один общий код заставил бы человека угадывать. */
+function ollamaErrorCode(e) {
+  const m = String((e && e.message) || '');
+  if (/fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|network/i.test(m)) return 'OLLAMA_NOT_RUNNING';
+  if (/HTTP \d+/.test(m)) return 'OLLAMA_HTTP_ERROR';
+  if (/пустой ответ/.test(m)) return 'OLLAMA_EMPTY_RESPONSE';
+  return 'OLLAMA_ERROR';
+}
+
 async function generate(prompt, requestedModel) {
+  let ollamaErr = null;
   if (!ollamaDead) {
     try {
       return await askOllama(prompt, requestedModel);
@@ -300,7 +316,8 @@ async function generate(prompt, requestedModel) {
       /* Ollama может быть просто не запущен — это нормально. Запоминаем,
        * чтобы не ждать таймаут на каждой задаче. */
       ollamaDead = true;
-      log(`Ollama недоступна (${e.message}) — переключаюсь на другой бэкенд`);
+      ollamaErr = ollamaErrorCode(e);
+      log(`Ollama недоступна (${e.message}) — переключаюсь на другой бэкенд [${ollamaErr}]`);
     }
   }
   if (GROQ_KEY || OPENROUTER_KEY) {
@@ -310,7 +327,7 @@ async function generate(prompt, requestedModel) {
       log(`облачный API не ответил (${e.message})`);
     }
   }
-  return askFallback(prompt);
+  return askFallback(prompt, ollamaErr || 'MODEL_NOT_CONFIGURED');
 }
 
 /* ---------- Шифрование задачи ----------
@@ -406,6 +423,9 @@ async function pollOnce() {
     /* Источник объявляется честно: сервер по нему отличает настоящий ответ
      * модели от шаблона этого же воркера (model_unavailable). */
     source: gen.source,
+    /* Причина заглушки, если она есть: сервер прокидывает её в PWA, и
+     * человек видит «запустите Ollama», а не «модель не загружена». */
+    ...(gen.error ? { error: gen.error } : {}),
     // model обязателен: сервер отклоняет результат без него.
     /* Объявляем ту модель, которую бэкенд реально запустил (gen.model), а не
      * ту, что просили: сервер по этому полю пишет отчёт, и расхождение

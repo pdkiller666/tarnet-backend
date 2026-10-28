@@ -31,7 +31,7 @@
 curl -s https://v1107336.hosted-by-vdsina.com/health | head -c 200
 ```
 
-Ожидаемо: `HTTP 200`, в теле `"status":"ok"`, `"buildVersion":"2.12.9-migrate-claim"`.
+Ожидаемо: `HTTP 200`, в теле `"status":"ok"`, `"buildVersion":"2.14.0-responsive"`.
 
 Если не 200 — дальше идти нельзя, остальное не имеет смысла.
 

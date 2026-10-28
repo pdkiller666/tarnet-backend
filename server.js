@@ -404,6 +404,10 @@ ensureColumn('ledger_txs', 'actionId', 'actionId TEXT');
  * /inference не может отличить model_unavailable от честного live-ответа и
  * выдаёт шаблон воркера за работу модели. */
 ensureColumn('worker_tasks', 'source', 'source TEXT');
+/* Причина заглушки, если воркер её назвал (OLLAMA_NOT_RUNNING и т.п.).
+ * Без этой колонки код терялся на /worker/submit, и PWA показывал
+ * «модель не загружена» вместо «запустите Ollama». */
+ensureColumn('worker_tasks', 'error', 'error TEXT');
 
 /* ===== Миграция: burn-строки без fromAddress =====
  *
@@ -4961,6 +4965,43 @@ app.get('/summary', (_req, res) => {
   const burnAddressTar = Number((burnt?.balanceTar ?? 0).toFixed(6));
   const burnAccountedTar = Number((burnReceiptsTar + burnTier6Tar).toFixed(6));
 
+  /* ===== Сверка казны: почему баланс не равен totalTreasuryTar =====
+   *
+   * 28.10 в аудите повис вопрос: баланс казны 0.192075 против начисленного
+   * 0.185113, разница 0.006962 непонятного происхождения. Причина найдена
+   * на живой БД и оказалась не «внешним пополнением», а тремя слагаемыми:
+   *
+   *   +0.006762  чек seq 30 (21.10 21:57), где workerAddress = адрес казны:
+   *              казна получила выплату как воркер;
+   *   +0.000400  treasuryTar из tier6_calls — totalTreasuryTar читает
+   *              ТОЛЬКО work_receipts, поэтому внешние вызовы в него не входят;
+   *   −0.000200  кэшбэк, списанный с адреса казны (debit уменьшает баланс,
+   *              но в «начислено» его нет).
+   *
+   * Почему НЕ правим totalTreasuryTar: он стоит в одном ряду с totalRewardTar
+   * и totalFeeGrossTar и все они из work_receipts — тот же довод, что для
+   * totalBurnedTar (см. выше). Вместо этого — явная сверка, как burnAudit:
+   * читатель видит, из чего сложился баланс, вместо догадок.
+   *
+   * ВАЖНО: строки `spend` с toAddress = казна в баланс казны НЕ идут.
+   * debit() уменьшает баланс плательщика, а toAddress — только метка. Этот
+   * учёт уже один раз давал неверную разбивку при реконструкции по kind. */
+  const tier6Treasury = get('SELECT COALESCE(SUM(treasuryTar), 0) AS s FROM tier6_calls');
+  const tier6TreasuryTar2 = Number(Number(tier6Treasury?.s ?? 0).toFixed(6));
+  const selfPayout = get(
+    `SELECT COALESCE(SUM(amountTar), 0) AS s FROM ledger_txs WHERE toAddress = ? AND kind = 'payout'`,
+    [TREASURY_ADDRESS],
+  );
+  const selfPayoutTar = Number(Number(selfPayout?.s ?? 0).toFixed(6));
+  const cashbackOut = get(
+    `SELECT COALESCE(SUM(amountTar), 0) AS s FROM ledger_txs WHERE fromAddress = ? AND kind = 'cashback'`,
+    [TREASURY_ADDRESS],
+  );
+  const cashbackOutTar = Number(Number(cashbackOut?.s ?? 0).toFixed(6));
+  const treasuryAccruedTar = Number((Number(t.treasury ?? 0) + tier6TreasuryTar2).toFixed(6));
+  const treasuryExpected = Number((treasuryAccruedTar + selfPayoutTar - cashbackOutTar).toFixed(6));
+  const treasuryActual = Number((treas?.balanceTar ?? 0).toFixed(6));
+
   res.json({
     receipts: Number(t.receipts),
     workers: get('SELECT COUNT(DISTINCT workerAddress) AS c FROM work_receipts').c,
@@ -4990,6 +5031,19 @@ app.get('/summary', (_req, res) => {
       addressBalanceTar: burnAddressTar,
       delta: Number((burnAccountedTar - burnAddressTar).toFixed(6)),
       holds: Math.abs(burnAccountedTar - burnAddressTar) < 1e-6,
+    },
+    /* Сверка казны: три слагаемых, которые раньше были «непонятной
+     * разницей». holds: true означает, что баланс объяснён полностью. */
+    treasuryAudit: {
+      workReceiptsTar: Number(Number(t.treasury ?? 0).toFixed(6)),
+      tier6Tar: tier6TreasuryTar2,
+      accruedTar: treasuryAccruedTar,
+      selfPayoutTar,
+      cashbackOutTar,
+      expectedBalanceTar: treasuryExpected,
+      actualBalanceTar: treasuryActual,
+      delta: Number((treasuryActual - treasuryExpected).toFixed(6)),
+      holds: Math.abs(treasuryActual - treasuryExpected) < 1e-6,
     },
     onchainSettlements: settledCount,
     /* Честная маркировка: записи в onchain_settlements созданы локально,
@@ -5024,7 +5078,14 @@ const WORKER_TASK_TTL_MS = Number(process.env.WORKER_TASK_TTL_MS || 30000);
  * отсутствующий уже через 15 с, а не через две минуты. Держится только
  * вместе с пульсом во время генерации: 7B на CPU думает дольше 15 с, и без
  * пульса живой воркер выглядел бы офлайн ровно в момент работы. */
-const WORKER_ACTIVE_WINDOW_MS = Number(process.env.WORKER_ACTIVE_WINDOW_MS || 15000);
+/* Окно присутствия: сколько воркер считается живым после последнего опроса.
+ * 60 с при опросе раз в секунду дают запас 60x. Было 15 с — на демо баннер
+ * гас, если человек отвлёкся на двадцать секунд, и живой ПК показывался как
+ * офлайн. Побочный эффект честности: отсутствующий воркер теперь виден как
+ * отсутствующий через минуту, а не через 15 с. Держится вместе с пульсом во
+ * время генерации: 7B на CPU думает дольше 60 с, и без пульса живой воркер
+ * выглядел бы офлайн ровно в момент работы. */
+const WORKER_ACTIVE_WINDOW_MS = Number(process.env.WORKER_ACTIVE_WINDOW_MS || 60000);
 const WORKER_MIN_SUBMIT_MS = 500; // защита от мгновенного «ответа без работы»
 
 /* Есть ли воркер, который недавно забирал задачи. Если нет — /inference
@@ -5106,6 +5167,9 @@ function enqueueWorkerTask({ prompt, model, tier }) {
           usage,
           model: row.model,
           source: row.source,
+          /* Причина заглушки от воркера (OLLAMA_NOT_RUNNING и т.п.).
+           * null — воркер причину не назвал. */
+          error: row.error || null,
           workerAddress: row.workerAddress,
         });
       }
@@ -5274,13 +5338,17 @@ app.post('/worker/submit', (req, res) => {
    * присылает, и такой ответ считается настоящим — иначе уже работающие
    * воркеры разом попали бы в model_unavailable. */
   const declaredSource = typeof body.source === 'string' && body.source.length ? body.source : null;
+  /* Код ошибки от воркера. Необязателен: старые воркеры его не шлют.
+   * Сохраняем как есть — перевод в человеческий текст делает PWA, чтобы
+   * формулировки жили в одном месте и менялись без передеплоя воркера. */
+  const declaredError = typeof body.error === 'string' && body.error.length ? body.error : null;
   /* encryptedPayload стирается сразу по получении результата: задача
    * завершена, хранить шифротекст больше не для чего. */
   run(
     `UPDATE worker_tasks SET status = 'done', response = ?, tokensGenerated = ?,
-       usageJson = ?, model = ?, source = ?, finishedAt = ?, encryptedPayload = NULL
+       usageJson = ?, model = ?, source = ?, error = ?, finishedAt = ?, encryptedPayload = NULL
      WHERE taskId = ?`,
-    [storedResponse, tokens, JSON.stringify(body.usage || null), body.model, declaredSource, Date.now(), taskId],
+    [storedResponse, tokens, JSON.stringify(body.usage || null), body.model, declaredSource, declaredError, Date.now(), taskId],
   );
   /* Ключ НЕ удаляем здесь: его ещё нужен читателю, чтобы расшифровать ответ
    * при выдаче клиенту. Удаление — в enqueueWorkerTask после расшифровки. */
@@ -6096,9 +6164,15 @@ async function runInference(req, res) {
        * свой шаблон. Считать это работой модели нельзя, и молчать об этом
        * тоже — иначе пользователь видит "живой воркер" с пустым смыслом. */
       if (w.source === 'deterministic_fallback') {
-        fallbackReason = 'model_unavailable';
+        /* Воркер назвал причину — отдаём её как есть (OLLAMA_NOT_RUNNING).
+         * Причина различима в PWA: «запустите Ollama» и «модель не
+         * загружена» лечатся разными действиями, и общий код заставлял бы
+         * человека угадывать. Неизвестная причина — model_unavailable. */
+        fallbackReason = w.error || 'model_unavailable';
         result.emulated = true;
-        result.warning = 'Воркер подключён, но модель на его ПК не загружена — ответ собран шаблоном воркера';
+        result.warning = w.error === 'OLLAMA_NOT_RUNNING'
+          ? 'Ollama не запущена на ПК воркера — запустите её или выберите «Свой ключ»'
+          : 'Воркер подключён, но модель на его ПК не загружена — ответ собран шаблоном воркера';
       }
     } catch (e) {
       /* Таймаут отделён от прочих сбоёв: "модель думала слишком долго" и

@@ -433,10 +433,10 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     wPoll.status === 200 && wPoll.body.task === null, wPoll.body?.task);
 
   // ---------- 8.7a. Окно присутствия и пульс ----------
-  section('8.7a. Окно присутствия 15 с и пульс во время генерации');
+  section('8.7a. Окно присутствия 60 с и пульс во время генерации');
   const hWin = await api('/health');
-  ok('/health отдаёт worker_active_window_ms = 15000',
-    hWin.body.worker_active_window_ms === 15000, hWin.body.worker_active_window_ms);
+  ok('/health отдаёт worker_active_window_ms = 60000',
+    hWin.body.worker_active_window_ms === 60000, hWin.body.worker_active_window_ms);
 
   /* Ноль присутствия — состояние на этот момент приёмки. Проверка идёт ДО
    * пульса: после него active_workers станет 1 и причина сменится. */
@@ -6305,6 +6305,174 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     ok('39.15 в отданном CSS есть адаптив под ландшафт',
       servedBody.includes('orientation: landscape'));
     ok('39.15 в отданном CSS есть тач-цель', servedBody.includes('--tap'));
+  }
+
+  /* ===== 40. Tier 6 не попадает в очередь воркера =====
+   *
+   * Главный регресс пилюли «Свой ключ»: запрос с ключом уходил на локальный
+   * воркер вместо провайдера. Симптом в PWA — «Ollama недоступна (fetch
+   * failed)» при исправном ключе.
+   *
+   * Проверяется НЕ намерение, а факт: после вызова tier 6 в таблице
+   * worker_tasks не появляется ни одной строки. Обратный контроль в том же
+   * блоке: локальный вызов строку создаёт — значит измерение видит очередь,
+   * и «ноль строк» не пустая правда. */
+  section('40. tier 6 идёт провайдеру, а не в очередь воркера');
+  {
+    const http40 = require('http');
+    const { DatabaseSync: DS40 } = require('node:sqlite');
+    const port40 = await freePort();
+    const fake40 = http40.createServer((req, res) => {
+      let raw = '';
+      req.on('data', (d) => { raw += d; });
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          model: 'qwen3-coder',
+          choices: [{ message: { content: 'ответ провайдера, а не воркера' } }],
+          usage: { total_tokens: 23 },
+        }));
+      });
+    });
+    await new Promise((r) => fake40.listen(port40, '127.0.0.1', r));
+
+    const s40 = await spawnServer({
+      TARNET_TIER6_ENDPOINT: `http://127.0.0.1:${port40}/v1/chat/completions`,
+    });
+    try {
+      const db40 = () => new DS40(path.join(s40.dir, 'test.db'));
+      const countTasks = () => {
+        const d = db40();
+        try {
+          return Number(d.prepare('SELECT COUNT(*) AS c FROM worker_tasks').get().c);
+        } finally { d.close(); }
+      };
+
+      const PAY40 = '0x' + (RUN + 'c40').padEnd(40, '0').slice(0, 40);
+      const d0 = db40();
+      try {
+        d0.prepare(`INSERT INTO balances (address, balanceTar, stakedTar, reservedTar, updatedAt)
+          VALUES (?, ?, 0, 0, ?)
+          ON CONFLICT(address) DO UPDATE SET balanceTar = excluded.balanceTar`)
+          .run(PAY40, 0.05, new Date().toISOString());
+      } finally { d0.close(); }
+
+      const before40 = countTasks();
+
+      /* --- 40.1 сам вызов --- */
+      const t6 = await apiAt(s40.base, '/inference', 'POST', {
+        prompt: 'проверка роутинга по ключу',
+        modelId: 'openrouter/qwen3-coder',
+        clientAddress: PAY40,
+        tier: 6,
+      }, { 'X-Provider-Key': 'sk-test-key-40' });
+
+      ok('40.1 tier 6 + ключ → ответ провайдера (external_api)',
+        t6.status === 200 && t6.body?.source === 'external_api',
+        { status: t6.status, source: t6.body?.source, error: t6.body?.error });
+
+      /* --- 40.2 ГЛАВНОЕ: очередь воркера не тронута --- */
+      const after40 = countTasks();
+      ok('40.2 tier 6 НЕ создал задачу в worker_tasks',
+        after40 === before40,
+        { before: before40, after: after40 });
+
+      /* --- 40.3 модель в ответе — та, что просили --- */
+      ok('40.3 ответ объявляет облачную модель, а не локальную',
+        String(t6.body?.model || '').includes('qwen3-coder'),
+        t6.body?.model);
+
+      /* --- 40.4 гейт: tier 6 без облачной модели отклоняется --- */
+      const noModel40 = await apiAt(s40.base, '/inference', 'POST', {
+        prompt: 'tier 6 без модели',
+        clientAddress: PAY40,
+        tier: 6,
+      }, { 'X-Provider-Key': 'sk-test-key-40' });
+      ok('40.4 tier 6 без облачной модели → 400 TIER6_MODEL_REQUIRED',
+        noModel40.status === 400 && noModel40.body?.error === 'TIER6_MODEL_REQUIRED',
+        { status: noModel40.status, error: noModel40.body?.error });
+      ok('40.4 отказ гейта тоже не создал задачу воркера',
+        countTasks() === before40,
+        { before: before40, after: countTasks() });
+
+      /* --- 40.5 ПРИЧИНА ОШИБКИ ДОХОДИТ ДО КЛИЕНТА ---
+       * Воркер шлёт код OLLAMA_NOT_RUNNING — сервер обязан отдать его в
+       * fallback_reason, иначе PWA пишет «модель не загружена» и человек
+       * идёт проверять модель вместо запуска Ollama. */
+      const w40 = runAddress('o40');
+      await apiAt(s40.base, '/node', 'POST', { address: w40, stake: 30000, reputation: 0.8 });
+      await apiAt(s40.base, `/worker/poll?workerAddress=${w40}&model=test-model&heartbeat=1`);
+
+      const inflight40 = apiAt(s40.base, '/inference', 'POST', {
+        prompt: 'проверка кода ошибки Ollama',
+        workerAddress: w40,
+        model: 'test-model',
+      });
+      let task40 = null;
+      for (let i = 0; i < 60 && !task40; i++) {
+        const p = await apiAt(s40.base, `/worker/poll?workerAddress=${w40}&model=test-model`);
+        if (p.body?.task) task40 = p.body.task;
+        else await new Promise((r) => setTimeout(r, 100));
+      }
+      ok('40.5 задача для локального воркера опубликована (контроль измерения)',
+        Boolean(task40), task40?.taskId);
+
+      if (task40) {
+        await apiAt(s40.base, '/worker/submit', 'POST', {
+          taskId: task40.taskId,
+          workerAddress: w40,
+          response: 'шаблон воркера',
+          source: 'deterministic_fallback',
+          error: 'OLLAMA_NOT_RUNNING',
+          model: 'test-model',
+          usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
+        });
+      }
+      const done40 = await inflight40;
+      ok('40.5 код воркера доходит до клиента как fallback_reason',
+        done40.body?.fallback_reason === 'OLLAMA_NOT_RUNNING',
+        done40.body?.fallback_reason);
+      ok('40.5 причина названа человеческим текстом в warning',
+        /Ollama/i.test(String(done40.body?.warning || '')),
+        done40.body?.warning);
+    } finally {
+      s40.stop();
+      await new Promise((r) => fake40.close(r));
+    }
+  }
+
+  /* ===== 41. Сверка казны: баланс объяснён, а не «непонятная разница» =====
+   *
+   * 28.10 в аудите повисло расхождение 0.006962 TAR между балансом казны
+   * и начисленным. Причина найдена: три слагаемых (см. комментарий в
+   * /summary). Без теста это снова стало бы заявлением, которое никто не
+   * пересчитает. Проверяется самотождество: expected = accrued + selfPayout
+   * − cashbackOut, и actual = expected + delta. */
+  section('41. Казна: баланс сходится с начисленным и объяснёнными слагаемыми');
+  {
+    const sum41 = await api('/summary');
+    const ta = sum41.body?.treasuryAudit;
+    ok('41.1 /summary отдаёт treasuryAudit', Boolean(ta), Object.keys(ta || {}));
+
+    if (ta) {
+      ok('41.2 сумма частей сходится с ожидаемым балансом',
+        Math.abs((ta.accruedTar + ta.selfPayoutTar - ta.cashbackOutTar) - ta.expectedBalanceTar) < 1e-6,
+        { accrued: ta.accruedTar, self: ta.selfPayoutTar, cash: ta.cashbackOutTar, expected: ta.expectedBalanceTar });
+
+      ok('41.3 фактический баланс = ожидаемый + delta',
+        Math.abs((ta.expectedBalanceTar + ta.delta) - ta.actualBalanceTar) < 1e-6,
+        { expected: ta.expectedBalanceTar, delta: ta.delta, actual: ta.actualBalanceTar });
+
+      ok('41.4 tier 6 входит в начисленное на казну',
+        ta.accruedTar >= ta.workReceiptsTar,
+        { accrued: ta.accruedTar, work: ta.workReceiptsTar });
+
+      /* На чистой БД теста казна обязана сходиться без остатка: если
+       * появится четвёртый путь движения — тест это поймает. */
+      ok('41.5 на чистой БД казна сходится без остатка (holds)',
+        ta.holds === true,
+        { delta: ta.delta, expected: ta.expectedBalanceTar, actual: ta.actualBalanceTar });
+    }
   }
 
   console.log('\n' + '─'.repeat(50));
