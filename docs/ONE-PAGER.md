@@ -1,6 +1,6 @@
 # TarNet / Synapse — One-Pager (чистовик)
 
-**Статус:** сверено с живым стендом **2026-10-28, 23:46:09 MSK** (сборка `2.14.0-responsive`, схема леджера `2.1.0-dpouw`, тег `v2.14.0-responsive`).
+**Статус:** сверено с живым стендом **2026-10-29, 09:03 MSK** (сборка `2.15.1-treasury-cashback`, схема леджера `2.1.0-dpouw`, тег `v2.15.1-treasury-cashback`).
 **Правило:** каждая цифра ниже снята с живого стенда либо посчитана из его ответов. Ни одна не взята из документов и не округлена в большую сторону. Источник указан рядом с каждой.
 
 ---
@@ -15,16 +15,17 @@
 
 | Показатель | Значение | Откуда |
 |---|---|---|
-| Выполненных единиц работы | **725** чеков | `/summary.receipts` |
-| Адресов с историей начислений | **83** | `/summary.workers` |
-| Выплачено воркерам | **72.119545 TAR** | `/summary.totalRewardTar` |
-| Полный оборот леджера | **72.503071 TAR** | `/health.conservation.gross` |
+| Выполненных единиц работы | **731** чеков | `/summary.receipts` |
+| Адресов с историей начислений | **84** | `/summary.workers` |
+| Выплачено воркерам | **72.119989 TAR** | `/summary.totalRewardTar` |
+| Полный оборот леджера | **72.503515 TAR** | `/health.conservation.gross` |
 | Инвариант сохранения | **delta 0**, `holds: true`, 0 несогласованных строк | `/health.conservation` |
-| Суммарный учтённый труд | **740 196 253 CWU** | `/summary.totalCwu` |
+| Сверка казны и сжигания | **`treasuryAudit` и `burnAudit`: `holds: true`** — журнал сходится с балансами | `/summary` |
+| Суммарный учтённый труд | **740 196 725 CWU** | `/summary.totalCwu` |
 | Моделей в каталоге | **18** — 15 облачных у 8 вендоров + 3 локальные | `/models` |
-| Живых воркеров | **0 сейчас** (окно жизни — 15 с) | `/worker/status` |
+| Живых воркеров | **0 сейчас** (окно жизни — 60 с) | `/worker/status` |
 | Режим инференса | **`deterministic_fallback`** — заглушка, пока воркер не запущен | `/health.llm_mode` |
-| Автотестов приёмки | **918**, 0 падений | прогон 28.10.2026 |
+| Автотестов приёмки | **933**, 0 падений | прогон 29.10.2026 |
 | Привязка устройств | **подпись Ed25519** + одноразовый nonce | `/devices/link` |
 | Перенос старых балансов | **`POST /migrate/claim`** — подпись нового кошелька | `2.12.9` (не менялось) |
 
@@ -43,7 +44,7 @@
 
 **Старые балансы больше не заморожены.** До `2.12.9` адрес в PWA был 20 случайными байтами без ключа, и демо-начисления на таких адресах были недоступны навсегда. `POST /migrate/claim` переносит их на текущий кошелёк: подпись ставит **новый** адрес (старый ключа не имеет по определению), перенос идёт одной строкой реестра и не меняет сумму по всем балансам. Перенос с живого аккаунта, с адреса с ключом и с адреса привязанного устройства закрыт.
 
-**Что показывает инвариант сохранения.** Выплаты воркерам (72.119545) плюс сожжённое (0.185113), казна (0.185113) и роялти (0.013300) дают ровно 72.503071 — оборот леджера. Расхождение нулевое на 725 чеках. Это не декларация, а проверяемое тождество: любой может пересчитать его из двух публичных endpoint'ов.
+**Что показывает инвариант сохранения.** Выплаты воркерам (72.119989) плюс сожжённое (0.185113), казна (0.185113) и роялти (0.013300) дают ровно 72.503515 — оборот леджера. Расхождение нулевое на 731 чеке. Это не декларация, а проверяемое тождество: любой может пересчитать его из двух публичных endpoint'ов.
 
 **Чего у нас пока нет — прямо и без оговорок.**
 
@@ -51,12 +52,12 @@
 2. **Комитет валидаторов не набран.** Требуется 5 независимых валидаторов со стейком 10 TAR каждый — **50 TAR заблокированного стейка**. Сейчас 0 членов, гейт работает в вырожденном режиме самопроверки. Это вопрос денег, а не кода.
 3. **P2P только на localhost.** Три узла маршрута слушают `ws://127.0.0.1`, `announced_public: false`. Криптография настоящая (RSA-OAEP + AES-256-GCM, 3 хопа), распределённости нет.
 4. **Обучение не идёт.** Knowledge Loop: `phase: 2.5 [SPEC / ROADMAP]`, `training.implemented: false`, причина — нужен GPU. Адаптеры в статусе `pending_gpu`.
-5. **Токен пока без опоры в спросе.** **90.27%** награды — эмиссия (65.098459 TAR) против **9.73%** из комиссий (7.018435 TAR). На 1 TAR платного спроса приходится **9.28 TAR** напечатанных. Это главная незакрытая проблема экономики.
-6. **Tier 6 проверен одной сделкой.** `tier6_calls: 1` — 28.10 17:03 MSK прошёл успешный вызов с живым ключом OpenRouter (`fee 0.0005 = cashback 0.0001 + burn 0.0002 + treasury 0.0002`, `funded_by: client`, `delta: 0`). Выборка из одного запроса не показывает поведение под нагрузкой: лимиты провайдера, параллельные резервы и TTL на реальном трафике не проверялись.
+5. **Токен пока без опоры в спросе.** **90.27%** награды — эмиссия (65.101539 TAR) против **9.73%** из комиссий (7.018450 TAR). На 1 TAR платного спроса приходится **9.28 TAR** напечатанных. Это главная незакрытая проблема экономики.
+6. **Tier 6 проверен шесть раз, не потоком.** `tier6_calls: 6` — успешные вызовы с живым ключом OpenRouter, `gross 0.003`, `delta: 0`, `fundedByClient: 6`. Шесть запросов не показывают поведение под нагрузкой: лимиты провайдера, параллельные резервы и TTL на реальном трафике не проверялись.
 
 **Аудит 8 компонентов видения:** **2 ✅ / 3 ⚠️ / 3 ❌ (~44%)** по методике `docs/VISION-8-COMPONENTS.md` (✅ = 1, ⚠️ = 0.5). Не ~62%: 62.5% выходит, только если ⚠️ считать полным ✅.
 
-**Почему это всё же интересно.** Ядро — криптография, леджер и экономика — проверяемо сегодня: 725 чеков, нулевое расхождение, 918 автотестов, воспроизводимая приёмка одной командой, сквозной инференс через мобильную сеть. Отсутствует не протокол, а его рынок: устройства. Это разница между «мы построили сеть» (неправда) и «мы построили работающий протокол, которому нужна сеть» (правда, и её можно проверить).
+**Почему это всё же интересно.** Ядро — криптография, леджер и экономика — проверяемо сегодня: 731 чек, нулевое расхождение, 933 автотеста, воспроизводимая приёмка одной командой, сквозной инференс через мобильную сеть. Отсутствует не протокол, а его рынок: устройства. Это разница между «мы построили сеть» (неправда) и «мы построили работающий протокол, которому нужна сеть» (правда, и её можно проверить).
 
 **The Ask.** $150K pre-seed за 5–10% токенов — на подключение первых исполнителей, комитет валидаторов и GPU-обучение адаптеров.
 
@@ -68,20 +69,21 @@
 
 **What it is.** A decentralized compute network for LLM inference: device owners serve requests and earn `$TAR`, while the protocol keeps an independent ledger of verified work (dPoUW) with a checkable conservation-of-value invariant.
 
-**State as of 28 Oct 2026, 23:46:09 MSK** (build `2.14.0-responsive`, ledger schema `2.1.0-dpouw`, tag `v2.14.0-responsive`):
+**State as of 29 Oct 2026, 09:03 MSK** (build `2.15.1-treasury-cashback`, ledger schema `2.1.0-dpouw`, tag `v2.15.1-treasury-cashback`):
 
 | Metric | Value | Source |
 |---|---|---|
-| Completed units of work | **725** receipts | `/summary.receipts` |
-| Addresses with payout history | **83** | `/summary.workers` |
-| Paid to workers | **72.119545 TAR** | `/summary.totalRewardTar` |
-| Total ledger turnover | **72.503071 TAR** | `/health.conservation.gross` |
+| Completed units of work | **731** receipts | `/summary.receipts` |
+| Addresses with payout history | **84** | `/summary.workers` |
+| Paid to workers | **72.119989 TAR** | `/summary.totalRewardTar` |
+| Total ledger turnover | **72.503515 TAR** | `/health.conservation.gross` |
 | Conservation invariant | **delta 0**, `holds: true`, 0 inconsistent rows | `/health.conservation` |
-| Total accounted work | **740,196,253 CWU** | `/summary.totalCwu` |
+| Treasury and burn reconciliation | **`treasuryAudit` and `burnAudit`: `holds: true`** — ledger matches balances | `/summary` |
+| Total accounted work | **740,196,725 CWU** | `/summary.totalCwu` |
 | Models in catalog | **18** — 15 cloud across 8 vendors + 3 local | `/models` |
-| Live workers | **0 right now** (15-second liveness window) | `/worker/status` |
+| Live workers | **0 right now** (60-second liveness window) | `/worker/status` |
 | Inference mode | **`deterministic_fallback`** — stub until the worker runs | `/health.llm_mode` |
-| Acceptance assertions | **918**, 0 failures | run of 28 Oct 2026 |
+| Acceptance assertions | **933**, 0 failures | run of 29 Oct 2026 |
 | Device binding | **Ed25519 signature** + single-use nonce | `/devices/link` |
 | Legacy balance claim | **`POST /migrate/claim`** — signed by the new wallet | `2.12.9` (unchanged) |
 
@@ -100,7 +102,7 @@
 
 **Legacy balances are no longer frozen.** Before `2.12.9` the PWA address was 20 random bytes with no key, so demo credits on such addresses were permanently unreachable. `POST /migrate/claim` moves them to the current wallet: the **new** address signs (the old one has no key by definition), the move is a single ledger row, and the sum across all balances is unchanged. Claims from a live account, from an address that has a key, and from a bound device are all rejected.
 
-**What the conservation invariant shows.** Worker payouts (72.119545) plus burned (0.185113), treasury (0.185113) and royalties (0.013300) equal exactly 72.503071 — the ledger's turnover. Zero discrepancy across 725 receipts. This is not a claim but a checkable identity: anyone can recompute it from two public endpoints.
+**What the conservation invariant shows.** Worker payouts (72.119989) plus burned (0.185113), treasury (0.185113) and royalties (0.013300) equal exactly 72.503515 — the ledger's turnover. Zero discrepancy across 731 receipts. This is not a claim but a checkable identity: anyone can recompute it from two public endpoints.
 
 **What we do not have yet — stated plainly.**
 
@@ -109,11 +111,11 @@
 3. **P2P is localhost-only.** Three route nodes listen on `ws://127.0.0.1`, `announced_public: false`. The cryptography is real (RSA-OAEP + AES-256-GCM, 3 hops); the distribution is not there.
 4. **Training is not running.** Knowledge Loop: `phase: 2.5 [SPEC / ROADMAP]`, `training.implemented: false`, blocked on GPU. Adapters sit in `pending_gpu`.
 5. **The token has no demand floor yet.** **90.27%** of rewards are emission (65.098459 TAR) against **9.73%** from fees (7.018435 TAR). Every 1 TAR of paid demand carries **9.28 TAR** printed. This is the main unsolved problem of the economy.
-6. **Tier 6 has been exercised exactly once.** `tier6_calls: 1` — one successful call with a live OpenRouter key on 28 Oct 17:03 MSK (`fee 0.0005 = cashback 0.0001 + burn 0.0002 + treasury 0.0002`, `funded_by: client`, `delta: 0`). A single request says nothing about behaviour under load: provider rate limits, concurrent reserves and TTL on real traffic are unverified.
+6. **Tier 6 has been exercised six times, not under load.** `tier6_calls: 6` — successful calls with a live OpenRouter key, `gross 0.003`, `delta: 0`, `fundedByClient: 6`. Six requests say nothing about behaviour under load: provider rate limits, concurrent reserves and TTL on real traffic are unverified.
 
 **Eight-component vision audit:** **2 ✅ / 3 ⚠️ / 3 ❌ (~44%)** per the `docs/VISION-8-COMPONENTS.md` methodology (✅ = 1, ⚠️ = 0.5). Not ~62%: 62.5% only appears if ⚠️ is counted as full ✅.
 
-**Why it is still interesting.** The core — cryptography, ledger and economics — is verifiable today: 725 receipts, zero discrepancy, 918 automated assertions, reproducible acceptance in one command, end-to-end inference over a mobile network. What is missing is not the protocol but its market: devices. That is the difference between "we built a network" (false) and "we built a working protocol that needs a network" (true, and checkable).
+**Why it is still interesting.** The core — cryptography, ledger and economics — is verifiable today: 731 receipts, zero discrepancy, 933 automated assertions, reproducible acceptance in one command, end-to-end inference over a mobile network. What is missing is not the protocol but its market: devices. That is the difference between "we built a network" (false) and "we built a working protocol that needs a network" (true, and checkable).
 
 **The Ask.** $150K pre-seed for 5–10% of tokens — to onboard the first executors, seat the validator committee, and fund GPU training of the adapters.
 
@@ -123,11 +125,11 @@
 
 - **Не цитировать:** `$1.50–2.50/M`, `$0.30–0.50/M`, `$2.00/M`, `$330/мес`, `$1.00/M` — цены Whitepaper, в коде не действуют.
 - **Не писать «83 узла в сети».** 83 — адреса с историей начислений. Живой воркер на 28.10 23:46 — **ноль**; окно жизни воркера 60 секунд (было 15), поэтому «ноль сейчас» не значит «сеть мертва», но и «сеть работает» говорить нельзя.
-- **Не писать «72.12 TAR распределено» без уточнения.** Это выплаты воркерам; оборот леджера 72.503071.
+- **Не писать «72.12 TAR распределено» без уточнения.** Это выплаты воркерам; оборот леджера 72.503515.
 - **Не писать «сеть постоянно живая».** 28.10 воркер был онлайн и сквозной тест прошёл, но на 23:46 `active_workers: 0`, `llm_mode: deterministic_fallback`. Говорить «путь доказан», не «сеть работает непрерывно».
-- **Не ставить старые снимки как текущие.** 705/78/56.55 — снимок 24.10; 716/83/72.116894 — снимок 28.10 16:30; 721/83/72.117293 — снимок 28.10 19:30; **725/83/72.119545** — снимок 28.10 23:46:09.
-- **Не писать «Tier 6 работает под нагрузкой».** `tier6_calls: 1` — одна сделка с живым ключом. Говорить можно про «вызов проходит и арифметика сходится», нельзя — про поток, лимиты и параллельные резервы.
-- **Не писать «738 тестов» или «713+25»** — актуально **918** на одном прогоне `node test-dpouw.js --test`.
+- **Не ставить старые снимки как текущие.** 705/78/56.55 — снимок 24.10; 716/83/72.116894 — снимок 28.10 16:30; 721/83/72.117293 — снимок 28.10 19:30; 725/83/72.119545 — снимок 28.10 23:46:09; **731/84/72.119989** — снимок 29.10 09:03.
+- **Не писать «Tier 6 работает под нагрузкой».** `tier6_calls: 6` — шесть сделок с живым ключом. Говорить можно про «вызов проходит и арифметика сходится», нельзя — про поток, лимиты и параллельные резервы.
+- **Не писать «738 тестов» или «713+25»** — актуально **933** на одном прогоне `node test-dpouw.js --test`.
 - **Не смешивать «9 провайдеров» и «8 вендоров».** `/models` считает `provider: "local"` отдельной строкой, поэтому 9 = 8 вендоров + локальные. Gemini и Groq в коде есть, но в каталог не внесены — в цифру 18 не входят.
 - **Не называть привязку устройств «заявкой».** С `2.12.8` это подпись Ed25519 с одноразовым nonce. Но и не обещать больше: подпись доказывает владение **аккаунтом**, а не самим ПК.
 - **Источники для перепроверки:** `GET /health`, `/summary`, `/config`, `/worker/status`, `/knowledge/status`, `/p2p/status`.
