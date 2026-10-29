@@ -51,7 +51,7 @@
  * index.html и styles.css, то есть в кэшируемой оболочке: без поднятия
  * имени кэша телефон продолжил бы показывать обе облачные модели и
  * собирать «PROVIDER_AUTH_FAILED» без объяснения. */
-const CACHE = 'tarnet-app-v15';
+const CACHE = 'tarnet-app-v16';
 
 const ASSETS = [
   '/app/',

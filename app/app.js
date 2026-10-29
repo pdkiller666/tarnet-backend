@@ -234,6 +234,34 @@ const MODES = {
 
 let bannerTimer = null;
 
+/* Баннер больше не живёт в центре экрана: подробный текст ушёл в sr-only
+ * (его читает скринридер), а в шапке осталась точка с ореолом.
+ *
+ * Поэтому className собирается ЧЕРЕЗ эту функцию, а не присваивается
+ * целиком. Прямое `box.className = 'banner offline'` стёрло бы sr-only,
+ * и подробный баннер снова всплыл бы в центре сцены — ровно то, что
+ * убирали. Одно место присваивания вместо четырёх по функции. */
+function setBannerState(box, state) {
+  box.className = `banner sr-only ${state}`;
+}
+
+/* Статус в шапке: state — те же четыре значения, что у баннера
+ * (online / online-other / offline / unknown), чтобы не держать два
+ * независимых словаря состояний, которые разъедутся при первой правке. */
+const NET_LABEL = {
+  online: 'сеть активна',
+  'online-other': 'сеть активна',
+  offline: 'ваш ПК не в сети',
+  unknown: 'сервер недоступен',
+};
+function setNetStatus(state) {
+  const box = $('netStatus');
+  const label = $('netText');
+  if (!box) return;
+  box.dataset.state = state;
+  if (label) label.textContent = NET_LABEL[state] || state;
+}
+
 async function refreshWorkerBanner() {
   const box = $('workerBanner');
   const text = $('workerBannerText');
@@ -245,7 +273,8 @@ async function refreshWorkerBanner() {
   } catch (e) {
     /* Сервер молчит — это не «ПК не в сети». Врать в обе стороны нельзя. */
     box.hidden = false;
-    box.className = 'banner unknown';
+    setBannerState(box, 'unknown');
+    setNetStatus('unknown');
     howto.hidden = true;
     text.textContent = e.code === 'RATE_LIMIT'
       ? '⏳ Лимит запросов — статус воркера обновится через минуту'
@@ -259,7 +288,8 @@ async function refreshWorkerBanner() {
 
   if (mode === 'deterministic_fallback' || active === 0) {
     box.hidden = false;
-    box.className = 'banner offline';
+    setBannerState(box, 'offline');
+    setNetStatus('offline');
     howto.hidden = false;
     text.textContent = '⚠️ Ваш ПК не в сети. Ответы генерируются демо-обработчиком.';
     return;
@@ -299,7 +329,8 @@ async function refreshWorkerBanner() {
   }
 
   box.hidden = false;
-  box.className = mine ? 'banner online' : 'banner online-other';
+  setBannerState(box, mine ? 'online' : 'online-other');
+  setNetStatus(mine ? 'online' : 'online-other');
   howto.hidden = true;
 
   const modelPart = model ? ` Модель: ${model}.` : '';

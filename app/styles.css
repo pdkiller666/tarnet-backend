@@ -40,6 +40,26 @@
 
 * { box-sizing: border-box; }
 
+/* ---------- Скроллбар как часть оформления ----------
+ *
+ * Системный светлый скроллбар в тёмной теме выглядит как белая полоса
+ * поверх продукта и сразу выдаёт «собрано на скорую руку». Здесь он
+ * перекрашивается один раз для всего приложения, а не по компонентам:
+ * правило на конкретный контейнер (например .tabs) остаётся сильнее и
+ * продолжает работать — у него выше специфичность.
+ *
+ * Ширина 6px, а не 8: полоса не должна отъедать место у ленты ответов,
+ * но обязана остаться попадаемой мышью. */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .12);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .22); }
+/* Firefox не знает ::-webkit-scrollbar и берёт это. */
+html { scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, .14) transparent; }
+
 /* [hidden] обязан побеждать.
  *
  * Браузерное [hidden] { display: none } — это UA-стиль, а любой авторский
@@ -58,6 +78,28 @@
  * видно, что оно общее, а не заплатка под конкретный блок.
  */
 [hidden] { display: none !important; }
+
+/* Скрыть визуально, оставив в DOM.
+ *
+ * Нужно там, где элемент обязан остаться доступным для тестов и обработчиков,
+ * но в интерфейсе ему не место: селекты «Адаптер» и «Контур» переехали в
+ * поповер, а старые id должны продолжать существовать — на них завязаны
+ * app.js и 933 теста. display:none сломал бы часть проверок и убрал элемент
+ * из дерева доступности; этот паттерн оставляет его на месте.
+ *
+ * Не путать с [hidden]: тот означает «элемента нет», а этот — «элемент есть,
+ * но не на экране» (например, читается скринридером). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 
 html, body {
   margin: 0;
@@ -547,17 +589,20 @@ textarea::placeholder { color: var(--muted-2); }
   flex: 0 0 auto;
   display: grid;
   place-items: center;
-  width: 38px;
-  height: 38px;
+  width: 34px;
+  height: 34px;
   padding: 0;
-  border-radius: 12px;
+  /* Круг, а не скруглённый квадрат: кнопка отправки — единственный
+   * элемент, который человек нажимает постоянно, и квадрат рядом с
+   * круглыми пилюлями читался как чужая деталь. */
+  border-radius: 50%;
   background: var(--accent);
   color: #fff;
   border: none;
   cursor: pointer;
   transition: background .16s var(--ease), transform .12s var(--ease), opacity .16s var(--ease);
 }
-#sendBtn svg { width: 18px; height: 18px; margin-top: -2px; }
+#sendBtn svg { width: 16px; height: 16px; margin-top: -2px; }
 #sendBtn:hover:not(:disabled) { background: var(--accent-strong); }
 #sendBtn:active:not(:disabled) { transform: scale(.94); }
 #sendBtn:disabled { opacity: .45; cursor: not-allowed; }
@@ -1065,16 +1110,18 @@ body { overflow: hidden; }
   align-items: center;
   gap: 8px;
   padding: 10px 12px;
-  background: var(--accent-soft);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
   color: var(--text-strong);
-  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+  /* Без рамки: граница делала кнопку «формой», хотя это главное действие
+   * сайдбара. Подложка с прозрачностью даёт тот же вес, но без чертёжности. */
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   font-size: 13.5px;
   font-weight: 600;
   cursor: pointer;
   transition: background .16s var(--ease), border-color .16s var(--ease);
 }
-.new-chat-btn:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); border-color: var(--accent); }
+.new-chat-btn:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
 
 /* Навигация в сайдбаре — вертикальная, а не пилюли в ряд: .tab остаётся
    тем же классом, на него завязаны обработчики в app.js. */
@@ -1136,8 +1183,10 @@ body { overflow: hidden; }
   display: block;
   width: 100%;
   padding: 7px 10px;
+  /* Безрамочная поверхность: подложка вместо рамки. Плашка кошелька —
+   * это фон для адреса, а не кнопка с границей. */
   background: var(--panel);
-  border: 1px solid var(--border);
+  border: 1px solid transparent;
   border-radius: var(--radius-xs);
   color: var(--text);
   text-align: left;
@@ -1145,7 +1194,7 @@ body { overflow: hidden; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.wallet-pill:hover { border-color: var(--border-strong); }
+.wallet-pill:hover { background: var(--panel-2); }
 .sidebar-balance { margin: 0; font-size: 12.5px; color: var(--muted); }
 .sidebar-balance strong { color: var(--text-strong); font-variant-numeric: tabular-nums; }
 .faucet-mini {
@@ -1202,6 +1251,112 @@ body { overflow: hidden; }
 .stage-controls select { font-size: 12.5px; padding: 5px 8px; }
 .stage-right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 
+/* ---------- Модель без рамки ----------
+ * Селект модели — единственный контрол в шапке. Рамка делала его похожим
+ * на поле формы, хотя это выбор режима. Фон появляется только на hover:
+ * до наведения элемент не спорит с содержимым за внимание. */
+.model-field { flex: 0 0 auto; max-width: 260px; }
+.model-field select {
+  border: 1px solid transparent;
+  background: transparent;
+  padding: 6px 10px;
+  border-radius: var(--radius-xs);
+  font-size: 13px;
+  color: var(--text);
+  transition: background .16s var(--ease), border-color .16s var(--ease);
+}
+.model-field select:hover { background: var(--panel); }
+.model-field select:focus-visible {
+  outline: none;
+  border-color: var(--border-strong);
+  background: var(--panel);
+}
+
+/* ---------- Поповер настроек ----------
+ * <details> вместо самодельного дропдауна: открытие, закрытие по повторному
+ * клику и доступность с клавиатуры работают без JS. Позиционирование
+ * absolute нужно, чтобы панель не растягивала шапку. */
+.settings-pop { position: relative; flex: 0 0 auto; }
+.settings-pop > summary {
+  list-style: none;
+  cursor: pointer;
+}
+.settings-pop > summary::-webkit-details-marker { display: none; }
+.settings-body {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 300px;
+  max-width: min(300px, calc(100vw - 32px));
+  padding: 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+}
+.settings-body .field { display: flex; flex-direction: column; gap: 4px; }
+.settings-body .field > span {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--muted-2);
+}
+.settings-body .stage-hint { margin: 0; }
+
+/* ---------- Статус сети в шапке ----------
+ * Точка с ореолом вместо зелёного баннера в центре. Ореол — box-shadow
+ * без размытия по границе: он читается как «горит», не занимая места.
+ * Четыре состояния те же, что у баннера (data-state), поэтому одна
+ * правка цвета меняет и точку, и подпись. */
+.net-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px 4px 8px;
+  border-radius: 999px;
+  background: transparent;
+  font-size: 11.5px;
+  color: var(--muted-2);
+  white-space: nowrap;
+}
+.net-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted-2);
+  flex: 0 0 auto;
+  transition: background .2s var(--ease), box-shadow .2s var(--ease);
+}
+.net-status[data-state="online"] .net-dot,
+.net-status[data-state="online-other"] .net-dot {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent),
+              0 0 10px color-mix(in srgb, var(--ok) 55%, transparent);
+}
+.net-status[data-state="online"] .net-text { color: color-mix(in srgb, var(--ok) 70%, var(--muted)); }
+.net-status[data-state="offline"] .net-dot {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 16%, transparent),
+              0 0 9px color-mix(in srgb, var(--warn) 45%, transparent);
+}
+.net-status[data-state="offline"] .net-text { color: color-mix(in srgb, var(--warn) 62%, var(--muted)); }
+.net-status[data-state="unknown"] .net-dot {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 16%, transparent),
+              0 0 9px color-mix(in srgb, var(--danger) 40%, transparent);
+}
+.net-status[data-state="unknown"] .net-text { color: color-mix(in srgb, var(--danger) 62%, var(--muted)); }
+
+/* Иконки в кнопках шапки: SVG вместо эмодзи наследует currentColor и
+ * масштабируется вместе с кнопкой. */
+.settings-pop > summary svg { width: 17px; height: 17px; display: block; }
+.icon-btn svg { width: 17px; height: 17px; display: block; }
+.shield svg { width: 13px; height: 13px; flex: 0 0 auto; }
+
 .shield {
   display: inline-flex;
   align-items: center;
@@ -1241,20 +1396,32 @@ body { overflow: hidden; }
   padding-bottom: 4px;
 }
 
-/* ---------- Bento (нулевое состояние) ---------- */
+/* ---------- Bento (нулевое состояние) ----------
 
 .bento-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 10px;
+  /* Жёстко две колонки, а не auto-fit. При auto-fit четыре плитки на
+   * широком экране вставали в ряд 4×1, а на среднем — 3+1: последняя
+   * плитка висела сиротой в половину ряда, и сетка выглядела сломанной.
+   * Две колонки дают ровный прямоугольник 2×2 в любом размере.
+   * Сужение до одной колонки — только на телефоне (медиазапрос ниже). */
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
   width: 100%;
   margin-top: 22px;
   text-align: left;
 }
 .bento {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
+  /* Иконка слева, текст справа: две строки текста сидят друг под другом
+   * и оба начинаются после иконки — иначе подпись съезжала под иконку
+   * и плитка читалась сверху вниз дольше, чем нужно. */
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  grid-template-rows: auto auto;
+  column-gap: 10px;
+  row-gap: 2px;
+  align-content: center;
+  align-items: center;
   padding: 14px;
   background: var(--panel);
   border: 1px solid var(--border);
@@ -1269,7 +1436,16 @@ body { overflow: hidden; }
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   background: var(--panel-2);
 }
-.bento-icon { font-size: 18px; line-height: 1; }
+.bento-icon {
+  grid-row: 1 / span 2;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  font-size: 17px;
+  line-height: 1;
+  color: var(--muted);
+}
 .bento-title { font-size: 13.5px; font-weight: 620; color: var(--text-strong); }
 .bento-sub { font-size: 11.5px; color: var(--muted-2); }
 
@@ -1308,6 +1484,9 @@ body { overflow: hidden; }
 }
 .mode-pills { display: flex; gap: 4px; flex-wrap: wrap; }
 .pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   padding: 5px 10px;
   background: transparent;
   border: 1px solid var(--border);
@@ -1319,6 +1498,10 @@ body { overflow: hidden; }
   cursor: pointer;
   transition: color .16s var(--ease), border-color .16s var(--ease), background .16s var(--ease);
 }
+/* Иконка в пилюле не крупнее текста: она подсказывает режим, а не
+ * заявляет о себе. currentColor важен — цвет меняется вместе с
+ * состоянием .active без отдельных правил для каждого режима. */
+.pill svg { width: 13px; height: 13px; flex: 0 0 auto; }
 .pill:hover { color: var(--text); border-color: var(--border-strong); }
 .pill.active {
   color: var(--accent-emerald);
@@ -1339,13 +1522,70 @@ body { overflow: hidden; }
 .distill-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 7px;
   font-size: 11.5px;
   color: var(--muted);
   cursor: pointer;
   white-space: nowrap;
+  /* Позиционный контекст для невидимого input: он накрывает дорожку
+   * переключателя, чтобы клик по ней срабатывал как клик по чекбоксу. */
+  position: relative;
 }
-.distill-toggle input { width: 13px; height: 13px; accent-color: var(--accent-violet); }
+
+/* Родной чекбокс не удалён, а прозрачен и растянут на всю дорожку.
+ * Удалять его нельзя: обработчик и тесты ищут #distillToggle, а без
+ * input не будет .checked и работы с клавиатуры.
+ * Растянут он ровно на переключатель (36×20), поэтому клик мимо него
+ * по тексту остаётся обычным кликом по label. */
+.distill-toggle input {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 36px;
+  height: 20px;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+  z-index: 2;
+}
+
+/* Дорожка переключателя. Состояние берётся из соседнего input через
+ * :checked + — селектор идёт после input по разметке, поэтому работает
+ * без единой строки JS. */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--panel-3);
+  border: 1px solid var(--border);
+  transition: background .2s var(--ease), border-color .2s var(--ease);
+}
+.switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: transform .2s var(--ease), background .2s var(--ease);
+}
+.distill-toggle input:checked + .switch {
+  background: color-mix(in srgb, var(--accent-violet) 55%, transparent);
+  border-color: color-mix(in srgb, var(--accent-violet) 65%, transparent);
+}
+.distill-toggle input:checked + .switch::after {
+  transform: translateX(16px);
+  background: #fff;
+}
+.distill-toggle input:focus-visible + .switch {
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.distill-label { color: var(--muted); }
+.distill-toggle input:checked ~ .distill-label { color: var(--text); }
 
 .send-btn {
   margin-left: auto;
@@ -1355,7 +1595,7 @@ body { overflow: hidden; }
   width: 34px;
   height: 34px;
   padding: 0;
-  border-radius: 10px;
+  border-radius: 50%;
   background: var(--accent);
   color: #fff;
   border: none;

@@ -43,7 +43,9 @@
           <p class="sub" id="modeLine">проверяю режим…</p>
         </div>
       </div>
-      <button type="button" class="icon-btn sidebar-close" id="sidebarClose" aria-label="Закрыть панель">✕</button>
+      <button type="button" class="icon-btn sidebar-close" id="sidebarClose" aria-label="Закрыть панель">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
     </div>
 
     <button type="button" class="new-chat-btn" id="newChatBtn">
@@ -52,13 +54,13 @@
 
     <nav class="tabs sidebar-nav" role="tablist" aria-label="Разделы приложения">
       <button class="tab active" role="tab" data-tab="chat" aria-selected="true">
-        <span aria-hidden="true">💬</span><span class="tab-label">Synapse Chat</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.9 8.9 0 0 1-4-.9L3 21l1.9-4.4a8.4 8.4 0 0 1-.9-4A8.4 8.4 0 0 1 12.4 3a8.4 8.4 0 0 1 8.6 8.5Z"/></svg><span class="tab-label">Synapse Chat</span>
       </button>
       <button class="tab" role="tab" data-tab="devices" aria-selected="false">
-        <span aria-hidden="true">🖥️</span><span class="tab-label">Мои узлы &amp; BYOK</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg><span class="tab-label">Мои узлы &amp; BYOK</span>
       </button>
       <button class="tab" role="tab" data-tab="agents" aria-selected="false">
-        <span aria-hidden="true">🤖</span><span class="tab-label">Агенты</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4M9 14h.01M15 14h.01"/></svg><span class="tab-label">Агенты</span>
       </button>
     </nav>
 
@@ -77,7 +79,7 @@
         <span class="mono" id="sidebarAddr">0x…</span>
       </button>
       <p class="sidebar-balance">Баланс: <strong id="sidebarBalance">—</strong> <span class="unit">TAR</span></p>
-      <button type="button" class="faucet-mini" id="sidebarFaucet" hidden>💧 Получить 0.01 TAR</button>
+      <button type="button" class="faucet-mini" id="sidebarFaucet" hidden>Получить 0.01 TAR</button>
       <p class="sidebar-status"><span class="dot" id="p2pDot"></span> <span id="p2pText">P2P</span></p>
     </div>
   </aside>
@@ -89,39 +91,69 @@
 
     <header class="stage-header top">
       <div class="top-inner">
-        <button type="button" class="icon-btn burger" id="sidebarOpen" aria-label="Открыть меню">☰</button>
+        <button type="button" class="icon-btn burger" id="sidebarOpen" aria-label="Открыть меню">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        </button>
 
         <div class="stage-controls">
-          <label class="field">
-            <span>Модель</span>
-            <select id="model"><option value="">авто (базовая)</option></select>
+          <!-- Модель — единственный видимый контрол шапки. Без рамки и без
+               капса: это выбор по умолчанию, а не настройка. -->
+          <label class="field model-field">
+            <span class="sr-only">Модель</span>
+            <select id="model" aria-label="Модель"><option value="">авто (базовая)</option></select>
           </label>
-          <label class="field">
-            <span>Адаптер</span>
-            <select id="adapter"><option value="">загружаю…</option></select>
-          </label>
-          <label class="field">
-            <span>Контур</span>
-            <select id="contour">
-              <option value="private">Private — промпт не уходит наружу</option>
-              <option value="cloud">Cloud — промпт уходит провайдеру по вашему ключу</option>
-            </select>
-          </label>
+
+          <!-- Адаптер и Контур переехали в поповер, но остались в DOM:
+               на #adapter и #contour завязаны app.js и тесты, а переключение
+               контура для человека теперь делают пилюли в омнибоксе.
+               <details> выбран вместо самодельного поповера: клавиатура и
+               Escape работают без единой строки JS. -->
+          <details class="settings-pop" id="settingsPop">
+            <summary class="icon-btn" aria-label="Настройки" title="Настройки">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.9 19.3a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.7 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9.1a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1.03Z"/></svg>
+            </summary>
+            <div class="settings-body">
+              <label class="field">
+                <span>Адаптер</span>
+                <select id="adapter"><option value="">загружаю…</option></select>
+              </label>
+              <label class="field">
+                <span>Контур</span>
+                <select id="contour">
+                  <option value="private">Private — промпт не уходит наружу</option>
+                  <option value="cloud">Cloud — промпт уходит провайдеру по вашему ключу</option>
+                </select>
+              </label>
+              <p class="hint tiny stage-hint" id="contourHint">Промпт обрабатывается воркерами сети и не покидает её.</p>
+            </div>
+          </details>
         </div>
 
         <div class="stage-right">
-          <span class="shield" id="piiShield" title="Классификатор PII срабатывает перед выходом промпта во внешний API">🛡️ PII Shield</span>
-          <button type="button" class="icon-btn" id="artifactToggle" aria-label="Панель артефактов" title="Артефакты">📄</button>
+          <!-- Статус сети: точка с ореолом вместо зелёного баннера в центре.
+               Текст остаётся рядом, но приглушённый: в шапке нужен признак,
+               а не сообщение. Подробности — в #workerBanner (sr-only,
+               его читает скринридер и обновляет app.js). -->
+          <span class="net-status" id="netStatus" data-state="unknown">
+            <span class="net-dot" id="netDot" aria-hidden="true"></span>
+            <span class="net-text" id="netText">проверяю…</span>
+          </span>
+          <span class="shield" id="piiShield" title="Классификатор PII срабатывает перед выходом промпта во внешний API">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg>
+            PII Shield
+          </span>
+          <button type="button" class="icon-btn" id="artifactToggle" aria-label="Панель артефактов" title="Артефакты">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M9 13h6M9 17h4"/></svg>
+          </button>
           <button id="installBtn" class="ghost small" hidden>Установить</button>
         </div>
       </div>
-      <p class="hint tiny stage-hint" id="contourHint">Промпт обрабатывается воркерами сети и не покидает её.</p>
     </header>
 
     <!-- Статус воркера: виден до первого вопроса. Если ПК спит, ответы тихо
          уходят в deterministic_fallback — пользователь должен знать это заранее,
          а не догадываться по качеству ответа. -->
-    <div id="workerBanner" class="banner" role="status" aria-live="polite" hidden>
+    <div id="workerBanner" class="banner sr-only" role="status" aria-live="polite" hidden>
       <span id="workerBannerText"></span>
       <button id="workerHowto" class="link" hidden>Инструкция по подключению</button>
     </div>
@@ -140,22 +172,30 @@
                  ни одна плитка не обещает того, чего в сборке нет. -->
             <div class="bento-grid">
               <button type="button" class="bento" data-prompt="Напиши функцию на JavaScript, которая считает SHA-256 через WebCrypto">
-                <span class="bento-icon">💻</span>
+                <span class="bento-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 6-6 6 6 6M16 6l6 6-6 6"/></svg>
+                </span>
                 <span class="bento-title">Код и отладка</span>
                 <span class="bento-sub">Локальные модели сети, Tier 1–3</span>
               </button>
               <button type="button" class="bento" data-goto="devices">
-                <span class="bento-icon">🔑</span>
+                <span class="bento-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m11 12 8-8M17 4l3 3M14 7l3 3"/></svg>
+                </span>
                 <span class="bento-title">Свой ключ (BYOK)</span>
                 <span class="bento-sub">Платите провайдеру напрямую</span>
               </button>
               <button type="button" class="bento" data-goto="agents">
-                <span class="bento-icon">🤖</span>
+                <span class="bento-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4M9 14h.01M15 14h.01"/></svg>
+                </span>
                 <span class="bento-title">Суверенный агент</span>
                 <span class="bento-sub">Think → Act → Observe, с подписью</span>
               </button>
               <button type="button" class="bento" data-goto="devices">
-                <span class="bento-icon">⚡</span>
+                <span class="bento-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4.1 12.7a1 1 0 0 0 .8 1.6h5.4L10 22l8.9-10.7a1 1 0 0 0-.8-1.6h-5.4Z"/></svg>
+                </span>
                 <span class="bento-title">Подключить ПК</span>
                 <span class="bento-sub">Воркер в один клик, заработок в TAR</span>
               </button>
@@ -177,14 +217,31 @@
 
             <div class="omnibox-bar">
               <div class="mode-pills" role="group" aria-label="Режим запроса">
-                <button type="button" class="pill active" data-mode="private">🛡️ Рой</button>
-                <button type="button" class="pill" data-mode="byok">🔑 Свой ключ</button>
-                <button type="button" class="pill" data-mode="agent">🤖 Агент</button>
+                <button type="button" class="pill active" data-mode="private">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg>
+                  Рой
+                </button>
+                <button type="button" class="pill" data-mode="byok">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m11 12 8-8M17 4l3 3M14 7l3 3"/></svg>
+                  Свой ключ
+                </button>
+                <button type="button" class="pill" data-mode="agent">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4M9 14h.01M15 14h.01"/></svg>
+                  Агент
+                </button>
               </div>
 
+              <!-- Переключатель дистилляции.
+                   Родной чекбокс остался на месте и продолжает работать:
+                   на #distillToggle завязаны обработчик в app.js и тест 38.3.
+                   Он стал невидимым (opacity:0) и накрыл собой дорожку
+                   переключателя, а рисует состояние соседний .switch.
+                   Убирать input нельзя: тогда пропадёт .checked, клавиатура
+                   и связь с consentBox. -->
               <label class="distill-toggle" title="Разрешить использовать обезличенные запросы для улучшения сети">
                 <input type="checkbox" id="distillToggle">
-                <span>🧬 Дистилляция</span>
+                <span class="switch" aria-hidden="true"></span>
+                <span class="distill-label">Дистилляция</span>
               </label>
 
               <button type="submit" id="sendBtn" class="send-btn" aria-label="Отправить">
@@ -508,10 +565,18 @@
   <aside class="artifact-drawer" id="artifactDrawer" aria-label="Артефакты и инспектор" hidden>
     <div class="drawer-head">
       <div class="drawer-tabs" role="tablist">
-        <button type="button" class="drawer-tab active" role="tab" data-drawer="artifact" aria-selected="true">📄 Артефакт</button>
-        <button type="button" class="drawer-tab" role="tab" data-drawer="inspector" aria-selected="false">🔍 Inspector</button>
+        <button type="button" class="drawer-tab active" role="tab" data-drawer="artifact" aria-selected="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/></svg>
+          Артефакт
+        </button>
+        <button type="button" class="drawer-tab" role="tab" data-drawer="inspector" aria-selected="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          Inspector
+        </button>
       </div>
-      <button type="button" class="icon-btn" id="artifactClose" aria-label="Закрыть панель">✕</button>
+      <button type="button" class="icon-btn" id="artifactClose" aria-label="Закрыть панель">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
     </div>
     <div class="drawer-body">
       <div class="drawer-pane" id="artifactPane">
