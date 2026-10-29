@@ -257,6 +257,36 @@ H_APP=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/app/")
 H_DL=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/download/worker.js")
 [ "$H_DL" = "200" ] && ok "/download/worker.js" "HTTP 200" || no "/download/worker.js" "HTTP $H_DL"
 
+# ---------- 3.8 документы в корне воркспейса ----------
+# Корень workspace не под git: документы живут в backend-api/docs/, а инвестору
+# уходят копии из корня. Раньше копии разъезжались молча (29.10 EMAIL-TEMPLATE
+# в корне был 8080 б против 9207 в docs). Теперь корень — симлинки, и расхождение
+# стало невозможным — но только пока ссылки целы. Проверяем и это.
+WS_ROOT="$(cd "$REPO_DIR/.." && pwd)"
+DOC_LINKS="ONE-PAGER.md PITCH-DECK.md DEMO-SCRIPT.md EMAIL-TEMPLATE.md AUDIT-REALITY.md PROJECT-HISTORY.md"
+if [ -d "$WS_ROOT" ]; then
+  LINKS_BAD=""
+  LINKS_OK=0
+  for f in $DOC_LINKS; do
+    p="$WS_ROOT/$f"
+    if [ -L "$p" ] && [ -f "$p" ]; then
+      LINKS_OK=$((LINKS_OK+1))
+    elif [ -L "$p" ]; then
+      LINKS_BAD="$LINKS_BAD $f(битая)"
+    elif [ -f "$p" ]; then
+      # Обычный файл в корне — это и есть возврат к расхождению.
+      LINKS_BAD="$LINKS_BAD $f(копия)"
+    else
+      LINKS_BAD="$LINKS_BAD $f(нет)"
+    fi
+  done
+  if [ -z "$LINKS_BAD" ]; then
+    ok "документы в корне" "$LINKS_OK/$LINKS_OK — симлинки в backend-api"
+  else
+    no "документы в корне" "не симлинки:$LINKS_BAD"
+  fi
+fi
+
 # ---------- итог ----------
 printf '\n'
 if [ "$FAIL" -eq 0 ]; then
