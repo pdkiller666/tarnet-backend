@@ -6493,6 +6493,194 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+  /* ===== 42. Динамический список локальных моделей =====
+   *
+   * Дефект, который эти тесты закрывают, был не косметическим: воркер в
+   * `ollamaTags()` кэшировал ПУСТОЙ массив как «моделей нет» навсегда
+   * (`if (ollamaTagsCache)` считает truthy и `[]`), а `generate()` любой
+   * `ollama HTTP 404` записывал в ту же переменную, что «Ollama не запущена».
+   * Человек ставил модель после старта воркера и до перезапуска получал
+   * заглушку.
+   *
+   * Поэтому проверяется не «список есть», а три исхода по отдельности:
+   * точное попадание, подмена на установленную модель, и различение
+   * «пусто» от «не присылали» на стороне сервера. */
+  section('42. Динамический список локальных моделей: воркер объявляет установленное');
+  {
+    const http42 = require('http');
+    const installed42 = ['qwen2.5-coder:1.5b', 'llama3.2:3b'];
+    const fakeOllama = http42.createServer((req, res) => {
+      if (req.url === '/api/tags') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ models: installed42.map((name) => ({ name })) }));
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    });
+    const port42 = await freePort();
+    await new Promise((r) => fakeOllama.listen(port42, '127.0.0.1', r));
+
+    /* OLLAMA_URL и WORKER_ADDRESS читаются при загрузке модуля, поэтому
+     * переменные ставятся ДО require. Без WORKER_ADDRESS воркер создал бы
+     * ~/.tarnet/worker.json — тест насорил бы в домашней папке. */
+    const savedEnv = {
+      OLLAMA_URL: process.env.OLLAMA_URL,
+      WORKER_ADDRESS: process.env.WORKER_ADDRESS,
+      OLLAMA_MODEL: process.env.OLLAMA_MODEL,
+    };
+    process.env.OLLAMA_URL = `http://127.0.0.1:${port42}`;
+    process.env.WORKER_ADDRESS = runAddress('ed1');
+    process.env.OLLAMA_MODEL = 'qwen2.5-coder:1.5b';
+
+    try {
+      const worker = require('./worker-demo.js');
+
+      const report42 = await worker.workerModelReport();
+      ok('42.1 воркер отдаёт список установленных моделей',
+        Array.isArray(report42.installedModels)
+          && report42.installedModels.length === installed42.length,
+        report42.installedModels);
+      ok('42.2 installedModels содержит имя как его называет Ollama',
+        report42.installedModels.includes('qwen2.5-coder:1.5b'),
+        report42.installedModels);
+      ok('42.3 ollamaOnline: true при живой Ollama',
+        report42.ollamaOnline === true, report42.ollamaOnline);
+
+      /* Разные написания одной модели: каталог `/models` знает
+       * `qwen2.5-coder-7b`, Ollama — `qwen2.5-coder:7b`. Если сравнение
+       * пойдёт по сырым строкам, установленная модель исчезнет из списка —
+       * ровно противоположно задаче. */
+      ok('42.4 `:` и `-` в имени модели не мешают сравнению',
+        worker.normalizeModelName('qwen2.5-coder:7b')
+          === worker.normalizeModelName('qwen2.5-coder-7b'),
+        [worker.normalizeModelName('qwen2.5-coder:7b'),
+          worker.normalizeModelName('qwen2.5-coder-7b')]);
+
+      /* Точное попадание: просили установленную — её и считаем. */
+      const exact42 = await worker.resolveOllamaModel('llama3.2:3b');
+      ok('42.5 установленная модель резолвится в свой тег',
+        exact42 === 'llama3.2:3b', exact42);
+
+      /* Промах ЛЕЧИТСЯ, а не падает: раньше здесь возвращалось запрошенное
+       * имя, Ollama отвечала 404, и человек получал заглушку при том, что
+       * рабочая модель на машине БЫЛА. */
+      const miss42 = await worker.resolveOllamaModel('qwen2.5-coder-7b');
+      ok('42.6 неустановленная модель → OLLAMA_MODEL, а не 404',
+        miss42 === 'qwen2.5-coder:1.5b', miss42);
+      ok('42.7 подмена не выдаёт себя за запрошенную модель',
+        miss42 !== 'qwen2.5-coder-7b', miss42);
+
+      /* ---------- сторона сервера: приём и отдача ---------- */
+      const w42 = runAddress('ab1');
+      await api('/node', 'POST', { address: w42, stake: 30000, reputation: 0.8 });
+
+      const q42 = encodeURIComponent(JSON.stringify(installed42));
+      await api(`/worker/poll?workerAddress=${w42}&model=qwen2.5-coder:1.5b`
+        + `&installedModels=${q42}&ollamaOnline=1`);
+
+      const st42 = await api('/worker/status');
+      const me42 = (st42.body.workers || [])
+        .find((w) => String(w.workerAddress).toLowerCase() === w42.toLowerCase());
+      ok('42.8 /worker/status отдаёт installedModels воркера',
+        Array.isArray(me42?.installedModels)
+          && me42.installedModels.length === installed42.length,
+        me42?.installedModels);
+      ok('42.9 /worker/status отдаёт ollamaOnline булевым',
+        me42?.ollamaOnline === true, me42?.ollamaOnline);
+
+      /* NULL и `[]` — разные вещи. Старая версия воркера списка не шлёт, и
+       * PWA не вправе советовать ей «запустите Ollama». */
+      const w42b = runAddress('ab2');
+      await api('/node', 'POST', { address: w42b, stake: 30000, reputation: 0.8 });
+      await api(`/worker/poll?workerAddress=${w42b}&model=qwen2.5-coder:1.5b`);
+      const st42b = await api('/worker/status');
+      const me42b = (st42b.body.workers || [])
+        .find((w) => String(w.workerAddress).toLowerCase() === w42b.toLowerCase());
+      ok('42.10 воркер без списка → installedModels: null, а не []',
+        me42b?.installedModels === null, me42b?.installedModels);
+      ok('42.11 воркер без списка → ollamaOnline: null, а не false',
+        me42b?.ollamaOnline === null, me42b?.ollamaOnline);
+
+      /* Пустой массив — это ОТВЕТ «ничего не установлено», его нельзя
+       * спутать с отсутствием ответа. */
+      await api(`/worker/poll?workerAddress=${w42b}&installedModels=`
+        + `${encodeURIComponent('[]')}&ollamaOnline=0`);
+      const st42c = await api('/worker/status');
+      const me42c = (st42c.body.workers || [])
+        .find((w) => String(w.workerAddress).toLowerCase() === w42b.toLowerCase());
+      ok('42.12 пустой список от воркера → [], а не null',
+        Array.isArray(me42c?.installedModels) && me42c.installedModels.length === 0,
+        me42c?.installedModels);
+      ok('42.13 ollamaOnline=0 доезжает как false',
+        me42c?.ollamaOnline === false, me42c?.ollamaOnline);
+
+      /* Опрос БЕЗ параметров не имеет права стереть уже полученный список:
+       * старый воркер, опрашивающий раз в секунду, обнулял бы данные нового. */
+      await api(`/worker/poll?workerAddress=${w42}&model=qwen2.5-coder:1.5b`);
+      const st42d = await api('/worker/status');
+      const me42d = (st42d.body.workers || [])
+        .find((w) => String(w.workerAddress).toLowerCase() === w42.toLowerCase());
+      ok('42.14 опрос без параметров не стирает присланный список',
+        Array.isArray(me42d?.installedModels) && me42d.installedModels.length === 2,
+        me42d?.installedModels);
+
+      /* Битый JSON — не 500 и не падение опроса: воркер отдал бы задачу
+       * внутри чужого запроса в адресной строке. */
+      const bad42 = await api(`/worker/poll?workerAddress=${w42}`
+        + `&installedModels=${encodeURIComponent('{не json')}`);
+      ok('42.15 битый installedModels → 200, опрос не падает',
+        bad42.status === 200, bad42.status);
+
+      const st42e = await api('/worker/status');
+      const me42e = (st42e.body.workers || [])
+        .find((w) => String(w.workerAddress).toLowerCase() === w42.toLowerCase());
+      ok('42.16 после битого JSON список цел',
+        Array.isArray(me42e?.installedModels) && me42e.installedModels.length === 2,
+        me42e?.installedModels);
+
+      /* Мусор в списке фильтруется: нестроки и пустые не должны доехать
+       * до селекта моделей в PWA. */
+      const junk42 = encodeURIComponent(JSON.stringify(['ok-model', 42, '', null, { a: 1 }]));
+      await api(`/worker/poll?workerAddress=${w42b}&installedModels=${junk42}`);
+      const st42f = await api('/worker/status');
+      const me42f = (st42f.body.workers || [])
+        .find((w) => String(w.workerAddress).toLowerCase() === w42b.toLowerCase());
+      ok('42.17 нестроки в списке моделей отброшены',
+        Array.isArray(me42f?.installedModels)
+          && me42f.installedModels.length === 1
+          && me42f.installedModels[0] === 'ok-model',
+        me42f?.installedModels);
+    } finally {
+      fakeOllama.close();
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+
+    /* ---------- PWA: фильтр по установленному ---------- */
+    const pwaSrc42 = fs.readFileSync(path.join(__dirname, 'app', 'app.js'), 'utf8');
+    /* Без регулярки: класс символов и его экранирование — источник двух
+     * ложных провалов подряд. Сравнивается готовая строка, как она есть в коде. */
+    const normNeedle = "replace(/[:\\-_.]/g, '')";
+    ok('42.19 PWA сравнивает имена моделей с той же нормализацией',
+      pwaSrc42.includes('function normalizeModelId') && pwaSrc42.includes(normNeedle),
+      pwaSrc42.includes('function normalizeModelId')
+        ? 'строка нормализации отличается от воркерной'
+        : 'нет normalizeModelId в app.js');
+    ok('42.20 PWA берёт список из /worker/status',
+      /workerModelsReport/.test(pwaSrc42) && /call\('\/worker\/status'\)/.test(pwaSrc42));
+    ok('42.21 PWA фильтрует локальные по installedModels',
+      /report\.models\.has\(normalizeModelId/.test(pwaSrc42),
+      'локальные не фильтруются по установленному');
+    ok('42.22 PWA не фильтрует, если список неизвестен',
+      /report\.known\s*\n?\s*\?/.test(pwaSrc42) || /: localAll/.test(pwaSrc42),
+      'нет ветки «список неизвестен — не фильтруем»');
+    ok('42.23 PWA различает «Ollama не запущена» и «ничего не стоит»',
+      /Запустите Ollama/.test(pwaSrc42)
+        && /не установлено ни одной/.test(pwaSrc42));
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

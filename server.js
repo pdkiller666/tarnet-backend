@@ -404,6 +404,30 @@ ensureColumn('ledger_txs', 'actionId', 'actionId TEXT');
  * /inference не может отличить model_unavailable от честного live-ответа и
  * выдаёт шаблон воркера за работу модели. */
 ensureColumn('worker_tasks', 'source', 'source TEXT');
+/* Список моделей, реально установленных на ПК воркера.
+ *
+ * Хранится JSON-строкой, а не отдельной таблицей: это снимок последнего
+ * пульса, а не история. Отдельная таблица дала бы мусор из прошлых запусков,
+ * который пришлось бы чистить по TTL, — а нужен ровно один ответ на вопрос
+ * «что сейчас есть на этом ПК».
+ *
+ * `installed_models` может быть NULL (старый воркер списка не прислал).
+ * NULL и `[]` — разные вещи: NULL значит «воркер не умеет сообщать»,
+ * `[]` — «прислал, и там пусто». Без этого различия PWA советовала бы
+ * «запустите Ollama» воркерам, которые её и не спрашивали. */
+ensureColumn('worker_presence', 'installed_models', 'installed_models TEXT');
+ensureColumn('worker_presence', 'ollama_online', 'ollama_online INTEGER');
+
+/* NULL и `[]` обязаны остаться разными снаружи: NULL — воркер не присылал
+ * список, `[]` — прислал пустой. Битый JSON в базе читается как NULL:
+ * повреждённое значение не должно выдавать себя за «моделей нет». */
+function parseInstalledModels(raw) {
+  if (typeof raw !== 'string') return null;
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter(m => typeof m === 'string') : null;
+  } catch (_e) { return null; }
+}
 /* Причина заглушки, если воркер её назвал (OLLAMA_NOT_RUNNING и т.п.).
  * Без этой колонки код терялся на /worker/submit, и PWA показывал
  * «модель не загружена» вместо «запустите Ollama». */
@@ -5596,18 +5620,49 @@ app.get('/worker/poll', (req, res) => {
   const model = typeof req.query.model === 'string' ? req.query.model : null;
   const now = Date.now();
 
+  /* Список моделей из пульса. Разбираем аккуратно: строка пришла из query,
+   * и битый JSON не должен ронять опрос — воркер тогда просто не отдал бы
+   * задачу из-за чужих данных в адресной строке.
+   *
+   * Отсутствие параметра и пустой массив — РАЗНОЕ (см. ensureColumn выше):
+   * отсутствие — NULL (старый воркер), `[]` — воркер сказал «ничего нет». */
+  let installedModels; // undefined = не присылали
+  if (typeof req.query.installedModels === 'string') {
+    try {
+      const parsed = JSON.parse(req.query.installedModels);
+      if (Array.isArray(parsed)) {
+        /* Только строки, только непустые, только разумной длины: поле идёт
+         * в ответ PWA, и мусор в нём — это мусор в селекте моделей. */
+        installedModels = parsed
+          .filter(m => typeof m === 'string' && m.length && m.length <= 200)
+          .slice(0, 64);
+      }
+    } catch (_e) { installedModels = undefined; }
+  }
+  const ollamaOnline = req.query.ollamaOnline === '1' ? 1
+    : req.query.ollamaOnline === '0' ? 0
+    : undefined;
+
   /* Пульс присутствия. Пишется на КАЖДЫЙ опрос, даже если задач нет —
    * иначе /inference никогда не узнает, что воркер жив, и режим worker
    * не включится. Без адреса пульс не пишется: анонимный опрос не делает
    * воркера участником сети. */
   if (workerAddress) {
     run(
-      `INSERT INTO worker_presence (workerAddress, model, lastSeenAt, polls) VALUES (?, ?, ?, 1)
+      `INSERT INTO worker_presence (workerAddress, model, lastSeenAt, polls, installed_models, ollama_online)
+       VALUES (?, ?, ?, 1, ?, ?)
        ON CONFLICT(workerAddress) DO UPDATE SET
          lastSeenAt = excluded.lastSeenAt,
          model = COALESCE(excluded.model, worker_presence.model),
-         polls = worker_presence.polls + 1`,
-      [workerAddress, model, now],
+         polls = worker_presence.polls + 1,
+         /* COALESCE, а не прямое присваивание: опрос без параметров не должен
+          * СТИРАТЬ ранее присланный список. Иначе старый воркер, опрашивающий
+          * раз в секунду, обнулял бы данные, полученные от нового. */
+         installed_models = COALESCE(excluded.installed_models, worker_presence.installed_models),
+         ollama_online = COALESCE(excluded.ollama_online, worker_presence.ollama_online)`,
+      [workerAddress, model, now,
+        installedModels === undefined ? null : JSON.stringify(installedModels),
+        ollamaOnline === undefined ? null : ollamaOnline],
     );
   }
 
@@ -5755,8 +5810,12 @@ app.get('/worker/status', (_req, res) => {
     active_workers: Number(active),
     pending_tasks: Number(pending),
     mode: LLM.describeMode({ activeWorkers: Number(active) }).llm_mode,
+    /* `installedModels` — то, что PWA использует как ЕДИНСТВЕННЫЙ источник
+     * правды для селекта локальных моделей. Раньше его не было, и выбирать
+     * приходилось из каталога сети — а он знает модели вообще, а не модели
+     * этого ПК. Отсюда и брались `ollama HTTP 404`. */
     workers: all(
-      `SELECT workerAddress, model, lastSeenAt, polls FROM worker_presence
+      `SELECT workerAddress, model, lastSeenAt, polls, installed_models, ollama_online FROM worker_presence
        WHERE lastSeenAt >= ? ORDER BY lastSeenAt DESC`,
       [cutoff],
     ).map(w => ({
@@ -5764,6 +5823,12 @@ app.get('/worker/status', (_req, res) => {
       model: w.model,
       lastSeenAgoMs: Date.now() - Number(w.lastSeenAt),
       polls: Number(w.polls),
+      /* null — воркер не присылал список (старая версия); [] — прислал пустой.
+       * Клиент обязан различать эти два случая, иначе старый воркер получит
+       * совет «запустите Ollama», хотя он про Ollama и не спрашивал. */
+      installedModels: parseInstalledModels(w.installed_models),
+      ollamaOnline: w.ollama_online === null || w.ollama_online === undefined
+        ? null : Boolean(w.ollama_online),
     })),
   });
 });

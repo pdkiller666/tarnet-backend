@@ -439,6 +439,59 @@ function syncContourToModel() {
   }
 }
 
+/* ---------- Что реально установлено на воркерах сети ----------
+ * Единственный источник правды для селекта ЛОКАЛЬНЫХ моделей.
+ *
+ * До этого локальные брались из каталога `/models`, а он знает модели
+ * ВООБЩЕ, а не модели конкретного ПК. Человек выбирал `qwen2.5-coder-7b`,
+ * которой у него не было, задача уезжала на его машину, и вместо ответа
+ * приходил `ollama HTTP 404` с заглушкой вместо ответа модели.
+ *
+ * Объединение по ВСЕМ онлайн-воркерам, а не по «моему»: `/inference` сам
+ * выбирает воркера по маршруту, и выбирать за него в интерфейсе нельзя.
+ * Модель, стоящая на чужом ПК, — законный выбор; важно только, чтобы она
+ * стояла ХОТЯ БЫ на одном живом.
+ *
+ * Три состояния, которые обязан различать клиент:
+ *   known: false — ни один воркер списка не прислал (старая версия).
+ *                  Фильтровать нельзя: скроем всё и обвиним человека зря.
+ *   known: true, ollamaOnline: false — Ollama не запущена.
+ *   known: true, ollamaOnline: true — настоящий список.
+ */
+function normalizeModelId(s) {
+  /* Тот же порядок, что в `worker-demo.js`: `:`, `-`, `_`, `.` в пустоту.
+   * Без этого `qwen2.5-coder-7b` из каталога не совпал бы с тегом
+   * `qwen2.5-coder:7b` от Ollama, и установленная модель исчезла бы
+   * из списка — ровно противоположно задаче. */
+  return String(s || '').toLowerCase().replace(/[:\-_.]/g, '');
+}
+
+async function workerModelsReport() {
+  try {
+    const ws = await call('/worker/status');
+    const list = Array.isArray(ws.workers) ? ws.workers : [];
+    const models = new Set();
+    let known = false;
+    let ollamaOnline = null; // null = неизвестно
+    for (const w of list) {
+      /* Массив — список есть; null/undefined — старая версия воркера. */
+      if (Array.isArray(w.installedModels)) {
+        known = true;
+        for (const m of w.installedModels) models.add(normalizeModelId(m));
+      }
+      if (typeof w.ollamaOnline === 'boolean') {
+        /* Хотя бы один воркер с живой Ollama — значит ждать есть чего. */
+        ollamaOnline = Boolean(ollamaOnline) || w.ollamaOnline;
+      }
+    }
+    return { known, models, ollamaOnline, workers: list.length };
+  } catch (_e) {
+    /* Статус воркеров недоступен — не фильтруем: пустой список выглядел бы
+     * как «моделей нет», хотя проблема в сети. */
+    return { known: false, models: new Set(), ollamaOnline: null, workers: 0 };
+  }
+}
+
 async function loadModels() {
   const sel = $('model');
   if (!sel) return;
@@ -447,7 +500,15 @@ async function loadModels() {
   try {
     const data = await call('/models');
     const all = (data && Array.isArray(data.models) ? data.models : []);
-    const local = all.filter((m) => m.provider === 'local' && Number(m.tier) <= 3);
+
+    /* Локальные — только те, что реально стоят на воркерах сети. Каталог
+     * остаётся источником метаданных (имя, контекст, лицензия), но право
+     * быть в списке даёт факт установки, а не запись в реестре. */
+    const report = await workerModelsReport();
+    const localAll = all.filter((m) => m.provider === 'local' && Number(m.tier) <= 3);
+    const local = report.known
+      ? localAll.filter((m) => report.models.has(normalizeModelId(m.modelId)))
+      : localAll;
     /* Облачные — только по ключу: без него сервер такой выбор отклонит.
      *
      * И только те, чей провайдер совпадает с провайдером СОХРАНЁННОГО
@@ -479,6 +540,15 @@ async function loadModels() {
       const g = document.createElement('optgroup');
       g.label = 'Локальные — в сети';
       for (const m of local) g.appendChild(modelOption(m, false));
+      sel.appendChild(g);
+    } else if (report.known) {
+      /* Пусто НЕ потому, что каталог пуст, а потому, что на воркерах ничего
+       * не стоит. Разные причины — разные советы. Молчаливый пустой список
+       * отправил бы человека искать проблему в сети. */
+      const g = document.createElement('optgroup');
+      g.label = report.ollamaOnline === false
+        ? 'Запустите Ollama, чтобы увидеть локальные модели'
+        : 'На подключённых ПК не установлено ни одной локальной модели';
       sel.appendChild(g);
     }
     if (cloud.length) {

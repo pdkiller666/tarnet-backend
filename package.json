@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.16.2-brand-economy-ui",
+  "version": "2.16.3-dynamic-models",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

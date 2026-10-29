@@ -48,24 +48,60 @@ function normalizeModelName(s) {
   return String(s || '').toLowerCase().replace(/[:\-_.]/g, '');
 }
 
-let ollamaTagsCache = null;
-async function ollamaTags() {
-  if (ollamaTagsCache) return ollamaTagsCache;
+/* Кэш живёт ОГРАНИЧЕННОЕ время, а не вечно.
+ *
+ * Здесь был дефект, который виден только на живом ПК: `if (ollamaTagsCache)`
+ * считает truthy и ПУСТОЙ массив. Первый же замер, когда Ollama была
+ * выключена, кэшировал `[]` — и до перезапуска процесса воркер отвечал
+ * «моделей нет», даже если человек их уже поставил. Список, который нужен
+ * PWA для выбора, врал бы ровно в самом частом сценарии: «поставил Ollama
+ * после воркера».
+ *
+ * Отдельно храним `online`: «Ollama выключена» и «Ollama работает, но
+ * моделей нет» — разные вещи. Пустой массив без флага заставил бы PWA
+ * писать «нет моделей» человеку, у которого не запущен Ollama. */
+const OLLAMA_TAGS_TTL_MS = 15000;
+let ollamaTagsCache = { models: [], at: 0, online: false };
+
+async function ollamaTags({ maxAgeMs = OLLAMA_TAGS_TTL_MS } = {}) {
+  if (Date.now() - ollamaTagsCache.at < maxAgeMs) return ollamaTagsCache.models;
   try {
     const res = await fetch(`${OLLAMA}/api/tags`, { signal: AbortSignal.timeout(3000) });
-    if (!res.ok) return [];
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const j = await res.json();
-    ollamaTagsCache = (Array.isArray(j.models) ? j.models : [])
+    const models = (Array.isArray(j.models) ? j.models : [])
       .map((m) => m && m.name).filter(Boolean);
-    return ollamaTagsCache;
+    ollamaTagsCache = { models, at: Date.now(), online: true };
+    return models;
   } catch (_e) {
+    /* Недоступность не кэшируем навсегда: следующий пульс проверит снова. */
+    ollamaTagsCache = { models: [], at: Date.now(), online: false };
     return [];
   }
 }
 
-/* Запрошенное имя → реальный тег Ollama. Не найдено — отдаём запрошенное
- * как есть: пусть Ollama сама скажет, что такой модели нет, вместо тихой
- * подмены на чужую модель. */
+/* Отчёт для сервера: что реально установлено на ЭТОМ ПК и жива ли Ollama.
+ * Один объект, чтобы список и флаг не разъехались между двумя запросами. */
+async function workerModelReport() {
+  const installedModels = await ollamaTags();
+  return { installedModels, ollamaOnline: ollamaTagsCache.online };
+}
+
+/* Запрошенное имя → реальный тег Ollama. Не найдено — отдаём `OLLAMA_MODEL`,
+ * а не запрошенное имя.
+ *
+ * Раньше здесь при промахе возвращалось запрошенное как есть («пусть Ollama
+ * сама скажет»). На практике это давало `ollama HTTP 404`: каталог `/models`
+ * знает модель `qwen2.5-coder-7b`, а на конкретном ПК установлена только
+ * `qwen2.5-coder:1.5b`. Клиент выбирал 7b из списка сети, задача уезжала на
+ * этот ПК, и человек вместо ответа получал заглушку — хотя рабочая модель
+ * на машине БЫЛА.
+ *
+ * Теперь промах лечится починкой, а не падением: считаем `OLLAMA_MODEL`
+ * (он точно установлен) и говорим об этом в лог и в ответе. Но только если
+ * Ollama реально жива: при выключенной Ollama подмена бессмысленна, и
+ * исходная ошибка должна остаться видна.
+ */
 async function resolveOllamaModel(requested) {
   if (!requested) return MODEL;
   const want = normalizeModelName(requested);
@@ -76,7 +112,18 @@ async function resolveOllamaModel(requested) {
    * подходящем теге у Ollama: сверяем по базовому имени. */
   const base = want.replace(/latest$/, '');
   const loose = tags.find((t) => normalizeModelName(t).replace(/latest$/, '') === base);
-  return loose || String(requested);
+  if (loose) return loose;
+
+  /* Промах. Список получен (Ollama отвечает) — значит модель просто не
+   * поставлена; считаем ту, что точно есть. Список пуст из-за недоступности
+   * — не подменяем: воркер и так уйдёт в другой бэкенд, а тихая подмена
+   * скрыла бы настоящую причину. */
+  if (tags.length) {
+    const fallback = tags.includes(MODEL) ? MODEL : tags[0];
+    log(`Модель ${requested} не найдена, использую ${fallback} (OLLAMA_MODEL)`);
+    return fallback;
+  }
+  return String(requested);
 }
 
 const log = (...a) => console.log(`[${new Date().toLocaleTimeString('ru-RU')}]`, ...a);
@@ -294,7 +341,19 @@ function askFallback(prompt, errorCode) {
   };
 }
 
-let ollamaDead = false;
+/* Пауза после недоступности — ограниченная, а не навсегда.
+ *
+ * Раньше здесь стоял голый `ollamaDead = true`, и он не сбрасывался НИКОГДА:
+ * одна неудача ( в том числе `HTTP 404` на отсутствующую модель) отключала
+ * Ollama до перезапуска процесса. Человек запускал Ollama, ставил модель —
+ * воркер продолжал отдавать заглушку с `model_unavailable`, и причину
+ * приходилось искать в исходниках.
+ *
+ * Теперь это не флаг, а метка времени: после паузы бэкенд пробуется снова.
+ * 30 с — компромисс: достаточно, чтобы не ждать таймаут на каждой задаче,
+ * и мало, чтобы человек, поставивший модель, увидел результат сразу. */
+const OLLAMA_RETRY_MS = 30000;
+let ollamaDeadUntil = 0;
 
 /* Отличаем «Ollama не запущена» от «Ollama ответила ошибкой». Лечатся они
  * по-разному: первое — запустить программу, второе — смотреть её лог и
@@ -309,15 +368,22 @@ function ollamaErrorCode(e) {
 
 async function generate(prompt, requestedModel) {
   let ollamaErr = null;
-  if (!ollamaDead) {
+  if (Date.now() >= ollamaDeadUntil) {
     try {
       return await askOllama(prompt, requestedModel);
     } catch (e) {
-      /* Ollama может быть просто не запущен — это нормально. Запоминаем,
-       * чтобы не ждать таймаут на каждой задаче. */
-      ollamaDead = true;
       ollamaErr = ollamaErrorCode(e);
-      log(`Ollama недоступна (${e.message}) — переключаюсь на другой бэкенд [${ollamaErr}]`);
+      /* Отключаем бэкенд НА ВРЕМЯ только при недоступности процесса.
+       *
+       * `HTTP 404`/`500` — Ollama работает и ответила. Ждать 30 с, чтобы
+       * спросить е╦ снова, бессмысленно: на следующей задаче будет тот же
+       * ответ. А вот «выключили» — повод не тратить таймаут каждый раз. */
+      if (ollamaErr === 'OLLAMA_NOT_RUNNING') {
+        ollamaDeadUntil = Date.now() + OLLAMA_RETRY_MS;
+        log(`Ollama недоступна (${e.message}) — другой бэкенд на ${OLLAMA_RETRY_MS / 1000} с [${ollamaErr}]`);
+      } else {
+        log(`Ollama ответила ошибкой (${e.message}) [${ollamaErr}]`);
+      }
     }
   }
   if (GROQ_KEY || OPENROUTER_KEY) {
@@ -369,14 +435,31 @@ let running = true;
  * минуты), а опрашивать в это время он не может: цикл занят генерацией.
  * Без пульса живой воркер выглядел бы офлайн ровно в момент работы, и
  * /inference ушёл бы в шаблон, пока модель ещё думает. */
+/* Список моделей уходит тем же запросом, что и пульс: отдельная ручка
+ * означала бы два запроса и окно, в котором сервер знает адрес, но не знает
+ * модели. JSON кодируется в query — список короткий (единицы имён), а
+ * менять метод на POST ради него значило бы ломать совместимость со старым
+ * сервером, который ждёт GET. */
+async function presenceQuery({ heartbeatFlag = false } = {}) {
+  const rep = await workerModelReport();
+  const parts = [
+    `workerAddress=${encodeURIComponent(WORKER)}`,
+    `model=${encodeURIComponent(MODEL)}`,
+    `installedModels=${encodeURIComponent(JSON.stringify(rep.installedModels))}`,
+    `ollamaOnline=${rep.ollamaOnline ? '1' : '0'}`,
+  ];
+  if (heartbeatFlag) parts.push('heartbeat=1');
+  return parts.join('&');
+}
+
 async function heartbeat() {
   try {
-    await api('GET', `/worker/poll?workerAddress=${encodeURIComponent(WORKER)}&model=${encodeURIComponent(MODEL)}&heartbeat=1`);
+    await api('GET', `/worker/poll?${await presenceQuery({ heartbeatFlag: true })}`);
   } catch (_e) { /* пульс не критичен: провал не должен ломать генерацию */ }
 }
 
 async function pollOnce() {
-  const r = await api('GET', `/worker/poll?workerAddress=${encodeURIComponent(WORKER)}&model=${encodeURIComponent(MODEL)}`);
+  const r = await api('GET', `/worker/poll?${await presenceQuery()}`);
   if (!r.ok || !r.data?.task) return;
 
   const task = r.data.task;
@@ -482,7 +565,9 @@ async function main() {
 
 /* Экспорт для юнит-тестов: разрешение имён моделей проверяется без сети и
  * без запуска воркера. */
-module.exports = { normalizeModelName, resolveOllamaModel, ollamaTags, generate, main };
+module.exports = {
+  normalizeModelName, resolveOllamaModel, ollamaTags, workerModelReport, generate, main,
+};
 
 if (require.main === module) {
   main().catch((e) => {
