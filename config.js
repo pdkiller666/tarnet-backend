@@ -107,6 +107,22 @@ const CONFIG = {
   TREASURY_RATE: 0.025,
   LORA_ROYALTY_RATE: 0.05, // 5% от Fee_Reward, а не от gross
 
+  /* --- Утилизация токена: оплата работой ВНУТРИ системы дешевле ---
+   *
+   * Обычная комиссия протокола — 5% (выше). Но если клиент платит из
+   * собственного баланса TAR, деньги не покидают контур: это внутренний
+   * оборот, а не вывод стоимости. За него берётся 2% вместо 5%, и это
+   * ЕДИНСТВЕННАЯ причина, по которой такой платёж дешевле.
+   *
+   * Тонкость, которую легко испортить: 2% — это не «5% минус скидка 3%».
+   * Ставка заменяется целиком, и делится пополам 1% burn + 1% treasury.
+   * Если оставить старые BURN_RATE/TREASURY_RATE и просто уменьшить gross,
+   * инвариант gross = burn + treasury + royalty + worker перестанет
+   * сходиться: доли считались бы от одной базы, а списывалось бы другое. */
+  TAR_UTILITY_FEE_BPS: Number(process.env.TAR_UTILITY_FEE_BPS || 200), // 200 bps = 2%
+  TAR_UTILITY_BURN_RATE: 0.01,
+  TAR_UTILITY_TREASURY_RATE: 0.01,
+
   // --- Поток 2: эмиссия (Block Reward), биткоин-подобный халвинг ---
   INITIAL_BLOCK_REWARD: Number(process.env.INITIAL_BLOCK_REWARD || 50), // E_0, TAR за эпоху
   EPOCH_DURATION_SEC: Number(process.env.EPOCH_DURATION_SEC || 86400),  // сутки

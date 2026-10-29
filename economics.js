@@ -95,15 +95,27 @@ function omega(stake, reputation) {
 /* ---------- Reward Engine ---------- */
 class RewardEngine {
   /* Поток 1: плата за работу. Возвращает брутто и разложение комиссии. */
-  static feeStream(cwu, { adapterId, hasAdapterAuthor = false } = {}) {
+  static feeStream(cwu, { adapterId, hasAdapterAuthor = false, paymentMode = null } = {}) {
     const gross = (cwu * CONFIG.PRICE_USD_PER_1M_TOKENS) / 1e6 / CONFIG.USD_PER_TAR;
     /* Округление делается ОДИН раз на каждом слагаемом, а доля воркера
      * считается остатком от округлённого gross. Если округлять все доли
      * независимо, их сумма расходится с gross на несколько 1e-6 — и
      * инвариант сохранения формально ломается на ровном месте. */
     const grossR = round(gross);
-    const burn = round(grossR * CONFIG.BURN_RATE);
-    const treasury = round(grossR * CONFIG.TREASURY_RATE);
+    /* Ставка комиссии зависит от того, ОТКУДА пришли деньги.
+     *
+     * TAR_UTILITY — оплата из внутреннего баланса TAR. Это оборот внутри
+     * контура, а не вывод стоимости наружу, поэтому ставка ниже: 1% burn +
+     * 1% treasury вместо 2.5% + 2.5%. Заменяется ВСЯ пара ставок, а не
+     * только одна: иначе сумма долей не сойдётся с gross.
+     *
+     * Любой другой режим (в том числе null и 'TAR' от старых клиентов)
+     * получает прежние 5% — поведение по умолчанию не меняется. */
+    const utility = paymentMode === 'TAR_UTILITY';
+    const burnRate = utility ? CONFIG.TAR_UTILITY_BURN_RATE : CONFIG.BURN_RATE;
+    const treasuryRate = utility ? CONFIG.TAR_UTILITY_TREASURY_RATE : CONFIG.TREASURY_RATE;
+    const burn = round(grossR * burnRate);
+    const treasury = round(grossR * treasuryRate);
     const net = round(grossR - burn - treasury);
     const royalty = hasAdapterAuthor ? round(net * CONFIG.LORA_ROYALTY_RATE) : 0;
     const worker = round(net - royalty);
@@ -116,6 +128,12 @@ class RewardEngine {
       worker: round(worker),
       adapterId: adapterId || null,
       hasAdapterAuthor,
+      paymentMode: utility ? 'TAR_UTILITY' : 'TAR',
+      /* Фактическая ставка — наружу, чтобы отчёт и тест читали одно и то же
+       * число, а не пересчитывали его из констант. */
+      feeRate: utility
+        ? (CONFIG.TAR_UTILITY_BURN_RATE + CONFIG.TAR_UTILITY_TREASURY_RATE)
+        : (CONFIG.BURN_RATE + CONFIG.TREASURY_RATE),
     };
   }
 
@@ -159,6 +177,7 @@ class RewardEngine {
     denominator = 0,
     unclaimed = 0,
     mode = CONFIG.REWARD_MODE,
+    paymentMode = null,
   }) {
     const cwu = CWUCalculator.compute(tokens, tier, gamma);
     if (cwu.gamma === 0) {
@@ -175,8 +194,8 @@ class RewardEngine {
     const useBlock = mode === 'bootstrap' || mode === 'hybrid';
 
     const fee = useFee
-      ? RewardEngine.feeStream(cwu.cwu, { adapterId, hasAdapterAuthor })
-      : { gross: 0, burn: 0, treasury: 0, net: 0, royalty: 0, worker: 0, adapterId: adapterId || null, hasAdapterAuthor };
+      ? RewardEngine.feeStream(cwu.cwu, { adapterId, hasAdapterAuthor, paymentMode })
+      : { gross: 0, burn: 0, treasury: 0, net: 0, royalty: 0, worker: 0, adapterId: adapterId || null, hasAdapterAuthor, paymentMode: 'TAR', feeRate: 0 };
 
     const block = useBlock
       ? RewardEngine.blockStream({ cwu: cwu.cwu, omegaValue, denominator, unclaimed, epochEmissionTar })

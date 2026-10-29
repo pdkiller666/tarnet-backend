@@ -427,6 +427,326 @@ function encryptResult(plaintext, sessionKeyB64) {
   return `enc:v1:${iv.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${ct.toString('base64')}`;
 }
 
+/* ---------- Входящий WebSocket (v2.17.0) ----------
+ *
+ * ЗАЧЕМ. Опрос раз в секунду даёт до секунды задержки и, главное, не даёт
+ * серверу входящего канала: он не может сказать воркеру ничего, пока тот сам
+ * не спросит. Постоянный сокет это исправляет.
+ *
+ * НОГРАНИЧЕНИЯ, КОТОРЫЕ ЗДЕСЬ ВАЖНЕЕ ВОЗМОЖНОСТЕЙ:
+ *   1) Файл скачивается и запускается БЕЗ npm install. Поэтому только
+ *      встроенные средства: глобальный `WebSocket` и Ed25519 из `node:crypto`.
+ *      Никакого `ws` в зависимостях воркера.
+ *   2) Глобальный `WebSocket` появился не в Node 18, а позже. Файл обещает
+ *      Node 18+, поэтому отсутствие конструктора — не ошибка, а повод молча
+ *      остаться на опросе. Воркер обязан работать и там.
+ *   3) Сокет может не подняться (прокси, firewall, старый сервер). Если за
+ *      WS_CONNECT_BUDGET_MS соединения нет — возвращаемся к опросу. Молчаливое
+ *      «вишу и жду» выглядело бы как зависший воркер.
+ *
+ * ПОДПИСЬ. Ключ выводится из seed в ~/.tarnet/worker-key.json (права 600).
+ * Адрес воркера при этом НЕ выводится из ключа: у старых воркеров адрес —
+ * randomBytes(20), и менять его нельзя, иначе пропадёт накопленная работа.
+ * Сервер привязывает ключ к адресу при первом handshake (TOFU) — этого
+ * достаточно, чтобы второй человек с тем же адресом не получил задачи. */
+const AUTH_PREFIX = 'TARNET_WS_AUTH';
+
+/* DER-префиксы для ed25519. Тот же формат, что в identity.js сервера:
+ * PKCS8 для приватного (seed внутри), SPKI для публичного (raw 32 байта). */
+const PKCS8_ED25519_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+const SPKI_ED25519_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+
+const WS_CONNECT_BUDGET_MS = Number(process.env.TARNET_WS_CONNECT_MS || 10000);
+const WS_RECONNECT_MAX_MS = 15000;
+
+function wsKeyFile() {
+  return path.join(os.homedir(), '.tarnet', 'worker-key.json');
+}
+
+/* Seed создаётся один раз и переживает перезапуск. Если файла нет и создать
+ * его нельзя — ключ будет эфемерным, и handshake сломается при первом же
+ * рестарте (TOFU увидит другой ключ и ответит ADDRESS_KEY_MISMATCH). Об этом
+ * честно пишем в лог, а не делаем вид, что всё в порядке. */
+function loadOrCreateSeed() {
+  const fromEnv = String(process.env.TARNET_WORKER_SEED || '').trim();
+  if (/^[0-9a-fA-F]{64}$/.test(fromEnv)) return Buffer.from(fromEnv, 'hex');
+
+  const file = wsKeyFile();
+  try {
+    if (fs.existsSync(file)) {
+      const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (/^[0-9a-fA-F]{64}$/.test(saved.seedHex || '')) return Buffer.from(saved.seedHex, 'hex');
+    }
+  } catch (_e) { /* битый файл — пересоздадим */ }
+
+  const seed = nodeCrypto.randomBytes(32);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      seedHex: seed.toString('hex'),
+      createdAt: new Date().toISOString(),
+    }, null, 2));
+    fs.chmodSync(file, 0o600);
+  } catch (e) {
+    log(`не смог сохранить ключ WS (${e.message}) — при рестарте handshake отклонится`);
+  }
+  return seed;
+}
+
+function ed25519FromSeed(seed) {
+  const priv = nodeCrypto.createPrivateKey({
+    key: Buffer.concat([PKCS8_ED25519_PREFIX, seed]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  const pubDer = nodeCrypto.createPublicKey(priv).export({ format: 'der', type: 'spki' });
+  return { priv, pubHex: Buffer.from(pubDer).slice(-32).toString('hex') };
+}
+
+/* Адрес сокета выводится из того же API, что и HTTP: отдельная переменная
+ * означала бы два места, которые могут разойтись (http на один хост, ws на
+ * другой), и это выяснялось бы только на живом человеке. */
+function wsUrl() {
+  const base = API.replace(/^http:/i, 'ws:').replace(/^https:/i, 'wss:');
+  return base + '/p2p/worker';
+}
+
+function wsSupported() {
+  return typeof WebSocket === 'function';
+}
+
+function signAuth(nonce, timestamp, keys) {
+  const payload = `${AUTH_PREFIX}:${nonce}:${WORKER}:${timestamp}`;
+  return nodeCrypto.sign(null, Buffer.from(payload, 'utf8'), keys.priv).toString('base64');
+}
+
+/* Очередь задач. Модель на CPU считает минуты, а кадры могут прийти один за
+ * другим: без очереди второй TASK запустил бы вторую генерацию параллельно и
+ * на 1 CPU они бы мешали друг другу, растягивая обе. */
+let wsTaskChain = Promise.resolve();
+
+/* Один экземпляр на процесс. Хранит сокет и состояние реконнекта. */
+const wsState = {
+  ws: null,
+  connected: false,
+  attempts: 0,
+  everConnected: false,
+  closedByUs: false,
+  keys: null,
+};
+
+/* Обработка одной задачи — ОДНА функция на оба транспорта.
+ * Возвращает объект результата, доставку делает вызывающий: WS отправит
+ * кадром, poll — через POST /worker/submit. Дублировать генерацию и
+ * расшифровку в двух ветках значило бы получить два slightly разных
+ * поведения, которые расходятся ровно в самом редком случае. */
+async function runTask(task) {
+  let prompt;
+  try {
+    prompt = task.encryptedPayload && task.sessionKey
+      ? decryptTask(task.encryptedPayload, task.sessionKey)
+      : String(task.prompt || '');
+  } catch (e) {
+    log(`задача ${task.taskId} не расшифрована (${e.message}) — пропускаю`);
+    return { ok: false, reason: 'decrypt_failed', taskId: task.taskId };
+  }
+  log(`задача ${task.taskId}: «${prompt.slice(0, 60)}»`);
+
+  const started = Date.now();
+  const pulse = setInterval(heartbeat, 7000);
+  let gen;
+  try {
+    gen = await generate(prompt, task.model || null);
+  } finally {
+    clearInterval(pulse);
+  }
+  const took = Date.now() - started;
+
+  return {
+    ok: true,
+    taskId: task.taskId,
+    prompt,
+    gen,
+    took,
+    /* Ответ шифруется ключом сессии, когда он есть. Ключ пришёл по TLS и
+     * живёт только в памяти — на диск не попадает. */
+    payload: task.sessionKey
+      ? { encryptedResponse: encryptResult(gen.response, task.sessionKey) }
+      : { response: gen.response },
+  };
+}
+
+function wsSend(obj) {
+  const ws = wsState.ws;
+  if (!ws || ws.readyState !== 1) return false;
+  try {
+    ws.send(JSON.stringify(obj));
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+function onWsTask(task) {
+  wsTaskChain = wsTaskChain.then(async () => {
+    const out = await runTask(task);
+    if (!out.ok) {
+      wsSend({ type: 'ERROR', taskId: task.taskId, error: out.reason, workerAddress: WORKER });
+      return;
+    }
+    const sent = wsSend({
+      type: 'RESULT',
+      taskId: out.taskId,
+      workerAddress: WORKER,
+      ...out.payload,
+      usage: out.gen.usage,
+      source: out.gen.source,
+      ...(out.gen.error ? { error: out.gen.error } : {}),
+      /* Объявляем модель, которую бэкенд реально запустил: расхождение
+       * «просили 7b, считали 1.5b» должно быть видно в отчёте. */
+      model: out.gen.model || MODEL,
+    });
+    if (sent) {
+      submitted += 1;
+      log(`отдал ${out.taskId} по ws (${out.gen.source}, ${out.gen.usage.total_tokens} ток., ${out.took} мс) — всего ${submitted}`);
+    } else {
+      /* Сокет умер между приёмом задачи и отправкой ответа. Результат уже
+       * посчитан, терять его незачем: отправляем по HTTP, сервер примет —
+       * задача в статусе claimed и ждёт именно этого taskId. */
+      log(`сокет закрылся, отдаю ${out.taskId} по http`);
+      const sub = await api('POST', '/worker/submit', {
+        taskId: out.taskId,
+        workerAddress: WORKER,
+        ...out.payload,
+        usage: out.gen.usage,
+        source: out.gen.source,
+        ...(out.gen.error ? { error: out.gen.error } : {}),
+        model: out.gen.model || MODEL,
+      });
+      if (sub.ok) submitted += 1;
+    }
+  }).catch((e) => {
+    log(`ошибка обработки задачи по ws: ${e.message}`);
+  });
+}
+
+function wsAuthResponse(challenge) {
+  const keys = wsState.keys || (wsState.keys = ed25519FromSeed(loadOrCreateSeed()));
+  const timestamp = Date.now();
+  wsSend({
+    type: 'AUTH_RESPONSE',
+    workerAddress: WORKER,
+    pubkey: keys.pubHex,
+    signature: signAuth(challenge.nonce, timestamp, keys),
+    timestamp,
+    model: MODEL,
+    /* Тир объявляем как base: воркер демонстрационный и не заявляет
+     * экспертный профиль. Сервер учитывает это мягко — жёсткий фильтр по
+     * тиру отбросил бы единственного подключённого воркера. */
+    tier: process.env.TARNET_TIER || 'base',
+  });
+}
+
+/* Подключение с бюджетом времени. Резолвится true только на AUTH_OK: сам по
+ * себе открытый сокет ничего не доказывает, пока handshake не прошёл. */
+function connectWs(budgetMs = WS_CONNECT_BUDGET_MS) {
+  return new Promise((resolve) => {
+    if (!wsSupported()) return resolve(false);
+
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(budget);
+      resolve(ok);
+    };
+    const budget = setTimeout(() => {
+      log(`ws не поднялся за ${Math.round(budgetMs / 1000)} с — остаюсь на опросе`);
+      try { if (wsState.ws) wsState.ws.close(); } catch (_e) { /* уже закрыт */ }
+      finish(false);
+    }, budgetMs);
+
+    let ws;
+    try {
+      ws = new WebSocket(wsUrl());
+    } catch (e) {
+      log(`ws недоступен (${e.message}) — остаюсь на опросе`);
+      return finish(false);
+    }
+    wsState.ws = ws;
+    wsState.closedByUs = false;
+
+    ws.addEventListener('open', () => {
+      log(`ws открыт: ${wsUrl()}`);
+    });
+
+    ws.addEventListener('message', (ev) => {
+      let frame;
+      try {
+        frame = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data));
+      } catch (_e) {
+        return;
+      }
+      if (frame.type === 'HELLO_CHALLENGE') return wsAuthResponse(frame);
+      if (frame.type === 'AUTH_OK') {
+        wsState.connected = true;
+        wsState.everConnected = true;
+        wsState.attempts = 0;
+        log(`ws авторизован: ${frame.workerAddress}`);
+        return finish(true);
+      }
+      if (frame.type === 'AUTH_FAIL') {
+        log(`ws handshake отклонён: ${frame.error}`);
+        wsState.connected = false;
+        try { ws.close(); } catch (_e) { /* уже закрыт */ }
+        return finish(false);
+      }
+      if (frame.type === 'TASK') return onWsTask(frame.task || {});
+      return undefined;
+    });
+
+    ws.addEventListener('close', () => {
+      const wasConnected = wsState.connected;
+      wsState.connected = false;
+      if (wsState.ws === ws) wsState.ws = null;
+      if (wsState.closedByUs) return finish(false);
+      finish(false);
+      /* Реконнект только если сокет уже работал: иначе это первая попытка,
+       * и решать ей — вызывающему коду (он может уйти на опрос). */
+      if (wasConnected) scheduleReconnect();
+    });
+
+    ws.addEventListener('error', () => {
+      /* Ошибка всегда сопровождается close — там и разбор. Здесь молчим,
+       * чтобы не дублировать сообщение в лог. */
+    });
+  });
+}
+
+/* 1s → 2s → 4s → 8s → 15s (потолок) + джиттер. Джиттер обязателен: без него
+ * после падения сервера все воркеры придут на реконнект в одну секунду и
+ * дадут залповую нагрузку на 1 CPU. */
+function scheduleReconnect() {
+  if (wsState.closedByUs) return;
+  const base = Math.min(1000 * Math.pow(2, wsState.attempts), WS_RECONNECT_MAX_MS);
+  wsState.attempts += 1;
+  const jitter = Math.floor(Math.random() * 400);
+  const delay = base + jitter;
+  log(`ws переподключение через ${(delay / 1000).toFixed(1)} с (попытка ${wsState.attempts})`);
+  setTimeout(async () => {
+    if (wsState.closedByUs) return;
+    const ok = await connectWs();
+    if (!ok) scheduleReconnect();
+  }, delay);
+}
+
+function wsClose() {
+  wsState.closedByUs = true;
+  if (wsState.ws) {
+    try { wsState.ws.close(); } catch (_e) { /* уже закрыт */ }
+  }
+}
+
 /* ---------- Основной цикл ---------- */
 let submitted = 0;
 let running = true;
@@ -464,61 +784,26 @@ async function pollOnce() {
 
   const task = r.data.task;
 
-  /* Расшифровка на локальной машине. Промпт не покидает этот процесс в
-   * открытом виде: он пришёл зашифрованным и расшифрован здесь. */
-  let prompt;
-  try {
-    prompt = task.encryptedPayload && task.sessionKey
-      ? decryptTask(task.encryptedPayload, task.sessionKey)
-      : String(task.prompt || '');
-  } catch (e) {
-    log(`задача ${task.taskId} не расшифрована (${e.message}) — пропускаю`);
-    /* Задачу не отправляем: без промпта результат был бы выдуман. Сервер
-     * сам пометит её истёкшей по таймауту. */
-    return;
-  }
-  log(`задача ${task.taskId}: «${prompt.slice(0, 60)}»`);
-
-  const started = Date.now();
-  /* Пульс идёт вдвое чаще окна присутствия: один пропущенный запрос не
-   * должен гасить воркера. Клиренс — в finally, иначе таймер пережил бы задачу. */
-  const pulse = setInterval(heartbeat, 7000);
-  let gen;
-  try {
-    /* task.model — имя модели, которую выбрал клиент из каталога. Именно оно
-     * уходит в бэкенд; MODEL остаётся только fallback'ом для совместимости
-     * со старым сервером, который поле model не заполнял. */
-    gen = await generate(prompt, task.model || null);
-  } finally {
-    clearInterval(pulse);
-  }
-  const took = Date.now() - started;
+  /* Расшифровка и генерация — в общей runTask: тот же код исполняет задачу,
+   * пришедшую кадром по WS. Разные ветки здесь означали бы два поведения,
+   * которые расходятся ровно в самом редком случае. */
+  const out = await runTask(task);
+  if (!out.ok) return;
+  const { gen, took } = out;
 
   const sub = await api('POST', '/worker/submit', {
-    taskId: task.taskId,
+    taskId: out.taskId,
     workerAddress: WORKER,
-    /* Ответ уходит шифротекстом, когда есть ключ сессии. Поле response
-     * остаётся для совместимости со старым сервером. */
-    ...(task.sessionKey
-      ? { encryptedResponse: encryptResult(gen.response, task.sessionKey) }
-      : { response: gen.response }),
+    ...out.payload,
     usage: gen.usage,
-    /* Источник объявляется честно: сервер по нему отличает настоящий ответ
-     * модели от шаблона этого же воркера (model_unavailable). */
     source: gen.source,
-    /* Причина заглушки, если она есть: сервер прокидывает её в PWA, и
-     * человек видит «запустите Ollama», а не «модель не загружена». */
     ...(gen.error ? { error: gen.error } : {}),
-    // model обязателен: сервер отклоняет результат без него.
-    /* Объявляем ту модель, которую бэкенд реально запустил (gen.model), а не
-     * ту, что просили: сервер по этому полю пишет отчёт, и расхождение
-     * «просили 7b, считали 1.5b» должно быть видно, а не замазано. */
     model: gen.model || MODEL,
   });
 
   if (sub.ok) {
     submitted += 1;
-    log(`отдал ${task.taskId} (${gen.source}, ${gen.usage.total_tokens} ток., ${took} мс) — всего ${submitted}`);
+    log(`отдал ${out.taskId} (${gen.source}, ${gen.usage.total_tokens} ток., ${took} мс) — всего ${submitted}`);
   } else {
     log(`отправка отклонена: HTTP ${sub.status} ${JSON.stringify(sub.data).slice(0, 160)}`);
   }
@@ -551,9 +836,43 @@ async function main() {
   log('опросите /health на сервере: llm_mode должен стать worker');
   log('Ctrl+C — остановить');
 
-  process.on('SIGINT', () => { running = false; log('остановлен'); process.exit(0); });
+  process.on('SIGINT', () => {
+    running = false;
+    wsClose();
+    log('остановлен');
+    process.exit(0);
+  });
+
+  /* --- Транспорт: сначала WS, опрос — отступление ---
+   *
+   * Порядок именно такой. WS даёт доставку без задержки в секунду и
+   * входящий канал, поэтому он предпочтителен. Но он может не подняться
+   * по десятку причин (старый сервер, прокси, firewall, Node без
+   * глобального WebSocket), и ни одна из них не должна оставить человека
+   * без работающего воркера. Поэтому попытка ограничена бюджетом времени,
+   * а любой отказ — это переход на опрос, а не выход. */
+  let usingWs = false;
+  if (!wsSupported()) {
+    log('в этой версии Node нет глобального WebSocket — работаю на опросе');
+  } else {
+    log(`подключаюсь по ws: ${wsUrl()}`);
+    usingWs = await connectWs();
+    if (usingWs) {
+      log('ws активен — задачи будут приходить сразу, без опроса');
+    } else {
+      log('ws не поднялся — работаю на опросе (совместимо со старым сервером)');
+    }
+  }
 
   while (running) {
+    /* Пока сокет жив, опрос не нужен: задача приходит кадром. Опрашиваем
+     * только когда WS нет — включая случай, когда он отвалился и реконнект
+     * ещё не прошёл. Без этого условия воркер забирал бы одну и ту же
+     * задачу дважды: кадром и опросом. */
+    if (wsState.connected) {
+      await sleep(POLL_MS);
+      continue;
+    }
     try {
       await pollOnce();
     } catch (e) {
@@ -567,6 +886,9 @@ async function main() {
  * без запуска воркера. */
 module.exports = {
   normalizeModelName, resolveOllamaModel, ollamaTags, workerModelReport, generate, main,
+  /* Экспорт транспорта — для тестов handshake без запуска цикла опроса. */
+  connectWs, signAuth, ed25519FromSeed, loadOrCreateSeed, wsState, wsUrl, wsSupported,
+  runTask, AUTH_PREFIX,
 };
 
 if (require.main === module) {

@@ -6681,6 +6681,289 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
         && /не установлено ни одной/.test(pwaSrc42));
   }
 
+  /* ===== 43. Входящий WS-мультиплексинг и утилизация токена =====
+   *
+   * Проверяется не «модуль загружается», а поведение:
+   *   — handshake отвергает подпись чужим ключом и без подписи;
+   *   — подключённый воркер получает задачу кадром, а не через poll;
+   *   — без сокета задача по-прежнему уходит в очередь (совместимость);
+   *   — ставка TAR_UTILITY = 2%, а инвариант остаётся delta: 0.
+   *
+   * Отдельно проверяется TOFU: второй ключ на тот же адрес отвергается.
+   * Без этой проверки handshake доказывал бы только «кто-то знает ключ». */
+  section('43. WS-мультиплексинг воркеров и утилизация токена (v2.17.0)');
+  {
+    const wsInboundMod = require('./ws-inbound');
+
+    /* 43.1–43.2 — модуль и его защитные константы. Значения проверяются
+     * как факт конфигурации: OOM-защита бессмысленна, если maxPayload
+     * окажется 100 MB. */
+    ok('43.1 модуль ws-inbound экспортирует фабрику',
+      typeof wsInboundMod.createWsInbound === 'function');
+    ok('43.2 лимит кадра 1 MB и пинг 15 с',
+      wsInboundMod.MAX_PAYLOAD_BYTES === 1024 * 1024
+        && wsInboundMod.PING_INTERVAL_MS === 15000
+        && wsInboundMod.PONG_DEAD_MS === 35000,
+      {
+        max: wsInboundMod.MAX_PAYLOAD_BYTES,
+        ping: wsInboundMod.PING_INTERVAL_MS,
+        dead: wsInboundMod.PONG_DEAD_MS,
+      });
+
+    /* 43.3–43.6 — живой handshake против основного сервера приёмки.
+     * Подпись собирается тем же кодом, что и в воркере: иначе тест проверял
+     * бы свою реализацию, а не совместимость с воркером. */
+    const workerMod = require('./worker-demo');
+    const crypto43 = require('crypto');
+
+    const wsBase43 = BASE.replace(/^http:/i, 'ws:').replace(/^https:/i, 'wss:');
+    const wsUrl43 = wsBase43 + '/p2p/worker';
+
+    /* Ожидание кадра с таймаутом. Универсальный помощник: без него каждый
+     * шаг handshake писал бы свой обработчик onmessage и путался в них. */
+    const waitFrame = (ws, want, timeoutMs = 5000) => new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        ws.removeEventListener('message', onMsg);
+        resolve(null);
+      }, timeoutMs);
+      const onMsg = (ev) => {
+        let f = null;
+        try { f = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); } catch (_e) { return; }
+        if (!f || f.type !== want) return;
+        clearTimeout(timer);
+        ws.removeEventListener('message', onMsg);
+        resolve(f);
+      };
+      ws.addEventListener('message', onMsg);
+    });
+
+    if (typeof WebSocket !== 'function') {
+      /* Глобального WebSocket нет (старый Node) — проверки handshake не
+       * выполняются. Это SKIP, а не «пройдено»: зелёная галочка на
+       * непроверенной защите хуже отсутствия проверки. */
+      skip('43.3–43.8 WS handshake', 'в этой версии Node нет глобального WebSocket');
+    } else {
+      const w43 = runAddress('a43');
+      await api('/node', 'POST', { address: w43, stake: 30000, reputation: 0.8 });
+
+      /* --- 43.3: handshake с ПРАВИЛЬНОЙ подписью --- */
+      const seed43 = crypto43.randomBytes(32);
+      const keys43 = workerMod.ed25519FromSeed(seed43);
+      const sock43 = new WebSocket(wsUrl43);
+      const challenge43 = await waitFrame(sock43, 'HELLO_CHALLENGE', 6000);
+      ok('43.3 сервер присылает HELLO_CHALLENGE с nonce',
+        Boolean(challenge43 && typeof challenge43.nonce === 'string' && challenge43.nonce.length >= 32),
+        challenge43 ? { len: challenge43.nonce.length } : 'нет кадра');
+
+      if (!challenge43) {
+        try { sock43.close(); } catch (_e) { /* уже закрыт */ }
+      } else {
+        const ts43 = Date.now();
+        const payload43 = `TARNET_WS_AUTH:${challenge43.nonce}:${w43}:${ts43}`;
+        const sig43 = crypto43.sign(null, Buffer.from(payload43, 'utf8'), keys43.priv).toString('base64');
+        sock43.send(JSON.stringify({
+          type: 'AUTH_RESPONSE',
+          workerAddress: w43,
+          pubkey: keys43.pubHex,
+          signature: sig43,
+          timestamp: ts43,
+          model: 'test-model-43',
+          tier: 'base',
+        }));
+        const authOk43 = await waitFrame(sock43, 'AUTH_OK', 6000);
+        ok('43.4 подпись Ed25519 принята, воркер авторизован',
+          Boolean(authOk43 && authOk43.workerAddress === w43),
+          authOk43?.error || 'нет AUTH_OK');
+
+        /* 43.5 — реестр WS видит ровно этого воркера. */
+        const reg43 = await api('/worker/ws');
+        const listed43 = (reg43.body.workers || [])
+          .find((x) => String(x.workerAddress).toLowerCase() === w43.toLowerCase());
+        ok('43.5 подключённый воркер виден в /worker/ws',
+          Boolean(listed43) && reg43.body.total >= 1,
+          { total: reg43.body.total, model: listed43?.model });
+
+        /* 43.6 — задача уходит КАДРОМ. Это главная проверка транспорта:
+         * сам по себе AUTH_OK доказывает только авторизацию. */
+        const taskFrame43 = waitFrame(sock43, 'TASK', 10000);
+        const inf43 = api('/inference', 'POST', {
+          prompt: 'ws inbound delivery 43',
+          tier: 'base',
+          workerAddress: w43,
+        });
+        const got43 = await taskFrame43;
+        ok('43.6 задача доставлена кадром TASK, без опроса',
+          Boolean(got43 && got43.task && got43.task.taskId)
+            && typeof got43.task.encryptedPayload === 'string',
+          got43?.task ? { taskId: got43.task.taskId } : 'кадр не пришёл');
+
+        /* Задачу надо закрыть, иначе /inference провисит до таймаута и
+         * испортит время прогона. Отвечаем минимальным валидным RESULT. */
+        if (got43 && got43.task) {
+          const t43 = got43.task;
+          const key43 = Buffer.from(t43.sessionKey, 'base64');
+          const iv43 = crypto43.randomBytes(12);
+          const ci43 = crypto43.createCipheriv('aes-256-gcm', key43, iv43);
+          const ct43 = Buffer.concat([ci43.update('ответ по ws', 'utf8'), ci43.final()]);
+          const enc43 = `enc:v1:${iv43.toString('base64')}:${ci43.getAuthTag().toString('base64')}:${ct43.toString('base64')}`;
+          sock43.send(JSON.stringify({
+            type: 'RESULT',
+            taskId: t43.taskId,
+            workerAddress: w43,
+            encryptedResponse: enc43,
+            model: 'test-model-43',
+            source: 'live_llm',
+            tokensGenerated: 4,
+            usage: { total_tokens: 4 },
+          }));
+        }
+        await inf43.catch(() => null);
+
+        /* --- 43.7: TOFU. Второй ключ на тот же адрес обязан быть отвергнут.
+         * Это единственное, что мешает подключиться «за» чужой адрес. --- */
+        const other43 = workerMod.ed25519FromSeed(crypto43.randomBytes(32));
+        const sock43b = new WebSocket(wsUrl43);
+        const ch43b = await waitFrame(sock43b, 'HELLO_CHALLENGE', 6000);
+        let tofu43 = null;
+        if (ch43b) {
+          const ts43b = Date.now();
+          const pl43b = `TARNET_WS_AUTH:${ch43b.nonce}:${w43}:${ts43b}`;
+          sock43b.send(JSON.stringify({
+            type: 'AUTH_RESPONSE',
+            workerAddress: w43,
+            pubkey: other43.pubHex,
+            signature: crypto43.sign(null, Buffer.from(pl43b, 'utf8'), other43.priv).toString('base64'),
+            timestamp: ts43b,
+          }));
+          tofu43 = await waitFrame(sock43b, 'AUTH_FAIL', 6000);
+        }
+        ok('43.7 второй ключ на тот же адрес отвергнут (TOFU)',
+          Boolean(tofu43 && tofu43.error === 'ADDRESS_KEY_MISMATCH'),
+          tofu43?.error || 'нет AUTH_FAIL');
+        try { sock43b.close(); } catch (_e) { /* уже закрыт */ }
+
+        /* --- 43.8: подпись чужим ключом не проходит --- */
+        const sock43c = new WebSocket(wsUrl43);
+        const ch43c = await waitFrame(sock43c, 'HELLO_CHALLENGE', 6000);
+        let badSig43 = null;
+        if (ch43c) {
+          const ts43c = Date.now();
+          /* Подписываем правильный payload, но НЕ тем ключом, который
+           * объявляем: именно так выглядит попытка выдать себя за другого. */
+          const forged = workerMod.ed25519FromSeed(crypto43.randomBytes(32));
+          const pl43c = `TARNET_WS_AUTH:${ch43c.nonce}:${w43}:${ts43c}`;
+          sock43c.send(JSON.stringify({
+            type: 'AUTH_RESPONSE',
+            workerAddress: w43,
+            pubkey: keys43.pubHex,
+            signature: crypto43.sign(null, Buffer.from(pl43c + 'x', 'utf8'), forged.priv).toString('base64'),
+            timestamp: ts43c,
+          }));
+          badSig43 = await waitFrame(sock43c, 'AUTH_FAIL', 6000);
+        }
+        ok('43.8 подпись чужим ключом отвергнута',
+          Boolean(badSig43 && badSig43.error === 'BAD_SIGNATURE'),
+          badSig43?.error || 'нет AUTH_FAIL');
+        try { sock43c.close(); } catch (_e) { /* уже закрыт */ }
+
+        try { sock43.close(); } catch (_e) { /* уже закрыт */ }
+        /* Дать серверу снять сокет из реестра до следующих проверок. */
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+  }
+
+  /* ===== 43.9–43.13: утилизация токена =====
+   * Проверяется ставка и инвариант, а не наличие поля: «поле есть» ничего
+   * не доказывает. Сравниваются две работы с ОДИНАКОВЫМ входом: разница
+   * может быть только в ставке. */
+  {
+    const wU = runAddress('b43');
+    await api('/node', 'POST', { address: wU, stake: 30000, reputation: 0.8 });
+
+    /* Клиент с балансом: утилизация списывает с его счёта. Без баланса
+     * debit вернёт insufficient_balance, и скидка не проявится в леджере. */
+    const clientU = runAddress('c43');
+    await api('/node', 'POST', { address: clientU, stake: 0, reputation: 0 });
+    const faucetU = await api('/faucet/claim', 'POST', { address: clientU });
+    const faucetOkU = faucetU.status === 200 || faucetU.status === 201;
+
+    /* Объём подобран под баланс краника, а не «побольше».
+     *
+     * Арифметика: краник даёт 0.01 TAR, а gross считается как
+     * tokens × $0.20 / 1e6 / 20. При 2 000 000 токенов gross = 0.02 —
+     * debit вернул бы insufficient_balance, и «утилизация» прошла бы
+     * БЕЗ движения денег. Тест на ставку при этом остался бы зелёным,
+     * потому что breakdown считается независимо от успеха списания.
+     * Поэтому 500 000 токенов: gross = 0.005, баланса хватает с запасом,
+     * и проверка 43.10b ниже требует именно фактического списания. */
+    const TOK = 500000;
+    const baseWork = await api('/work', 'POST', {
+      workerAddress: wU, tokens: TOK, tier: 'base',
+      response: 'utilization control ' + RUN,
+    });
+    ok('43.9 контрольная работа по обычной ставке принята',
+      baseWork.status === 201, baseWork.status);
+
+    let utilWork = { status: 0, body: null };
+    if (faucetOkU) {
+      utilWork = await api('/work', 'POST', {
+        workerAddress: wU, tokens: TOK, tier: 'base',
+        clientAddress: clientU,
+        paymentMethod: 'TAR',
+        paymentMode: 'TAR_UTILITY',
+        response: 'utilization control ' + RUN,
+      });
+    }
+    ok('43.10 работа с оплатой TAR_UTILITY принята',
+      faucetOkU ? utilWork.status === 201 : false,
+      faucetOkU ? utilWork.status : 'faucet не выдал баланс');
+
+    /* 43.10b — деньги РЕАЛЬНО ушли с баланса клиента.
+     *
+     * Без этой проверки всё остальное ничего не доказывает: ставка 2%
+     * считается и при неудачном списании, так что «утилизация» могла бы
+     * существовать только в ответе API. Здесь требуется charged: true —
+     * то есть строка ledger_txs действительно появилась. */
+    ok('43.10b оплата TAR_UTILITY реально списала баланс клиента',
+      Boolean(utilWork.body && utilWork.body.payment && utilWork.body.payment.charged === true),
+      utilWork.body ? utilWork.body.payment : 'нет ответа');
+
+    if (baseWork.status === 201 && utilWork.status === 201) {
+      const b = baseWork.body.breakdown;
+      const u = utilWork.body.breakdown;
+      /* Ставка: burn+gross. У обычной работы это 2.5%, у утилизации 1%. */
+      const rateOf = (x) => (x.burnTar + x.treasuryTar) / x.feeGrossTar;
+      ok('43.11 при TAR_UTILITY комиссия 2%, а не 5%',
+        Math.abs(rateOf(b) - 0.05) < 1e-6 && Math.abs(rateOf(u) - 0.02) < 1e-6,
+        { обычная: Number(rateOf(b).toFixed(6)), утилизация: Number(rateOf(u).toFixed(6)) });
+      ok('43.12 при утилизации воркер получает больше (доля выросла)',
+        u.feeRewardTar > b.feeRewardTar,
+        { обычная: b.feeRewardTar, утилизация: u.feeRewardTar });
+      ok('43.13 инвариант сохранения держится в обоих режимах',
+        Math.abs(baseWork.body.conservation.delta) < 1e-6
+          && baseWork.body.conservation.holds === true
+          && Math.abs(utilWork.body.conservation.delta) < 1e-6
+          && utilWork.body.conservation.holds === true,
+        {
+          обычная: baseWork.body.conservation,
+          утилизация: utilWork.body.conservation,
+        });
+    }
+
+    /* 43.14 — метрика в /summary читает ledger_txs, а не чеки. Проверяем
+     * факт появления строки kind='utilization' через публичный счётчик. */
+    const sumU = await api('/summary');
+    ok('43.14 /summary отдаёт totalUtilizedTar и считает строки утилизации',
+      typeof sumU.body.totalUtilizedTar === 'number'
+        && typeof sumU.body.totalUtilizedCount === 'number'
+        && (faucetOkU ? sumU.body.totalUtilizedCount >= 1 : true),
+      {
+        totalUtilizedTar: sumU.body.totalUtilizedTar,
+        totalUtilizedCount: sumU.body.totalUtilizedCount,
+      });
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

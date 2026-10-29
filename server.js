@@ -40,6 +40,10 @@ const knowledgeLoop = require('./knowledge-loop');
  * Модуль чистый (без БД): сервер передаёт ему снимок лимитов и каталог
  * инструментов, а запись денег остаётся здесь, рядом с debit/credit. */
 const agentRuntime = require('./agent-runtime');
+/* Волна 5: входящий WebSocket-мультиплексинг воркеров.
+ * Модуль не знает про БД и Express: сервер передаёт ему get/run/all и
+ * обработчик результата. Так не возникает циклического require. */
+const { createWsInbound } = require('./ws-inbound');
 
 // ===== Configuration =====
 const PORT = process.env.PORT || 3001;
@@ -386,6 +390,19 @@ CREATE TABLE IF NOT EXISTS worker_presence (
   polls INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_worker_presence_seen ON worker_presence (lastSeenAt);
+/* Привязка ed25519-ключа к адресу воркера для входящего WS (TOFU).
+ * Без этой таблицы handshake доказывал бы только «кто-то знает какой-то
+ * ключ»: второй человек с тем же адресом подключился бы «за» первого и
+ * получал его задачи. Здесь первый успешный handshake фиксирует ключ, и
+ * смена ключа для того же адреса отвергается (ADDRESS_KEY_MISMATCH).
+ * Это именно TOFU, а не вывод адреса из ключа: у старых воркеров адрес —
+ * randomBytes(20), пары у него не было никогда. */
+CREATE TABLE IF NOT EXISTS ws_worker_auth (
+  workerAddress TEXT PRIMARY KEY,
+  pubkeyHex TEXT NOT NULL,
+  firstSeenAt INTEGER NOT NULL,
+  lastSeenAt INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_receipts_worker ON work_receipts (workerAddress, seq);
 CREATE INDEX IF NOT EXISTS idx_receipts_epoch ON work_receipts (epoch);
 `);
@@ -1934,7 +1951,7 @@ function lookupActionId(id) {
 /* ===== Ядро начисления =====
  * Единственный путь, которым в системе появляются токены. Никаких условий
  * «если повезло»: при γ=1 начисление всегда, при γ=0 — никогда. */
-function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, response, actionId, flush = false, demo = false }) {
+function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, response, actionId, flush = false, demo = false, paymentMode = null }) {
   const t = normalizeTier(tier);
   if (!t) {
     const err = new Error(`tier must be one of ${TIERS.join('|')}`);
@@ -2112,6 +2129,10 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
     epochEmissionTar: emissionTar,
     omegaValue, denominator, unclaimed,
     mode: CONFIG.REWARD_MODE,
+    /* Способ оплаты доходит до feeStream: от него зависит ставка комиссии
+     * (5% обычная, 2% при оплате из внутреннего баланса TAR). Без этой
+     * строки флаг оставался бы принятым и проигнорированным. */
+    paymentMode,
   });
   const conservation = RewardEngine.checkConservation(settled);
 
@@ -2179,8 +2200,21 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
     // 4.5) Оплата потребления: если запрос пришёл от известного клиента,
     //      gross списывается с его баланса. Без этой строки весь поток был
     //      фиктивным: начисления создавались из ничего.
+    /* Вид списания различает ДВА РАЗНЫХ события в жизни токена.
+     *
+     *   'spend'       — клиент оплатил работу по обычной ставке 5%.
+     *   'utilization' — оплата из внутреннего баланса TAR по ставке 2%.
+     *
+     * Разделять обязательно: утилизация — это показатель того, что токен
+     * работает внутри контура, а не выводится. Смешав оба вида в 'spend',
+     * метрика totalUtilizedTar считала бы любой платёж утилизацией.
+     *
+     * Плата за разделение: читатели 'spend' обязаны видеть оба вида, иначе
+     * траты в /cross-compute обнулятся у тех, кто платит TAR_UTILITY.
+     * Читатель обновлён в том же коммите. */
+    const spendKind = settled.fee.paymentMode === 'TAR_UTILITY' ? 'utilization' : 'spend';
     const payment = clientAddress
-      ? debit(clientAddress, settled.fee.gross, 'spend', id, TREASURY_ADDRESS)
+      ? debit(clientAddress, settled.fee.gross, spendKind, id, TREASURY_ADDRESS)
       : { charged: false, reason: 'no_client' };
 
     if (settled.workerTotal > 0) credit(workerAddress, settled.workerTotal, 'payout', id, TREASURY_ADDRESS);
@@ -2864,8 +2898,12 @@ app.get('/cross-compute/:address', (req, res) => {
    * 'spend'). Без этого слагаемого виджет показывал бы траты только за
    * облако и завышал сальдо ровно на комиссию сети. */
   const networkSpend = get(
+    /* Оба вида списания: 'spend' (обычная оплата) и 'utilization' (оплата
+     * из баланса TAR по льготной ставке). Учитывать только 'spend' значило
+     * бы показывать ноль трат клиенту, который платит токеном — то есть
+     * ровно тому, ради кого утилизация и вводилась. */
     `SELECT COALESCE(SUM(amountTar), 0) AS s, COUNT(*) AS n
-       FROM ledger_txs WHERE fromAddress = ? AND kind = 'spend'`, [address]);
+       FROM ledger_txs WHERE fromAddress = ? AND kind IN ('spend', 'utilization')`, [address]);
 
   const earnedTar = round(Number(earned.s));
   const cloudTar = round(Number(spent.s));
@@ -4651,6 +4689,14 @@ function handleWork(req, res) {
        * до ядра: повтор того же actionId — идемпотентный возврат существующего
        * состояния, а не второе начисление. */
       actionId: body.actionId,
+      /* Ставка комиссии зависит от способа оплаты: 5% обычная, 2% при
+       * оплате из внутреннего баланса TAR. Условие — названный клиент:
+       * без clientAddress списывать не с кого, и льготная ставка была бы
+       * скидкой в никуда. */
+      paymentMode: body.clientAddress
+        && String(body.paymentMethod || 'TAR').toUpperCase() === 'TAR'
+        && String(body.paymentMode || '').toUpperCase() === 'TAR_UTILITY'
+        ? 'TAR_UTILITY' : null,
     });
 
     /* Повтор с тем же ключом. 200, а не 201: нового ресурса не создано.
@@ -5427,6 +5473,22 @@ app.get('/summary', (_req, res) => {
     totalBurnedTier6Tar: burnTier6Tar,
     totalTreasuryTar: Number(Number(t.treasury).toFixed(6)),
     totalLoraRoyaltyTar: Number(Number(t.royalty).toFixed(6)),
+    /* Утилизация токена: сколько TAR потрачено ВНУТРИ контура.
+     *
+     * Источник — ledger_txs, а не work_receipts: утилизация это движение с
+     * баланса клиента (kind='utilization'), и в чеке её нет как отдельного
+     * поля. Считать по чекам значило бы показывать ноль при живом механизме.
+     *
+     * Метрика нужна как доказательство компонента 7: до неё «утилизация»
+     * была словом в манифесте, grep по коду давал 0 вхождений. */
+    totalUtilizedTar: Number(
+      Number(get(
+        `SELECT COALESCE(SUM(amountTar), 0) AS s FROM ledger_txs WHERE kind = 'utilization'`,
+      ).s).toFixed(6),
+    ),
+    totalUtilizedCount: Number(get(
+      `SELECT COUNT(*) AS c FROM ledger_txs WHERE kind = 'utilization'`,
+    ).c),
     burnAddressBalanceTar: burnAddressTar,
     treasuryBalanceTar: Number((treas?.balanceTar ?? 0).toFixed(6)),
     /* Сверка вместо надежды: сумма двух источников обязана совпасть с
@@ -5539,6 +5601,37 @@ function decryptWithKey(blob, key) {
 
 /* Публикация задачи и ожидание результата. Крутим setTimeout, а не блокирующий
  * цикл: пока /inference ждёт, сервер обязан обслуживать /worker/poll. */
+/* ===== Входящий WS-транспорт (v2.17.0) =====
+ *
+ * Экземпляр один на процесс. Создаётся здесь, потому что ниже его зовёт
+ * enqueueWorkerTask, а функция объявлена выше своих использований. */
+const wsInbound = createWsInbound({
+  get, run, all,
+  log: (msg) => console.log(msg),
+  /* Результат из WS разбирается ТОЙ ЖЕ функцией, что и HTTP /worker/submit:
+   * иначе подписавшийся воркер получал бы более мягкие правила (без проверки
+   * модели, без TTL) — см. комментарий у ingestWorkerResult. */
+  onResult: (workerAddress, frame) => {
+    const body = {
+      taskId: frame.taskId,
+      workerAddress,
+      response: typeof frame.response === 'string' ? frame.response : null,
+      encryptedResponse: typeof frame.encryptedResponse === 'string' ? frame.encryptedResponse : null,
+      model: frame.model,
+      usage: frame.usage || null,
+      tokensGenerated: frame.tokensGenerated,
+      source: frame.source,
+      error: frame.error,
+    };
+    const out = ingestWorkerResult(body);
+    if (out.status !== 200) {
+      /* Не роняем сокет: один плохой результат не повод рвать канал, по
+       * которому пойдут следующие задачи. Воркер получит ERROR и решит сам. */
+      console.log(`ws: результат ${frame.taskId} отклонён (${out.status}) ${JSON.stringify(out.body)}`);
+    }
+  },
+});
+
 function enqueueWorkerTask({ prompt, model, tier }) {
   const taskId = 'wt_' + crypto.randomBytes(12).toString('hex');
   const now = Date.now();
@@ -5549,6 +5642,45 @@ function enqueueWorkerTask({ prompt, model, tier }) {
      VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
     [taskId, encryptWithKey(prompt, sessionKey), model || null, tier || null, now, now + WORKER_TASK_TTL_MS],
   );
+
+  /* --- Гибридная отправка: WS, если есть кому, иначе poll ---
+   *
+   * Задача уже лежит в worker_tasks строкой 'pending' — это и есть путь
+   * отступления. Дальше пробуем отдать её сразу по сокету.
+   *
+   * Порядок принципиален: сначала атомарный claim, потом отправка. Если
+   * отправить и оставить 'pending', воркер мог бы получить её дважды —
+   * кадром и ближайшим /worker/poll — и посчитать дважды. Между UPDATE и
+   * send есть окно, но оно безопасно: строка уже 'claimed', и poll её не
+   * увидит; если send упадёт, мы вернём 'pending' и полл подхватит. */
+  const wsAddr = wsInbound.pickLeastBusy(tier);
+  if (wsAddr) {
+    const claimed = run(
+      `UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?
+       WHERE taskId = ? AND status = 'pending'`,
+      [now, wsAddr, taskId],
+    );
+    if (claimed && Number(claimed.changes) === 1) {
+      const sent = wsInbound.sendTask(wsAddr, {
+        taskId,
+        encryptedPayload: encryptWithKey(prompt, sessionKey),
+        sessionKey: sessionKey.toString('base64'),
+        encryption: 'aes-256-gcm',
+        model: model || null,
+        tier: tier || null,
+        createdAt: now,
+        expiresAt: now + WORKER_TASK_TTL_MS,
+        deadlineMs: WORKER_TASK_TTL_MS,
+      });
+      if (!sent) {
+        /* Сокет закрылся между выбором и отправкой. Возвращаем строку в
+         * очередь — иначе задача провисит 'claimed' до TTL и упадёт по
+         * таймауту, хотя рабочий воркер есть. */
+        run(`UPDATE worker_tasks SET status = 'pending', claimedAt = NULL, workerAddress = NULL
+             WHERE taskId = ? AND status = 'claimed'`, [taskId]);
+      }
+    }
+  }
 
   return new Promise((resolve, reject) => {
     const started = Date.now();
@@ -5725,35 +5857,42 @@ app.get('/worker/poll', (req, res) => {
   });
 });
 
-/* Воркер присылает результат. Токены считаются по его usage, а не по вере
- * на слово: tokensGenerated обязателен и должен быть положительным. */
-app.post('/worker/submit', (req, res) => {
-  const body = req.body || {};
+/* Разбор результата воркера — ОДНА функция на два транспорта.
+ *
+ * Здесь был соблазн оставить WS-путь отдельным: он «свой», кадр уже прошёл
+ * handshake, зачем перепроверять. Ровно так один транспорт становится мягче
+ * другого, и подписавшийся воркер получает право прислать задачу без модели
+ * или после истечения TTL. Проверки обязаны быть одинаковыми, поэтому
+ * HTTP-эндпоинт ниже стал тонкой обёрткой, а вся логика — здесь.
+ *
+ * Возвращает { status, body } — HTTP-код и тело для /worker/submit; WS-путь
+ * игнорирует status и просто отвечает кадром ACK/ERROR. */
+function ingestWorkerResult(body) {
   const taskId = typeof body.taskId === 'string' ? body.taskId : null;
   const workerAddress = typeof body.workerAddress === 'string' ? body.workerAddress : null;
   const plainResponse = typeof body.response === 'string' ? body.response : null;
   const encryptedResponse = typeof body.encryptedResponse === 'string' ? body.encryptedResponse : null;
 
-  if (!taskId) return res.status(400).json({ error: 'taskId is required' });
-  if (!workerAddress) return res.status(400).json({ error: 'workerAddress is required' });
+  if (!taskId) return { status: 400, body: { error: 'taskId is required' } };
+  if (!workerAddress) return { status: 400, body: { error: 'workerAddress is required' } };
   if (!plainResponse && !encryptedResponse) {
-    return res.status(400).json({ error: 'response is required' });
+    return { status: 400, body: { error: 'response is required' } };
   }
   if (submitRateLimited(workerAddress)) {
-    return res.status(429).json({ error: 'Too many submissions — limit is 10 per minute' });
+    return { status: 429, body: { error: 'Too many submissions — limit is 10 per minute' } };
   }
 
   const row = get('SELECT * FROM worker_tasks WHERE taskId = ?', [taskId]);
-  if (!row) return res.status(404).json({ error: 'Unknown taskId' });
-  if (row.status === 'done') return res.status(409).json({ error: 'Task already submitted', taskId });
+  if (!row) return { status: 404, body: { error: 'Unknown taskId' } };
+  if (row.status === 'done') return { status: 409, body: { error: 'Task already submitted', taskId } };
   if (Date.now() > row.expiresAt) {
     run(`UPDATE worker_tasks SET status = 'expired' WHERE taskId = ?`, [taskId]);
-    return res.status(410).json({ error: 'Task expired', taskId });
+    return { status: 410, body: { error: 'Task expired', taskId } };
   }
   /* Воркер обязан объявить модель: иначе в /health нечего показать, а в
    * отчёте нечем объяснить, откуда взялся ответ. */
   if (typeof body.model !== 'string' || !body.model.length) {
-    return res.status(400).json({ error: 'model is required — worker must declare the model it ran' });
+    return { status: 400, body: { error: 'model is required — worker must declare the model it ran' } };
   }
 
   /* Расшифровка ответа. Если воркер прислал шифротекст — он обязан сойтись:
@@ -5763,11 +5902,11 @@ app.post('/worker/submit', (req, res) => {
   if (encryptedResponse) {
     const key = workerTaskKeys.get(taskId);
     if (!key) {
-      return res.status(409).json({ error: 'Session key expired — task must be requeued', taskId });
+      return { status: 409, body: { error: 'Session key expired — task must be requeued', taskId } };
     }
     const decrypted = decryptWithKey(encryptedResponse, key);
     if (!decrypted || !decrypted.length) {
-      return res.status(400).json({ error: 'encryptedResponse failed to decrypt', taskId });
+      return { status: 400, body: { error: 'encryptedResponse failed to decrypt', taskId } };
     }
     /* В БД кладём ШИФРОТЕКСТ, а не расшифрованный текст: иначе промпт
      * вернулся бы на диск открытым через ответ. Расшифрует его читатель
@@ -5795,7 +5934,14 @@ app.post('/worker/submit', (req, res) => {
   /* Ключ НЕ удаляем здесь: его ещё нужен читателю, чтобы расшифровать ответ
    * при выдаче клиенту. Удаление — в enqueueWorkerTask после расшифровки. */
 
-  res.json({ taskId, accepted: true, tokensGenerated: tokens, workerAddress });
+  return { status: 200, body: { taskId, accepted: true, tokensGenerated: tokens, workerAddress } };
+}
+
+/* Воркер присылает результат. Токены считаются по его usage, а не по вере
+ * на слово: tokensGenerated обязателен и должен быть положительным. */
+app.post('/worker/submit', (req, res) => {
+  const { status, body } = ingestWorkerResult(req.body || {});
+  res.status(status).json(body);
 });
 
 /* Состояние очереди для наблюдаемости. */
@@ -5831,6 +5977,13 @@ app.get('/worker/status', (_req, res) => {
         ? null : Boolean(w.ollama_online),
     })),
   });
+});
+
+/* Состояние входящего WS. Отдельный эндпоинт, а не поле в /health: /health
+ * — про инвариант сохранения, и добавлять туда транспортные счётчики значило
+ * бы смешать две разные группы ответственности. */
+app.get('/worker/ws', (_req, res) => {
+  res.json(wsInbound.snapshot());
 });
 
 /* --- Inference Engine ---
@@ -6781,6 +6934,15 @@ async function runInference(req, res) {
   const outcome = recordWork({
     workerAddress, clientAddress, tokens: tokensGenerated,
     tier, adapterId, response: result.response || `[emulated:${tokensGenerated} tokens]`,
+    /* Оплата из внутреннего баланса TAR идёт по ставке 2% вместо 5%.
+     *
+     * Условие строгое: клиент назван, платёж проходит через его баланс, и
+     * он явно выбрал TAR_UTILITY. Без clientAddress списывать не с кого, и
+     * льготная ставка была бы скидкой в никуда — тогда режим не включается
+     * и остаётся обычная ставка. */
+    paymentMode: paymentMethod === 'TAR' && clientAddress
+      ? (String(body.paymentMode || '').toUpperCase() === 'TAR_UTILITY' ? 'TAR_UTILITY' : null)
+      : null,
   });
 
   /* В лог НЕ пишется текст ответа. Он содержит эхо промпта (шаблон стенда
@@ -7235,9 +7397,16 @@ if (require.main === module) {
     for (const r of routes) console.log(`   ${r}`);
     console.log(`⚙️  Reward mode: ${CONFIG.REWARD_MODE} | no randomness in payouts`);
     console.log(`📐 CWU κ: ${JSON.stringify(TIER_WEIGHTS)} | fee φ=${CONFIG.PROTOCOL_FEE_RATE} (burn ${CONFIG.BURN_RATE}, treasury ${CONFIG.TREASURY_RATE})`);
-    console.log(`🏔️  Emission: E0=${CONFIG.INITIAL_BLOCK_REWARD} TAR/epoch, halving every ${CONFIG.HALVING_PERIOD_EPOCHS} epochs`);
+    /* Формулировка «halving» врала о механике: в economics.js это
+     * непрерывная экспонента 50×2^(-epoch/365), а не ступень раз в период. */
+    console.log(`🏔️  Emission: E0=${CONFIG.INITIAL_BLOCK_REWARD} TAR/epoch, continuous decay 2^(-epoch/${CONFIG.HALVING_PERIOD_EPOCHS})`);
     console.log(`🔏 Receipt signatures: ed25519 (gateway ${GATEWAY.address.slice(0, 12)}…)`);
     console.log(`🔐 Wallet keys: aes-256-gcm at rest (${reencrypted} legacy keys migrated)`);
+    /* WS поднимается ПОСЛЕ того, как HTTP уже слушает: WebSocketServer с
+     * опцией server перехватывает upgrade-запросы того же сокета. Отдельный
+     * порт потребовал бы правки firewall и второго пункта в /health. */
+    wsInbound.attach(server);
+    console.log(`🔌 Worker WS inbound: ws://<host>:${PORT}/p2p/worker (maxPayload ${wsInbound.snapshot().max_payload_bytes} B, ping ${wsInbound.snapshot().ping_interval_ms} ms)`);
     console.log(`🖥️  Web UI: http://localhost:${PORT}/index.html`);
   });
 }
