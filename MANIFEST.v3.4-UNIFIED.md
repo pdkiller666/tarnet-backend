@@ -1,7 +1,7 @@
 # 🌐 TARNET & SYNAPSE (SWARM-GRID CORE)
 # ЕДИНЫЙ ЭТАЛОННЫЙ СТАНДАРТ АРХИТЕКТУРЫ, ЭКОНОМИКИ И МАНИФЕСТ ПРОЕКТА
 **Версия:** 3.4-UNIFIED (Consensus Standard: Gemini + Qwen + OpenClaw)  
-**Дата:** 22 октября 2026 г. (ревизия 24.10.2026) | **Сборка живого стенда:** `2.12.0-tier6-byok` (схема леджера — `2.1.0-dpouw`)  
+**Дата:** 22 октября 2026 г. (ревизия 24.10.2026) | **Сборка живого стенда:** `2.17.0-ws-utility` (схема леджера — `2.1.0-dpouw`), сверено 29.10.2026 14:41 MSK  
 **Ревизия:** 22.10.2026 — сверка с кодом (6 расхождений устранены, см. Приложение Б) · **24.10.2026** — полный аудит: 5 расхождений (3 занижали проект, 2 завышали), см. Приложение Б.6  
 **Основатель и Главный Архитектор:** Илья Тарасов  
 
@@ -71,13 +71,13 @@
 
 ---
 
-## 4. ДЕЙСТВУЮЩЕЕ ЯДРО ФАЗЫ 1 (`2.12.0-tier6-byok`) — ЧТО РЕАЛЬНО РАБОТАЕТ В КОДЕ СЕГОДНЯ
+## 4. ДЕЙСТВУЮЩЕЕ ЯДРО ФАЗЫ 1 (`2.17.0-ws-utility`) — ЧТО РЕАЛЬНО РАБОТАЕТ В КОДЕ СЕГОДНЯ
 
-Проверяется запросами к `localhost:3001` и прогоном `node test-dpouw.js --test` (**624 проверки, 0 провалов**) и `node test-mesh.js` (**25 проверок, 0 провалов**), итого **649**, снимок 24.10.2026. Флаг `--test` поднимает изолированный сервер на временной БД (`mktemp`) с отдельным `TARNET_SECRETS_DIR` и свободным портом: приёмка не требует запущенного стенда и не затрагивает его БД. Адреса и `actionId` уникальны по суффиксу `RUN`, поэтому прогон воспроизводим.
+Проверяется запросами к `localhost:3001` и прогоном `node test-dpouw.js --test` (**970 проверок, 0 провалов**) и `node test-mesh.js` (**25 проверок, 0 провалов**), итого **995**, снимок 29.10.2026. Флаг `--test` поднимает изолированный сервер на временной БД (`mktemp`) с отдельным `TARNET_SECRETS_DIR` и свободным портом: приёмка не требует запущенного стенда и не затрагивает его БД. Адреса и `actionId` уникальны по суффиксу `RUN`, поэтому прогон воспроизводим.
 
 ### 4.1. Матрица живой функциональности
 
-| Компонент | Статус `2.12.0-tier6-byok` | Проверка |
+| Компонент | Статус `2.17.0-ws-utility` | Проверка |
 | :--- | :--- | :--- |
 | Реестр узлов, стейк, репутация | ✅ работает | `GET /nodes`, `POST /node` |
 | Антимонопольный роутинг `√stake × reputation` | ✅ работает | `routingWeight` в `POST /inference` |
@@ -92,7 +92,9 @@
 | Батчинг коротких работ | ✅ порог генерации чека — `max(50, tokens_for_nonzero_payout(tier))`: `base` = 50, `nano` = 500, `expert` = 13. Работы ниже порога копятся в `pending_work` и объединяются в следующий чек | `POST /work` → `202 {queued, pending_work, threshold}`; чек несёт `batchedFrom[]` |
 | Идемпотентность `actionId` | ✅ работает: `POST /work` — ключ, а не подсказка. Повтор → `200 {duplicate:true, existing:'receipt'}` (тот же `seq`, без второго начисления); повтор короткой работы → `202 {reason:'already_pending'}`, накопление не удваивается; повтор работы из `batchedFrom` → тот чек, `batchedInto = seq`; тот же ключ на другого воркера → `409`; без `actionId` ключа нет — два одинаковых запроса дают две работы | `POST /work` → раздел 8.11 приёмки |
 | Soft delete адаптеров | ✅ `DELETE /adapter/:id` ставит `deleted_at`; физического удаления нет, история роялти цела, новые работы → 409 | `GET /adapters` → `deleted_at`; чек несёт `adapterDeletedAt` |
-| Реальный LLM-инференс | ⚠️ **не активен**: `llm_mode: deterministic_fallback`, `active_workers: 0`. Механика режима `worker` (маршрут воркер → external_api → fallback) в коде есть, но ни один воркер не подключён | `GET /health` → `active_workers: 0`; `POST /inference` отдаёт «Модель не подключена». Реальный инференс — при подключённом воркере (Фаза 1, режим `worker`) |
+| Реальный LLM-инференс | ⚠️ **механика работает, сеть не постоянна**: на замере 29.10 14:41 — `active_workers: 1`, `llm_mode: worker` (воркер `0xe56c…`, `qwen2.5-coder:1.5b`, 4343 опроса). Окно жизни воркера — 60 с, поэтому «сейчас 1» не значит «сеть». Это по-прежнему **один узел, включаемый руками** | `GET /worker/status`, `GET /health` → `llm_mode`. Сквозной путь доказан 28.10 (телефон → VPS → дом → Ollama) |
+| **Внутренняя утилизация токена (`TAR_UTILITY`)** | ✅ **в коде с 2.17.0**: `paymentMode: TAR_UTILITY` в `POST /work` и `/inference` списывает **2%** (`TAR_UTILITY_FEE_BPS: 200`), поровну в burn и казну (`BURN_RATE: 0.01`, `TREASURY_RATE: 0.01`) | `config.js:122-124`; `server.js:2215, 4698, 6940`; приёмка 43.14. **Экономически не использован:** `/summary` → `totalUtilizedTar: 0`, `totalUtilizedCount: 0` |
+| **Входящий WS воркера (`/p2p/worker`)** | ✅ **в коде с 2.17.0**: `ws-inbound.js` — Ed25519-хендшейк с nonce (`AUTH_PREFIX = TARNET_WS_AUTH`), TOFU по адресу (`ADDRESS_KEY_MISMATCH` при подмене ключа). Воркер держит **исходящее** соединение и получает задачу кадром `TASK`, фолбэк на `/worker/poll` сохранён | `ws-inbound.js`; `worker-demo.js:671` (`new WebSocket`); `GET /worker/ws`. Портов воркер не открывает → `registry.total: 0` остаётся верным |
 | Onion Routing | ✅ работает: `onion.js` (289 строк) — RSA-2048-OAEP-SHA256 шифрует 32-байтный ключ AES, нагрузка идёт AES-256-GCM; TTL слоя, защита от replay, шифрование обратного пути. `app/` — полная PWA (веб-манифест, service worker, 3 иконки). Остаётся: `archive/python-app/crypto.py` — `Wallet`, `generate_wallet()`, `sign_message()` на **SHA-256** (хеш-заглушка, **не Ed25519**) | `POST /inference/onion` → `delivered: true`, `hops: 3`; `test-mesh.js` → 25 ✅ |
 | Аппаратная проверка TEE Quote | ⏳ Фаза 2–3, в БД лишь флаг `isTeeAttested` | `nodes.isTeeAttested` |
 | Смарт-контракты L1/L2 и DAO | ⏳ `[SPEC]`, **0 файлов `.sol`**, письменной спеки нет | `/settlements` — синтетический `txHash` |
@@ -103,7 +105,7 @@
 
 1. **Единица полезной работы (CWU):**
    $$W_i = N_{\text{tokens}} \times \kappa_{\text{tier}} \times \gamma_{\text{verify}}, \qquad \gamma \in \{0, 1\}$$
-   Расширение ($0.25N_{\text{in}} + 1.0N_{\text{out}}$ и доменный $\delta_{\text{domain}}$) — RFC Фазы 2, в `2.12.0-tier6-byok` не применяется, чтобы не искажать инвариант эмиссии.
+   Расширение ($0.25N_{\text{in}} + 1.0N_{\text{out}}$ и доменный $\delta_{\text{domain}}$) — RFC Фазы 2, в `2.17.0-ws-utility` не применяется, чтобы не искажать инвариант эмиссии.
 
 2. **Двухпоточная награда (`Dual-Stream`):**
    $$\text{Reward}_i = \text{Fee\_Reward}_i + \text{Block\_Reward}_i$$
@@ -137,7 +139,7 @@
 **Фактическая структура чека (по `ledger.js` → `decorate()`), проверено `GET /receipt/:worker`:**
 
 ```typescript
-interface PoUWReceipt {          // ФАКТ: build 2.12.0-tier6-byok
+interface PoUWReceipt {          // ФАКТ: build 2.17.0-ws-utility
   seq: number;                   // глобальный монотонный счётчик
   workerId: string;              // дубль workerAddress для API
   workerAddress: string;
@@ -256,3 +258,29 @@ interface PoUWReceiptV2 {        // ЧАСТИЧНО: хеши есть, пол�
 и `VALIDATOR_STAKE_LOCK_TAR = 10` (нужно 50 TAR стейка); 86.2% награды — эмиссия при 13.8% fee;
 0 файлов `.sol`; GPU-обучения нет (`pending_gpu`).
 
+### Б.7. Аудит 29.10.2026 — сверка всех документов с кодом и продом
+
+Срез `29.10.2026 14:41 MSK`, стенд `https://v1107336.hosted-by-vdsina.com`, сборка `2.17.0-ws-utility`.
+Проверено: `node test-dpouw.js --test` → **970 ✅ / 0 ❌**, `node test-mesh.js` → **25 ✅ / 0 ❌**.
+
+| Источник | Значение |
+| :--- | :--- |
+| `GET /health` | `buildVersion 2.17.0-ws-utility` · `conservation {gross:80.772805, distributed:80.772805, delta:0, holds:true, inconsistentRows:0}` · `active_workers: 1`, `llm_mode: worker` |
+| `GET /health` | `conservationTier6 {calls:9, gross:0.0045, distributed:0.0045, delta:0, holds:true, fundedByClient:9, fundedByEmission:0}` |
+| `GET /health` | эпоха `373` · выпущено `24.623064` · роздано `8.228295` · невостребовано `5.109733` · `halvingPeriodEpochs: 365` |
+| `GET /summary` | чеков `750` · воркеров `90` · CWU `744 298 062` · выплачено `80.387229 TAR` |
+| `GET /summary` | Fee `7.057418` (**8.78%**) · Block `73.329811` (**91.22%**) · сожжено `0.186138` · казна `0.186138` · роялти `0.0133` |
+| `GET /summary` | `burnAudit.holds: true` · `treasuryAudit.holds: true` · `treasuryBalanceTar: 0.1947` · `onchainSettlements: 17` · `onchain.simulated: true` |
+| `GET /summary` | **`totalUtilizedTar: 0`**, `totalUtilizedCount: 0` — механизм утилизации есть, экономически не использован |
+| `GET /models` | **18** моделей: 15 облачных у 8 вендоров + 3 локальные (`provider: local` считается отдельной строкой → 9 значений `provider`) |
+| `GET /worker/status` | `active_workers: 1`, `mode: worker`, воркер `0xe56c…`, `qwen2.5-coder:1.5b`, 4343 опроса |
+
+**Что изменилось против Б.6.** Механизм утилизации токена, объявленный отсутствующим в 24.10, **появился в коде**
+(`TAR_UTILITY`, 2%, `config.js:122-124`) — но остаётся невостребованным (`totalUtilizedTar: 0`). Входящий WS
+воркера (`/p2p/worker`, `ws-inbound.js`) добавлен в 2.17.0: `registry.total: 0` по-прежнему верен, потому что
+воркер не открывает портов, а держит исходящее соединение.
+
+**Что не изменилось.** Сеть — один узел, включаемый руками: `active_workers: 1` на замере не означает
+постоянного исполнителя (окно жизни 60 с). `registry.total: 0` — ни одного узла с внешним адресом.
+Комитет валидаторов — 0 членов. `0` файлов `.sol`. GPU-обучения нет. Onion через WS-воркеры не реализован:
+у воркера нет RSA-ключа, `worker-demo.js` onion-логики не содержит.

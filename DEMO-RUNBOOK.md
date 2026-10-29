@@ -1,7 +1,7 @@
 # DEMO-RUNBOOK — показ TarNet инвестору
 
-**Версия:** `2.12.0-tier6-byok` · **Стенд:** `https://v1107336.hosted-by-vdsina.com`
-**Приёмка:** 624/624 ✅ (`test-dpouw.js`) + 25/25 (`test-mesh.js`) = **649 проверок**
+**Версия:** `2.17.0-ws-utility` · **Стенд:** `https://v1107336.hosted-by-vdsina.com`
+**Приёмка:** 970/970 ✅ (`test-dpouw.js`) + 25/25 (`test-mesh.js`) = **995 проверок**
 **Сверено:** 2026-10-24 07:30 MSK. Хеш сборки здесь намеренно не указан — он меняется
 каждый деплой, и такая строка устаревает быстрее, чем её успевают прочитать.
 Актуальный хеш смотреть так: `ssh VPS 'cd /opt/tarnet/backend-api && git rev-parse --short HEAD'`, или `./scripts/verify.sh`.
@@ -42,7 +42,7 @@
 ```bash
 curl -s https://v1107336.hosted-by-vdsina.com/health \
   | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).buildVersion))"
-# ожидаем: 2.12.0-tier6-byok  (и cloudflared_processes: 0)
+# ожидаем: 2.17.0-ws-utility  (и cloudflared_processes: 0)
 ```
 
 Если `buildVersion` пустой или `cloudflared_processes > 0` — открыт dev-стенд,
@@ -92,7 +92,7 @@ https://v1107336.hosted-by-vdsina.com/health
 
 ```json
 "conservation": { "delta": 0, "holds": true },
-"buildVersion": "2.4.1-tier-fix",
+"buildVersion": "2.17.0-ws-utility",
 "llm_mode": "deterministic_fallback"
 ```
 
@@ -483,7 +483,7 @@ curl -s -X POST https://v1107336.hosted-by-vdsina.com/demo/flush-work \
 
 | # | Проверка | Результат |
 |---|---|---|
-| 1 | `GET /health` | 200, `delta: 0`, `buildVersion: 2.12.0-tier6-byok` |
+| 1 | `GET /health` | 200, `delta: 0`, `buildVersion: 2.17.0-ws-utility` |
 | 2 | `GET /p2p/status` | 200, 3 узла |
 | 3 | `POST /id/register` | 200, `serverDerived: false` |
 | 4 | `GET /app/` | 200, 11801 байт |

@@ -1,6 +1,6 @@
 # TarNet / Synapse — One-Pager (чистовик)
 
-**Статус:** сверено с живым стендом **2026-10-29, 09:03 MSK** (сборка `2.15.1-treasury-cashback`, схема леджера `2.1.0-dpouw`, тег `v2.15.1-treasury-cashback`).
+**Статус:** сверено с живым стендом **2026-10-29, 14:41 MSK** (сборка `2.17.0-ws-utility`, схема леджера `2.1.0-dpouw`, тег `v2.17.0-ws-utility`).
 **Правило:** каждая цифра ниже снята с живого стенда либо посчитана из его ответов. Ни одна не взята из документов и не округлена в большую сторону. Источник указан рядом с каждой.
 
 ---
@@ -11,25 +11,26 @@
 
 **Что это.** Децентрализованная сеть вычислений для LLM-инференса: владельцы устройств выполняют запросы, получают за это `$TAR`, а протокол ведёт независимый реестр выполненной работы (dPoUW) с проверяемым сохранением стоимости.
 
-**Состояние на 28.10.2026, 23:46:09 MSK:**
+**Состояние на 29.10.2026, 14:41 MSK:**
 
 | Показатель | Значение | Откуда |
 |---|---|---|
-| Выполненных единиц работы | **731** чеков | `/summary.receipts` |
-| Адресов с историей начислений | **84** | `/summary.workers` |
-| Выплачено воркерам | **72.119989 TAR** | `/summary.totalRewardTar` |
-| Полный оборот леджера | **72.503515 TAR** | `/health.conservation.gross` |
+| Выполненных единиц работы | **750** чеков | `/summary.receipts` |
+| Адресов с историей начислений | **90** | `/summary.workers` |
+| Выплачено воркерам | **80.387229 TAR** | `/summary.totalRewardTar` |
+| Полный оборот леджера | **80.772805 TAR** | `/health.conservation.gross` |
 | Инвариант сохранения | **delta 0**, `holds: true`, 0 несогласованных строк | `/health.conservation` |
 | Сверка казны и сжигания | **`treasuryAudit` и `burnAudit`: `holds: true`** — журнал сходится с балансами | `/summary` |
-| Суммарный учтённый труд | **740 196 725 CWU** | `/summary.totalCwu` |
+| Суммарный учтённый труд | **744 298 062 CWU** | `/summary.totalCwu` |
 | Моделей в каталоге | **18** — 15 облачных у 8 вендоров + 3 локальные | `/models` |
-| Живых воркеров | **0 сейчас** (окно жизни — 60 с) | `/worker/status` |
-| Режим инференса | **`deterministic_fallback`** — заглушка, пока воркер не запущен | `/health.llm_mode` |
-| Автотестов приёмки | **933**, 0 падений | прогон 29.10.2026 |
+| Живых воркеров | **1 сейчас** — `0xe56c…`, 4343 опроса (окно жизни — 60 с) | `/worker/status` |
+| Режим инференса | **`worker`** — живая модель `qwen2.5-coder:1.5b` | `/health.llm_mode` |
+| Автотестов приёмки | **995** (970 + 25), 0 падений | прогон 29.10.2026 |
 | Привязка устройств | **подпись Ed25519** + одноразовый nonce | `/devices/link` |
 | Перенос старых балансов | **`POST /migrate/claim`** — подпись нового кошелька | `2.12.9` (не менялось) |
+| Внутренняя утилизация токена | механизм **есть** (`TAR_UTILITY`, 2%), но `totalUtilizedTar: 0` — не используется | `/summary` |
 
-**Сквозной путь доказан, а не заявлен.** 28.10.2026 телефон в мобильной сети отправил запрос → VPS → домашний ПК исполнителя → Ollama (`qwen2.5-coder:1.5b`) → VPS → телефон. Ответ пришёл от **живой модели**: `llm_mode: worker`, воркер `0xaf34…` онлайн, более 2 000 опросов. Это не стенд на `127.0.0.1` — это мобильная сеть и домашнее устройство. **На момент этой записи воркер выключен** (`active_workers: 0`, `llm_mode: deterministic_fallback`): путь доказан, но не постоянно живой.
+**Сквозной путь доказан, а не заявлен.** 28.10.2026 телефон в мобильной сети отправил запрос → VPS → домашний ПК исполнителя → Ollama (`qwen2.5-coder:1.5b`) → VPS → телефон. Ответ пришёл от **живой модели**: `llm_mode: worker`, воркер `0xaf34…` онлайн, более 2 000 опросов. Это не стенд на `127.0.0.1` — это мобильная сеть и домашнее устройство. **На замере 29.10 14:41 воркер снова онлайн** (`active_workers: 1`, `llm_mode: worker`, 4343 опроса) — но окно жизни 60 с, поэтому «сейчас работает» не равно «сеть работает».
 
 **Экономика — то, что реально в коде.**
 
@@ -44,20 +45,20 @@
 
 **Старые балансы больше не заморожены.** До `2.12.9` адрес в PWA был 20 случайными байтами без ключа, и демо-начисления на таких адресах были недоступны навсегда. `POST /migrate/claim` переносит их на текущий кошелёк: подпись ставит **новый** адрес (старый ключа не имеет по определению), перенос идёт одной строкой реестра и не меняет сумму по всем балансам. Перенос с живого аккаунта, с адреса с ключом и с адреса привязанного устройства закрыт.
 
-**Что показывает инвариант сохранения.** Выплаты воркерам (72.119989) плюс сожжённое (0.185113), казна (0.185113) и роялти (0.013300) дают ровно 72.503515 — оборот леджера. Расхождение нулевое на 731 чеке. Это не декларация, а проверяемое тождество: любой может пересчитать его из двух публичных endpoint'ов.
+**Что показывает инвариант сохранения.** Выплаты воркерам (80.387229) плюс сожжённое (0.186138), казна (0.186138) и роялти (0.013300) дают ровно 80.772805 — оборот леджера. Расхождение нулевое на 750 чеках. Это не декларация, а проверяемое тождество: любой может пересчитать его из двух публичных endpoint'ов.
 
 **Чего у нас пока нет — прямо и без оговорок.**
 
-1. **Сеть из одного узла — и тот сейчас выключен.** `active_workers: 0` на момент записи: устройство основателя офлайн, инференс идёт заглушкой `deterministic_fallback`. Механика режима `worker` работает и доказана сквозным тестом 28.10, но второго независимого исполнителя нет, и постоянно живым узел тоже не является. Честная формулировка: «протокол работает, сеть состоит из одного узла, который надо включать руками».
+1. **Сеть из одного узла.** На замере 29.10 14:41 воркер был онлайн (`active_workers: 1`, `0xe56c…`, 4343 опроса), но окно жизни — 60 секунд: устройство основателя, выключаемое руками. Механика режима `worker` доказана сквозным тестом 28.10, второго независимого исполнителя нет. Честная формулировка: «протокол работает, сеть состоит из одного узла, который надо включать руками».
 2. **Комитет валидаторов не набран.** Требуется 5 независимых валидаторов со стейком 10 TAR каждый — **50 TAR заблокированного стейка**. Сейчас 0 членов, гейт работает в вырожденном режиме самопроверки. Это вопрос денег, а не кода.
 3. **P2P только на localhost.** Три узла маршрута слушают `ws://127.0.0.1`, `announced_public: false`. Криптография настоящая (RSA-OAEP + AES-256-GCM, 3 хопа), распределённости нет.
 4. **Обучение не идёт.** Knowledge Loop: `phase: 2.5 [SPEC / ROADMAP]`, `training.implemented: false`, причина — нужен GPU. Адаптеры в статусе `pending_gpu`.
-5. **Токен пока без опоры в спросе.** **90.27%** награды — эмиссия (65.101539 TAR) против **9.73%** из комиссий (7.018450 TAR). На 1 TAR платного спроса приходится **9.28 TAR** напечатанных. Это главная незакрытая проблема экономики.
-6. **Tier 6 проверен шесть раз, не потоком.** `tier6_calls: 6` — успешные вызовы с живым ключом OpenRouter, `gross 0.003`, `delta: 0`, `fundedByClient: 6`. Шесть запросов не показывают поведение под нагрузкой: лимиты провайдера, параллельные резервы и TTL на реальном трафике не проверялись.
+5. **Токен пока без опоры в спросе.** **91.22%** награды — эмиссия (73.329811 TAR) против **8.78%** из комиссий (7.057418 TAR). На 1 TAR платного спроса (7.442994 gross) приходится **9.85 TAR** напечатанных. Механизм внутренней утилизации (`TAR_UTILITY`, 2%) в коде с 2.17.0, но экономически мёртв: `totalUtilizedTar: 0`.
+6. **Tier 6 проверен девять раз, не потоком.** `tier6_calls: 9` — успешные вызовы с живым ключом OpenRouter, `gross 0.0045`, `delta: 0`, `fundedByClient: 9`. Девять запросов не показывают поведение под нагрузкой: лимиты провайдера, параллельные резервы и TTL на реальном трафике не проверялись.
 
 **Аудит 8 компонентов видения:** **2 ✅ / 3 ⚠️ / 3 ❌ (~44%)** по методике `docs/VISION-8-COMPONENTS.md` (✅ = 1, ⚠️ = 0.5). Не ~62%: 62.5% выходит, только если ⚠️ считать полным ✅.
 
-**Почему это всё же интересно.** Ядро — криптография, леджер и экономика — проверяемо сегодня: 731 чек, нулевое расхождение, 933 автотеста, воспроизводимая приёмка одной командой, сквозной инференс через мобильную сеть. Отсутствует не протокол, а его рынок: устройства. Это разница между «мы построили сеть» (неправда) и «мы построили работающий протокол, которому нужна сеть» (правда, и её можно проверить).
+**Почему это всё же интересно.** Ядро — криптография, леджер и экономика — проверяемо сегодня: 750 чеков, нулевое расхождение, 995 автотестов, воспроизводимая приёмка одной командой, сквозной инференс через мобильную сеть. Отсутствует не протокол, а его рынок: устройства. Это разница между «мы построили сеть» (неправда) и «мы построили работающий протокол, которому нужна сеть» (правда, и её можно проверить).
 
 **The Ask.** $150K pre-seed за 5–10% токенов — на подключение первых исполнителей, комитет валидаторов и GPU-обучение адаптеров.
 
@@ -69,25 +70,26 @@
 
 **What it is.** A decentralized compute network for LLM inference: device owners serve requests and earn `$TAR`, while the protocol keeps an independent ledger of verified work (dPoUW) with a checkable conservation-of-value invariant.
 
-**State as of 29 Oct 2026, 09:03 MSK** (build `2.15.1-treasury-cashback`, ledger schema `2.1.0-dpouw`, tag `v2.15.1-treasury-cashback`):
+**State as of 29 Oct 2026, 14:41 MSK** (build `2.17.0-ws-utility`, ledger schema `2.1.0-dpouw`, tag `v2.17.0-ws-utility`):
 
 | Metric | Value | Source |
 |---|---|---|
-| Completed units of work | **731** receipts | `/summary.receipts` |
-| Addresses with payout history | **84** | `/summary.workers` |
-| Paid to workers | **72.119989 TAR** | `/summary.totalRewardTar` |
-| Total ledger turnover | **72.503515 TAR** | `/health.conservation.gross` |
+| Completed units of work | **750** receipts | `/summary.receipts` |
+| Addresses with payout history | **90** | `/summary.workers` |
+| Paid to workers | **80.387229 TAR** | `/summary.totalRewardTar` |
+| Total ledger turnover | **80.772805 TAR** | `/health.conservation.gross` |
 | Conservation invariant | **delta 0**, `holds: true`, 0 inconsistent rows | `/health.conservation` |
 | Treasury and burn reconciliation | **`treasuryAudit` and `burnAudit`: `holds: true`** — ledger matches balances | `/summary` |
-| Total accounted work | **740,196,725 CWU** | `/summary.totalCwu` |
+| Total accounted work | **744,298,062 CWU** | `/summary.totalCwu` |
 | Models in catalog | **18** — 15 cloud across 8 vendors + 3 local | `/models` |
-| Live workers | **0 right now** (60-second liveness window) | `/worker/status` |
-| Inference mode | **`deterministic_fallback`** — stub until the worker runs | `/health.llm_mode` |
-| Acceptance assertions | **933**, 0 failures | run of 29 Oct 2026 |
+| Live workers | **1 right now** — `0xe56c…`, 4343 polls (60-second liveness window) | `/worker/status` |
+| Inference mode | **`worker`** — live model `qwen2.5-coder:1.5b` | `/health.llm_mode` |
+| Acceptance assertions | **995** (970 + 25), 0 failures | run of 29 Oct 2026 |
 | Device binding | **Ed25519 signature** + single-use nonce | `/devices/link` |
 | Legacy balance claim | **`POST /migrate/claim`** — signed by the new wallet | `2.12.9` (unchanged) |
+| Token utilization | mechanism **exists** (`TAR_UTILITY`, 2%), but `totalUtilizedTar: 0` — unused | `/summary` |
 
-**The end-to-end path is proven, not claimed.** On 28 Oct 2026 a phone on a mobile network sent a request → VPS → the executor's home PC → Ollama (`qwen2.5-coder:1.5b`) → VPS → phone. The answer came from a **live model**: `llm_mode: worker`, worker `0xaf34…` online with over 2,000 polls. This is not a `127.0.0.1` bench — it is a mobile network and a home device. **At the time of writing the worker is off** (`active_workers: 0`, `llm_mode: deterministic_fallback`): the path is proven, but not continuously live.
+**The end-to-end path is proven, not claimed.** On 28 Oct 2026 a phone on a mobile network sent a request → VPS → the executor's home PC → Ollama (`qwen2.5-coder:1.5b`) → VPS → phone. The answer came from a **live model**: `llm_mode: worker`, worker `0xaf34…` online with over 2,000 polls. This is not a `127.0.0.1` bench — it is a mobile network and a home device. **At the 29 Oct 14:41 snapshot the worker is online again** (`active_workers: 1`, `llm_mode: worker`, 4343 polls) — but the liveness window is 60 seconds, so "working right now" is not the same as "the network works".
 
 **Economics — what is actually in the code.**
 
@@ -102,20 +104,20 @@
 
 **Legacy balances are no longer frozen.** Before `2.12.9` the PWA address was 20 random bytes with no key, so demo credits on such addresses were permanently unreachable. `POST /migrate/claim` moves them to the current wallet: the **new** address signs (the old one has no key by definition), the move is a single ledger row, and the sum across all balances is unchanged. Claims from a live account, from an address that has a key, and from a bound device are all rejected.
 
-**What the conservation invariant shows.** Worker payouts (72.119989) plus burned (0.185113), treasury (0.185113) and royalties (0.013300) equal exactly 72.503515 — the ledger's turnover. Zero discrepancy across 731 receipts. This is not a claim but a checkable identity: anyone can recompute it from two public endpoints.
+**What the conservation invariant shows.** Worker payouts (80.387229) plus burned (0.186138), treasury (0.186138) and royalties (0.013300) equal exactly 80.772805 — the ledger's turnover. Zero discrepancy across 750 receipts. This is not a claim but a checkable identity: anyone can recompute it from two public endpoints.
 
 **What we do not have yet — stated plainly.**
 
-1. **A network of one node — and that node is currently off.** `active_workers: 0` at the time of writing: the founder's device is offline and inference falls back to the `deterministic_fallback` stub. The `worker` mode works and is proven end-to-end on 28 Oct, but there is no second independent executor, and the node is not continuously live either. The honest phrasing: "the protocol works, the network consists of a single node that has to be switched on by hand."
+1. **A network of one node.** At the 29 Oct 14:41 snapshot the worker was online (`active_workers: 1`, `0xe56c…`, 4343 polls), but the liveness window is 60 seconds: it is the founder's device, switched on by hand. The `worker` mode is proven end-to-end on 28 Oct, but there is no second independent executor. The honest phrasing: "the protocol works, the network consists of a single node that has to be switched on by hand."
 2. **The validator committee is not formed.** It needs 5 independent validators staking 10 TAR each — **50 TAR of locked stake**. There are 0 members today, and the gate runs in a degenerate self-check mode. This is a funding problem, not an engineering one.
 3. **P2P is localhost-only.** Three route nodes listen on `ws://127.0.0.1`, `announced_public: false`. The cryptography is real (RSA-OAEP + AES-256-GCM, 3 hops); the distribution is not there.
 4. **Training is not running.** Knowledge Loop: `phase: 2.5 [SPEC / ROADMAP]`, `training.implemented: false`, blocked on GPU. Adapters sit in `pending_gpu`.
-5. **The token has no demand floor yet.** **90.27%** of rewards are emission (65.098459 TAR) against **9.73%** from fees (7.018435 TAR). Every 1 TAR of paid demand carries **9.28 TAR** printed. This is the main unsolved problem of the economy.
-6. **Tier 6 has been exercised six times, not under load.** `tier6_calls: 6` — successful calls with a live OpenRouter key, `gross 0.003`, `delta: 0`, `fundedByClient: 6`. Six requests say nothing about behaviour under load: provider rate limits, concurrent reserves and TTL on real traffic are unverified.
+5. **The token has no demand floor yet.** **91.22%** of rewards are emission (73.329811 TAR) against **8.78%** from fees (7.057418 TAR). Every 1 TAR of paid demand (7.442994 gross) carries **9.85 TAR** printed. The in-protocol utilization mechanism (`TAR_UTILITY`, 2%) exists since 2.17.0 but is economically dead: `totalUtilizedTar: 0`.
+6. **Tier 6 has been exercised nine times, not under load.** `tier6_calls: 9` — successful calls with a live OpenRouter key, `gross 0.0045`, `delta: 0`, `fundedByClient: 9`. Nine requests say nothing about behaviour under load: provider rate limits, concurrent reserves and TTL on real traffic are unverified.
 
 **Eight-component vision audit:** **2 ✅ / 3 ⚠️ / 3 ❌ (~44%)** per the `docs/VISION-8-COMPONENTS.md` methodology (✅ = 1, ⚠️ = 0.5). Not ~62%: 62.5% only appears if ⚠️ is counted as full ✅.
 
-**Why it is still interesting.** The core — cryptography, ledger and economics — is verifiable today: 731 receipts, zero discrepancy, 933 automated assertions, reproducible acceptance in one command, end-to-end inference over a mobile network. What is missing is not the protocol but its market: devices. That is the difference between "we built a network" (false) and "we built a working protocol that needs a network" (true, and checkable).
+**Why it is still interesting.** The core — cryptography, ledger and economics — is verifiable today: 750 receipts, zero discrepancy, 995 automated assertions, reproducible acceptance in one command, end-to-end inference over a mobile network. What is missing is not the protocol but its market: devices. That is the difference between "we built a network" (false) and "we built a working protocol that needs a network" (true, and checkable).
 
 **The Ask.** $150K pre-seed for 5–10% of tokens — to onboard the first executors, seat the validator committee, and fund GPU training of the adapters.
 
@@ -124,12 +126,12 @@
 ## Пометки для правки
 
 - **Не цитировать:** `$1.50–2.50/M`, `$0.30–0.50/M`, `$2.00/M`, `$330/мес`, `$1.00/M` — цены Whitepaper, в коде не действуют.
-- **Не писать «83 узла в сети».** 83 — адреса с историей начислений. Живой воркер на 28.10 23:46 — **ноль**; окно жизни воркера 60 секунд (было 15), поэтому «ноль сейчас» не значит «сеть мертва», но и «сеть работает» говорить нельзя.
-- **Не писать «72.12 TAR распределено» без уточнения.** Это выплаты воркерам; оборот леджера 72.503515.
-- **Не писать «сеть постоянно живая».** 28.10 воркер был онлайн и сквозной тест прошёл, но на 23:46 `active_workers: 0`, `llm_mode: deterministic_fallback`. Говорить «путь доказан», не «сеть работает непрерывно».
-- **Не ставить старые снимки как текущие.** 705/78/56.55 — снимок 24.10; 716/83/72.116894 — снимок 28.10 16:30; 721/83/72.117293 — снимок 28.10 19:30; 725/83/72.119545 — снимок 28.10 23:46:09; **731/84/72.119989** — снимок 29.10 09:03.
-- **Не писать «Tier 6 работает под нагрузкой».** `tier6_calls: 6` — шесть сделок с живым ключом. Говорить можно про «вызов проходит и арифметика сходится», нельзя — про поток, лимиты и параллельные резервы.
-- **Не писать «738 тестов» или «713+25»** — актуально **933** на одном прогоне `node test-dpouw.js --test`.
+- **Не писать «90 узлов в сети».** 90 — адреса с историей начислений. На замере 29.10 14:41 — `active_workers: 1`; окно жизни воркера 60 секунд, поэтому «один сейчас» не значит «сеть», а «ноль» — не значит «сеть мертва». Говорить: «один узел, включаемый руками».
+- **Не писать «80.39 TAR распределено» без уточнения.** Это выплаты воркерам; оборот леджера 80.772805.
+- **Не писать «сеть постоянно живая».** 28.10 воркер был онлайн и сквозной тест прошёл; на замере 29.10 14:41 — `active_workers: 1`, `llm_mode: worker`. Окно жизни 60 с, поэтому говорить «путь доказан», не «сеть работает непрерывно».
+- **Не ставить старые снимки как текущие.** 705/78/56.55 — снимок 24.10; 716/83/72.116894 — 28.10 16:30; 721/83/72.117293 — 28.10 19:30; 725/83/72.119545 — 28.10 23:46:09; 731/84/72.119989 — 29.10 09:03; **750/90/80.387229 — 29.10 14:41 (текущий)**.
+- **Не писать «Tier 6 работает под нагрузкой».** `tier6_calls: 9` — девять сделок с живым ключом. Говорить можно про «вызов проходит и арифметика сходится», нельзя — про поток, лимиты и параллельные резервы.
+- **Не писать «738 тестов» или «713+25»** — актуально **995** (970 на `node test-dpouw.js --test` + 25 на `node test-mesh.js`).
 - **Не смешивать «9 провайдеров» и «8 вендоров».** `/models` считает `provider: "local"` отдельной строкой, поэтому 9 = 8 вендоров + локальные. Gemini и Groq в коде есть, но в каталог не внесены — в цифру 18 не входят.
 - **Не называть привязку устройств «заявкой».** С `2.12.8` это подпись Ed25519 с одноразовым nonce. Но и не обещать больше: подпись доказывает владение **аккаунтом**, а не самим ПК.
 - **Источники для перепроверки:** `GET /health`, `/summary`, `/config`, `/worker/status`, `/knowledge/status`, `/p2p/status`.
