@@ -630,9 +630,19 @@ function onWsTask(task) {
   });
 }
 
-function wsAuthResponse(challenge) {
+async function wsAuthResponse(challenge) {
   const keys = wsState.keys || (wsState.keys = ed25519FromSeed(loadOrCreateSeed()));
   const timestamp = Date.now();
+  /* Список моделей нужен в САМОМ рукопожатии, а не только в HTTP-пульсе.
+   *
+   * Пока сокет жив, главный цикл не опрашивает сервер вовсе (`if
+   * wsState.connected) continue`), значит `installedModels` не уходил ни
+   * разу: сервер сохранял NULL, PWA получал `known: false` и показывал все
+   * локальные модели каталога вместо установленных на этом ПК.
+   *
+   * Отказ Ollama не должен ломать подключение: пустой список — это факт
+   * «ничего не установлено», а `ollamaOnline: false` объясняет почему. */
+  const rep = await workerModelReport();
   wsSend({
     type: 'AUTH_RESPONSE',
     workerAddress: WORKER,
@@ -640,6 +650,8 @@ function wsAuthResponse(challenge) {
     signature: signAuth(challenge.nonce, timestamp, keys),
     timestamp,
     model: MODEL,
+    installedModels: rep.installedModels,
+    ollamaOnline: rep.ollamaOnline,
     /* Тир объявляем как base: воркер демонстрационный и не заявляет
      * экспертный профиль. Сервер учитывает это мягко — жёсткий фильтр по
      * тиру отбросил бы единственного подключённого воркера. */
@@ -870,6 +882,30 @@ async function main() {
      * ещё не прошёл. Без этого условия воркер забирал бы одну и ту же
      * задачу дважды: кадром и опросом. */
     if (wsState.connected) {
+      /* Присутствие по WS продлевается кадром, а не опросом.
+       *
+       * Раньше здесь был только сон, и это давало два отказа сразу:
+       * сервер не обновлял `lastSeenAt` (воркер через 60 с выглядел
+       * офлайн), а список моделей застывал на моменте подключения.
+       * Список переснят быть обязан: `ollama pull` во время работы —
+       * обычное дело, и PWA не должен предлагать модель, которой уже нет.
+       *
+       * Интервал 20 с: окно активности на сервере 60 с, то есть три
+       * попытки до того, как воркер сочтут мёртвым. Кадр крошечный,
+       * а `/api/tags` кэшируется на 15 с — лишней нагрузки нет. */
+      if (Date.now() - (wsState.lastPresenceSentAt || 0) >= 20000) {
+        wsState.lastPresenceSentAt = Date.now();
+        try {
+          const rep = await workerModelReport();
+          wsSend({
+            type: 'PRESENCE',
+            workerAddress: WORKER,
+            model: MODEL,
+            installedModels: rep.installedModels,
+            ollamaOnline: rep.ollamaOnline,
+          });
+        } catch (_e) { /* кадр присутствия не критичен для работы */ }
+      }
       await sleep(POLL_MS);
       continue;
     }

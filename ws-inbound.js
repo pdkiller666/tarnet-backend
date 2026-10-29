@@ -218,8 +218,29 @@ class WsInbound {
   _touch(ws) {
     const addr = ws._wsAuth && ws._wsAuth.address;
     if (!addr) return;
+    const now = Date.now();
     const w = this.workers.get(addr);
-    if (w) w.lastPong = Date.now();
+    if (w) w.lastPong = now;
+
+    /* Присутствие продлевается не только рукопожатием.
+     *
+     * БЕЗ ЭТОГО живой WS-воркер через WORKER_ACTIVE_WINDOW_MS (60 с)
+     * становился невидимым: `lastSeenAt` писался ОДИН раз в handshake, а
+     * `/worker/status` считает активных по окну. Дальше `workers: []`,
+     * PWA получает `known: false` и по документированному правилу
+     * («список неизвестен — не фильтруем») показывает ВЕСЬ каталог
+     * локальных моделей — ровно тот баг, который видел человек.
+     *
+     * Пишем не чаще раза в 10 с: ping идёт каждые 15 с, но PONG может
+     * прийти и в ответ на клиентский кадр, и запись на каждый кадр была бы
+     * лишним UPDATE в БД на ровном месте. */
+    if (w && now - (w.lastPresenceWrite || 0) >= 10000) {
+      w.lastPresenceWrite = now;
+      try {
+        this.run('UPDATE worker_presence SET lastSeenAt = ? WHERE workerAddress = ?',
+          [now, addr]);
+      } catch (_e) { /* присутствие не критично для транспорта */ }
+    }
   }
 
   _onMessage(ws, data) {
@@ -237,12 +258,32 @@ class WsInbound {
     if (frame.type === 'RESULT') return this._onResult(ws, frame);
     if (frame.type === 'ERROR') return this._onError(ws, frame);
     if (frame.type === 'PONG') return this._touch(ws);
+    if (frame.type === 'PRESENCE') return this._onPresence(ws, frame);
     if (frame.type === 'HELLO') {
       // Клиент может поздороваться сам — это не ошибка, просто игнорируем:
       // challenge уже отправлен сервером и он единственный источник nonce.
       return undefined;
     }
     return this._fail(ws, 'UNKNOWN_TYPE');
+  }
+
+  /* Обновление присутствия от уже авторизованного воркера.
+   *
+   * Зачем отдельный кадр, а не только handshake: состав моделей меняется во
+   * время работы (`ollama pull`), и список, снятый при подключении, к утру
+   * врал бы. У опросного воркера это лечится каждым `/worker/poll`, а у
+   * WS-воркера опроса нет вовсе — без кадра список застыл бы на моменте
+   * подключения. */
+  _onPresence(ws, frame) {
+    const st = ws._wsAuth;
+    if (!st || !st.authenticated) return this._fail(ws, 'AUTH_REQUIRED');
+    this._markPresence(st.address, frame);
+    const w = this.workers.get(st.address);
+    if (w) {
+      w.lastPong = Date.now();
+      w.lastPresenceWrite = w.lastPong;
+    }
+    return undefined;
   }
 
   _onAuth(ws, frame) {
@@ -337,12 +378,23 @@ class WsInbound {
   _markPresence(workerAddress, frame) {
     const now = Date.now();
     const model = typeof frame.model === 'string' && frame.model.length ? frame.model : null;
+    /* Список установленного приходит кадром (handshake или PRESENCE).
+     * Отсутствие поля — это NULL, а не `[]`: старый воркер про список не
+     * знает, и записать ему «ничего не установлено» значило бы соврать. */
+    const list = Array.isArray(frame.installedModels)
+      ? frame.installedModels.filter((m) => typeof m === 'string' && m.length && m.length <= 200).slice(0, 64)
+      : null;
+    const online = typeof frame.ollamaOnline === 'boolean' ? (frame.ollamaOnline ? 1 : 0) : null;
     try {
       this.run(
-        `INSERT INTO worker_presence (workerAddress, model, lastSeenAt, polls)
-         VALUES (?, ?, ?, 1)
-         ON CONFLICT(workerAddress) DO UPDATE SET lastSeenAt = excluded.lastSeenAt, model = COALESCE(excluded.model, worker_presence.model)`,
-        [workerAddress, model, now],
+        `INSERT INTO worker_presence (workerAddress, model, lastSeenAt, polls, installed_models, ollama_online)
+         VALUES (?, ?, ?, 1, ?, ?)
+         ON CONFLICT(workerAddress) DO UPDATE SET
+           lastSeenAt = excluded.lastSeenAt,
+           model = COALESCE(excluded.model, worker_presence.model),
+           installed_models = COALESCE(excluded.installed_models, worker_presence.installed_models),
+           ollama_online = COALESCE(excluded.ollama_online, worker_presence.ollama_online)`,
+        [workerAddress, model, now, list === null ? null : JSON.stringify(list), online],
       );
     } catch (_e) { /* присутствие не критично для handshake */ }
   }

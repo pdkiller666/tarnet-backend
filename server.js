@@ -5262,17 +5262,33 @@ app.post('/receipt/verify', (req, res) => {
   const { signatureValid, payload } = ledger.verify(receipt, pubPem);
 
   // Арифметика нарастающего итога: сумма прошлых начислений воркера + это.
-  const worker = receipt.workerAddress ?? receipt.workerId;
+  /* Адрес может отсутствовать, и это НЕ ошибка запроса.
+   *
+   * Чек Tier 6 исторически приходил без `workerAddress` (внешний вызов не
+   * привязан к воркеру). `undefined` уезжал в bind-параметр SQLite, драйвер
+   * бросал TypeError, и клиент получал 500 «Internal server error» вместо
+   * внятного «подпись неверна/сумма не сходится». В PWA это превращалось в
+   * `? не проверено` — то есть в молчание вместо ответа.
+   *
+   * Пустой адрес — законный случай: нарастающий итог тогда не с чем
+   * сверять (у такого чека нет истории начислений), и честный ответ —
+   * cumulativeValid: null, а не падение. */
+  const worker = receipt.workerAddress ?? receipt.workerId ?? null;
+  const hasWorker = typeof worker === 'string' && worker.length > 0;
   const prev = get(`SELECT COALESCE(SUM(rewardTar),0) AS s FROM work_receipts
-                    WHERE workerAddress = ? AND seq < ?`, [worker, Number(receipt.seq) || 0]);
-  const expected = round(Number(prev.s) + Number(receipt.rewardTar));
-  const cumulativeValid = Math.abs(expected - Number(receipt.cumulativeTotal)) < 1e-6;
+                    WHERE workerAddress = ? AND seq < ?`,
+    [hasWorker ? worker : '', Number(receipt.seq) || 0]);
+  const expected = round(Number(prev?.s ?? 0) + Number(receipt.rewardTar ?? 0));
+  const claimed = Number(receipt.cumulativeTotal);
+  const cumulativeValid = hasWorker && Number.isFinite(claimed)
+    ? Math.abs(expected - claimed) < 1e-6
+    : null;
 
   res.json({
     signatureValid,
     cumulativeValid,
-    expectedCumulative: expected,
-    claimedCumulative: Number(receipt.cumulativeTotal),
+    expectedCumulative: hasWorker ? expected : null,
+    claimedCumulative: Number.isFinite(claimed) ? claimed : null,
     payload,
     gatewayAddress: GATEWAY.address,
   });
@@ -6423,17 +6439,29 @@ async function runInference(req, res) {
              * что проверяет /health, но для одного вызова. */
             delta: round((cashback + burnTar + treasuryTar) - fee),
           },
-          receipt: {
-            receipt_id: callId,
-            tier: 6,
-            tokens_used: apiResult.usageTokens,
-            cost_tar: fee,
-            burned_tar: burnTar,
-            treasury_tar: treasuryTar,
-            cashback_tar: cashback,
-            conservation: { delta: round((cashback + burnTar + treasuryTar) - fee) },
-            timestamp: Date.now(),
-            signature: signPayload(receiptPayload({
+          receipt: (() => {
+            /* Чек Tier 6 обязан проверяться тем же `/receipt/verify`, что и
+             * локальный, и для этого он должен САМ нести все поля, из
+             * которых собирается подписанная строка.
+             *
+             * Здесь было два дефекта, и каждый в одиночку делал проверку
+             * невозможной:
+             *
+             *  1. `timestamp` вызывался ДВАЖДЫ — один раз в чеке, другой раз
+             *     внутри payload. Подпись считалась по другому числу, чем
+             *     лежало в чеке, поэтому верная подпись не сходилась никогда.
+             *  2. В чеке были только snake_case-поля внешнего API
+             *     (`burned_tar`), а `ledger.verify` читает `burnTar`,
+             *     `cwu`, `rewardTar`, `workerAddress`. Отсутствие
+             *     `workerAddress` вдобавок уезжало в SQL-параметр и давало
+             *     500 вместо ответа «подпись неверна».
+             *
+             * Теперь поля считаются ОДИН раз и попадают в чек целиком:
+             * snake_case оставлен для читателей внешнего контракта (PWA
+             * показывает `burned_tar`), канонические имена — для верификатора. */
+            const ts6 = Date.now();
+            const epoch6 = epochIndex();
+            const payload6 = {
               seq: 0,
               workerAddress: tier6Client || '',
               cwu: 0,
@@ -6441,11 +6469,36 @@ async function runInference(req, res) {
               cumulativeTotal: 0,
               burnTar, treasuryTar,
               royaltyTar: 0,
-              epoch: epochIndex(),
-              timestamp: Date.now(),
+              epoch: epoch6,
+              timestamp: ts6,
               prevSignature: '',
-            }), GATEWAY.privateKeyPem),
-          },
+            };
+            return {
+              receipt_id: callId,
+              tier: 6,
+              tokens_used: apiResult.usageTokens,
+              cost_tar: fee,
+              burned_tar: burnTar,
+              treasury_tar: treasuryTar,
+              cashback_tar: cashback,
+              conservation: { delta: round((cashback + burnTar + treasuryTar) - fee) },
+              /* Канонические поля — их читает `ledger.verify`. Значения те же,
+               * что ушли в подпись, иначе проверка снова разъедется. */
+              seq: payload6.seq,
+              workerAddress: payload6.workerAddress,
+              cwu: payload6.cwu,
+              rewardTar: payload6.rewardTar,
+              cumulativeTotal: payload6.cumulativeTotal,
+              burnTar: payload6.burnTar,
+              treasuryTar: payload6.treasuryTar,
+              royaltyTar: payload6.royaltyTar,
+              epoch: epoch6,
+              timestamp: ts6,
+              prevSignature: payload6.prevSignature,
+              signatureAlg: 'ed25519',
+              signature: signPayload(receiptPayload(payload6), GATEWAY.privateKeyPem),
+            };
+          })(),
         });
       }
     }

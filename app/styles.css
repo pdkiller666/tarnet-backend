@@ -1351,6 +1351,32 @@ body { overflow: hidden; }
   letter-spacing: .06em;
   color: var(--muted-2);
 }
+/* Чекбокс режима оплаты: строка, а не колонка.
+ * `.field` — колонка (подпись над полем), и голый input внутри неё
+ * растянулся бы на всю ширину поповера в пустую рамку. Здесь раскладка
+ * «галочка + текст в одну строку», текст не капсом: это предложение
+ * с ценой, а не название поля. */
+.settings-body .check-field {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+}
+.settings-body .check-field > input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.settings-body .check-field > span {
+  font-size: 12px;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--text);
+  line-height: 1.35;
+}
 .settings-body .stage-hint { margin: 0; }
 
 /* ---------- Статус сети в шапке ----------

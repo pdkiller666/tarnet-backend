@@ -9,13 +9,13 @@
 
 ## RU
 
-**Тема:** Pre-Seed: 995 тестов, живой /health, 18 моделей
+**Тема:** Pre-Seed: 1005 тестов, живой /health, 18 моделей
 
 Здравствуйте, {Имя}.
 
 Я строю TarNet / Synapse — протокол распределённого LLM-инференса с независимым реестром выполненной работы (dPoUW). Владелец устройства выполняет запрос и получает `$TAR`; протокол фиксирует работу так, что сумму по всем балансам можно пересчитать из двух публичных endpoint'ов. Промпты не хранятся на сервере.
 
-Состояние на сегодня проверяется без моего участия. `GET https://v1107336.hosted-by-vdsina.com/health` отдаёт `buildVersion: 2.17.0-ws-utility` и инвариант сохранения с нулевым расхождением: `delta: 0`, `holds: true`. `GET /summary` даёт 750 чеков работы на 90 адресах, выплачено 80.387229 TAR, оборот леджера 80.772805 TAR. Арифметика сходится ровно: выплаты + сожжённое + казна + роялти = оборот, до шестого знака. Приёмка — 995 автотестов (970 + 25), 0 падений, одной командой. Каталог моделей — 18, из них 15 облачных у 8 провайдеров и 3 локальные; сквозной вызов с живым ключом провайдера пройден, кэшбэк начислен отдельной строкой леджера.
+Состояние на сегодня проверяется без моего участия. `GET https://v1107336.hosted-by-vdsina.com/health` отдаёт `buildVersion: 2.17.0-ws-utility` и инвариант сохранения с нулевым расхождением: `delta: 0`, `holds: true`. `GET /summary` даёт 750 чеков работы на 90 адресах, выплачено 80.387229 TAR, оборот леджера 80.772805 TAR. Арифметика сходится ровно: выплаты + сожжённое + казна + роялти = оборот, до шестого знака. Приёмка — 1005 автотестов (980 + 25), 0 падений, одной командой. Каталог моделей — 18, из них 15 облачных у 8 провайдеров и 3 локальные; сквозной вызов с живым ключом провайдера пройден, кэшбэк начислен отдельной строкой леджера.
 
 Чего нет, чтобы вы не искали это сами. Сеть — один узел, включаемый руками: на замере воркер был онлайн (`active_workers: 1`, `llm_mode: worker`), но окно жизни — 60 секунд, поэтому «сейчас работает» не значит «сеть работает». Все адреса в реестре локальные и не объявлены публично. Расчёты on-chain симулированы, Solidity-контрактов в репозитории ноль. Казна на `critical`: `0.1949` TAR при операционных расходах $517 в месяц. Tier 6 проверен девятью вызовами, а не потоком. Механизм утилизации токена в коде есть (`TAR_UTILITY`, 2%), но не включён: `totalUtilizedTar: 0`. Всё это в `docs/AUDIT-REALITY.md`. Отдельно про казну: раньше баланс был больше начисленного и я не знал почему. Причину нашёл и разложил на два слагаемых (чек, где воркером записана сама казна; `treasuryTar` из Tier 6, не входящий в `totalTreasuryTar`). Третье слагаемое оказалось не расходом, а дефектом учёта: кэшбэк записывался как списание с казны, хотя деньги с неё не уходили. Исправил и запись, и историю, и формулу. В `/summary` теперь есть блок `treasuryAudit` с `holds: true`, который это проверяет — именно он и поймал дефект в первые минуты после выкатки.
 
@@ -27,13 +27,13 @@
 
 ## EN
 
-**Subject:** Pre-Seed: 995 tests, a live /health, 18 models
+**Subject:** Pre-Seed: 1005 tests, a live /health, 18 models
 
 Hello {Name},
 
 I'm building TarNet / Synapse — a protocol for distributed LLM inference with an independent proof-of-useful-work ledger (dPoUW). A device owner runs a request and earns `$TAR`; the protocol records the work so that the sum across all balances can be recomputed from two public endpoints. Prompts are never stored on the server.
 
-You can check today's state without me. `GET https://v1107336.hosted-by-vdsina.com/health` returns `buildVersion: 2.17.0-ws-utility` and a conservation invariant with zero discrepancy: `delta: 0`, `holds: true`. `GET /summary` returns 750 work receipts across 90 addresses, 80.387229 TAR paid to workers, 80.772805 TAR of ledger turnover. The arithmetic closes exactly: payouts + burned + treasury + royalties equals turnover to the sixth decimal. Acceptance is 995 automated assertions (970 + 25), 0 failures, one command. The model catalog holds 18 entries — 15 cloud models across 8 providers and 3 local; an end-to-end call with a real provider key has completed, with the cashback written as its own ledger row.
+You can check today's state without me. `GET https://v1107336.hosted-by-vdsina.com/health` returns `buildVersion: 2.17.0-ws-utility` and a conservation invariant with zero discrepancy: `delta: 0`, `holds: true`. `GET /summary` returns 750 work receipts across 90 addresses, 80.387229 TAR paid to workers, 80.772805 TAR of ledger turnover. The arithmetic closes exactly: payouts + burned + treasury + royalties equals turnover to the sixth decimal. Acceptance is 1005 automated assertions (980 + 25), 0 failures, one command. The model catalog holds 18 entries — 15 cloud models across 8 providers and 3 local; an end-to-end call with a real provider key has completed, with the cashback written as its own ledger row.
 
 What is not there, so you don't have to dig for it. The network is a single node switched on by hand: at snapshot time the worker was online (`active_workers: 1`, `llm_mode: worker`), but the liveness window is 60 seconds, so "working right now" is not "the network works". All addresses in the registry are local and none are publicly announced. On-chain settlement is simulated; there are zero Solidity contracts in the repository. The treasury is `critical`: `0.1949` TAR against $517/month of operating cost. Tier 6 has been exercised by nine calls, not by load. The in-protocol token utilization mechanism exists in code (`TAR_UTILITY`, 2%) but is not switched on: `totalUtilizedTar: 0`. All of this is in `docs/AUDIT-REALITY.md`. On the treasury specifically: the balance used to exceed what was accrued and I did not know why. I found the cause and split it into two components (a receipt where the treasury itself is recorded as the worker; `treasuryTar` from Tier 6, which is not part of `totalTreasuryTar`). A third component turned out to be not a cost but an accounting defect: cashback was recorded as a debit from the treasury even though no money left it. I fixed the writer, the history, and the formula. `/summary` now exposes a `treasuryAudit` block with `holds: true` that verifies it — that block is what caught the defect within minutes of release.
 
@@ -45,7 +45,7 @@ I'm raising $150K pre-seed for 5–10% of tokens. The money goes to three things
 
 ## Пометки для правки
 
-- **Тема письма фиксирована:** «Pre-Seed: 995 тестов, живой /health, 18 моделей». Менять только вместе с цифрами.
+- **Тема письма фиксирована:** «Pre-Seed: 1005 тестов, живой /health, 18 моделей». Менять только вместе с цифрами.
 - **Не убирать абзац «Чего нет».** Он и есть причина, по которой письмо читают до конца: инвестор всё равно найдёт это на due diligence, но уже с потерянным доверием.
 - **Не писать «децентрализованная сеть»** без оговорки, что исполнитель один и он локальный. Правильная формулировка — «протокол, которому нужна сеть».
 - **Не обещать on-chain, TEE или комитет как существующие.** `simulated: true`, поле `isTeeAttested` в БД, комитета нет.

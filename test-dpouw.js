@@ -6964,6 +6964,206 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       });
   }
 
+  /* ===== 44. Чек Tier 6 и присутствие WS-воркера =====
+   *
+   * Два дефекта, которые человек видел глазами в PWA:
+   *   — «? не проверено» на чеке Tier 6 (подпись не сходилась никогда);
+   *   — в селекте все локальные модели каталога вместо установленных.
+   *
+   * Проверяется ПОВЕДЕНИЕ, а не наличие полей: подпись обязана сходиться
+   * через тот же /receipt/verify, что и у локального чека, а installedModels
+   * обязан доехать до /worker/status по WS-каналу, где опроса нет вовсе. */
+  section('44. Чек Tier 6 и присутствие WS-воркера (v2.17.0-ws-utility)');
+  {
+    const http = require('http');
+    const { DatabaseSync } = require('node:sqlite');
+    const provPort44 = await freePort();
+    const fakeProvider44 = http.createServer((req, res) => {
+      let raw = '';
+      req.on('data', (d) => { raw += d; });
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          model: 'qwen3-coder',
+          choices: [{ message: { content: 'ответ tier6' } }],
+          usage: { total_tokens: 12 },
+        }));
+      });
+    });
+    await new Promise((r) => fakeProvider44.listen(provPort44, '127.0.0.1', r));
+
+    const s44 = await spawnServer({
+      TARNET_TIER6_ENDPOINT: `http://127.0.0.1:${provPort44}/v1/chat/completions`,
+    });
+    try {
+      const PAY44 = '0x' + (RUN + 'e4').padEnd(40, '0').slice(0, 40);
+      /* Баланс пишется напрямую в БД изолированного сервера: краник на нём
+       * выдаёт 0.01 TAR, а комиссия Tier 6 списывается сразу и целиком —
+       * пополнение через HTTP сделало бы тест зависимым от лимитов краника. */
+      {
+        const sdb44 = new DatabaseSync(path.join(s44.dir, 'test.db'));
+        try {
+          sdb44.prepare(`INSERT INTO balances (address, balanceTar, stakedTar, reservedTar, updatedAt)
+                         VALUES (?, ?, 0, 0, ?)
+                         ON CONFLICT(address) DO UPDATE SET balanceTar = excluded.balanceTar`)
+            .run(PAY44, 1.0, new Date().toISOString());
+        } finally { sdb44.close(); }
+      }
+
+      const t644 = await apiAt(s44.base, '/inference', 'POST', {
+        prompt: 'проверка подписи tier6',
+        modelId: 'openrouter/qwen3-coder',
+        clientAddress: PAY44,
+        tier: 6,
+      }, { 'X-Provider-Key': '***' });
+
+      ok('44.1 вызов Tier 6 прошёл и вернул чек',
+        t644.status === 200 && Boolean(t644.body?.receipt),
+        { status: t644.status, error: t644.body?.error });
+
+      const r644 = (t644.body && t644.body.receipt) || {};
+      /* Канонические поля обязаны быть в самом чеке: без них верификатор
+       * собирает подписанную строку из undefined и проверка невозможна. */
+      ok('44.2 чек Tier 6 несёт канонические поля для верификатора',
+        typeof r644.workerAddress === 'string'
+          && Number.isFinite(Number(r644.burnTar))
+          && Number.isFinite(Number(r644.treasuryTar))
+          && Number.isFinite(Number(r644.timestamp)),
+        { workerAddress: r644.workerAddress, burnTar: r644.burnTar, timestamp: r644.timestamp });
+
+      /* Главная проверка директивы: подпись Tier 6 СХОДИТСЯ. Раньше здесь
+       * была невозможность, а не отказ: timestamp подписывался вторым
+       * вызовом Date.now(), поэтому верная подпись не проходила никогда. */
+      const v644 = await apiAt(s44.base, '/receipt/verify', 'POST', { receipt: r644 });
+      ok('44.3 подпись Tier 6 проверяется и верна',
+        v644.status === 200 && v644.body?.signatureValid === true,
+        { status: v644.status, signatureValid: v644.body?.signatureValid, error: v644.body?.error });
+
+      /* Чек без адреса воркера не должен ронять эндпоинт: раньше undefined
+       * уезжал в bind-параметр SQLite, драйвер бросал TypeError, и клиент
+       * получал 500 «Internal server error» вместо ответа про подпись. */
+      const orphan44 = { ...r644 };
+      delete orphan44.workerAddress;
+      const vOrphan44 = await apiAt(s44.base, '/receipt/verify', 'POST', { receipt: orphan44 });
+      ok('44.4 чек без workerAddress → 200 и cumulativeValid: null, а не 500',
+        vOrphan44.status === 200 && vOrphan44.body?.cumulativeValid === null,
+        { status: vOrphan44.status, cumulativeValid: vOrphan44.body?.cumulativeValid });
+
+      /* --- 44.5–44.8: присутствие по WS ---
+       * Проверяется то, чего не было вовсе: WS-воркер не обновлял
+       * присутствие. `lastSeenAt` писался один раз в handshake, поэтому
+       * через WORKER_ACTIVE_WINDOW_MS (60 с) живой воркер считался офлайн,
+       * /worker/status отдавал workers: [], и PWA по документированному
+       * правилу «список неизвестен — не фильтруем» показывал ВЕСЬ каталог. */
+      if (typeof WebSocket !== 'function') {
+        skip('44.5–44.8 присутствие WS', 'в этой версии Node нет глобального WebSocket');
+      } else {
+        const workerMod44 = require('./worker-demo');
+        const crypto44 = require('crypto');
+        const wsBase44 = s44.base.replace(/^http:/i, 'ws:');
+        const w44 = '0x' + (RUN + 'f4').padEnd(40, '0').slice(0, 40);
+        const keys44 = workerMod44.ed25519FromSeed(crypto44.randomBytes(32));
+
+        const waitFrame44 = (ws, want, timeoutMs = 6000) => new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            ws.removeEventListener('message', onMsg44);
+            resolve(null);
+          }, timeoutMs);
+          const onMsg44 = (ev) => {
+            let f = null;
+            try { f = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); } catch (_e) { return; }
+            if (!f || f.type !== want) return;
+            clearTimeout(timer);
+            ws.removeEventListener('message', onMsg44);
+            resolve(f);
+          };
+          ws.addEventListener('message', onMsg44);
+        });
+
+        const sock44 = new WebSocket(wsBase44 + '/p2p/worker');
+        const ch44 = await waitFrame44(sock44, 'HELLO_CHALLENGE');
+        if (!ch44) {
+          skip('44.5 handshake с installedModels', 'нет HELLO_CHALLENGE');
+          try { sock44.close(); } catch (_e) { /* уже закрыт */ }
+        } else {
+          const ts44 = Date.now();
+          const pl44 = `TARNET_WS_AUTH:${ch44.nonce}:${w44}:${ts44}`;
+          sock44.send(JSON.stringify({
+            type: 'AUTH_RESPONSE',
+            workerAddress: w44,
+            pubkey: keys44.pubHex,
+            signature: crypto44.sign(null, Buffer.from(pl44, 'utf8'), keys44.priv).toString('base64'),
+            timestamp: ts44,
+            model: 'qwen2.5-coder:1.5b',
+            installedModels: ['qwen2.5-coder:1.5b'],
+            ollamaOnline: true,
+          }));
+          const okay44 = await waitFrame44(sock44, 'AUTH_OK');
+          ok('44.5 WS handshake принимает installedModels',
+            Boolean(okay44), okay44 ? 'AUTH_OK' : 'нет AUTH_OK');
+
+          const st44 = await apiAt(s44.base, '/worker/status');
+          const me44 = (st44.body?.workers || []).find((w) => w.workerAddress === w44);
+          ok('44.6 /worker/status отдаёт список из рукопожатия',
+            Boolean(me44 && Array.isArray(me44.installedModels)
+              && me44.installedModels.length === 1
+              && me44.installedModels[0] === 'qwen2.5-coder:1.5b'),
+            me44 ? me44.installedModels : 'воркер не найден в присутствии');
+
+          /* Кадр PRESENCE обновляет список во время работы: у WS-воркера
+           * опроса нет, и без кадра список застыл бы на моменте подключения
+           * (`ollama pull` во время работы — обычное дело). */
+          sock44.send(JSON.stringify({
+            type: 'PRESENCE',
+            workerAddress: w44,
+            model: 'qwen2.5-coder:1.5b',
+            installedModels: ['qwen2.5-coder:1.5b', 'llama3:8b'],
+            ollamaOnline: true,
+          }));
+          await new Promise((r) => setTimeout(r, 500));
+          const st44b = await apiAt(s44.base, '/worker/status');
+          const me44b = (st44b.body?.workers || []).find((w) => w.workerAddress === w44);
+          ok('44.7 кадр PRESENCE обновляет список моделей',
+            Boolean(me44b && Array.isArray(me44b.installedModels)
+              && me44b.installedModels.length === 2),
+            me44b ? me44b.installedModels : 'воркер не найден в присутствии');
+
+          try { sock44.close(); } catch (_e) { /* уже закрыт */ }
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      }
+
+      /* 44.8 — клиент обязан присылать список В САМОМ рукопожатии.
+       * Поведение проверено выше на сервере; этот тест ловит регрессию в
+       * воркере, который иначе молча перестанет отправлять поле, и сервер
+       * снова начнёт хранить NULL. */
+      const workerSrc44 = fs.readFileSync(path.join(__dirname, 'worker-demo.js'), 'utf8');
+      ok('44.8 воркер отправляет installedModels в AUTH_RESPONSE',
+        /type: 'AUTH_RESPONSE'[\s\S]{0,700}installedModels/.test(workerSrc44),
+        'поле не отправляется в рукопожатии');
+
+      /* 44.9 — ноль живых воркеров это ИЗВЕСТНЫЙ факт, а не «список
+       * неизвестен». Иначе фильтр отключается ровно в самом частом случае
+       * (воркер выключен) и человек снова видит весь каталог. */
+      const pwaSrc44 = fs.readFileSync(path.join(__dirname, 'app', 'app.js'), 'utf8');
+      ok('44.9 PWA считает «воркеров нет» известным фактом',
+        /if \(!list\.length\)/.test(pwaSrc44)
+          && /known: true, models: new Set\(\)/.test(pwaSrc44),
+        'нулевое число воркеров всё ещё даёт known: false');
+
+      /* 44.10 — подпись Tier 6 не может печататься красным крестом из-за
+       * несверяемой суммы: у такого чека нет истории начислений, и сервер
+       * отвечает cumulativeValid: null. `null` falsy — старая проверка
+       * показывала «✗ сумма не сходится» на честном чеке. */
+      ok('44.10 PWA различает «сумма не сверяется» и «сумма не сходится»',
+        /cumulativeValid === null[\s\S]{0,200}не сверяется/.test(pwaSrc44),
+        'null трактуется как расхождение');
+    } finally {
+      await new Promise((r) => fakeProvider44.close(r));
+      s44.stop();
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

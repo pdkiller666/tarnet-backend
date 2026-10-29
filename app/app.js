@@ -437,6 +437,24 @@ function syncContourToModel() {
       ? `Промпт уйдёт провайдеру ${info.provider} по вашему ключу. Локальные воркеры не используются.`
       : 'Промпт обрабатывается воркерами сети и не покидает её.';
   }
+  /* Галочка TAR_UTILITY неактивна для облачной модели.
+   *
+   * У Tier 6 комиссия списывается веткой `reserveTier6Fee` → `debit(..., 'spend')`,
+   * и `paymentMode` там не читается вовсе. Оставить галочку включённой
+   * значило бы обещать скидку 2%, которой не будет, — то есть соврать в
+   * интерфейсе ровно там, где человек считает деньги. Снятая галочка при
+   * этом сохраняется: возврат на локальную модель обязан вернуть выбор, а не
+   * заставлять ставить его заново. */
+  const tarUtil = $('tarUtil');
+  if (tarUtil) {
+    tarUtil.disabled = cloud;
+    const label = tarUtil.parentElement && tarUtil.parentElement.querySelector('span');
+    if (label) {
+      label.textContent = cloud
+        ? 'Оплата из баланса TAR — только для локальных моделей'
+        : 'Платить из баланса TAR — комиссия 2% вместо 5%';
+    }
+  }
 }
 
 /* ---------- Что реально установлено на воркерах сети ----------
@@ -484,11 +502,26 @@ async function workerModelsReport() {
         ollamaOnline = Boolean(ollamaOnline) || w.ollamaOnline;
       }
     }
-    return { known, models, ollamaOnline, workers: list.length };
+    /* Ноль живых воркеров — это ИЗВЕСТНЫЙ факт, а не «список неизвестен».
+     *
+     * Здесь была дыра, из-за которой фильтр не включался в самом частом
+     * случае: воркер выключен → `workers: []` → `known: false` → PWA по
+     * правилу «неизвестно — не фильтруем» показывал ВЕСЬ локальный каталог
+     * (deepseek-r1-distill, qwen2.5-coder:1.5b, qwen2.5-coder-7b), хотя на
+     * машине не запущено ничего. Человек выбирал модель, которой нет, и
+     * получал `ollama HTTP 404` — ровно тот дефект, который фильтр и должен
+     * был убрать.
+     *
+     * «Неизвестно» остаётся только для недоступного /worker/status и для
+     * старого воркера, который поле не присылает. */
+    if (!list.length) {
+      return { known: true, models: new Set(), ollamaOnline: null, workers: 0, reachable: true };
+    }
+    return { known, models, ollamaOnline, workers: list.length, reachable: true };
   } catch (_e) {
     /* Статус воркеров недоступен — не фильтруем: пустой список выглядел бы
      * как «моделей нет», хотя проблема в сети. */
-    return { known: false, models: new Set(), ollamaOnline: null, workers: 0 };
+    return { known: false, models: new Set(), ollamaOnline: null, workers: 0, reachable: false };
   }
 }
 
@@ -546,9 +579,15 @@ async function loadModels() {
        * не стоит. Разные причины — разные советы. Молчаливый пустой список
        * отправил бы человека искать проблему в сети. */
       const g = document.createElement('optgroup');
-      g.label = report.ollamaOnline === false
-        ? 'Запустите Ollama, чтобы увидеть локальные модели'
-        : 'На подключённых ПК не установлено ни одной локальной модели';
+      /* Три разные причины, три разных совета. «Ничего не установлено» и
+       * «нет ни одного ПК» — не одно и то же: в первом случае надо ставить
+       * модель, во втором — запускать воркер. Один текст на оба случая
+       * отправлял человека чинить не то. */
+      g.label = report.workers === 0
+        ? 'Нет подключённых ПК — запустите воркер на своей машине'
+        : report.ollamaOnline === false
+          ? 'Запустите Ollama, чтобы увидеть локальные модели'
+          : 'На подключённых ПК не установлено ни одной локальной модели';
       sel.appendChild(g);
     }
     if (cloud.length) {
@@ -967,8 +1006,14 @@ function receiptBlock(res) {
       : '');
 
   /* seq есть только у локальных чеков. У Tier 6 в ответе лежит receipt_id,
-   * а seq = seq 0 подписи — это не номер чека. Печатать «#undefined» нельзя. */
-  const seqLabel = r.seq !== undefined && r.seq !== null
+   * а seq подписи — это константа 0, а не номер чека.
+   *
+   * Признак тира, а не «seq равен нулю»: у локального чека seq начинается с
+   * единицы, но полагаться на это нельзя — при обнулении таблицы он снова
+   * начнётся с 1, а контракт поля от тира не зависит. Печатать «#0» вместо
+   * номера значило бы выдать служебную константу подписи за идентификатор. */
+  const isTier6 = Number(r.tier) === 6;
+  const seqLabel = !isTier6 && r.seq !== undefined && r.seq !== null
     ? `#${esc(r.seq)}`
     : esc(short(String(r.receipt_id || '—')));
 
@@ -988,11 +1033,29 @@ function receiptBlock(res) {
   call('/receipt/verify', { method: 'POST', body: { receipt: r } })
     .then((v) => {
       if (!slot) return;
-      if (v.signatureValid && v.cumulativeValid) {
+      /* `cumulativeValid: null` — это «сверять не с чем», а не «не сходится».
+       *
+       * У чека Tier 6 (внешний вызов) нет истории начислений воркера, и
+       * нарастающий итог для него не определён: сервер честно отвечает null.
+       * Проверка `v.signatureValid && v.cumulativeValid` считала null ложью и
+       * печатала «✗ сумма не сходится» на ЧЕСТНОМ чеке — то есть верную
+       * подпись показывала как ошибку. Это хуже, чем «не проверено»:
+       * красный крест читается как подделка.
+       *
+       * Поэтому три состояния, а не два: подпись верна и сумма сошлась —
+       * зелёное; подпись верна, сверки нет — зелёное с явной оговоркой;
+       * подпись неверна или сумма разошлась — красное. */
+      if (!v.signatureValid) {
+        slot.textContent = '✗ подпись неверна';
+        slot.className = 'sig-bad';
+      } else if (v.cumulativeValid === null || v.cumulativeValid === undefined) {
+        slot.textContent = `✓ подпись верна (${r.signatureAlg || 'ed25519'}) · сумма не сверяется`;
+        slot.className = 'sig-ok';
+      } else if (v.cumulativeValid) {
         slot.textContent = `✓ подпись верна (${r.signatureAlg || 'ed25519'})`;
         slot.className = 'sig-ok';
       } else {
-        slot.textContent = `✗ ${v.signatureValid ? 'сумма не сходится' : 'подпись неверна'}`;
+        slot.textContent = '✗ сумма не сходится';
         slot.className = 'sig-bad';
       }
     })
@@ -1067,6 +1130,29 @@ async function sendPrompt(prompt, opts = {}) {
      * означает «базовая», и тогда сервер берёт BASE_MODEL сам. */
     const modelId = $('model')?.value;
     if (modelId) body.modelId = modelId;
+
+    /* Оплата из внутреннего баланса TAR: комиссия 2% вместо 5%.
+     *
+     * Сервер принимает режим только при названном клиенте и явном
+     * `paymentMode: 'TAR_UTILITY'` — без этого поля льготная ставка не
+     * включалась никогда, и `/summary` честно показывал `totalUtilizedTar: 0`
+     * при исправном механизме. Именно поэтому метрика была нулевой: её
+     * просто никто не вызывал.
+     *
+     * Стоит ПОСЛЕ объявления modelId, а не до: обращение к `const` выше её
+     * строки — ReferenceError в temporal dead zone, то есть падение на
+     * каждом запросе.
+     *
+     * Только для локального контура: у Tier 6 комиссия списывается другой
+     * веткой (`reserveTier6Fee` → `debit(..., 'spend')`), и `paymentMode`
+     * там не читается вовсе — отправлять его значило бы обещать скидку,
+     * которой не будет. */
+    const tarUtilEl = $('tarUtil');
+    const isCloudModel = modelId ? MODEL_INFO.get(modelId)?.tier === 6 : false;
+    if (tarUtilEl && tarUtilEl.checked && !isCloudModel) {
+      body.paymentMethod = 'TAR';
+      body.paymentMode = 'TAR_UTILITY';
+    }
 
     /* ===== Tier 6: свой ключ провайдера =====
      * tier: 6 отправляется только когда выбрана ОБЛАЧНАЯ модель.

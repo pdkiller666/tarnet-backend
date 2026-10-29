@@ -25,7 +25,7 @@
 | Моделей в каталоге | **18** — 15 облачных у 8 вендоров + 3 локальные | `/models` |
 | Живых воркеров | **1 сейчас** — `0xe56c…`, 4343 опроса (окно жизни — 60 с) | `/worker/status` |
 | Режим инференса | **`worker`** — живая модель `qwen2.5-coder:1.5b` | `/health.llm_mode` |
-| Автотестов приёмки | **995** (970 + 25), 0 падений | прогон 29.10.2026 |
+| Автотестов приёмки | **1005** (980 + 25), 0 падений | прогон 29.10.2026 |
 | Привязка устройств | **подпись Ed25519** + одноразовый nonce | `/devices/link` |
 | Перенос старых балансов | **`POST /migrate/claim`** — подпись нового кошелька | `2.12.9` (не менялось) |
 | Внутренняя утилизация токена | механизм **есть** (`TAR_UTILITY`, 2%), но `totalUtilizedTar: 0` — не используется | `/summary` |
@@ -58,7 +58,7 @@
 
 **Аудит 8 компонентов видения:** **2 ✅ / 3 ⚠️ / 3 ❌ (~44%)** по методике `docs/VISION-8-COMPONENTS.md` (✅ = 1, ⚠️ = 0.5). Не ~62%: 62.5% выходит, только если ⚠️ считать полным ✅.
 
-**Почему это всё же интересно.** Ядро — криптография, леджер и экономика — проверяемо сегодня: 750 чеков, нулевое расхождение, 995 автотестов, воспроизводимая приёмка одной командой, сквозной инференс через мобильную сеть. Отсутствует не протокол, а его рынок: устройства. Это разница между «мы построили сеть» (неправда) и «мы построили работающий протокол, которому нужна сеть» (правда, и её можно проверить).
+**Почему это всё же интересно.** Ядро — криптография, леджер и экономика — проверяемо сегодня: 750 чеков, нулевое расхождение, 1005 автотестов, воспроизводимая приёмка одной командой, сквозной инференс через мобильную сеть. Отсутствует не протокол, а его рынок: устройства. Это разница между «мы построили сеть» (неправда) и «мы построили работающий протокол, которому нужна сеть» (правда, и её можно проверить).
 
 **The Ask.** $150K pre-seed за 5–10% токенов — на подключение первых исполнителей, комитет валидаторов и GPU-обучение адаптеров.
 
@@ -84,7 +84,7 @@
 | Models in catalog | **18** — 15 cloud across 8 vendors + 3 local | `/models` |
 | Live workers | **1 right now** — `0xe56c…`, 4343 polls (60-second liveness window) | `/worker/status` |
 | Inference mode | **`worker`** — live model `qwen2.5-coder:1.5b` | `/health.llm_mode` |
-| Acceptance assertions | **995** (970 + 25), 0 failures | run of 29 Oct 2026 |
+| Acceptance assertions | **1005** (980 + 25), 0 failures | run of 29 Oct 2026 |
 | Device binding | **Ed25519 signature** + single-use nonce | `/devices/link` |
 | Legacy balance claim | **`POST /migrate/claim`** — signed by the new wallet | `2.12.9` (unchanged) |
 | Token utilization | mechanism **exists** (`TAR_UTILITY`, 2%), but `totalUtilizedTar: 0` — unused | `/summary` |
@@ -117,7 +117,7 @@
 
 **Eight-component vision audit:** **2 ✅ / 3 ⚠️ / 3 ❌ (~44%)** per the `docs/VISION-8-COMPONENTS.md` methodology (✅ = 1, ⚠️ = 0.5). Not ~62%: 62.5% only appears if ⚠️ is counted as full ✅.
 
-**Why it is still interesting.** The core — cryptography, ledger and economics — is verifiable today: 750 receipts, zero discrepancy, 995 automated assertions, reproducible acceptance in one command, end-to-end inference over a mobile network. What is missing is not the protocol but its market: devices. That is the difference between "we built a network" (false) and "we built a working protocol that needs a network" (true, and checkable).
+**Why it is still interesting.** The core — cryptography, ledger and economics — is verifiable today: 750 receipts, zero discrepancy, 1005 automated assertions, reproducible acceptance in one command, end-to-end inference over a mobile network. What is missing is not the protocol but its market: devices. That is the difference between "we built a network" (false) and "we built a working protocol that needs a network" (true, and checkable).
 
 **The Ask.** $150K pre-seed for 5–10% of tokens — to onboard the first executors, seat the validator committee, and fund GPU training of the adapters.
 
@@ -131,7 +131,7 @@
 - **Не писать «сеть постоянно живая».** 28.10 воркер был онлайн и сквозной тест прошёл; на замере 29.10 14:41 — `active_workers: 1`, `llm_mode: worker`. Окно жизни 60 с, поэтому говорить «путь доказан», не «сеть работает непрерывно».
 - **Не ставить старые снимки как текущие.** 705/78/56.55 — снимок 24.10; 716/83/72.116894 — 28.10 16:30; 721/83/72.117293 — 28.10 19:30; 725/83/72.119545 — 28.10 23:46:09; 731/84/72.119989 — 29.10 09:03; **750/90/80.387229 — 29.10 14:41 (текущий)**.
 - **Не писать «Tier 6 работает под нагрузкой».** `tier6_calls: 9` — девять сделок с живым ключом. Говорить можно про «вызов проходит и арифметика сходится», нельзя — про поток, лимиты и параллельные резервы.
-- **Не писать «738 тестов» или «713+25»** — актуально **995** (970 на `node test-dpouw.js --test` + 25 на `node test-mesh.js`).
+- **Не писать «738 тестов» или «713+25»** — актуально **1005** (980 на `node test-dpouw.js --test` + 25 на `node test-mesh.js`).
 - **Не смешивать «9 провайдеров» и «8 вендоров».** `/models` считает `provider: "local"` отдельной строкой, поэтому 9 = 8 вендоров + локальные. Gemini и Groq в коде есть, но в каталог не внесены — в цифру 18 не входят.
 - **Не называть привязку устройств «заявкой».** С `2.12.8` это подпись Ed25519 с одноразовым nonce. Но и не обещать больше: подпись доказывает владение **аккаунтом**, а не самим ПК.
 - **Источники для перепроверки:** `GET /health`, `/summary`, `/config`, `/worker/status`, `/knowledge/status`, `/p2p/status`.

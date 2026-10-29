@@ -225,7 +225,7 @@ omega, share, adapterId, actionId, timestamp, prevSignature, signature
 ## Проверка
 
 ```bash
-# приёмка: 970 проверок (+25 в test-mesh.js), 0 падений
+# приёмка: 980 проверок (+25 в test-mesh.js), 0 падений
 # --test сам поднимает изолированный сервер на свободном порту
 # и временной БД (TARNET_DB=$(mktemp)); запущенный стенд не нужен
 node test-dpouw.js --test
@@ -262,7 +262,7 @@ backend-api/
 ├── economics.js           # CWUCalculator, RewardEngine, γ_verify, эмиссия
 ├── ledger.js              # CumulativeLedger, подписи, учёт эпох
 ├── seed.js                # чистая база: ноды + служебные счёта
-├── test-dpouw.js          # приёмка dPoUW (970 проверок, флаг --test)
+├── test-dpouw.js          # приёмка dPoUW (980 проверок, флаг --test)
 ├── concurrency-check.sh   # отзывчивость под нагрузкой
 ├── ui/index.html          # консоль: плавный баланс, детализация, вывод
 ├── archive/lottery-tests/ # тесты прежней модели (история)

@@ -126,6 +126,17 @@
                   <option value="cloud">Cloud — промпт уходит провайдеру по вашему ключу</option>
                 </select>
               </label>
+              <!-- Оплата из внутреннего баланса TAR со скидкой.
+                   Без этого контрола режим TAR_UTILITY был недостижим из
+                   интерфейса: сервер его поддерживает (ставка 2% вместо 5%,
+                   строка kind='utilization' в леджере), но ни один запрос из
+                   PWA не нёс paymentMode, поэтому /summary честно показывал
+                   totalUtilizedTar: 0. Выключен по умолчанию: тратить
+                   внутренний баланс — решение человека, а не тихий дефолт. -->
+              <label class="field check-field">
+                <input type="checkbox" id="tarUtil">
+                <span>Платить из баланса TAR — комиссия 2% вместо 5%</span>
+              </label>
               <p class="hint tiny stage-hint" id="contourHint">Промпт обрабатывается воркерами сети и не покидает её.</p>
             </div>
           </details>
