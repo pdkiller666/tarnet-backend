@@ -433,6 +433,30 @@ ensureColumn('worker_tasks', 'error', 'error TEXT');
   }
 })();
 
+/* ===== Миграция: cashback-строки без ложного списания с казны =====
+ *
+ * Тот же дефект атрибуции, что у burn, только в другой строке. `credit`
+ * возвращал кэшбэк плательщику, но в `fromAddress` писал TREASURY_ADDRESS —
+ * как будто казна эти деньги отдала со своего баланса. Фактически кэшбэк
+ * начисляется из уже списанной с плательщика комиссии, и баланс казны не
+ * уменьшается ни на копейку.
+ *
+ * Поймано 29.10 на проде: treasuryAudit.holds был false с delta 0.0006 —
+ * ровно сумма шести tier6-кэшбэков, которые «списались с казны» только на
+ * бумаге. Начислено 0.186313 + казна-как-воркер 0.006762 = 0.193075, что
+ * точно совпадало с фактическим балансом — лишний член был один.
+ *
+ * Меняем только fromAddress: суммы, balances и toAddress не переписаны. */
+(function migrateCashbackAttribution() {
+  const fixed = db.prepare(
+    `UPDATE ledger_txs SET fromAddress = NULL
+      WHERE kind = 'cashback' AND fromAddress IS NOT NULL`,
+  ).run();
+  if (fixed.changes > 0) {
+    console.log(`💸 ledger_txs: ${fixed.changes} cashback-строк без ложного списания с казны (fromAddress → NULL)`);
+  }
+})();
+
 /* ===== Device Pairing: привязка ПК к аккаунту TarNet ID =====
  *
  * ЗАЧЕМ ОТДЕЛЬНАЯ ТАБЛИЦА, А НЕ tar_id.device_id. Колонка `device_id` уже
@@ -4967,21 +4991,29 @@ app.get('/summary', (_req, res) => {
 
   /* ===== Сверка казны: почему баланс не равен totalTreasuryTar =====
    *
-   * 28.10 в аудите повис вопрос: баланс казны 0.192075 против начисленного
-   * 0.185113, разница 0.006962 непонятного происхождения. Причина найдена
-   * на живой БД и оказалась не «внешним пополнением», а тремя слагаемыми:
+   * 28.10 в аудите повис вопрос: баланс казны не совпадал с начисленным,
+   * разница 0.006962 непонятного происхождения. Причина оказалась не
+   * «внешним пополнением», а двумя слагаемыми:
    *
    *   +0.006762  чек seq 30 (21.10 21:57), где workerAddress = адрес казны:
    *              казна получила выплату как воркер;
-   *   +0.000400  treasuryTar из tier6_calls — totalTreasuryTar читает
-   *              ТОЛЬКО work_receipts, поэтому внешние вызовы в него не входят;
-   *   −0.000200  кэшбэк, списанный с адреса казны (debit уменьшает баланс,
-   *              но в «начислено» его нет).
+   *   +0.001200  treasuryTar из tier6_calls — totalTreasuryTar читает
+   *              ТОЛЬКО work_receipts, поэтому внешние вызовы не входят.
    *
    * Почему НЕ правим totalTreasuryTar: он стоит в одном ряду с totalRewardTar
    * и totalFeeGrossTar и все они из work_receipts — тот же довод, что для
    * totalBurnedTar (см. выше). Вместо этого — явная сверка, как burnAudit:
    * читатель видит, из чего сложился баланс, вместо догадок.
+   *
+   * ДЕФЕКТ, ПОЙМАННЫЙ ЭТОЙ ЖЕ СВЕРКОЙ 29.10. Первая версия формулы вычитала
+   * `cashbackOutTar`. На проде это дало holds:false с delta ровно 0.0006 —
+   * суммой шести tier6-кэшбэков, у которых в fromAddress стояла казна.
+   * Но кэшбэк никогда не уходил с баланса казны: он возвращается из уже
+   * списанной с плательщика комиссии. Ложная атрибуция в `credit` создавала
+   * несуществующее списание. Формула исправлена (вычитания нет), сама запись
+   * исправлена, старые строки мигрированы. `cashbackOutTar` оставлен как
+   * диагностика: он обязан быть 0, и если снова станет больше — это баг
+   * атрибуции, а не расход.
    *
    * ВАЖНО: строки `spend` с toAddress = казна в баланс казны НЕ идут.
    * debit() уменьшает баланс плательщика, а toAddress — только метка. Этот
@@ -4993,13 +5025,18 @@ app.get('/summary', (_req, res) => {
     [TREASURY_ADDRESS],
   );
   const selfPayoutTar = Number(Number(selfPayout?.s ?? 0).toFixed(6));
+  /* Диагностика, не слагаемое: кэшбэк с fromAddress = казна — дефект
+   * атрибуции. После миграции обязан быть 0. В формулу не входит, иначе
+   * сверка «объясняла» бы баланс несуществующим расходом. */
   const cashbackOut = get(
-    `SELECT COALESCE(SUM(amountTar), 0) AS s FROM ledger_txs WHERE fromAddress = ? AND kind = 'cashback'`,
+    `SELECT COUNT(*) AS n, COALESCE(SUM(amountTar), 0) AS s FROM ledger_txs
+      WHERE fromAddress = ? AND kind = 'cashback'`,
     [TREASURY_ADDRESS],
   );
+  const cashbackOutRows = Number(cashbackOut?.n ?? 0);
   const cashbackOutTar = Number(Number(cashbackOut?.s ?? 0).toFixed(6));
   const treasuryAccruedTar = Number((Number(t.treasury ?? 0) + tier6TreasuryTar2).toFixed(6));
-  const treasuryExpected = Number((treasuryAccruedTar + selfPayoutTar - cashbackOutTar).toFixed(6));
+  const treasuryExpected = Number((treasuryAccruedTar + selfPayoutTar).toFixed(6));
   const treasuryActual = Number((treas?.balanceTar ?? 0).toFixed(6));
 
   res.json({
@@ -5039,11 +5076,15 @@ app.get('/summary', (_req, res) => {
       tier6Tar: tier6TreasuryTar2,
       accruedTar: treasuryAccruedTar,
       selfPayoutTar,
+      /* Должно быть 0. Ненулевое значение = дефект атрибуции cashback,
+       * а не расход казны: в формулу ожидаемого баланса не входит. */
       cashbackOutTar,
+      cashbackOutRows,
       expectedBalanceTar: treasuryExpected,
       actualBalanceTar: treasuryActual,
       delta: Number((treasuryActual - treasuryExpected).toFixed(6)),
-      holds: Math.abs(treasuryActual - treasuryExpected) < 1e-6,
+      holds: Math.abs(treasuryActual - treasuryExpected) < 1e-6
+        && cashbackOutRows === 0,
     },
     onchainSettlements: settledCount,
     /* Честная маркировка: записи в onchain_settlements созданы локально,
@@ -5775,8 +5816,17 @@ async function runInference(req, res) {
           /* Кэшбэк возвращается плательщику: если комиссию заплатил владелец
            * аккаунта, возврат на устройство был бы подарком устройству из
            * денег владельца. */
+          /* fromAddress у cashback не заполняется — по той же причине, что у
+           * burn. Кэшбэк не движение с баланса казны: он возвращается из уже
+           * списанной с плательщика комиссии (строка `spend`). Раньше здесь
+           * стоял TREASURY_ADDRESS, и любой расчёт расходов казны видел
+           * 0.0006 несуществующих списаний — именно из-за них
+           * treasuryAudit.holds был false на проде 29.10:
+           *   0.186313 начислено + 0.006762 казна-как-воркер = 0.193075,
+           *   а «списаний» насчитывалось 0.0006 при фактических нуле.
+           * toAddress остаётся плательщиком: по нему видно, кому вернули. */
           if (cashback > 0 && payer) {
-            credit(payer, cashback, 'cashback', callId, TREASURY_ADDRESS);
+            credit(payer, cashback, 'cashback', callId, null);
           }
           if (treasuryTar > 0) credit(TREASURY_ADDRESS, treasuryTar, 'treasury', callId, TREASURY_ADDRESS);
           /* Burn пишется без fromAddress: комиссия уже списана строкой

@@ -6443,11 +6443,18 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
 
   /* ===== 41. Сверка казны: баланс объяснён, а не «непонятная разница» =====
    *
-   * 28.10 в аудите повисло расхождение 0.006962 TAR между балансом казны
-   * и начисленным. Причина найдена: три слагаемых (см. комментарий в
-   * /summary). Без теста это снова стало бы заявлением, которое никто не
-   * пересчитает. Проверяется самотождество: expected = accrued + selfPayout
-   * − cashbackOut, и actual = expected + delta. */
+   * 28.10 в аудите повисло расхождение между балансом казны и начисленным.
+   * Причина найдена: два слагаемых (см. комментарий в /summary) — выплата
+   * казне как воркеру и treasuryTar из tier6_calls. Без теста это снова
+   * стало бы заявлением, которое никто не пересчитает.
+   *
+   * ИСТОРИЯ ВТОРОГО ДЕФЕКТА (29.10). Первая версия формулы вычитала
+   * `cashbackOutTar`, и на проде это дало holds:false с delta 0.0006 —
+   * ровно суммой шести tier6-кэшбэков, у которых в fromAddress стояла
+   * казна. Вычитание было неверным дважды: кэшбэк не уходил с казны, и
+   * формула «объясняла» баланс несуществующим расходом. Тест 41.2 держал
+   * ровно ошибочную формулу, поэтому и оставался зелёным. Теперь он
+   * проверяет правильную, а 41.6–41.7 караулят возврат дефекта. */
   section('41. Казна: баланс сходится с начисленным и объяснёнными слагаемыми');
   {
     const sum41 = await api('/summary');
@@ -6456,8 +6463,8 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
 
     if (ta) {
       ok('41.2 сумма частей сходится с ожидаемым балансом',
-        Math.abs((ta.accruedTar + ta.selfPayoutTar - ta.cashbackOutTar) - ta.expectedBalanceTar) < 1e-6,
-        { accrued: ta.accruedTar, self: ta.selfPayoutTar, cash: ta.cashbackOutTar, expected: ta.expectedBalanceTar });
+        Math.abs((ta.accruedTar + ta.selfPayoutTar) - ta.expectedBalanceTar) < 1e-6,
+        { accrued: ta.accruedTar, self: ta.selfPayoutTar, expected: ta.expectedBalanceTar });
 
       ok('41.3 фактический баланс = ожидаемый + delta',
         Math.abs((ta.expectedBalanceTar + ta.delta) - ta.actualBalanceTar) < 1e-6,
@@ -6472,6 +6479,17 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       ok('41.5 на чистой БД казна сходится без остатка (holds)',
         ta.holds === true,
         { delta: ta.delta, expected: ta.expectedBalanceTar, actual: ta.actualBalanceTar });
+
+      /* Регресс на сам дефект атрибуции: ни одна cashback-строка не вправе
+       * указывать казну плательщиком. Если появится — баланс казны снова
+       * начнёт «объясняться» несуществующим расходом. */
+      ok('41.6 кэшбэк не числится списанием с казны (0 строк)',
+        Number(ta.cashbackOutRows) === 0 && Number(ta.cashbackOutTar) === 0,
+        { rows: ta.cashbackOutRows, tar: ta.cashbackOutTar });
+
+      ok('41.7 cashbackOut не участвует в расчёте ожидаемого баланса',
+        Math.abs((ta.accruedTar + ta.selfPayoutTar) - ta.expectedBalanceTar) < 1e-6,
+        { accrued: ta.accruedTar, self: ta.selfPayoutTar, cash: ta.cashbackOutTar });
     }
   }
 
