@@ -263,7 +263,7 @@ H_DL=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/download/worker
 # в корне был 8080 б против 9207 в docs). Теперь корень — симлинки, и расхождение
 # стало невозможным — но только пока ссылки целы. Проверяем и это.
 WS_ROOT="$(cd "$REPO_DIR/.." && pwd)"
-DOC_LINKS="ONE-PAGER.md PITCH-DECK.md DEMO-SCRIPT.md EMAIL-TEMPLATE.md AUDIT-REALITY.md PROJECT-HISTORY.md"
+DOC_LINKS="ONE-PAGER.md PITCH-DECK.md DEMO-SCRIPT.md EMAIL-TEMPLATE.md AUDIT-REALITY.md PROJECT-HISTORY.md MANIFEST.v3.4-UNIFIED.md"
 if [ -d "$WS_ROOT" ]; then
   LINKS_BAD=""
   LINKS_OK=0
