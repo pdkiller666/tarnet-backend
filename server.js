@@ -6616,7 +6616,12 @@ async function runInference(req, res) {
       fallbackReason = fallbackReason || agentTrace.stopReason;
     }
   } else {
-    await runTransport(prompt);
+    /* Присваивание обязательно, а не «вызов ради побочного эффекта»:
+     * runTransport возвращает ответ шага (ветка Onion — свой объект, остальные —
+     * `result`). Без присваивания результат выбрасывался, `result` оставался
+     * undefined, и следующий же доступ `result.tokensGenerated` ронял запрос
+     * в 500 — что и случилось с onion: true на проде 29.10. */
+    result = await runTransport(prompt);
   }
 
   /* Токены считаются по сумме шагов, а не по последнему: оплата за работу —
