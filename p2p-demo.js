@@ -112,7 +112,14 @@ function describeMesh(mesh) {
     nodes: mesh.nodes.map((n) => ({
       role: n.role,
       address: n.address,
+      /* url — адрес, по которому узел СОЕДИНЯЕТСЯ внутри процесса. При bind
+       * на 0.0.0.0 это loopback: подключиться к 0.0.0.0 нельзя. */
       url: n.url,
+      /* publicUrl — что узел анонсирует наружу. Раньше это поле жило только
+       * в transport и не доходило до describeMesh: /p2p/status собирал его
+       * сам из n.transport.publicUrl, а клиент describeMesh (тесты, p2p-demo)
+       * видел только loopback-url и не мог отличить стенд от реальной сети. */
+      publicUrl: n.transport?.publicUrl ?? n.url,
       stats: { ...n.transport.stats },
     })),
     client: { address: mesh.client.address, stats: { ...mesh.client.stats } },

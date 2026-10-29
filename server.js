@@ -1173,6 +1173,18 @@ ensureColumn('nodes', 'rsaPublicKeyPem', 'rsaPublicKeyPem TEXT');
  * факт. Ниже — backfill ТОЛЬКО по доказательству: узел получает expert, если
  * реально выполнял expert-работу и имеет ненулевой стейк. */
 ensureColumn('nodes', 'tier', "tier TEXT DEFAULT 'base'");
+/* nodes.publicUrl — адрес, по которому узел ДОСТИЖИМ из интернета.
+ *
+ * Зачем отдельная колонка, если есть p2p-transport: реестр узлов и транспорт —
+ * разные вещи. Транспорт знает адрес ТОЛЬКО своих узлов в этом процессе; узел
+ * на другом хосте регистрируется через POST /node, и без сохранённого
+ * publicUrl его адрес нигде не остаётся — в /p2p/status он выглядел бы как
+ * запись без адреса, а маршрут через него собрать нельзя.
+ *
+ * Nullable сознательно: 43 уже зарегистрированных узла адреса не сообщали, и
+ * NOT NULL объявил бы их неполноценными задним числом. Отсутствие адреса —
+ * честный факт («не знаем, где он»), а не ошибка регистрации. */
+ensureColumn('nodes', 'publicUrl', 'publicUrl TEXT');
 {
   /* Почему backfill вообще нужен. Без него миграция делает все 133 узла
    * 'base', фильтр expert/heavy даёт ПУСТОЙ комитет, и submit-lora начинает
@@ -2156,6 +2168,32 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
      * сжигание — распределение этой же комиссии, а не второе движение
      * с баланса воркера. Подробности — в recordBurn. */
     if (settled.burnTotal > 0) recordBurn(settled.burnTotal, id);
+
+    /* 4.6) Блокирующий аудит казны.
+     *
+     * ПОЧЕМУ ВНУТРИ tx И ПОСЛЕ НАЧИСЛЕНИЙ: сверять баланс до записи бессмысленно
+     * — расхождение создаёт именно эта транзакция. Здесь все строки уже
+     * применены, и `treasuryAuditSnapshot()` видит то же состояние, что увидит
+     * `/summary` секундой позже.
+     *
+     * Почему БРОСОК, а не `res.json({ok:false})`: брошенное исключение
+     * откатывает BEGIN IMMEDIATE целиком — чек, балансы, реестр. Иначе система
+     * продолжила бы начислять поверх расхождения, и каждый следующий чек уносил
+     * бы ошибку дальше в историю, где её уже не отделить от нормы.
+     *
+     * Гейт смотрит ТОЛЬКО на delta баланса. `cashbackOutRows` в условие НЕ
+     * входит намеренно: это дефект атрибуции истории, он не двигает баланс, и
+     * остановка экономики его не исправит — остановила бы все начисления
+     * навсегда ради диагностики. Он виден в `/summary` отдельным полем. */
+    const gate = treasuryAuditSnapshot();
+    if (!(Math.abs(gate.delta) < 1e-6)) {
+      const err = new Error(
+        `treasury audit failed: expected ${gate.expectedBalanceTar}, actual ${gate.actualBalanceTar}, delta ${gate.delta}`,
+      );
+      err.code = 'TREASURY_AUDIT_FAILED';
+      err.audit = gate;
+      throw err;
+    }
 
     bumpEpoch(dbx, epoch, {
       emissionTar,
@@ -3996,7 +4034,7 @@ app.get('/ledger', (req, res) => {
 
 /* --- Node --- */
 app.post('/node', (req, res) => {
-  const { address, stake, reputation, isTeeAttested, rsaPublicKeyPem, tier } = req.body || {};
+  const { address, stake, reputation, isTeeAttested, rsaPublicKeyPem, tier, publicUrl } = req.body || {};
   if (typeof address !== 'string' || !address.length) {
     return res.status(400).json({ error: 'address is required' });
   }
@@ -4012,6 +4050,53 @@ app.post('/node', (req, res) => {
       return res.status(400).json({ error: `tier must be one of ${NODE_TIERS.join('/')}`, got: t });
     }
     nodeTier = t;
+  }
+  /* publicUrl — адрес, по которому узел достижим СНАРУЖИ (ws://1.2.3.4:4001).
+   *
+   * Зачем валидировать строго. Это поле попадёт в /p2p/status и в чужой
+   * маршрут: узел A скажет клиенту B «я тут», и B пойдёт по этому адресу.
+   * Мусор в поле — это сокет, который никто не откроет, причём ошибка
+   * всплывёт у ДРУГОГО участника, а не у того, кто её внёс.
+   *
+   * Требования:
+   *   - схема только ws:// НЕ wss:// — транспорт поднимает обычный ws,
+   *     и обещание wss привело бы к TLS-рукопожатию через plaintext-сокет;
+   *   - host не 0.0.0.0/:: — это bind-адрес, а не цель подключения;
+   *   - порт обязателен: без него остаётся схема по умолчанию, и узел
+   *     окажется на 80-м порту, где ничего не слушает.
+   * Отказ, а не «сохраню как есть»: испорченный адрес хуже отсутствующего,
+   * потому что отсутствие видно, а испорченный — только по таймауту. */
+  let nodePublicUrl = null;
+  if (publicUrl !== undefined && publicUrl !== null && String(publicUrl).trim() !== '') {
+    const raw = String(publicUrl).trim();
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch (_e) {
+      return res.status(400).json({ error: 'publicUrl must be a valid URL like ws://1.2.3.4:4001', got: raw });
+    }
+    if (parsed.protocol !== 'ws:') {
+      return res.status(400).json({
+        error: 'publicUrl must use ws:// (plaintext transport)',
+        got: parsed.protocol,
+        note: 'Транспорт поднимает обычный ws, не wss. Обещание wss привело бы к TLS через plaintext-сокет.',
+      });
+    }
+    if (!parsed.port) {
+      return res.status(400).json({
+        error: 'publicUrl must include an explicit port',
+        got: raw,
+        note: 'Без порта цель окажется на 80-м, где транспорт не слушает.',
+      });
+    }
+    if (['0.0.0.0', '::', '[::]', ''].includes(parsed.hostname)) {
+      return res.status(400).json({
+        error: 'publicUrl host is a bind address, not a connect target',
+        got: parsed.hostname,
+        note: 'Укажите внешний IP или DNS-имя этого узла.',
+      });
+    }
+    nodePublicUrl = `${parsed.protocol}//${parsed.host}`;
   }
   /* Ключ для Onion Routing проверяем до записи: невалидный PEM обнаружится
    * только при попытке упаковки слоя, то есть далеко от регистрации, где его
@@ -4032,20 +4117,31 @@ app.post('/node', (req, res) => {
    * перерегистрировать узел, не повторяя ключ или тир. Для tier это особенно
    * важно: backfill выставил expert по факту работы, а клиент, не знающий о
    * тирах, сбросил бы его в base первым же запросом и вывел себя из комитета. */
-  const existing = get('SELECT rsaPublicKeyPem, tier FROM nodes WHERE address = ?', [address]);
+  const existing = get('SELECT rsaPublicKeyPem, tier, publicUrl FROM nodes WHERE address = ?', [address]);
   const pubKey = rsaPublicKeyPem !== undefined
     ? (rsaPublicKeyPem || null)
     : (existing ? existing.rsaPublicKeyPem : null);
   const finalTier = nodeTier !== null ? nodeTier : (existing?.tier || 'base');
-  run('INSERT OR REPLACE INTO nodes (address, stake, reputation, isTeeAttested, routingWeight, rsaPublicKeyPem, tier) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [address, Number(stake) || 0, Number(reputation) || 0, isTeeAttested ? 1 : 0, rw, pubKey, finalTier]);
+  /* publicUrl — та же логика, что у ключа и тира: не передан → сохраняется
+   * прежний. Сброс в NULL при перерегистрации стёр бы единственный адрес
+   * узла, а клиент, не знающий о поле, сделал бы это первым же запросом. */
+  const finalPublicUrl = nodePublicUrl !== null
+    ? nodePublicUrl
+    : (existing ? (existing.publicUrl || null) : null);
+  run('INSERT OR REPLACE INTO nodes (address, stake, reputation, isTeeAttested, routingWeight, rsaPublicKeyPem, tier, publicUrl) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [address, Number(stake) || 0, Number(reputation) || 0, isTeeAttested ? 1 : 0, rw, pubKey, finalTier, finalPublicUrl]);
   run(`INSERT INTO balances (address, balanceTar, stakedTar, updatedAt) VALUES (?, 0, ?, ?)
        ON CONFLICT(address) DO UPDATE SET stakedTar = excluded.stakedTar, updatedAt = excluded.updatedAt`,
     [address, Number(stake) || 0, new Date().toISOString()]);
   res.json({ address, stake: Number(stake) || 0, reputation: Number(reputation) || 0,
     isTeeAttested: !!isTeeAttested, routingWeight: rw, tier: finalTier,
     validatorEligible: ['expert', 'heavy'].includes(finalTier),
-    onionCapable: Boolean(pubKey) });
+    onionCapable: Boolean(pubKey),
+    /* Отдаём сохранённый адрес, а не присланный: клиент должен видеть, что
+     * реально легло в реестр, — иначе расхождение обнаружится только через
+     * /p2p/status, когда исправлять его будет уже поздно. */
+    publicUrl: finalPublicUrl,
+    publicUrlHost: finalPublicUrl ? new URL(finalPublicUrl).hostname : null });
 });
 
 app.get('/nodes', (_req, res) => {
@@ -4571,6 +4667,18 @@ function handleWork(req, res) {
      * конфликт ключей. Вернуть чужой чек значило бы отдать его первому, кто
      * угадает id. */
     if (e.code === 'ACTION_ID_CONFLICT') return res.status(409).json({ error: e.message, actionId: req.body?.actionId ?? null });
+    /* Блокирующий аудит казны — 500, а не 400: клиент прислал корректный
+     * запрос, сломано состояние сервера. Отдаём audit целиком, иначе дежурный
+     * видит «что-то упало» без expected/actual/delta и идёт читать базу
+     * вручную. Транзакция уже откатана — чек не выпущен. */
+    if (e.code === 'TREASURY_AUDIT_FAILED') {
+      return res.status(500).json({
+        error: e.message,
+        code: 'TREASURY_AUDIT_FAILED',
+        audit: e.audit ?? null,
+        charged: false,
+      });
+    }
     throw e;
   }
 }
@@ -4627,6 +4735,94 @@ async function ensureDemoMesh() {
   return demoMeshStarting;
 }
 
+/* --- Опциональный Onion-путь для обычного /inference ---
+ *
+ * ЧЕСТНО О ГРАНИЦАХ. Локальный путь /inference — это очередь в БД: воркер
+ * забирает задачу через /worker/task и присылает результат. В этом пути НЕТ
+ * реле и нет хопов — придумать их в ответе значило бы показать клиенту
+ * маршрут, по которому запрос не шёл.
+ *
+ * Onion-путь — отдельный транспорт: пакет реально идёт по WebSocket через
+ * цепь реле. Он доступен, когда все узлы маршрута живут в поднятом меше.
+ * Сейчас это демо-меш процесса (реле и воркер на loopback) — то же самое,
+ * что делает /inference/onion. Поэтому флаг `onion: true` означает именно
+ * «проведи запрос по цепи», а не «нарисуй красивый маршрут».
+ *
+ * Почему опционально, а не всегда: маршрут через реле — это RSA-упаковка
+ * трёх слоёв и три сетевых прыжка на каждый запрос. Для обычного чата это
+ * чистая задержка без выигрыша в приватности, если узлы и так доверенные.
+ */
+async function tryOnionTransport({ prompt, routeNodes, clientAddress, model }) {
+  const addrs = Array.isArray(routeNodes) && routeNodes.length ? routeNodes : null;
+  if (!addrs) {
+    return { attempted: false, delivered: false, reason: 'no_route' };
+  }
+  if (addrs.length > 5) {
+    return { attempted: false, delivered: false, reason: 'route_too_long', got: addrs.length };
+  }
+
+  /* Проверяем узлы той же проверкой, что /inference/onion: без
+   * rsaPublicKeyPem собрать слой нельзя. */
+  const route = [];
+  for (const addr of addrs) {
+    if (typeof addr !== 'string' || !addr.length) {
+      return { attempted: false, delivered: false, reason: 'bad_route_entry', got: addr };
+    }
+    const node = get('SELECT address, rsaPublicKeyPem FROM nodes WHERE address = ?', [addr]);
+    if (!node) {
+      return { attempted: false, delivered: false, reason: 'route_node_unregistered', address: addr };
+    }
+    if (!node.rsaPublicKeyPem) {
+      return { attempted: false, delivered: false, reason: 'route_node_not_onion_capable', address: addr };
+    }
+    route.push({ address: node.address, rsaPublicKeyPem: node.rsaPublicKeyPem });
+  }
+
+  let mesh;
+  try {
+    mesh = await ensureDemoMesh();
+  } catch (e) {
+    return { attempted: true, delivered: false, reason: 'mesh_unavailable', detail: e.message };
+  }
+
+  const inMesh = new Set(mesh.nodes.map(n => n.address));
+  if (!route.every(n => inMesh.has(n.address))) {
+    /* Маршрут содержит узлы вне меша: открыть к ним сокет некуда. Разные
+     * вещи: «узел зарегистрирован» и «узел достижим по сети». */
+    return {
+      attempted: true,
+      delivered: false,
+      reason: 'route_not_reachable',
+      note: 'Узлы маршрута зарегистрированы, но недостижимы по сети: в меше этого процесса их нет.',
+    };
+  }
+
+  try {
+    const d = await mesh.client.sendOnion({
+      route,
+      innerRequest: { prompt, model: model || null, clientAddress: clientAddress || null },
+    });
+    /* Роли восстанавливаем по адресам: клиенту нужен читаемый маршрут
+     * `['client','relay1','relay2','worker']`, а не голые 0x-адреса. */
+    const roleOf = new Map(mesh.nodes.map(n => [n.address, n.role]));
+    const routeLabels = ['client', ...route.map(n => roleOf.get(n.address) || 'node'), 'worker'];
+    return {
+      attempted: true,
+      delivered: true,
+      hops: d.hops,
+      route: routeLabels,
+      routeAddresses: route.map(n => n.address),
+      entryNode: d.entryNode,
+      answer: d.answer,
+      packetBytes: d.packetBytes,
+      transport: 'websocket',
+      ttlMs: d.ttlMs,
+    };
+  } catch (e) {
+    return { attempted: true, delivered: false, reason: 'delivery_failed', detail: e.message };
+  }
+}
+
 app.get('/p2p/status', async (_req, res) => {
   let mesh;
   try {
@@ -4657,12 +4853,42 @@ app.get('/p2p/status', async (_req, res) => {
       role: n.role,
       address: n.address,
       url: n.url,
-      publicUrl: n.transport?.publicUrl ?? n.url,
+      publicUrl: n.publicUrl ?? n.transport?.publicUrl ?? n.url,
       /* stats обязателен: по нему доказывается, что доставка шла по сети
        * (воркер requests ≥ 1, реле requests = 0). Без него утверждение
        * «луковица реально дошла» ничем не подтверждено. */
       stats: { ...n.transport.stats },
     })),
+    /* --- Узлы из реестра, а не из демо-сети ---
+     *
+     * Выше в nodes[] — демо-меш этого процесса: три узла на loopback, они
+     * существуют, чтобы луковица имела куда дойти. Это стенд, и называть его
+     * сетью нельзя: все адреса там 127.0.0.1.
+     *
+     * Здесь — то, что реально умеет адрес: узлы, зарегистрированные через
+     * POST /node с полем publicUrl. Считаем и отдаём их отдельным блоком, а не
+     * подмешиваем в nodes[]: смешивание сделало бы `announced_public`
+     * зависимым от того, кто когда регистрировался, и скрыло бы факт «в
+     * процессе только стенд». */
+    registry: (() => {
+      const rows = all(`SELECT address, publicUrl, tier FROM nodes
+                         WHERE publicUrl IS NOT NULL AND TRIM(publicUrl) != ''`);
+      return {
+        total: rows.length,
+        nodes: rows.map(r => ({
+          address: r.address,
+          publicUrl: r.publicUrl,
+          host: (() => { try { return new URL(r.publicUrl).hostname; } catch (_e) { return null; } })(),
+          tier: r.tier || 'base',
+        })),
+        /* Отдельный флаг именно для реестра: announced_public выше отвечает
+         * на вопрос «анонсирует ли себя демо-меш», а этот — «есть ли в
+         * реестре хотя бы один узел с внешним адресом». Путать их нельзя:
+         * можно иметь публичный реестр и при этом loopback-стенд в процессе. */
+        has_public_nodes: rows.some(r =>
+          !/\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])[:/]/.test(r.publicUrl)),
+      };
+    })(),
     client: d.client,
   });
 });
@@ -4948,6 +5174,52 @@ app.get('/settlements', (req, res) => {
 });
 
 /* --- Summary --- */
+/* Снимок аудита казны. Вынесен ИЗ /summary в функцию, потому что теперь у
+ * него два читателя: отчёт и блокирующий гейт начисления.
+ *
+ * ПОЧЕМУ ОДНА ФУНКЦИЯ, А НЕ ДВЕ ПОХОЖИЕ: гейт, считающий «по-своему», — это
+ * второй источник истины того же факта. Через месяц кто-то поправит формулу в
+ * одном месте, и отчёт скажет «сходится», а гейт — «нет» (или наоборот). Один
+ * расчёт — одна правда.
+ *
+ * Формула: expected = работа по чекам + комиссия tier6 + выплаты казне как
+ * воркеру. `cashbackOut` в сумму НЕ входит — необязательное вычитание давало
+ * ложное holds:false, разобранное 29.10. */
+function treasuryAuditSnapshot() {
+  const totals = ledger.totals();
+  const workReceiptsTar = Number(Number(totals.treasury ?? 0).toFixed(6));
+  const tier6Row = get('SELECT COALESCE(SUM(treasuryTar), 0) AS s FROM tier6_calls');
+  const tier6Tar = Number(Number(tier6Row?.s ?? 0).toFixed(6));
+  const selfPayoutRow = get(
+    `SELECT COALESCE(SUM(amountTar), 0) AS s FROM ledger_txs WHERE toAddress = ? AND kind = 'payout'`,
+    [TREASURY_ADDRESS],
+  );
+  const selfPayoutTar = Number(Number(selfPayoutRow?.s ?? 0).toFixed(6));
+  const cashbackOut = get(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(amountTar), 0) AS s FROM ledger_txs
+      WHERE fromAddress = ? AND kind = 'cashback'`,
+    [TREASURY_ADDRESS],
+  );
+  const cashbackOutRows = Number(cashbackOut?.n ?? 0);
+  const cashbackOutTar = Number(Number(cashbackOut?.s ?? 0).toFixed(6));
+  const treas = get('SELECT balanceTar FROM balances WHERE address = ?', [TREASURY_ADDRESS]);
+  const actualBalanceTar = Number((treas?.balanceTar ?? 0).toFixed(6));
+  const accruedTar = Number((workReceiptsTar + tier6Tar).toFixed(6));
+  const expectedBalanceTar = Number((accruedTar + selfPayoutTar).toFixed(6));
+  return {
+    workReceiptsTar,
+    tier6Tar,
+    accruedTar,
+    selfPayoutTar,
+    cashbackOutTar,
+    cashbackOutRows,
+    expectedBalanceTar,
+    actualBalanceTar,
+    delta: Number((actualBalanceTar - expectedBalanceTar).toFixed(6)),
+    holds: Math.abs(actualBalanceTar - expectedBalanceTar) < 1e-6 && cashbackOutRows === 0,
+  };
+}
+
 app.get('/summary', (_req, res) => {
   const t = ledger.totals();
   const gross = Number(t.feeGross) + Number(t.block);
@@ -5018,26 +5290,20 @@ app.get('/summary', (_req, res) => {
    * ВАЖНО: строки `spend` с toAddress = казна в баланс казны НЕ идут.
    * debit() уменьшает баланс плательщика, а toAddress — только метка. Этот
    * учёт уже один раз давал неверную разбивку при реконструкции по kind. */
-  const tier6Treasury = get('SELECT COALESCE(SUM(treasuryTar), 0) AS s FROM tier6_calls');
-  const tier6TreasuryTar2 = Number(Number(tier6Treasury?.s ?? 0).toFixed(6));
-  const selfPayout = get(
-    `SELECT COALESCE(SUM(amountTar), 0) AS s FROM ledger_txs WHERE toAddress = ? AND kind = 'payout'`,
-    [TREASURY_ADDRESS],
-  );
-  const selfPayoutTar = Number(Number(selfPayout?.s ?? 0).toFixed(6));
-  /* Диагностика, не слагаемое: кэшбэк с fromAddress = казна — дефект
-   * атрибуции. После миграции обязан быть 0. В формулу не входит, иначе
-   * сверка «объясняла» бы баланс несуществующим расходом. */
-  const cashbackOut = get(
-    `SELECT COUNT(*) AS n, COALESCE(SUM(amountTar), 0) AS s FROM ledger_txs
-      WHERE fromAddress = ? AND kind = 'cashback'`,
-    [TREASURY_ADDRESS],
-  );
-  const cashbackOutRows = Number(cashbackOut?.n ?? 0);
-  const cashbackOutTar = Number(Number(cashbackOut?.s ?? 0).toFixed(6));
-  const treasuryAccruedTar = Number((Number(t.treasury ?? 0) + tier6TreasuryTar2).toFixed(6));
-  const treasuryExpected = Number((treasuryAccruedTar + selfPayoutTar).toFixed(6));
-  const treasuryActual = Number((treas?.balanceTar ?? 0).toFixed(6));
+  const treasuryAudit = treasuryAuditSnapshot();
+  /* Поля раскладываются в прежние имена намеренно: ответ /summary — контракт,
+   * и переименование полей сломало бы читателей. Меняется только источник
+   * вычисления — теперь он общий с блокирующим гейтом. */
+  const {
+    workReceiptsTar: treasuryWorkReceiptsTar,
+    tier6Tar: treasuryTier6Tar,
+    accruedTar: treasuryAccruedTar,
+    selfPayoutTar,
+    cashbackOutTar,
+    cashbackOutRows,
+    expectedBalanceTar: treasuryExpected,
+    actualBalanceTar: treasuryActual,
+  } = treasuryAudit;
 
   res.json({
     receipts: Number(t.receipts),
@@ -5072,8 +5338,8 @@ app.get('/summary', (_req, res) => {
     /* Сверка казны: три слагаемых, которые раньше были «непонятной
      * разницей». holds: true означает, что баланс объяснён полностью. */
     treasuryAudit: {
-      workReceiptsTar: Number(Number(t.treasury ?? 0).toFixed(6)),
-      tier6Tar: tier6TreasuryTar2,
+      workReceiptsTar: treasuryWorkReceiptsTar,
+      tier6Tar: treasuryTier6Tar,
       accruedTar: treasuryAccruedTar,
       selfPayoutTar,
       /* Должно быть 0. Ненулевое значение = дефект атрибуции cashback,
@@ -5082,9 +5348,8 @@ app.get('/summary', (_req, res) => {
       cashbackOutRows,
       expectedBalanceTar: treasuryExpected,
       actualBalanceTar: treasuryActual,
-      delta: Number((treasuryActual - treasuryExpected).toFixed(6)),
-      holds: Math.abs(treasuryActual - treasuryExpected) < 1e-6
-        && cashbackOutRows === 0,
+      delta: treasuryAudit.delta,
+      holds: treasuryAudit.holds,
     },
     onchainSettlements: settledCount,
     /* Честная маркировка: записи в onchain_settlements созданы локально,
@@ -6171,6 +6436,12 @@ async function runInference(req, res) {
   /* Причина отката на шаблон, видимая клиенту. Без неё "ответ есть, но
    * модель молчит" неотличим от честной работы: source одинаковый. */
   let fallbackReason = null;
+  /* Результат попытки Onion-пути. `let`, а не `var`: без объявления
+   * присваивание внутри runTransport создало бы ГЛОБАЛЬНУЮ переменную, и
+   * второй запрос увидел бы `onionAttempt` от первого — то есть молча пошёл
+   * бы мимо Onion (флаг «уже пробовали»). Именно поэтому объявлено здесь,
+   * в области видимости запроса, а не рядом с вызовом. */
+  let onionAttempt = null;
 
   /* Один шаг транспорта: worker -> external_api -> deterministic_fallback.
    *
@@ -6185,6 +6456,37 @@ async function runInference(req, res) {
    */
   const runTransport = async (stepPrompt) => {
     const prompt = stepPrompt;
+
+  /* ===== 2.9) Onion-путь (опционально) =====
+   *
+   * Включается только явным флагом `onion: true` в теле запроса • по
+   * умолчанию транспорт прежний. Почему не автоматически: Onion — это три
+   * RSA-слоя и три сетевых прыжка на каждый шаг, и включать это молча для
+   * всех означало бы замедлить обычный чат без спроса.
+   *
+   * Если клиент попросил Onion, а маршрут недоступен — отдаём причину, но
+   * НЕ падаем и НЕ подменяем маршрут локальным молча: `onion.reason` говорит,
+   * что именно помешало, а запрос идёт штатным путём. Молчаливый фолбэк
+   * скрыл бы, что приватного маршрута не было. */
+  if (body.onion === true && !onionAttempt) {
+    onionAttempt = await tryOnionTransport({
+      prompt,
+      routeNodes: body.onionRoute || body.routeNodes,
+      clientAddress: body.clientAddress || null,
+      model: modelId || body.model || null,
+    });
+    if (onionAttempt.delivered) {
+      return {
+        source: 'onion_mesh',
+        provider: 'home_worker',
+        model: modelId || body.model || null,
+        response: onionAttempt.answer,
+        usage: null,
+        tokensGenerated: Math.max(1, Math.floor(String(onionAttempt.answer || '').length / 4)),
+        emulated: false,
+      };
+    }
+  }
 
   if (hasActiveWorker()) {
     // Режим A: домашний узел забирает задачу и присылает результат.
@@ -6474,6 +6776,28 @@ async function runInference(req, res) {
     worker: workerAddress,
     workerAddress,
     routing,
+    /* Onion-путь: что реально произошло. null = клиент не просил Onion.
+     * Если просил, но не вышло — здесь честная причина, а не тишина:
+     * поле попытки важнее красивого маршрута, которого не было. */
+    onion: onionAttempt
+      ? {
+        requested: true,
+        delivered: Boolean(onionAttempt.delivered),
+        /* hops = 3 только когда пакет РЕАЛЬНО прошёл три слоя. У
+         * недоставленного запроса хопов нет — нечего считать. */
+        hops: onionAttempt.delivered ? onionAttempt.hops : 0,
+        route: onionAttempt.delivered ? onionAttempt.route : null,
+        routeAddresses: onionAttempt.routeAddresses ?? null,
+        entryNode: onionAttempt.entryNode ?? null,
+        packetBytes: onionAttempt.packetBytes ?? null,
+        transport: onionAttempt.transport ?? null,
+        reason: onionAttempt.delivered ? null : onionAttempt.reason,
+        detail: onionAttempt.delivered ? null : onionAttempt.detail ?? null,
+        /* Явно: ответ выше пришёл НЕ по луковице. Без этого флага клиент
+         * видел бы response и hops:0 без объяснения, что маршрута не было. */
+        usedFallbackTransport: !onionAttempt.delivered,
+      }
+      : null,
     tier,
     adapterId,
     clientAddress,
