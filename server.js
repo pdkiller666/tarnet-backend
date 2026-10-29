@@ -2803,6 +2803,69 @@ app.get('/balances', (_req, res) => {
     .map(b => ({ ...b, balanceTar: Number(b.balanceTar.toFixed(6)) })));
 });
 
+/* ===== Cross-Compute: замкнутый цикл $TAR по одному адресу =====
+ *
+ * Зачем отдельный эндпоинт, а не два запроса из браузера. Заработок лежит в
+ * `work_receipts`, траты на внешние вызовы — в `tier6_calls`, и это разные
+ * таблицы с разными ключами. Клиент мог бы сходить в /balances и /summary, но
+ * там нет выборки по адресу: /summary агрегирует всю сеть, а /balance не знает
+ * про заработок и траты вообще. Сложить ROI в браузере из кусков — значит
+ * держать формулу в двух местах и получить два разных ROI при первой правке.
+ *
+ * ЧЕСТНО ПРО ПРИРОДУ ЧИСЕЛ:
+ *   earnedTar  — из work_receipts, то есть реально выпущенные чеки воркера;
+ *   spentTar   — из tier6_calls, то есть комиссии внешних вызовов, где этот
+ *                адрес был ФАКТИЧЕСКИМ плательщиком (clientAddress = payer);
+ *   netTar     — их разность. Это не «прибыль»: TAR не имеет рыночной цены,
+ *                и подавать разность как доход было бы ложью. Подпись в UI
+ *                говорит «сальдо», а не «прибыль».
+ *
+ * Если адреса нет ни в одной таблице — 200 с нулями, а не 404. Новое
+ * устройство обязано увидеть виджет с нулями: 404 заставил бы клиент гадать,
+ * «нет данных» это или «сломано».
+ */
+app.get('/cross-compute/:address', (req, res) => {
+  const address = String(req.params.address || '').trim();
+  if (!address) return res.status(400).json({ error: 'address is required' });
+
+  const earned = get(
+    `SELECT COALESCE(SUM(rewardTar), 0) AS s, COUNT(*) AS n, COALESCE(SUM(cwu), 0) AS cwu
+       FROM work_receipts WHERE workerAddress = ?`, [address]);
+  const spent = get(
+    `SELECT COALESCE(SUM(feeGrossTar), 0) AS s, COUNT(*) AS n
+       FROM tier6_calls WHERE clientAddress = ?`, [address]);
+
+  /* Потраченное на сеть отдельно от внешних вызовов: комиссия локального
+   * инференса уходит в тот же цикл, но из другой таблицы (ledger_txs, kind
+   * 'spend'). Без этого слагаемого виджет показывал бы траты только за
+   * облако и завышал сальдо ровно на комиссию сети. */
+  const networkSpend = get(
+    `SELECT COALESCE(SUM(amountTar), 0) AS s, COUNT(*) AS n
+       FROM ledger_txs WHERE fromAddress = ? AND kind = 'spend'`, [address]);
+
+  const earnedTar = round(Number(earned.s));
+  const cloudTar = round(Number(spent.s));
+  const networkTar = round(Number(networkSpend.s));
+  const spentTar = round(cloudTar + networkTar);
+
+  res.json({
+    address,
+    earnedTar,
+    spentTar,
+    /* Раздельно, чтобы подпись в UI могла назвать источник: «облако» и
+     * «сеть» — разные вещи для человека, решившего подключить свой ПК. */
+    breakdown: { cloudTar, networkTar },
+    netTar: round(earnedTar - spentTar),
+    receipts: Number(earned.n),
+    tier6Calls: Number(spent.n),
+    networkCalls: Number(networkSpend.n),
+    cwu: round(Number(earned.cwu)),
+    /* Курс локальный: TAR не торгуется, поэтому пересчёт в деньги был бы
+     * выдумкой. Отдаём только TAR и единицу работы. */
+    unit: 'TAR',
+  });
+});
+
 /* ===== Faucet =====
  * Зачем он существует: после 2.12.1 Tier 6 требует баланс (402 на пустом
  * кошельке). Публичного пополнения нет, поэтому новый PWA не мог

@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>TarNet — Synapse</title>
+<title>TarNet — Tokenized AI Resource Network</title>
 <meta name="theme-color" content="#090a0f">
-<meta name="description" content="TarNet: приватный инференс на распределённой сети">
+<meta name="description" content="TarNet — Tokenized AI Resource Network. Приватный инференс: промпт не покидает сеть, под каждым ответом подписанный чек.">
 <link rel="manifest" href="/app/manifest.webmanifest">
 <link rel="icon" href="/app/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/app/icon.svg">
@@ -39,7 +39,8 @@
           </svg>
         </span>
         <div class="brand-text">
-          <h1>TarNet <span class="brand-sep">/</span> <span class="brand-sub">Synapse</span></h1>
+          <h1>TarNet</h1>
+          <p class="brand-tag">Tokenized AI Resource Network</p>
           <p class="sub" id="modeLine">проверяю режим…</p>
         </div>
       </div>
@@ -54,7 +55,7 @@
 
     <nav class="tabs sidebar-nav" role="tablist" aria-label="Разделы приложения">
       <button class="tab active" role="tab" data-tab="chat" aria-selected="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.9 8.9 0 0 1-4-.9L3 21l1.9-4.4a8.4 8.4 0 0 1-.9-4A8.4 8.4 0 0 1 12.4 3a8.4 8.4 0 0 1 8.6 8.5Z"/></svg><span class="tab-label">Synapse Chat</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.9 8.9 0 0 1-4-.9L3 21l1.9-4.4a8.4 8.4 0 0 1-.9-4A8.4 8.4 0 0 1 12.4 3a8.4 8.4 0 0 1 8.6 8.5Z"/></svg><span class="tab-label">TarNet Chat</span>
       </button>
       <button class="tab" role="tab" data-tab="devices" aria-selected="false">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg><span class="tab-label">Мои узлы &amp; BYOK</span>
@@ -81,6 +82,7 @@
       <p class="sidebar-balance">Баланс: <strong id="sidebarBalance">—</strong> <span class="unit">TAR</span></p>
       <button type="button" class="faucet-mini" id="sidebarFaucet" hidden>Получить 0.01 TAR</button>
       <p class="sidebar-status"><span class="dot" id="p2pDot"></span> <span id="p2pText">P2P</span></p>
+      <p class="brand-foot">TarNet — Tokenized AI Resource Network</p>
     </div>
   </aside>
 
@@ -213,7 +215,7 @@
              отправляют tier 6 сами по себе: тир выбирает МОДЕЛЬ. -->
         <form id="chatForm" class="composer omnibox-container">
           <div class="composer-box omnibox">
-            <textarea id="prompt" rows="1" placeholder="Спросите Synapse…" maxlength="65536" aria-label="Запрос"></textarea>
+            <textarea id="prompt" rows="1" placeholder="Спросите TarNet…" maxlength="65536" aria-label="Запрос"></textarea>
 
             <div class="omnibox-bar">
               <div class="mode-pills" role="group" aria-label="Режим запроса">
@@ -274,6 +276,36 @@
             <button id="faucetBtn" class="btn ghost small">Получить 0.01 TAR (тест)</button>
             <span class="hint tiny" id="faucetState">тестовые деньги для комиссии Tier 6</span>
           </div>
+        </div>
+
+        <!-- ===== Cross-Compute: замкнутый цикл $TAR =====
+             Три числа без обещаний прибыли: «заработано» — выпущенные чеки
+             этого адреса, «потрачено» — комиссии (облако + сеть), «сальдо» —
+             их разность. TAR не торгуется, поэтому пересчёта в доллары
+             здесь нет и не будет: он превратил бы сальдо в выдуманный доход.
+             Числа считает сервер (/cross-compute/:address), а не браузер:
+             формула должна жить в одном месте. -->
+        <div class="card" id="crossComputeCard">
+          <div class="card-head">
+            <h2>Cross-Compute</h2>
+            <span class="chip" id="ccCalls">—</span>
+          </div>
+          <div class="cc-grid">
+            <div class="cc-cell">
+              <span class="cc-label">Заработано на ПК</span>
+              <span class="cc-val" id="ccEarned">—</span>
+            </div>
+            <div class="cc-cell">
+              <span class="cc-label">Потрачено</span>
+              <span class="cc-val" id="ccSpent">—</span>
+            </div>
+            <div class="cc-cell wide">
+              <span class="cc-label">Сальдо (не прибыль)</span>
+              <span class="cc-val" id="ccNet">—</span>
+            </div>
+          </div>
+          <p class="cc-split" id="ccSplit"></p>
+          <p class="cc-note" id="ccNote">Считается по выпущенным чекам и комиссиям этого адреса.</p>
         </div>
 
         <div class="card">

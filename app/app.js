@@ -207,7 +207,7 @@ document.querySelectorAll('.tab').forEach((tab) => {
      * agents.js. Прячем здесь, а событием ниже сообщаем, что пора грузить
      * данные — иначе вкладка открывалась бы пустой до первого клика. */
     if ($('tab-agents')) $('tab-agents').hidden = name !== 'agents';
-    if (name === 'devices') { refreshBalance(); refreshFaucet(); }
+    if (name === 'devices') { refreshBalance(); refreshFaucet(); refreshCrossCompute(); }
     document.dispatchEvent(new CustomEvent('tarnet:tab', { detail: name }));
   });
 });
@@ -869,18 +869,52 @@ function receiptBlock(res) {
   /* Чек, выпущенный demo-flush, помечен на сервере. Без пометки зритель видит
    * обычный чек на объём ниже порога и делает вывод, что порог не работает. */
   const demoBadge = r.demo ? `<div class="row"><span>источник</span><b class="queued">демо: порог обойдён</b></div>` : '';
+
+  /* ===== Куда ушла комиссия =====
+   * Цифры берутся из ответа, а не считаются на клиенте: процент, делённый в
+   * браузере, разъедется с сервером при первой правке констант. Два разных
+   * ответа сервера называют одни и те же деньги по-разному:
+   *   локальный инференс — breakdown.burnTar / treasuryTar (верблюжий регистр);
+   *   Tier 6 (внешний API) — receipt.burned_tar / receipt.treasury_tar и
+   *   economics.cashback_tar (змейка, другая схема).
+   * Поэтому читаем оба источника, а не один: иначе карточка чека Tier 6
+   * молчала бы о том, что деньги ушли. */
+  const eco = res.economics || {};
+  const burnTar = Number(b.burnTar ?? r.burnTar ?? r.burned_tar ?? eco.burn_tar ?? 0);
+  const treasuryTar = Number(b.treasuryTar ?? r.treasuryTar ?? r.treasury_tar ?? eco.treasury_tar ?? 0);
+  const cashbackTar = Number(b.cashbackTar ?? r.cashbackTar ?? r.cashback_tar ?? eco.cashback_tar ?? res.cashback_tar ?? 0);
+  const feeGross = Number(b.feeGrossTar ?? r.feeGrossTar ?? r.cost_tar ?? eco.fee_gross_tar ?? 0);
+  /* Процент показываем только когда знаменатель есть: делить на ноль и
+   * печатать «NaN%» хуже, чем не печатать процент вообще. */
+  const pct = (v) => (feeGross > 0 ? ` (${(v / feeGross * 100).toFixed(1)}%)` : '');
+  const feeRows =
+    (burnTar > 0 || treasuryTar > 0
+      ? `<div class="row fee-split"><span>сожжено</span><b>${fmt(burnTar)} TAR${pct(burnTar)}</b></div>` +
+        `<div class="row fee-split"><span>в казну</span><b>${fmt(treasuryTar)} TAR${pct(treasuryTar)}</b></div>`
+      : '') +
+    (cashbackTar > 0
+      ? `<div class="row fee-split"><span>кэшбэк</span><b class="sig-ok">+${fmt(cashbackTar)} TAR</b></div>`
+      : '');
+
+  /* seq есть только у локальных чеков. У Tier 6 в ответе лежит receipt_id,
+   * а seq = seq 0 подписи — это не номер чека. Печатать «#undefined» нельзя. */
+  const seqLabel = r.seq !== undefined && r.seq !== null
+    ? `#${esc(r.seq)}`
+    : esc(short(String(r.receipt_id || '—')));
+
   el.innerHTML =
     demoBadge +
-    `<div class="row"><span>seq</span><b>#${esc(r.seq)}</b></div>` +
-    `<div class="row"><span>CWU</span><b>${esc(b.cwu ?? r.cwu)}</b></div>` +
+    `<div class="row"><span>seq</span><b>${seqLabel}</b></div>` +
+    `<div class="row"><span>CWU</span><b>${esc(b.cwu ?? r.cwu ?? 0)}</b></div>` +
     `<div class="row"><span>Fee</span><b>${fmt(b.feeRewardTar ?? r.feeRewardTar)} TAR</b></div>` +
     `<div class="row"><span>Block</span><b>${fmt(b.blockRewardTar ?? r.blockRewardTar)} TAR</b></div>` +
     `<div class="row"><span>итого</span><b>${fmt(b.rewardTar ?? r.rewardTar)} TAR</b></div>` +
+    feeRows +
     `<div class="row"><span>подпись ${esc(r.signatureAlg || 'ed25519')}</span>` +
-    `<b class="sig-ok" id="sig-${esc(r.seq)}">✓ ${esc(short(sig))}</b></div>`;
+    `<b class="sig-ok" id="sig-${esc(r.seq)}-${esc(r.receipt_id || '')}">✓ ${esc(short(sig))}</b></div>`;
 
   // Проверка подписи настоящая, а не «зелёная галочка по умолчанию».
-  const slot = el.querySelector(`#sig-${CSS.escape(String(r.seq))}`);
+  const slot = el.querySelector('.row:last-child b');
   call('/receipt/verify', { method: 'POST', body: { receipt: r } })
     .then((v) => {
       if (!slot) return;
@@ -1093,6 +1127,57 @@ async function refreshBalance() {
 }
 
 $('refreshBal').addEventListener('click', refreshBalance);
+
+/* ---------- Cross-Compute ----------
+ * Замкнутый цикл $TAR по одному адресу: заработал на своём ПК — потратил на
+ * облако и комиссии сети — осталось сальдо.
+ *
+ * Почему это отдельный запрос, а не сумма двух уже отрисованных чисел:
+ * баланс (`/balance`) — текущие деньги на счету, а заработано/потрачено —
+ * НАКОПЛЕННЫЕ суммы за всю историю. Они не равны и не обязаны быть равны:
+ * баланс уменьшается от трат, а «потрачено» растёт навсегда. Сложить их в
+ * браузере значило бы вычесть одно из другого дважды.
+ *
+ * Подпись «сальдо», а не «ROI»: ROI — это про вложенное и возвращённое, а
+ * здесь просто разность двух сумм в токене без рыночной цены. */
+async function refreshCrossCompute() {
+  const card = $('crossComputeCard');
+  if (!card || !ADDR) return;
+  const set = (id, text, cls) => {
+    const el = $(id);
+    if (!el) return;
+    el.textContent = text;
+    el.className = cls ? `cc-val ${cls}` : 'cc-val';
+  };
+  try {
+    const c = await call(`/cross-compute/${ADDR}`);
+    set('ccEarned', `${fmt(c.earnedTar)} TAR`);
+    set('ccSpent', `${fmt(c.spentTar)} TAR`);
+    const net = Number(c.netTar) || 0;
+    /* Цвет только у сальдо: если красить все три числа, цвет перестаёт
+     * что-либо значить и становится украшением. */
+    set('ccNet', `${net > 0 ? '+' : ''}${fmt(net)} TAR`, net > 0 ? 'pos' : net < 0 ? 'neg' : '');
+    $('ccCalls').textContent = `чеков: ${c.receipts} · вызовов: ${c.tier6Calls + c.networkCalls}`;
+    /* Разбивку показываем только когда есть что разбивать: две нулевые
+     * строки в пустом состоянии выглядят как сломанный виджет. */
+    const split = [];
+    if (c.breakdown.cloudTar > 0) split.push(`облако ${fmt(c.breakdown.cloudTar)}`);
+    if (c.breakdown.networkTar > 0) split.push(`сеть ${fmt(c.breakdown.networkTar)}`);
+    $('ccSplit').textContent = split.length ? `из них: ${split.join(' · ')} TAR` : '';
+    $('ccNote').textContent = c.receipts
+      ? `Считается по ${c.receipts} чекам и комиссиям этого адреса. TAR не торгуется — это не доход в деньгах.`
+      : 'Пока нет ни чеков, ни трат: подключите воркер или сделайте вызов, и цифры появятся.';
+  } catch (_e) {
+    /* Сетевой сбой не должен выглядеть как нули: «0 TAR» — это утверждение
+     * о заработке, а «—» — честное «не знаю». */
+    set('ccEarned', '—');
+    set('ccSpent', '—');
+    set('ccNet', '—');
+    $('ccCalls').textContent = 'нет данных';
+    $('ccSplit').textContent = '';
+    $('ccNote').textContent = 'Не удалось получить данные: сервер не ответил.';
+  }
+}
 
 /* ---------- Faucet ----------
  * Состояние читается из /faucet/status, а не из localStorage: выдачу

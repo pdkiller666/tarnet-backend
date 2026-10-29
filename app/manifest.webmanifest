@@ -1,7 +1,7 @@
 {
-  "name": "TarNet — Synapse",
+  "name": "TarNet — Tokenized AI Resource Network",
   "short_name": "TarNet",
-  "description": "Приватный инференс на распределённой сети TarNet",
+  "description": "TarNet — Tokenized AI Resource Network: приватный инференс на распределённой сети",
   "start_url": "/app/",
   "scope": "/app/",
   "display": "standalone",

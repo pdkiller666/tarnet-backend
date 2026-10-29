@@ -173,8 +173,18 @@ h1 {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.brand-sep { color: var(--muted-2); font-weight: 400; }
-.brand-sub { color: var(--muted); font-weight: 500; }
+/* Подзаголовок бренда. Приглушённый и мелкий: он называет продукт, но не
+ * спорит за внимание с названием диалога. Обрезается многоточием — в узком
+ * сайдбаре текст в 32 символа иначе вылезал за край. */
+.brand-tag {
+  margin: 2px 0 0;
+  font-size: 10.5px;
+  letter-spacing: .01em;
+  color: var(--muted-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .sub {
   margin: 1px 0 0;
@@ -539,8 +549,35 @@ pre code.hljs { background: transparent !important; padding: 0 !important; }
 .receipt .queued { color: var(--warn); }
 .receipt .pending-line { justify-content: flex-start; }
 .receipt .pending-line b { color: var(--warn); font-weight: 600; }
+/* Разбивка комиссии идёт мельче остальных строк: она отвечает на вопрос
+ * «куда ушли деньги», а не «сколько я получил». Отдельная группа нужна,
+ * чтобы три строки не сливались взглядом с итогом выплаты. */
+.receipt .fee-split { font-size: 11px; color: var(--muted-2); padding-left: 10px; }
+.receipt .fee-split b { color: var(--muted); font-weight: 500; }
 
-/* ---------- Композер ---------- */
+/* ---------- Cross-Compute: замкнутый цикл $TAR ----------
+ * Три числа в столбик: заработано, потрачено, сальдо. Сетка 2×1 с
+ * сальдом во всю ширину — оно итог и должно читаться первым.
+ * Цвет только у сальдо: красить все три значило бы сделать цвет шумом. */
+.cc-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 4px;
+}
+.cc-cell {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 9px 11px;
+}
+.cc-label { display: block; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted-2); }
+.cc-val { display: block; margin-top: 3px; font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; color: var(--text-strong); }
+.cc-cell.wide { grid-column: 1 / -1; }
+.cc-val.pos { color: var(--ok); }
+.cc-val.neg { color: var(--danger); }
+.cc-note { margin: 8px 0 0; font-size: 11px; color: var(--muted-2); }
+.cc-split { margin: 6px 0 0; font-size: 11px; color: var(--muted-2); font-family: var(--mono); }
 
 /* Композер прилипает к низу: в длинной ленте поле ввода всегда под рукой.
  * Фон и градиент сверху обязательны — иначе сообщения будут просвечивать
@@ -1197,6 +1234,15 @@ body { overflow: hidden; }
 .wallet-pill:hover { background: var(--panel-2); }
 .sidebar-balance { margin: 0; font-size: 12.5px; color: var(--muted); }
 .sidebar-balance strong { color: var(--text-strong); font-variant-numeric: tabular-nums; }
+
+/* Полное имя продукта в футере — по той же причине, что и в шапке: человек
+ * должен видеть, чем он пользуется, не открывая «О программе». */
+.brand-foot {
+  margin: 6px 0 0;
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--muted-2);
+}
 .faucet-mini {
   padding: 7px 10px;
   background: color-mix(in srgb, var(--accent-cyan) 12%, transparent);
@@ -1473,8 +1519,19 @@ body { overflow: hidden; }
   padding: 10px 10px 8px 14px;
   border-radius: 18px;
   box-shadow: var(--shadow-md), 0 0 0 1px color-mix(in srgb, var(--border) 60%, transparent);
+  /* Единая капсула: поле ввода, пилюли режима, дистилляция и кнопка
+   * отправки живут в одном контейнере, и фокус в ЛЮБОМ из них подсвечивает
+   * всю капсулу. Раньше рамка загоралась только на textarea, и человек,
+   * выбиравший режим, не видел, что он всё ещё внутри формы. */
+  transition: box-shadow .18s var(--ease), background .18s var(--ease);
+}
+.omnibox:focus-within {
+  background: var(--panel-2);
+  box-shadow: var(--shadow-md), 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent),
+              0 0 0 4px var(--accent-soft);
 }
 .omnibox textarea { max-height: 200px; }
+.omnibox textarea:focus { outline: none; }
 
 .omnibox-bar {
   display: flex;

@@ -1,4 +1,4 @@
-/* TarNet / Synapse — service worker.
+/* TarNet — Tokenized AI Resource Network. service worker.
  *
  * Задача ровно одна: приложение открывается без сети и не теряет оболочку.
  * API намеренно НЕ кэшируется: /inference и /health — живые данные, и
@@ -51,7 +51,7 @@
  * index.html и styles.css, то есть в кэшируемой оболочке: без поднятия
  * имени кэша телефон продолжил бы показывать обе облачные модели и
  * собирать «PROVIDER_AUTH_FAILED» без объяснения. */
-const CACHE = 'tarnet-app-v16';
+const CACHE = 'tarnet-app-v17';
 
 const ASSETS = [
   '/app/',
