@@ -23,6 +23,19 @@
   --accent-fg: #ffffff;
   --grad: linear-gradient(135deg, #4d7cfe 0%, #7b5cff 100%);
 
+  /* Два акцента — это дизайн-система, а не разнобой:
+   * --brand (бирюза) = бренд и главное действие: «Установить», «Faucet»,
+   *   «Зарегистрировать». Именно этим цветом человек решает «начать».
+   * --accent (синий) = функциональность внутри работы: отправка в омнибоксе,
+   *   копирование, повтор. Он не спорит с брендом, потому что это другое
+   *   действие — не «войти в продукт», а «сделать шаг внутри продукта».
+   * Раньше здесь был только синий, и CTA не отличался от служебной кнопки:
+   * человек не видел, где вход, а где рутина. */
+  --brand: #5fe0d3;
+  --brand-strong: #3fc9bb;
+  --brand-fg: #062522;
+  --brand-grad: linear-gradient(135deg, #5fe0d3 0%, #3b82f6 100%);
+
   --ok: #3ddc84;
   --warn: #f7b955;
   --danger: #ff6b6b;
@@ -152,14 +165,13 @@ body {
   place-items: center;
   width: 36px;
   height: 36px;
-  border-radius: 11px;
-  background: var(--accent-soft);
-  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
-  color: var(--accent);
+  /* Подложка и обводка убраны: у самой иконки теперь градиентный квадрат
+     со скруглением, и рамка под ним читалась как двойная обводка. */
+  color: var(--brand);
   flex: 0 0 auto;
 }
 
-.logo { width: 21px; height: 21px; display: block; }
+.logo { width: 36px; height: 36px; display: block; }
 
 .brand-text { min-width: 0; }
 
@@ -495,6 +507,19 @@ select:focus-visible, textarea:focus-visible, input:focus-visible, button:focus-
 .msg:focus-within .msg-actions { opacity: 1; }
 .tiny-btn { padding: 4px 10px; font-size: 11.5px; border-radius: 7px; }
 
+/* «Повторить», «Редактировать», «Скопировать» — вторичный акцент (синий).
+ * Это функциональность внутри работы, а не вход в продукт: бирюза тут
+ * спорила бы с главным действием. Нейтрально-серыми они были невидимы —
+ * человек не находил, чем повторить ответ. */
+.ghost.tiny-btn {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 38%, transparent);
+}
+.ghost.tiny-btn:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
 /* Блок кода с кнопкой копирования. */
 .code-wrap { position: relative; margin: 10px 0; }
 .code-wrap > pre {
@@ -675,6 +700,24 @@ button:active:not(:disabled), .btn:active { transform: translateY(1px); }
 button:disabled { opacity: .5; cursor: not-allowed; }
 
 .btn svg { width: 15px; height: 15px; }
+
+/* CTA бренда: бирюза. Только для «войти в продукт» — установка, краник,
+ * регистрация. Служебные кнопки (привязать, сохранить ключ, перенести)
+ * остаются синими: это шаги внутри работы, а не вход. */
+.btn.brand-cta {
+  background: var(--brand);
+  color: var(--brand-fg);
+}
+.btn.brand-cta:hover:not(:disabled) { background: var(--brand-strong); }
+.ghost.brand-cta {
+  background: color-mix(in srgb, var(--brand) 14%, transparent);
+  border-color: color-mix(in srgb, var(--brand) 45%, transparent);
+  color: var(--brand);
+}
+.ghost.brand-cta:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--brand) 22%, transparent);
+  border-color: var(--brand);
+}
 
 .ghost {
   background: transparent;

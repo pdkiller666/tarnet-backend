@@ -11,10 +11,15 @@
 <meta property="og:title" content="TarNet — нейросеть на обычных компьютерах">
 <meta property="og:description" content="Обычные компьютеры считают чужие запросы и получают за это оплату. Дешевле облачных ИИ.">
 <link rel="icon" href="/app/icon.svg" type="image/svg+xml">
+<link rel="icon" type="image/png" sizes="32x32" href="/app/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/app/icon-180.png">
 <style>
   :root {
     --bg: #0a0e14; --panel: #11161f; --panel2: #161d29; --border: #212b3a;
-    --text: #e8eef6; --muted: #8fa1b8; --accent: #4fd1c5; --accent2: #7c9cff;
+    /* Два акцента: бирюза --accent = бренд и CTA, синий --accent2 = функциональность.
+       Было #7c9cff (сиреневый) — третий цвет, который ни с чем не сочетался:
+       лендинг бирюзово-сиреневый, PWA синяя, консоль сине-фиолетовая. */
+    --text: #e8eef6; --muted: #8fa1b8; --accent: #5fe0d3; --accent2: #3b82f6;
     --ok: #3fb950; --warn: #e3b341; --danger: #f85149;
     --radius: 14px;
   }
@@ -33,8 +38,8 @@
   .badge {
     display: inline-flex; align-items: center; gap: 7px;
     font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
-    color: var(--accent); background: rgba(79,209,197,.09);
-    border: 1px solid rgba(79,209,197,.25); padding: 5px 12px; border-radius: 100px;
+    color: var(--accent); background: rgba(95,224,211,.09);
+    border: 1px solid rgba(95,224,211,.25); padding: 5px 12px; border-radius: 100px;
   }
   .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 2s infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
@@ -52,7 +57,7 @@
   section { margin: 56px 0; }
   h2 { font-size: 24px; margin: 0 0 8px; letter-spacing: -.01em; }
   h2 .num {
-    font-size: 13px; color: var(--accent); border: 1px solid rgba(79,209,197,.3);
+    font-size: 13px; color: var(--accent); border: 1px solid rgba(95,224,211,.3);
     border-radius: 8px; padding: 2px 8px; margin-right: 10px; vertical-align: 3px; font-weight: 600;
   }
   .sub { color: var(--muted); margin: 0 0 22px; font-size: 15px; }
@@ -102,8 +107,8 @@
   @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
   .bigres {
     display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline;
-    padding: 18px 20px; background: rgba(79,209,197,.06);
-    border: 1px solid rgba(79,209,197,.22); border-radius: 12px; margin-bottom: 16px;
+    padding: 18px 20px; background: rgba(95,224,211,.06);
+    border: 1px solid rgba(95,224,211,.22); border-radius: 12px; margin-bottom: 16px;
   }
   .bigres .v { font-size: 30px; font-weight: 700; color: var(--accent); letter-spacing: -.02em; }
   .bigres .u { font-size: 15px; color: var(--muted); }
@@ -156,7 +161,10 @@
   }
   .cta a:hover { border-color: var(--accent); }
   .cta a.primary { background: var(--accent); border-color: var(--accent); color: #06231f; }
-  .cta a.primary:hover { background: var(--accent2); border-color: var(--accent2); color: #06121f; }
+  /* Hover остаётся в бирюзе: раньше главная кнопка при наведении становилась
+     синей, то есть бренд менялся под курсором. Второй акцент — для другого
+     класса действий, а не для подсветки первого. */
+  .cta a.primary:hover { background: #3fc9bb; border-color: #3fc9bb; color: #06231f; }
   .split2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 10px; }
   .mini { background: #0b1017; border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px; }
   .mini .t { font-weight: 600; font-size: 14px; margin-bottom: 6px; }
@@ -182,7 +190,7 @@
   .err { color: var(--danger); font-size: 14px; margin-top: 10px; display: none; }
   .err.on { display: block; }
   html { scroll-behavior: smooth; }
-  ::selection { background: rgba(79,209,197,.28); }
+  ::selection { background: rgba(95,224,211,.28); }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
 
   /* ---------- Бренд: шапка сайта ----------
@@ -238,13 +246,13 @@
         <circle cx="9.2" cy="19.9" r="2.1" fill="#062522"/>
         <defs>
           <linearGradient id="tnGrad" x1="0" y1="0" x2="32" y2="32">
-            <stop stop-color="#5fe0d3"/><stop offset="1" stop-color="#7c9cff"/>
+            <stop stop-color="#5fe0d3"/><stop offset="1" stop-color="#3b82f6"/>
           </linearGradient>
         </defs>
       </svg>
       <span class="txt">
         <span class="name">Tar<em>Net</em></span>
-        <span class="tag">Synapse</span>
+        <span class="tag">Tokenized AI Resource Network</span>
       </span>
     </a>
     <div class="topnav">
@@ -259,7 +267,7 @@
 <div class="wrap">
 
   <header>
-    <span class="eyebrow"><b>TarNet</b> · сеть исполнения Synapse</span>
+    <span class="eyebrow"><b>TarNet</b> · Tokenized AI Resource Network</span>
     <span class="badge"><span class="dot"></span> <span id="liveBadge">сеть работает</span></span>
     <h1>Нейросеть, которая работает<br>на <span class="grad">чужих компьютерах</span> —<br>и платит им за это</h1>
     <p class="lead">
@@ -625,7 +633,7 @@
     <div class="fbrand">
       <span class="fname">Tar<em>Net</em></span>
       <span class="fsep">/</span>
-      <span class="fsub">Synapse</span>
+      <span class="fsub">Tokenized AI Resource Network</span>
     </div>
     <div class="fmeta">Демонстрационный стенд · экономика dPoUW 2.1</div>
     <div class="flinks">
