@@ -4761,6 +4761,28 @@ async function tryOnionTransport({ prompt, routeNodes, clientAddress, model }) {
     return { attempted: false, delivered: false, reason: 'route_too_long', got: addrs.length };
   }
 
+  /* МЕШ ПОДНИМАЕТСЯ ДО ЧТЕНИЯ КЛЮЧЕЙ.
+   *
+   * Здесь был дефект, видимый только на рестарте: ключи читались из БД, а
+   * демо-меш поднимался ПОСЛЕ. При старте процесса меш генерирует новые
+   * RSA-ключи и перезаписывает ими БД, поэтому первый запрос после рестарта
+   * шифровал слои СТАРЫМИ ключами из прошлого запуска. Узел их не принимал —
+   * ONION_WRONG_RECIPIENT, delivered: false. Второй запрос работал: ему уже
+   * доставались свежие ключи. Локальные тесты этого не видели, потому что
+   * шли на чистой БД, где старых ключей нет.
+   *
+   * Поэтому ключ берётся из ЖИВОГО меша, а БД — только проверка регистрации.
+   * Меш — единственный, кто знает приватные половины этих ключей; ключ из БД
+   * описывает прошлый запуск, а не тот, что сейчас примет пакет. */
+  let mesh;
+  try {
+    mesh = await ensureDemoMesh();
+  } catch (e) {
+    return { attempted: true, delivered: false, reason: 'mesh_unavailable', detail: e.message };
+  }
+
+  const meshKey = new Map(mesh.nodes.map(n => [n.address, n.publicKeyPem]));
+
   /* Проверяем узлы той же проверкой, что /inference/onion: без
    * rsaPublicKeyPem собрать слой нельзя. */
   const route = [];
@@ -4772,17 +4794,11 @@ async function tryOnionTransport({ prompt, routeNodes, clientAddress, model }) {
     if (!node) {
       return { attempted: false, delivered: false, reason: 'route_node_unregistered', address: addr };
     }
-    if (!node.rsaPublicKeyPem) {
+    const pem = meshKey.get(addr) || node.rsaPublicKeyPem;
+    if (!pem) {
       return { attempted: false, delivered: false, reason: 'route_node_not_onion_capable', address: addr };
     }
-    route.push({ address: node.address, rsaPublicKeyPem: node.rsaPublicKeyPem });
-  }
-
-  let mesh;
-  try {
-    mesh = await ensureDemoMesh();
-  } catch (e) {
-    return { attempted: true, delivered: false, reason: 'mesh_unavailable', detail: e.message };
+    route.push({ address: node.address, rsaPublicKeyPem: pem });
   }
 
   const inMesh = new Set(mesh.nodes.map(n => n.address));
@@ -4803,9 +4819,11 @@ async function tryOnionTransport({ prompt, routeNodes, clientAddress, model }) {
       innerRequest: { prompt, model: model || null, clientAddress: clientAddress || null },
     });
     /* Роли восстанавливаем по адресам: клиенту нужен читаемый маршрут
-     * `['client','relay1','relay2','worker']`, а не голые 0x-адреса. */
+     * `['client','relay1','relay2','worker']`, а не голые 0x-адреса.
+     * Хвостовой 'worker' НЕ добавляется руками: последний узел маршрута сам
+     * приходит с ролью worker, и дописывание давало `[..., 'worker', 'worker']`. */
     const roleOf = new Map(mesh.nodes.map(n => [n.address, n.role]));
-    const routeLabels = ['client', ...route.map(n => roleOf.get(n.address) || 'node'), 'worker'];
+    const routeLabels = ['client', ...route.map(n => roleOf.get(n.address) || 'node')];
     return {
       attempted: true,
       delivered: true,
