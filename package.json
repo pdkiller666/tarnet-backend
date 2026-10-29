@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.15.1-treasury-cashback",
+  "version": "2.16.0-p2p-onion",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {
