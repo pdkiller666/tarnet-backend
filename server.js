@@ -2269,14 +2269,33 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
  * Собирается из двух источников: очередь воркеров (БД) и наличие ключа
  * внешнего API (env). Врать здесь нельзя: инвестор отличит живую модель
  * от fallback только по этому полю. */
+
+/* Снимок живых воркеров для решения о режиме.
+ *
+ * Счётчик `active` говорит «процесс опрашивает», но не «модель готова».
+ * Решение о `worker` требует списка моделей и признака Ollama, поэтому оба
+ * потребителя (/health и /worker/status) берут данные из одного места:
+ * разойдись они — и один экран показывал бы worker, другой fallback. */
+function activeWorkerSnapshots(cutoff) {
+  return all(
+    `SELECT workerAddress, model, installed_models, ollama_online FROM worker_presence
+     WHERE lastSeenAt >= ?`,
+    [cutoff],
+  ).map(w => ({
+    workerAddress: w.workerAddress,
+    model: w.model,
+    installedModels: parseInstalledModels(w.installed_models),
+    ollamaOnline: w.ollama_online === null || w.ollama_online === undefined
+      ? null : Boolean(w.ollama_online),
+  }));
+}
+
 function llmStatus() {
   const cutoff = Date.now() - WORKER_ACTIVE_WINDOW_MS;
-  const active = Number(get(
-    `SELECT COUNT(*) AS c FROM worker_presence WHERE lastSeenAt >= ?`,
-    [cutoff],
-  )?.c || 0);
+  const snapshots = activeWorkerSnapshots(cutoff);
+  const active = snapshots.length;
   return {
-    ...LLM.describeMode({ activeWorkers: active }),
+    ...LLM.describeMode({ activeWorkers: active, workers: snapshots }),
     pii_blocked_today: LLM.piiBlockedToday(),
     /* Состояние PII-фильтра видно снаружи: включён ли ONNX, загрузилась ли
      * модель, какой порог. Иначе «почему заблокировало» превращается в гадание. */
@@ -5964,14 +5983,15 @@ app.post('/worker/submit', (req, res) => {
 app.get('/worker/status', (_req, res) => {
   const cutoff = Date.now() - WORKER_ACTIVE_WINDOW_MS;
   const pending = get(`SELECT COUNT(*) AS c FROM worker_tasks WHERE status = 'pending'`).c;
-  const active = get(
-    `SELECT COUNT(*) AS c FROM worker_presence WHERE lastSeenAt >= ?`,
-    [cutoff],
-  ).c;
+  const snapshots = activeWorkerSnapshots(cutoff);
+  const modeInfo = LLM.describeMode({ activeWorkers: snapshots.length, workers: snapshots });
   res.json({
-    active_workers: Number(active),
+    active_workers: snapshots.length,
     pending_tasks: Number(pending),
-    mode: LLM.describeMode({ activeWorkers: Number(active) }).llm_mode,
+    mode: modeInfo.llm_mode,
+    /* Причина режима видна снаружи: без неё «почему не worker» требует
+     * чтения кода вместо одного запроса. */
+    mode_reason: modeInfo.llm_mode_reason,
     /* `installedModels` — то, что PWA использует как ЕДИНСТВЕННЫЙ источник
      * правды для селекта локальных моделей. Раньше его не было, и выбирать
      * приходилось из каталога сети — а он знает модели вообще, а не модели

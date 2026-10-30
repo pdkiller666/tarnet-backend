@@ -1556,8 +1556,34 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('в списке видна модель — её покажет баннер',
     afterPoll.workers.some((w) => w.model === 'qwen2.5-coder:1.5b'),
     afterPoll.workers.map((w) => w.model));
-  ok('режим сети переключился на worker',
-    (await api('/health')).body?.llm_mode === 'worker');
+
+  /* Раньше здесь стояло безусловное `llm_mode === 'worker'` — и это
+   * закрепляло дефект в тесте. Опрос БЕЗ данных о моделях (именно так
+   * выглядит воркер, который списка не присылает) давал worker, хотя
+   * отвечать моделью он не мог: /inference отдавал `emulated: true` при
+   * статусе живого узла. Тест требовал ложного статуса, поэтому правка
+   * кода без правки теста была невозможна.
+   *
+   * Теперь контракт строже и проверяется с двух сторон: heartbeat сам по
+   * себе режим НЕ поднимает, подтверждённая модель — поднимает. */
+  const unverifiedHealth = (await api('/health')).body;
+  ok('8.19.1 heartbeat без данных о модели НЕ даёт worker',
+    unverifiedHealth.llm_mode !== 'worker',
+    { mode: unverifiedHealth.llm_mode, reason: unverifiedHealth.llm_mode_reason });
+  ok('8.19.2 причина названа model_unverified, а не "просто fallback"',
+    unverifiedHealth.llm_mode_reason === 'model_unverified',
+    unverifiedHealth.llm_mode_reason);
+
+  /* Тот же воркер присылает подтверждение: Ollama жива, модель в списке. */
+  await fetch(`${BASE}/worker/poll?workerAddress=${wBanner}`
+    + `&model=qwen2.5-coder%3A1.5b&installedModels=`
+    + `${encodeURIComponent(JSON.stringify(['qwen2.5-coder:1.5b']))}&ollamaOnline=1`);
+  const verifiedHealth = (await api('/health')).body;
+  ok('8.19.3 подтверждённая модель переключает режим на worker',
+    verifiedHealth.llm_mode === 'worker',
+    { mode: verifiedHealth.llm_mode, reason: verifiedHealth.llm_mode_reason });
+  ok('8.19.4 у подтверждённого режима причины нет (null, а не пустая строка)',
+    verifiedHealth.llm_mode_reason === null, verifiedHealth.llm_mode_reason);
 
   /* ---------- 8.20. [hidden] побеждает компонентный display ----------
    * Симптом, с которого началось: «переключаю вкладки — ничего не

@@ -461,17 +461,79 @@ function externalConfigured() {
   return Boolean(e.url && e.key);
 }
 
+/* Подтверждена ли РАБОТА МОДЕЛИ на живом воркере.
+ *
+ * heartbeat — это факт «процесс опрашивает сервер», а не «модель готова
+ * отвечать». `worker` объявлялся по одному heartbeat, поэтому воркер без
+ * Ollama и без единой модели давал /health = worker при ответах
+ * `emulated: true` (шаблон). Ложный статус живого узла — не неточность:
+ * по нему решают, работает ли сеть.
+ *
+ * Возвращает { ok, reason }. reason различает причины, иначе «почему
+ * fallback» ищется чтением кода, а не запросом. */
+function workerConfirmed(w) {
+  if (!w) return { ok: false, reason: 'model_unverified' };
+  const models = Array.isArray(w.installedModels) ? w.installedModels : null;
+  /* Прямой отказ воркера: Ollama не запущена. Это знание, а не догадка. */
+  if (w.ollamaOnline === false) return { ok: false, reason: 'ollama_offline' };
+  /* Список прислан и пуст: Ollama жива, моделей нет. */
+  if (models && models.length === 0) return { ok: false, reason: 'model_missing' };
+  if (models && models.length > 0) {
+    /* Заявленная модель обязана быть в присланном списке: воркер,
+     * опрашивающий с одной моделью и держащий другую, — это тот же
+     * шаблонный ответ, только с честным списком рядом. */
+    if (typeof w.model === 'string' && w.model.length && !models.includes(w.model)) {
+      return { ok: false, reason: 'model_missing' };
+    }
+    return { ok: true };
+  }
+  /* NULL/NULL — старый воркер не умеет сообщать про модели. «Не знаю»
+   * нельзя выдавать за «работает», но и за «модели нет» тоже: совет
+   * «поставьте модель» воркеру, который про модели не спрашивал, — это
+   * ложная диагностика. Отдельная причина. */
+  return { ok: false, reason: 'model_unverified' };
+}
+
+/* Причина для сводки, когда воркеров несколько: самая содержательная.
+ * `model_unverified` — самый слабый вывод («мы не знаем»), поэтому он
+ * проигрывает конкретным отказам. */
+function dominantReason(verdicts) {
+  const order = ['model_missing', 'ollama_offline', 'model_unverified'];
+  for (const r of order) {
+    if (verdicts.some(v => v.reason === r)) return r;
+  }
+  return 'model_unverified';
+}
+
 /* Описание текущего режима для /health. Работа воркера определяется снаружи
- * (нужен доступ к БД), поэтому передаётся аргументом. */
-function describeMode({ activeWorkers = 0 } = {}) {
+ * (нужен доступ к БД), поэтому передаётся аргументами: счётчик живых и их
+ * снимок (модель + установленные модели + признак Ollama).
+ *
+ * Без второго аргумента проверка невозможна, поэтому `worker` не
+ * объявляется: счётчик сам по себе не доказывает наличие модели. */
+function describeMode({ activeWorkers = 0, workers = null } = {}) {
   const e = env();
   if (activeWorkers > 0) {
-    return { llm_mode: 'worker', external_provider: null, active_workers: activeWorkers };
+    const list = Array.isArray(workers) ? workers : [];
+    const verdicts = list.map(workerConfirmed);
+    if (verdicts.some(v => v.ok)) {
+      return { llm_mode: 'worker', external_provider: null, active_workers: activeWorkers,
+        llm_mode_reason: null };
+    }
+    const reason = verdicts.length ? dominantReason(verdicts) : 'model_unverified';
+    if (externalConfigured()) {
+      return { llm_mode: 'external_api', external_provider: providerFromUrl(e.url),
+        active_workers: activeWorkers, llm_mode_reason: reason };
+    }
+    return { llm_mode: 'deterministic_fallback', external_provider: null,
+      active_workers: activeWorkers, llm_mode_reason: reason };
   }
   if (externalConfigured()) {
-    return { llm_mode: 'external_api', external_provider: providerFromUrl(e.url), active_workers: 0 };
+    return { llm_mode: 'external_api', external_provider: providerFromUrl(e.url),
+      active_workers: 0, llm_mode_reason: null };
   }
-  return { llm_mode: 'deterministic_fallback', external_provider: null, active_workers: 0 };
+  return { llm_mode: 'deterministic_fallback', external_provider: null,
+    active_workers: 0, llm_mode_reason: 'no_workers' };
 }
 
 module.exports = {
@@ -490,5 +552,6 @@ module.exports = {
   deterministicFallback,
   externalConfigured,
   describeMode,
+  workerConfirmed,
   env,
 };
