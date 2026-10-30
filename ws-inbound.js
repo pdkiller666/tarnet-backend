@@ -385,16 +385,23 @@ class WsInbound {
       ? frame.installedModels.filter((m) => typeof m === 'string' && m.length && m.length <= 200).slice(0, 64)
       : null;
     const online = typeof frame.ollamaOnline === 'boolean' ? (frame.ollamaOnline ? 1 : 0) : null;
+    /* Облачный бэкенд кадром. Не прислали (старый воркер) — NULL, а не '';
+     * пустая строка здесь значит «облака нет», и это проверенное знание,
+     * которое нельзя путать с молчанием. */
+    const cloudBackend = typeof frame.cloudBackend === 'string'
+      ? frame.cloudBackend.slice(0, 32)
+      : null;
     try {
       this.run(
-        `INSERT INTO worker_presence (workerAddress, model, lastSeenAt, polls, installed_models, ollama_online)
-         VALUES (?, ?, ?, 1, ?, ?)
+        `INSERT INTO worker_presence (workerAddress, model, lastSeenAt, polls, installed_models, ollama_online, cloud_backend)
+         VALUES (?, ?, ?, 1, ?, ?, ?)
          ON CONFLICT(workerAddress) DO UPDATE SET
            lastSeenAt = excluded.lastSeenAt,
            model = COALESCE(excluded.model, worker_presence.model),
            installed_models = COALESCE(excluded.installed_models, worker_presence.installed_models),
-           ollama_online = COALESCE(excluded.ollama_online, worker_presence.ollama_online)`,
-        [workerAddress, model, now, list === null ? null : JSON.stringify(list), online],
+           ollama_online = COALESCE(excluded.ollama_online, worker_presence.ollama_online),
+           cloud_backend = COALESCE(excluded.cloud_backend, worker_presence.cloud_backend)`,
+        [workerAddress, model, now, list === null ? null : JSON.stringify(list), online, cloudBackend],
       );
     } catch (_e) { /* присутствие не критично для handshake */ }
   }

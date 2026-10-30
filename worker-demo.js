@@ -81,10 +81,27 @@ async function ollamaTags({ maxAgeMs = OLLAMA_TAGS_TTL_MS } = {}) {
 }
 
 /* Отчёт для сервера: что реально установлено на ЭТОМ ПК и жива ли Ollama.
- * Один объект, чтобы список и флаг не разъехались между двумя запросами. */
+ * Один объект, чтобы список и флаг не разъехались между двумя запросами.
+ *
+ * `cloudBackend` обязателен по той же причине, по которой есть `ollamaOnline`:
+ * воркер умеет отвечать НЕ только Ollama — вторым и третьим бэкендом идут
+ * Groq и OpenRouter по ключу. Без этого поля сервер видел воркер без Ollama,
+ * у которого на самом деле есть живая модель в облаке, и объявлял
+ * `ollama_offline` — ложный fallback вместо живого ответа. Проверено на
+ * этой машине: `OPENROUTER_API_KEY` задан, Ollama нет. */
+function cloudBackendName() {
+  if (GROQ_KEY) return 'groq';
+  if (OPENROUTER_KEY) return 'openrouter';
+  return null;
+}
+
 async function workerModelReport() {
   const installedModels = await ollamaTags();
-  return { installedModels, ollamaOnline: ollamaTagsCache.online };
+  return {
+    installedModels,
+    ollamaOnline: ollamaTagsCache.online,
+    cloudBackend: cloudBackendName(),
+  };
 }
 
 /* Запрошенное имя → реальный тег Ollama. Не найдено — отдаём `OLLAMA_MODEL`,
@@ -652,6 +669,10 @@ async function wsAuthResponse(challenge) {
     model: MODEL,
     installedModels: rep.installedModels,
     ollamaOnline: rep.ollamaOnline,
+    /* Без этого поля сервер считал воркер с облачным ключом «без модели»:
+     * он присылает пустой список и `ollamaOnline: false`, потому что локальной
+     * модели у него нет — а отвечает живой моделью из облака. */
+    cloudBackend: rep.cloudBackend,
     /* Тир объявляем как base: воркер демонстрационный и не заявляет
      * экспертный профиль. Сервер учитывает это мягко — жёсткий фильтр по
      * тиру отбросил бы единственного подключённого воркера. */
@@ -780,6 +801,10 @@ async function presenceQuery({ heartbeatFlag = false } = {}) {
     `installedModels=${encodeURIComponent(JSON.stringify(rep.installedModels))}`,
     `ollamaOnline=${rep.ollamaOnline ? '1' : '0'}`,
   ];
+  /* Пустая строка = «бэкенда нет»; отдельного `cloudBackend=none` не надо —
+   * сервер различает «не прислал» (NULL) и «прислал пусто» по наличию
+   * самого параметра. */
+  parts.push(`cloudBackend=${encodeURIComponent(rep.cloudBackend || '')}`);
   if (heartbeatFlag) parts.push('heartbeat=1');
   return parts.join('&');
 }
@@ -838,8 +863,7 @@ async function main() {
   console.log(`  источник: ${addrSource}`);
   console.log(`  модель:  ${MODEL}`);
   const backend = GROQ_KEY ? 'groq' : (OPENROUTER_KEY ? 'openrouter' : 'ollama (или fallback)');
-  console.log(`  бэкенд:  ${backend}`);
-  console.log('');
+  console.log(`  бэкенд:  ${backend}`);  console.log('');
   log('регистрирую узел…');
   if (!(await register())) {
     log('без регистрации начисления не будет — исправьте причину и перезапустите');
@@ -903,6 +927,7 @@ async function main() {
             model: MODEL,
             installedModels: rep.installedModels,
             ollamaOnline: rep.ollamaOnline,
+            cloudBackend: rep.cloudBackend,
           });
         } catch (_e) { /* кадр присутствия не критичен для работы */ }
       }

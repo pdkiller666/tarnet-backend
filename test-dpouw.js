@@ -1585,6 +1585,26 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('8.19.4 у подтверждённого режима причины нет (null, а не пустая строка)',
     verifiedHealth.llm_mode_reason === null, verifiedHealth.llm_mode_reason);
 
+  /* Обратная сторона той же ошибки. Воркер умеет отвечать НЕ только Ollama:
+   * второй и третий бэкенд — Groq и OpenRouter по ключу. Такой воркер честно
+   * присылает `installedModels: []` и `ollamaOnline: false` (локальной модели
+   * у него нет) и при этом отдаёт живые ответы из облака.
+   *
+   * Без учёта облака проверка объявила бы ему `ollama_offline` — то есть
+   * соврала бы в другую сторону: сначала врали «worker» без модели, теперь
+   * «модели нет» при живой модели. Случай не гипотетический: на этой машине
+   * `OPENROUTER_API_KEY` задан, а Ollama отсутствует. */
+  await fetch(`${BASE}/worker/poll?workerAddress=${wBanner}`
+    + `&model=openrouter%2Fnvidia%2Fnemotron-3.5-lightning%3Afree`
+    + `&installedModels=${encodeURIComponent('[]')}&ollamaOnline=0&cloudBackend=openrouter`);
+  const cloudHealth = (await api('/health')).body;
+  ok('8.19.5 воркер с облачным ключом и без Ollama — всё равно worker',
+    cloudHealth.llm_mode === 'worker',
+    { mode: cloudHealth.llm_mode, reason: cloudHealth.llm_mode_reason });
+  ok('8.19.6 облачному воркеру не приписывается ollama_offline',
+    cloudHealth.llm_mode_reason !== 'ollama_offline',
+    cloudHealth.llm_mode_reason);
+
   /* ---------- 8.20. [hidden] побеждает компонентный display ----------
    * Симптом, с которого началось: «переключаю вкладки — ничего не
    * меняется». Причина не в JS: .panel имел display: flex, а это авторский

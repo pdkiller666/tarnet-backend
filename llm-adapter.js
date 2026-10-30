@@ -473,6 +473,23 @@ function externalConfigured() {
  * fallback» ищется чтением кода, а не запросом. */
 function workerConfirmed(w) {
   if (!w) return { ok: false, reason: 'model_unverified' };
+  /* Облачный бэкенд проверяется ПЕРВЫМ, и это не косметика.
+   *
+   * Воркер умеет отвечать не только Ollama: вторым и третьим бэкендом идут
+   * Groq и OpenRouter по ключу, и такой воркер честно присылает
+   * `installedModels: []` + `ollamaOnline: false` — просто потому, что локальной
+   * модели у него нет. Проверка Ollama раньше облака объявила бы ЖИВОМУ
+   * воркеру `ollama_offline`, то есть соврала бы в обратную сторону: раньше
+   * врали «worker» без модели, теперь — «модели нет» при живой модели.
+   *
+   * Проверено на этой машине: `OPENROUTER_API_KEY` задан (73 симв), Ollama
+   * отсутствует — то есть случай не гипотетический. */
+  if (typeof w.cloudBackend === 'string' && w.cloudBackend.length) {
+    /* Модель названа — её и объявляем; пустое имя не доказательство, но
+     * воркер без имени модели задача всё равно не даёт. */
+    if (typeof w.model === 'string' && w.model.length) return { ok: true };
+    return { ok: false, reason: 'model_unverified' };
+  }
   const models = Array.isArray(w.installedModels) ? w.installedModels : null;
   /* Прямой отказ воркера: Ollama не запущена. Это знание, а не догадка. */
   if (w.ollamaOnline === false) return { ok: false, reason: 'ollama_offline' };

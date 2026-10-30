@@ -434,6 +434,14 @@ ensureColumn('worker_tasks', 'source', 'source TEXT');
  * «запустите Ollama» воркерам, которые её и не спрашивали. */
 ensureColumn('worker_presence', 'installed_models', 'installed_models TEXT');
 ensureColumn('worker_presence', 'ollama_online', 'ollama_online INTEGER');
+/* Облачный бэкенд воркера: 'groq' | 'openrouter' | '' — нет.
+ *
+ * Без этого поля сервер видел воркер с ключом и без Ollama как «модели нет»:
+ * отчёт о присутствии говорил только про Ollama, а воркер в это время отвечал
+ * живой моделью из облака. NULL — старая версия воркера про облако не
+ * сообщает; '' — сообщает, что облака нет. Это разные ответы на вопрос
+ * «почему fallback», поэтому и хранятся раздельно. */
+ensureColumn('worker_presence', 'cloud_backend', 'cloud_backend TEXT');
 
 /* NULL и `[]` обязаны остаться разными снаружи: NULL — воркер не присылал
  * список, `[]` — прислал пустой. Битый JSON в базе читается как NULL:
@@ -2278,7 +2286,7 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
  * разойдись они — и один экран показывал бы worker, другой fallback. */
 function activeWorkerSnapshots(cutoff) {
   return all(
-    `SELECT workerAddress, model, installed_models, ollama_online FROM worker_presence
+    `SELECT workerAddress, model, installed_models, ollama_online, cloud_backend FROM worker_presence
      WHERE lastSeenAt >= ?`,
     [cutoff],
   ).map(w => ({
@@ -2287,6 +2295,9 @@ function activeWorkerSnapshots(cutoff) {
     installedModels: parseInstalledModels(w.installed_models),
     ollamaOnline: w.ollama_online === null || w.ollama_online === undefined
       ? null : Boolean(w.ollama_online),
+    /* NULL — старая версия воркера про облако не сообщает; '' — сообщает,
+     * что облака нет. Разница нужна для причины fallback. */
+    cloudBackend: typeof w.cloud_backend === 'string' ? w.cloud_backend : null,
   }));
 }
 
@@ -5809,6 +5820,12 @@ app.get('/worker/poll', (req, res) => {
   const ollamaOnline = req.query.ollamaOnline === '1' ? 1
     : req.query.ollamaOnline === '0' ? 0
     : undefined;
+  /* Облачный бэкенд. Пустая строка — ЗНАНИЕ «облака нет», отсутствие
+   * параметра — «не сообщал». Смешать их значило бы выдать старого воркера
+   * за проверенного. */
+  const cloudBackend = typeof req.query.cloudBackend === 'string'
+    ? req.query.cloudBackend.slice(0, 32)
+    : undefined;
 
   /* Пульс присутствия. Пишется на КАЖДЫЙ опрос, даже если задач нет —
    * иначе /inference никогда не узнает, что воркер жив, и режим worker
@@ -5816,8 +5833,8 @@ app.get('/worker/poll', (req, res) => {
    * воркера участником сети. */
   if (workerAddress) {
     run(
-      `INSERT INTO worker_presence (workerAddress, model, lastSeenAt, polls, installed_models, ollama_online)
-       VALUES (?, ?, ?, 1, ?, ?)
+      `INSERT INTO worker_presence (workerAddress, model, lastSeenAt, polls, installed_models, ollama_online, cloud_backend)
+       VALUES (?, ?, ?, 1, ?, ?, ?)
        ON CONFLICT(workerAddress) DO UPDATE SET
          lastSeenAt = excluded.lastSeenAt,
          model = COALESCE(excluded.model, worker_presence.model),
@@ -5826,10 +5843,12 @@ app.get('/worker/poll', (req, res) => {
           * СТИРАТЬ ранее присланный список. Иначе старый воркер, опрашивающий
           * раз в секунду, обнулял бы данные, полученные от нового. */
          installed_models = COALESCE(excluded.installed_models, worker_presence.installed_models),
-         ollama_online = COALESCE(excluded.ollama_online, worker_presence.ollama_online)`,
+         ollama_online = COALESCE(excluded.ollama_online, worker_presence.ollama_online),
+         cloud_backend = COALESCE(excluded.cloud_backend, worker_presence.cloud_backend)`,
       [workerAddress, model, now,
         installedModels === undefined ? null : JSON.stringify(installedModels),
-        ollamaOnline === undefined ? null : ollamaOnline],
+        ollamaOnline === undefined ? null : ollamaOnline,
+        cloudBackend === undefined ? null : cloudBackend],
     );
   }
 
@@ -5997,7 +6016,7 @@ app.get('/worker/status', (_req, res) => {
      * приходилось из каталога сети — а он знает модели вообще, а не модели
      * этого ПК. Отсюда и брались `ollama HTTP 404`. */
     workers: all(
-      `SELECT workerAddress, model, lastSeenAt, polls, installed_models, ollama_online FROM worker_presence
+      `SELECT workerAddress, model, lastSeenAt, polls, installed_models, ollama_online, cloud_backend FROM worker_presence
        WHERE lastSeenAt >= ? ORDER BY lastSeenAt DESC`,
       [cutoff],
     ).map(w => ({
@@ -6011,6 +6030,10 @@ app.get('/worker/status', (_req, res) => {
       installedModels: parseInstalledModels(w.installed_models),
       ollamaOnline: w.ollama_online === null || w.ollama_online === undefined
         ? null : Boolean(w.ollama_online),
+      /* Бэкенд, которым воркер реально отвечает: 'groq' | 'openrouter' | ''
+       * (нет) | null (старая версия). Без него «почему не worker» на машине
+       * с облачным ключом и без Ollama читалось бы как «модели нет». */
+      cloudBackend: typeof w.cloud_backend === 'string' ? w.cloud_backend : null,
     })),
   });
 });
