@@ -166,7 +166,7 @@ printf 'GitHub HEAD:    %s (совпал)\n' "$GH_HEAD"
 # ---------- 3. bundle и доставка ----------
 info "собираю bundle"
 rm -f "$LOCAL_BUNDLE"
-git bundle create "$LOCAL_BUNDLE" "$BRANCH" >/dev/null 2>&1 || die "git bundle"
+git bundle create "$LOCAL_BUNDLE" --tags "$BRANCH" >/dev/null 2>&1 || die "git bundle"
 printf 'bundle: %s байт\n' "$(stat -c %s "$LOCAL_BUNDLE")"
 
 scp "${SSH_OPTS[@]}" -q "$LOCAL_BUNDLE" "$VPS:$REMOTE_BUNDLE" || die "scp bundle на VPS"
@@ -179,7 +179,13 @@ DIR=$1; BR=$2; BUNDLE=$3
 cd "$DIR" || { echo "ERR: нет каталога $DIR"; exit 3; }
 PREV=$(git rev-parse HEAD 2>/dev/null || echo none)
 git fetch "$BUNDLE" "$BR" --force >/dev/null 2>&1 || { echo "ERR: fetch из bundle"; exit 4; }
+# NEW снимается сразу после fetch ветки: второй fetch перезаписывает FETCH_HEAD,
+# и чтение после него вернуло бы коммит тега вместо HEAD ветки.
 NEW=$(git rev-parse FETCH_HEAD)
+# Ветка едет одним refspec, теги — отдельным: без второго fetch на сервере
+# остаются только те теги, что были до деплоя, и `git describe` врёт на
+# сотни коммитов назад. force нужен, потому что тег мог уже существовать.
+git fetch "$BUNDLE" "+refs/tags/*:refs/tags/*" --force >/dev/null 2>&1 || { echo "ERR: fetch тегов из bundle"; exit 5; }
 
 # Всё, что разойдётся с целевым коммитом, сначала уезжает в бэкап, и только
 # потом reset --hard затирает. Иначе правка, сделанная прямо на сервере,
