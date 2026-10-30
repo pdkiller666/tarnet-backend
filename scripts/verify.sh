@@ -16,7 +16,26 @@ set -uo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="main"
 REPO_SLUG="pdkiller666/tarnet-backend"
-GH_CREDS="${TARNET_GH_CREDS:-/home/node/.openclaw/credentials/github/personal/ghp_d000abcd8efeb474c2425f28f1b0a409/hosts.yml}"
+# Путь к GitHub-креденшелам — только из окружения, без значения по умолчанию.
+#
+# Раньше здесь стоял жёсткий путь к hosts.yml с идентификатором ключа
+# внутри (`ghp_...` в имени каталога). Самого токена в файле не было, но
+# путь его выдавал: имя каталога — часть идентификатора, и по нему видно,
+# какой именно ключ лежит на машине. Урок 29.10 («внутри репо скриптов с
+# путями к секретам быть не должно») относился к `push.sh`, но этот файл
+# ему противоречил с самого начала.
+#
+# Без `TARNET_GH_CREDS` проверка HEAD на GitHub пропускается с явным текстом,
+# а не молча: тишина выглядела бы как «сверили и совпало».
+GH_CREDS="${TARNET_GH_CREDS:-}"
+# Если переменная не задана — ищем файл глобом, не называя идентификатор
+# ключа в исходнике. Смысл тот же (скрипт работает на этой машине), но в
+# репозитории больше нет имени каталога с `ghp_...`.
+if [ -z "$GH_CREDS" ]; then
+  for _c in "$HOME"/.openclaw/credentials/github/personal/*/hosts.yml; do
+    [ -r "$_c" ] && { GH_CREDS="$_c"; break; }
+  done
+fi
 VPS="${TARNET_VPS:-root@195.63.131.172}"
 SSH_KEY="${TARNET_SSH_KEY:-$HOME/.ssh/tarnet_vps}"
 REMOTE_DIR="${TARNET_REMOTE_DIR:-/opt/tarnet/backend-api}"
@@ -28,6 +47,10 @@ FAIL=0
 
 ok() { printf '  \033[32m✅\033[0m %-26s %s\n' "$1" "$2"; }
 no() { printf '  \033[31m❌\033[0m %-26s %s\n' "$1" "$2"; FAIL=$((FAIL+1)); }
+# Пропуск — это НЕ успех и НЕ отказ. Печатается всегда, чтобы «зелено»
+# нельзя было получить тишиной; в FAIL не идёт, иначе отсутствие токена
+# делало бы полный verify красным на машине без креденшелов.
+skip() { printf '  \033[33m⏭\033[0m  %-26s %s\n' "$1" "$2"; }
 
 # ---------- тестовые наборы ----------
 # Вердикт берётся из КОДА ВОЗВРАТА, а не из подсчёта символов. Итоговая строка
@@ -109,7 +132,11 @@ else
 fi
 
 if [ -z "$GH_HEAD" ]; then
-  no "GitHub HEAD" "не прочитал (нет токена или сети)"
+  if [ -z "$GH_CREDS" ]; then
+    skip "GitHub HEAD" "нет файла креденшелов — задайте TARNET_GH_CREDS"
+  else
+    no "GitHub HEAD" "не прочитал (токен есть, но сеть/ответ пусты)"
+  fi
 elif [ "$GH_HEAD" = "$LOCAL_HEAD" ]; then
   ok "GitHub HEAD" "$(printf %.7s "$GH_HEAD") = локальный $LOCAL_SHORT"
 else
