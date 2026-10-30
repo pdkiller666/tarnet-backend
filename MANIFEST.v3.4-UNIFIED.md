@@ -45,9 +45,9 @@
 | **Tier 3: Heavy** | GPU-узлы и риги (1×–2× RTX 3090/4090, A5000, HiveOS/RaveOS) | Экспертный инференс 7B–70B + LoRA, `Benchmark Gate`, `Critic-Aggregator` | `κ = 4.0` (expert)<br>**$0.80 / 1M** | `Private`, `Enterprise` | **1× RTX 4090** (120, 50%): **$118.20 / мес**<br>**2× RTX 4090** (240, 50%): **$236.39 / мес** |
 | **Tier 4: Client** | Любое устройство (`Synapse Chat` Web/Desktop/Mobile, OpenAI-совместимый SDK) | `DAG Planner`, локальный `PII-фильтр`, сборка ответа, фидбек | Плательщик (`N/A`) | выбор в UI | Скидки стейкинга до 20% + Free Tier за свой вклад |
 | **Tier 5: Cloud Anchor** `[SPEC Фаза 3]` | Облачные анклавы (`AWS Nitro`, Confidential VMs) через `Synapse Labs` | SLA 99.99%, пики, модели 70B+ | `κ = 10.0`<br>**$2.00 / 1M**<br>`[SPEC]` — в коде нет | **только `Enterprise`** *(в `Private` запрещён)* | Фиат по SLA + обязательный `Buyback & Burn $TAR` |
-| **Tier 6: External API** `[SPEC Фаза 2.5]` | Внешние API (`Gemini`, `OpenAI`, `Claude`, `DeepSeek`) по ключу пользователя (`BYOK`) | Мета-оркестрация (`Best-of-Breed`) для не-PII задач | по тарифу провайдера | **только `Extended`** *(при `pii_confidence ≥ 0.95`)* | `$TAR`-потребление: **5% Orchestration Fee** (2.5% Burn + 2.5% Treasury) |
+| **Tier 6: External API** `[SPEC Фаза 2.5]` | Внешние API (`Gemini`, `OpenAI`, `Claude`, `DeepSeek`) по ключу пользователя (`BYOK`) | Мета-оркестрация (`Best-of-Breed`) для не-PII задач | по тарифу провайдера | **только `Extended`** *(бинарный structured-PII гейт: совпадение → `422`, см. §Б.8 и `docs/PII-DECISION.md`)* | `$TAR`-потребление: **5% Orchestration Fee** (2.5% Burn + 2.5% Treasury) |
 
-> **Сноска к Tier 3.** Тир «heavy» (`κ = 10.0` → `$2.00/1M`) и доход `$330+/мес` **в коде отсутствуют**: `TIER_WEIGHTS = { nano: 0.1, base: 1.0, expert: 4.0 }`, потолок — `$0.80/1M`. Даже при `κ = 5.0` 2× RTX 4090 дают **$295.49/мес**, а не `$330`. Tier 3 Heavy (70B) — Фаза 3 `[SPEC]`, отдельный тариф по рыночному прайсу. Повышение `κ` — решение владельца, а не факт кода. Tier 6 в коде отсутствует (grep `tier6|orchestration|byok` → 0 совпадений).
+> **Сноска к Tier 3.** Тир «heavy» (`κ = 10.0` → `$2.00/1M`) и доход `$330+/мес` **в коде отсутствуют**: `TIER_WEIGHTS = { nano: 0.1, base: 1.0, expert: 4.0 }`, потолок — `$0.80/1M`. Даже при `κ = 5.0` 2× RTX 4090 дают **$295.49/мес**, а не `$330`. Tier 3 Heavy (70B) — Фаза 3 `[SPEC]`, отдельный тариф по рыночному прайсу. Повышение `κ` — решение владельца, а не факт кода. ~~Tier 6 в коде отсутствует (grep `tier6|orchestration|byok` → 0 совпадений).~~ **[устарело, см. §Б.8]** Tier 6 реализован: таблицы `tier6_calls` / `tier6_receipts` / `tier6_reserves`, `reserveTier6Fee` (`server.js:1747`, вызов `6246`); на 30.10 — `conservationTier6 {calls:12, holds:true}`.
 
 ---
 
@@ -56,10 +56,10 @@
 | Продукт | Разрешённые узлы | Приватность и правила PII | Назначение |
 | :--- | :--- | :--- | :--- |
 | **1. Synapse Private** | строго Tier 1–3 | Обязательный `Onion Routing` + `TEE` + шифрование обратного пути (`response_aes_key`). **PII разрешены**, данные не покидают рой | Частные лица, юристы, врачи, разработчики — максимум защиты |
-| **2. Synapse Extended** | Tier 1–3 + Tier 6 (BYOK) | Tier 6 по TLS **только если локальный PII-классификатор даёт `confidence ≥ 0.95`** и есть явное согласие в UI | Единое окно: приватное — в рой, открытый код/креатив — во внешний API |
+| **2. Synapse Extended** | Tier 1–3 + Tier 6 (BYOK) | Tier 6 по TLS **только если structured-PII гейт не нашёл совпадений** (карта, IBAN, SSN, email, IPv4, телефон) и есть явное согласие в UI | Единое окно: приватное — в рой, открытый код/креатив — во внешний API |
 | **3. Synapse Enterprise** | Tier 1–3 + Tier 5 Cloud (+ Tier 6 по политике) | SLA 99.99%, `Direct Encrypted Channel` в облачные TEE, аудит, маркировка `Processed by Cloud Anchor` | B2B и корпорации, оплата в фиате через `Synapse Labs` (GDPR Data Controller) |
 
-> **Инвариант безопасности:** при `confidence < 0.95` запрос **автоматически блокируется для Tier 6** и уходит в `Synapse Private` (Tier 1–3). Смешивание трафика `Private` и `Extended/Enterprise` в одном графе запрещено.
+> **Инвариант безопасности (приведён к коду 30.10).** Гейт Tier 6 **бинарный**: структурный regex нашёл совпадение → `422 PII_BLOCKED`, не нашёл → запрос идёт дальше. Порога `0.95` в решении нет: `LLM.piiCheck` (`llm-adapter.js:42`) возвращает `confidence` 0 или 1 и сравнивает только наличие совпадений. Поле `required_confidence: 0.95` в теле `422` — унаследованное и вводит в заблуждение. Имена в свободном тексте **не блокируются** (NER не поднят, см. `docs/PII-DECISION.md`). Смешивание трафика `Private` и `Extended/Enterprise` в одном графе запрещено.
 
 ### 3.1. Хранение промптов при дистилляции (`[SPEC Фаза 2.5]`)
 
@@ -73,7 +73,7 @@
 
 ## 4. ДЕЙСТВУЮЩЕЕ ЯДРО ФАЗЫ 1 (`2.17.0-ws-utility`) — ЧТО РЕАЛЬНО РАБОТАЕТ В КОДЕ СЕГОДНЯ
 
-Проверяется запросами к `localhost:3001` и прогоном `node test-dpouw.js --test` (**980 проверок, 0 провалов**) и `node test-mesh.js` (**25 проверок, 0 провалов**), итого **1005**, снимок 29.10.2026. Флаг `--test` поднимает изолированный сервер на временной БД (`mktemp`) с отдельным `TARNET_SECRETS_DIR` и свободным портом: приёмка не требует запущенного стенда и не затрагивает его БД. Адреса и `actionId` уникальны по суффиксу `RUN`, поэтому прогон воспроизводим.
+Проверяется запросами к `localhost:3001` и прогоном `node test-dpouw.js --test` (**987 проверок, 0 провалов**) и `node test-mesh.js` (**25 проверок, 0 провалов**), итого **1012**, снимок 30.10.2026 (§Б.8). Историческая цифра на 29.10 была **980 + 25 = 1005**. Флаг `--test` поднимает изолированный сервер на временной БД (`mktemp`) с отдельным `TARNET_SECRETS_DIR` и свободным портом: приёмка не требует запущенного стенда и не затрагивает его БД. Адреса и `actionId` уникальны по суффиксу `RUN`, поэтому прогон воспроизводим.
 
 ### 4.1. Матрица живой функциональности
 
@@ -93,7 +93,7 @@
 | Идемпотентность `actionId` | ✅ работает: `POST /work` — ключ, а не подсказка. Повтор → `200 {duplicate:true, existing:'receipt'}` (тот же `seq`, без второго начисления); повтор короткой работы → `202 {reason:'already_pending'}`, накопление не удваивается; повтор работы из `batchedFrom` → тот чек, `batchedInto = seq`; тот же ключ на другого воркера → `409`; без `actionId` ключа нет — два одинаковых запроса дают две работы | `POST /work` → раздел 8.11 приёмки |
 | Soft delete адаптеров | ✅ `DELETE /adapter/:id` ставит `deleted_at`; физического удаления нет, история роялти цела, новые работы → 409 | `GET /adapters` → `deleted_at`; чек несёт `adapterDeletedAt` |
 | Реальный LLM-инференс | ⚠️ **механика работает, сеть не постоянна**: на замере 29.10 14:41 — `active_workers: 1`, `llm_mode: worker` (воркер `0xe56c…`, `qwen2.5-coder:1.5b`, 4343 опроса). Окно жизни воркера — 60 с, поэтому «сейчас 1» не значит «сеть». Это по-прежнему **один узел, включаемый руками** | `GET /worker/status`, `GET /health` → `llm_mode`. Сквозной путь доказан 28.10 (телефон → VPS → дом → Ollama) |
-| **Внутренняя утилизация токена (`TAR_UTILITY`)** | ✅ **в коде с 2.17.0**: `paymentMode: TAR_UTILITY` в `POST /work` и `/inference` списывает **2%** (`TAR_UTILITY_FEE_BPS: 200`), поровну в burn и казну (`BURN_RATE: 0.01`, `TREASURY_RATE: 0.01`) | `config.js:122-124`; `server.js:2215, 4698, 6940`; приёмка 43.14. **Экономически не использован:** `/summary` → `totalUtilizedTar: 0`, `totalUtilizedCount: 0` |
+| **Внутренняя утилизация токена (`TAR_UTILITY`)** | ✅ **в коде с 2.17.0**: `paymentMode: TAR_UTILITY` в `POST /work` и `/inference` списывает **2%** (`TAR_UTILITY_FEE_BPS: 200`), поровну в burn и казну (`BURN_RATE: 0.01`, `TREASURY_RATE: 0.01`) | `config.js:122-124`; `server.js:2215, 4698, 6940`; приёмка 43.14. ~~**Экономически не использован:** `/summary` → `totalUtilizedTar: 0`, `totalUtilizedCount: 0`~~ **[устарело, см. §Б.8]** На 30.10 утилизация сработала: `totalUtilizedTar: 0.00001`, `totalUtilizedCount: 1` |
 | **Входящий WS воркера (`/p2p/worker`)** | ✅ **в коде с 2.17.0**: `ws-inbound.js` — Ed25519-хендшейк с nonce (`AUTH_PREFIX = TARNET_WS_AUTH`), TOFU по адресу (`ADDRESS_KEY_MISMATCH` при подмене ключа). Воркер держит **исходящее** соединение и получает задачу кадром `TASK`, фолбэк на `/worker/poll` сохранён | `ws-inbound.js`; `worker-demo.js:671` (`new WebSocket`); `GET /worker/ws`. Портов воркер не открывает → `registry.total: 0` остаётся верным |
 | Onion Routing | ✅ работает: `onion.js` (289 строк) — RSA-2048-OAEP-SHA256 шифрует 32-байтный ключ AES, нагрузка идёт AES-256-GCM; TTL слоя, защита от replay, шифрование обратного пути. `app/` — полная PWA (веб-манифест, service worker, 3 иконки). Остаётся: `archive/python-app/crypto.py` — `Wallet`, `generate_wallet()`, `sign_message()` на **SHA-256** (хеш-заглушка, **не Ed25519**) | `POST /inference/onion` → `delivered: true`, `hops: 3`; `test-mesh.js` → 25 ✅ |
 | Аппаратная проверка TEE Quote | ⏳ Фаза 2–3, в БД лишь флаг `isTeeAttested` | `nodes.isTeeAttested` |
@@ -186,11 +186,11 @@ interface PoUWReceiptV2 {        // ЧАСТИЧНО: хеши есть, пол�
 | № | Было | Стало | Доказательство |
 | :-- | :--- | :--- | :--- |
 | 1 | Tier 3: `κ = 10.0` (heavy), `$2.00/1M` | `κ = 4.0` (expert), `$0.80/1M`; heavy → `[SPEC]` | `TIER_WEIGHTS = {nano:0.1, base:1, expert:4}`; grep «heavy» → 0 |
-| 2 | Onion Routing «готов в Python (`app/crypto.py`)» | ⏳ `[SPEC / ROADMAP]` **на 22.10**; ⚠️ факт обновлён 24.10 — см. Б.6 (в Node `onion.js` реализован) | каталога `app/` нет **на 22.10**; `archive/python-app/crypto.py` — `Wallet`, `generate_wallet()`, `sign_message()` на SHA-256 |
+| 2 | Onion Routing «готов в Python (`app/crypto.py`)» | ⏳ `[SPEC / ROADMAP]` **на 22.10**; ⚠️ факт обновлён 24.10 — см. Б.6 (в Node `onion.js` реализован) | каталога `app/` нет **на 22.10** `[снимок 22.10; на 30.10 — `app/app.js` 2626 строк, `GET /app/` → 200, см. §Б.8]`; `archive/python-app/crypto.py` — `Wallet`, `generate_wallet()`, `sign_message()` на SHA-256 |
 | 3 | Контракты «спецификация готова (Solidity)» | ⏳ `[SPEC / ROADMAP]` | `find -name '*.sol'` → **0 файлов** |
 | 4 | `prevReceiptHash` / `receiptHash` (DAG) | ✅ **закрыто 24.10:** `dag-chain.js` + `server.js` пишут хеш-поля | `receiptPayload()` включает `prevSignature`; `payloadVersion: 2` несёт хеш-сцепку внутри подписи |
 | 5 | 2× RTX 4090 «$330+/мес при `κ=5.0`» | **$236.39** при `κ=4.0`; при `κ=5.0` → `$295.49` (см. Б.2) | `240 × 0.5 × 86400 × 30 / 1e6 × $0.20 × κ × 0.95` |
-| 6 | Tier 6 «5% Orchestration Fee» как факт | `[SPEC]`, Tier 6 в коде нет | grep `tier6\|orchestration\|byok` → 0 |
+| 6 | Tier 6 «5% Orchestration Fee» как факт | ~~`[SPEC]`, Tier 6 в коде нет~~ **[устарело, см. §Б.8]**: Tier 6 в коде с 2.12.0 | ~~grep → 0~~; на 30.10 `grep tier6` → 5 файлов, `conservationTier6.calls: 12` |
 
 ### Б.2. Пересчёт доходности Tier 3
 
@@ -219,7 +219,7 @@ interface PoUWReceiptV2 {        // ЧАСТИЧНО: хеши есть, пол�
 | `GET /summary` | Fee `7.008914` (**12.4%**) · Block `49.538006` (**87.6%**) · сожжено `0.184863` · казна `0.184863` · settlements `17` |
 | `GET /p2p/status` | 3 узла, у каждого блок `stats` (`framesIn/framesOut/requests/responses/dropped/replays`) |
 | `GET /adapters` | 3 фикстуры (`code` / `math` / `medical`), `totalLoraRoyaltyTar: 0.0133` |
-| Автотесты | `node test-dpouw.js --test` → **624 ✅ / 0 ❌** · `node test-mesh.js` → **25 ✅ / 0 ❌** — итого **649** (снимок 2026-10-24) |
+| Автотесты | ~~`node test-dpouw.js --test` → **624 ✅ / 0 ❌** · `node test-mesh.js` → **25 ✅ / 0 ❌** — итого **649**~~ **[устарело, см. §Б.8]** На 30.10: **987 ✅ / 0 ❌** + **25 ✅ / 0 ❌** = **1012** |
 
 Доля эмиссии — не константа: `totalBlockRewardTar / totalRewardTar` из `/summary` в момент публикации (для доли оплаты — `totalFeeRewardTar / totalRewardTar`).
 
@@ -245,9 +245,9 @@ interface PoUWReceiptV2 {        // ЧАСТИЧНО: хеши есть, пол�
 | :--- | :--- | :--- | :--- |
 | 1 | Onion Routing — `[SPEC]`, «каталога `app/` нет» | `onion.js` 289 строк, RSA-OAEP + AES-256-GCM, 3 хопа; `app/` — полная PWA | 📉 занижал |
 | 2 | `prevReceiptHash` / `receiptHash` «в коде отсутствует (grep → 0)» | `dag-chain.js` есть, колонки пишутся, чек `#696` несёт реальные хеши при `payloadVersion: 2` | 📉 занижал |
-| 3 | Схема стенда `2.1.0-dpouw`, 369 проверок | `2.12.0-tier6-byok`, 649 проверок (624 + 25) | 📉 занижал |
+| 3 | Схема стенда `2.1.0-dpouw`, 369 проверок | `2.12.0-tier6-byok`, 649 проверок (624 + 25) **[историч. снимок 24.10; на 30.10 — 1012, см. §Б.8]** | 📉 занижал |
 | 4 | Реальный LLM-инференс ✅ `source: live_llm` | `llm_mode: deterministic_fallback`, `active_workers: 0` | 📈 завышал |
-| 5 | Tier 5 / Tier 6 как часть архитектуры | в коде отсутствуют, `grep tier6\|orchestration\|byok` → 0 | 📈 завышал |
+| 5 | Tier 5 / Tier 6 как часть архитектуры | ~~в коде отсутствуют~~ **[устарело, см. §Б.8]**: Tier 6 в коде есть, 12 вызовов на 30.10 | 📈 завышал (на дату 24.10) |
 
 **Следствие для позиционирования.** Проект — не «работающая сеть роевого ИИ», а **работающий протокол,
 ожидающий сети исполнителей**. Ядро экономики и криптографии проверяемо; распределённого инференса нет.
@@ -261,7 +261,7 @@ interface PoUWReceiptV2 {        // ЧАСТИЧНО: хеши есть, пол�
 ### Б.7. Аудит 29.10.2026 — сверка всех документов с кодом и продом
 
 Срез `29.10.2026 14:41 MSK`, стенд `https://v1107336.hosted-by-vdsina.com`, сборка `2.17.0-ws-utility`.
-Проверено: `node test-dpouw.js --test` → **980 ✅ / 0 ❌**, `node test-mesh.js` → **25 ✅ / 0 ❌**.
+Проверено (снимок 29.10): `node test-dpouw.js --test` → ~~**980 ✅ / 0 ❌**~~ → **[устарело, см. §Б.8]** на 30.10 — **987 ✅ / 0 ❌**; `node test-mesh.js` → **25 ✅ / 0 ❌**.
 
 | Источник | Значение |
 | :--- | :--- |
@@ -271,12 +271,12 @@ interface PoUWReceiptV2 {        // ЧАСТИЧНО: хеши есть, пол�
 | `GET /summary` | чеков `750` · воркеров `90` · CWU `744 298 062` · выплачено `80.387229 TAR` |
 | `GET /summary` | Fee `7.057418` (**8.78%**) · Block `73.329811` (**91.22%**) · сожжено `0.186138` · казна `0.186138` · роялти `0.0133` |
 | `GET /summary` | `burnAudit.holds: true` · `treasuryAudit.holds: true` · `treasuryBalanceTar: 0.1947` · `onchainSettlements: 17` · `onchain.simulated: true` |
-| `GET /summary` | **`totalUtilizedTar: 0`**, `totalUtilizedCount: 0` — механизм утилизации есть, экономически не использован |
+| `GET /summary` | ~~`totalUtilizedTar: 0`~~, `totalUtilizedCount: 0` **[устарело, см. §Б.8]** — на 30.10 `totalUtilizedTar: 0.00001`, `totalUtilizedCount: 1` |
 | `GET /models` | **18** моделей: 15 облачных у 8 вендоров + 3 локальные (`provider: local` считается отдельной строкой → 9 значений `provider`) |
 | `GET /worker/status` | `active_workers: 1`, `mode: worker`, воркер `0xe56c…`, `qwen2.5-coder:1.5b`, 4343 опроса |
 
 **Что изменилось против Б.6.** Механизм утилизации токена, объявленный отсутствующим в 24.10, **появился в коде**
-(`TAR_UTILITY`, 2%, `config.js:122-124`) — но остаётся невостребованным (`totalUtilizedTar: 0`). Входящий WS
+(`TAR_UTILITY`, 2%, `config.js:122-124`) — и на 30.10 сработал один раз (`totalUtilizedTar: 0.00001`, см. §Б.8). Входящий WS
 воркера (`/p2p/worker`, `ws-inbound.js`) добавлен в 2.17.0: `registry.total: 0` по-прежнему верен, потому что
 воркер не открывает портов, а держит исходящее соединение.
 
@@ -284,3 +284,71 @@ interface PoUWReceiptV2 {        // ЧАСТИЧНО: хеши есть, пол�
 постоянного исполнителя (окно жизни 60 с). `registry.total: 0` — ни одного узла с внешним адресом.
 Комитет валидаторов — 0 членов. `0` файлов `.sol`. GPU-обучения нет. Onion через WS-воркеры не реализован:
 у воркера нет RSA-ключа, `worker-demo.js` onion-логики не содержит.
+
+### Б.8. Аудит 30.10.2026 — срез после `2.17.4-cloud-llm-backend`
+
+Срез `30.10.2026 06:45 MSK`, стенд `https://v1107336.hosted-by-vdsina.com`, сборка `2.17.4-cloud-llm-backend`
+(commit `cd5a93f`, схема `2.1.0-dpouw`). Прогон: `node test-dpouw.js --test` → **987 ✅ / 0 ❌** (RC=0),
+`node test-mesh.js` → **25 ✅ / 0 ❌** (RC=0). Итого **1012**. `test-mesh-worker.js` — **не третий набор**,
+а процесс-фикстура для `test-mesh.js` (`spawn`, `test-mesh.js:99`).
+
+**Направление дрейфа изменилось.** В Б.5–Б.7 документ **завышал** возможности. На 30.10 он **занижает** уже
+сделанное: Tier 6 объявлен отсутствующим при 12 живых вызовах, утилизация — нулевой при сработавшей ставке,
+тесты — 649 при 1012. Занижение дороже завышения: завышение проверяется запросом за секунды, а занижение
+толкает следующего исполнителя строить то, что уже работает.
+
+| Тема | Было в документе | Факт на 30.10 | Источник |
+| :--- | :--- | :--- | :--- |
+| Tier 6 | «в коде отсутствует, `grep tier6\|orchestration\|byok` → 0» | таблицы `tier6_calls` / `tier6_receipts` / `tier6_reserves`; `reserveTier6Fee` (`server.js:1747`, вызов `6246`); `grep tier6` → 5 файлов | `GET /health` → `conservationTier6` |
+| Tier 6 (деньги) | «`[SPEC]`, не факт» | `{calls:12, gross:0.006, distributed:0.006, delta:0, holds:true, fundedByClient:12, fundedByEmission:0}` — комиссия **не печаталась**, платил клиент | `GET /health` |
+| Утилизация `TAR_UTILITY` | «`totalUtilizedTar: 0`, `count: 0` — экономически не использован» | **`totalUtilizedTar: 0.00001`, `totalUtilizedCount: 1`** — механизм сработал на живой ставке | `GET /summary` |
+| Автотесты | `624 + 25 = 649`; позже «980 + 25 = 1005» | **`987 + 25 = 1012`** (985 базовых + 2 новых по onion) | прогон `--test`, RC=0 |
+| `app/` (PWA) | «каталога `app/` нет на 22.10» | `app/app.js` — 2626 строк, `GET /app/` → `200`, веб-манифест + service worker + 3 иконки | `wc -l`, `curl` |
+
+**Инварианты на срезе.** `conservation {gross:89.115042, distributed:89.115042, delta:0, holds:true}` ·
+`burnAudit.holds:true` · `treasuryAudit.holds:true` · эпоха `374` · чеков `755`, воркеров `91` · выплачено
+`88.724466 TAR` (block `81.572034` + fee `7.152432`) · казна `0.1978 TAR` при OPEX `517 $/мес` →
+`reserveStatus: critical`.
+
+**Что по-прежнему не работает — и это не дефект документа.** `active_workers: 0` и
+`llm_mode: deterministic_fallback` (`reason: no_workers`): живого инференса нет, ответы собирает
+детерминированный обработчик. `onchain.simulated: true` — 17 settlement'ов синтетические. P2P — 3 узла
+на `127.0.0.1` (`framesIn: 0`), то есть один хост, а не сеть. `0` файлов `.sol`, комитета 0 членов,
+GPU-обучения нет.
+
+**PII-гейт Tier 6.** `pii_classifier {enabled:false, ready:false, modelId:Xenova/bert-base-NER,
+minConfidence:0.95}`. Модели на проде физически нет: `/opt/tarnet/backend-api/.model-cache` отсутствует,
+пакеты (`@xenova/transformers@2.17.2`, `onnxruntime-node`) установлены. Вес по HF: `model.onnx` 411.2 MB,
+`model_quantized` 103.9 MB, `int8` 103.5 MB; код грузит `{quantized:true}` → **103.9 MB**. Замер на проде:
+kэш **105 MB**, пиковый RSS **687 MB** (`VmHWM`), загрузка **4.6 с**; RAM `1642` всего, `1165` доступно,
+swap `0`, порог `minFreeMb: 900`.
+
+**Решение принято — вариант B (`docs/PII-DECISION.md`).** Включать NER нельзя не из-за RAM, а из-за точности:
+при пороге `0.95` модель `bert-base-NER` размечает `Explain how TCP handshake works` как `B-ORG: T (0.94)`,
+`React and Vue` — мусором из `MISC`, `Berlin`/`Munich` — как `LOC (1.00)`, то есть блокировала бы обычные
+вопросы. ФИО ловит (`PER`), но обмен массовых отказов на редкий пропуск имён — плохая сделка.
+
+**Факт, который меняет постановку:** гейт Tier 6 `server.js:6169` вызывает `LLM.piiCheck`, а тот читает
+**только** `STRUCTURED_PATTERNS` (`llm-adapter.js:40-56`). `piiClassifier.classify` с NER вызывается в двух
+других местах — `/distill/record` (`4455`) и внешняя ветка (`6955`). «Включить ONNX» **не изменило бы гейт
+Tier 6**: он regex-only по устройству. Порог доступа к Tier 6 в документе «`pii_confidence ≥ 0.95`» приведён
+к коду: гейт бинарный (совпадение → `422`).
+
+**Проверено живьём (30.10).** `POST /inference` с `modelId: deepseek/deepseek-chat`:
+карта `4532015112830366` → `422 {error:"PII_BLOCKED", matches:["card"], required_confidence:0.95}`;
+**ФИО «Иван Иванович Петров» → `401 AUTH_MISSING_KEY`** — то есть при наличии ключа имя ушло бы провайдеру
+в открытом виде. Это записанное ограничение, не скрытое.
+
+**Что осталось:** имена, адреса, паспортные данные в свободном тексте **не блокируются**; NER — Фаза 3
+за отдельным сервисом. Tier 6 нельзя подавать как безопасный для произвольных пользовательских промптов.
+
+**Контракт onion.** `POST /inference/onion` читает `{routeNodes, prompt, clientAddress, model}`
+(`server.js:5090`). Документация **уже верна**: `DEMO-RUNBOOK.md` шаг 4 шлёт `prompt`, PWA тоже
+(`app/app.js:1154`). Вызов с `messages` → `400`; с `prompt` + `routeNodes` → `200 {"delivered":true,"hops":3}`.
+Значит контракт **не менялся** — исправлена только диагностика: вместо общего «prompt must be a non-empty
+string» на `messages[]` теперь `400 {error:"expected_field_prompt", expected:"prompt", received:"messages"}`.
+Закреплено тестами 8.15 (2 новые проверки).
+
+**Метод.** Каждое число выше воспроизводится одной командой: `GET /health`, `GET /summary`,
+`node test-dpouw.js --test`, `node test-mesh.js`. Значения **не переносить в новые отчёты копированием** —
+пересчитывать из прода на дату отчёта: это снимок, не константа.

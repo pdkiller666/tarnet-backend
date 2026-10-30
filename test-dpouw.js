@@ -1176,6 +1176,29 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   });
   ok('промпт больше 64 KiB — 413', tooLong.status === 413, tooLong.body);
 
+  /* Контракт маршрута — `prompt` (строка), а не `messages[]`. OpenAI-клиент
+   * по привычке шлёт `messages`, и раньше получал общее «prompt must be a
+   * non-empty string», по которому нельзя понять, что дело в имени поля.
+   * Проверяем, что отказ НАЗЫВАЕТ поле и остаётся 400, а не меняет
+   * поведение на «принимаем всё». */
+  const asMessages = await api('/inference/onion', 'POST', {
+    routeNodes: [onRoute[0].addr],
+    messages: [{ role: 'user', content: 'demo' }],
+  });
+  ok('messages[] вместо prompt — 400 с явным именем поля',
+    asMessages.status === 400
+      && asMessages.body?.error === 'expected_field_prompt'
+      && asMessages.body?.expected === 'prompt'
+      && asMessages.body?.received === 'messages',
+    asMessages.body);
+
+  const stillPrompt = await api('/inference/onion', 'POST', {
+    routeNodes: [onRoute[0].addr], prompt: 'demo',
+  });
+  ok('prompt по-прежнему работает (контракт не менялся)',
+    stillPrompt.status === 200 && typeof stillPrompt.body?.onionPacket === 'string',
+    stillPrompt.status);
+
   // ---------- Rate limiting ----------
   section('8.16. Rate limiting по классам: чтение / воркер / запись');
   {

@@ -5100,7 +5100,25 @@ app.post('/inference/onion', async (req, res) => {
     return res.status(400).json({ error: 'routeNodes supports at most 5 hops', got: routeNodes.length });
   }
   if (typeof prompt !== 'string' || prompt.length === 0) {
-    return res.status(400).json({ error: 'prompt must be a non-empty string' });
+    /* Диагностика, а не смена контракта: OpenAI-клиенты по привычке шлют
+     * `messages[]`, и общее «prompt must be a non-empty string» отправляло
+     * их искать баг в шифровании. Контракт этот маршрута — `prompt`
+     * (строка), так он и задокументирован в DEMO-RUNBOOK шаг 4 и так его
+     * шлёт PWA (app/app.js:1154). Здесь только называем поле вслух. */
+    if (Array.isArray(req.body && req.body.messages)) {
+      return res.status(400).json({
+        error: 'expected_field_prompt',
+        note: 'Этот маршрут принимает `prompt` (строка), а не `messages[]` (OpenAI-формат). '
+          + 'Соберите текст из messages и передайте в `prompt`.',
+        received: 'messages',
+        expected: 'prompt',
+        example: { routeNodes: ['0x...'], prompt: 'demo' },
+      });
+    }
+    return res.status(400).json({
+      error: 'prompt must be a non-empty string',
+      note: 'Поле `prompt` — непустая строка. Пример: {"routeNodes":["0x..."],"prompt":"demo"}',
+    });
   }
   /* Промпт огромного размера в луковице раздувает каждый слой: RSA несёт
    * только ключ, но AES-конверт растёт линейно. Ограничиваем явно. */
