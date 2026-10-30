@@ -29,10 +29,69 @@ FAIL=0
 ok() { printf '  \033[32m✅\033[0m %-26s %s\n' "$1" "$2"; }
 no() { printf '  \033[31m❌\033[0m %-26s %s\n' "$1" "$2"; FAIL=$((FAIL+1)); }
 
+# ---------- тестовые наборы ----------
+# Вердикт берётся из КОДА ВОЗВРАТА, а не из подсчёта символов. Итоговая строка
+# набора («Итого: 980 ✅ 0 ❌») содержит оба символа, поэтому `grep -c ❌` даёт
+# 1 на полностью зелёном прогоне — счёт по символам уже давал ложную тревогу.
+#
+# Запуск отвязан (setsid nohup): набор набирает 1000+ строк и живёт дольше
+# одного терминального сеанса. Раньше при обрыве лог недописывался, и «нет
+# вывода» выглядело как «нет падений».
+#
+# Таймаут короткий не потому, что набор «быстрый», а чтобы зависший тест давал
+# красное, а не вечное ожидание.
+run_suite() {
+  local label="$1" timeout="$2" cmd="$3" tag="$4"
+  local log="/tmp/tarnet-verify-${tag}.log" rcfile="/tmp/tarnet-verify-${tag}.rc"
+  rm -f "$rcfile"
+  setsid nohup sh -c "$cmd >'$log' 2>&1; echo \$? >'$rcfile'" >/dev/null 2>&1 &
+  local waited=0
+  while [ ! -s "$rcfile" ] && [ "$waited" -lt "$timeout" ]; do
+    sleep 5; waited=$((waited+5))
+  done
+  if [ ! -s "$rcfile" ]; then
+    no "тесты $label" "нет завершения за ${timeout}с — смотри $log"
+    return
+  fi
+  local rc summary
+  rc=$(cat "$rcfile" 2>/dev/null)
+  summary=$(grep -a 'Итого:' "$log" 2>/dev/null | tail -1 | sed 's/.*Итого: *//')
+  if [ "$rc" = "0" ] && [ -n "$summary" ]; then
+    ok "тесты $label" "$summary"
+  elif [ -z "$summary" ]; then
+    no "тесты $label" "exit $rc, итоговой строки нет — набор не дошёл до конца ($log)"
+  else
+    no "тесты $label" "$summary (exit $rc)"
+  fi
+}
+
+verify_tests() {
+  if [ "${TARNET_SKIP_TESTS:-0}" = "1" ]; then
+    # Осознанный пропуск печатается, чтобы «зелено» нельзя было получить тишиной.
+    printf '  \033[33m⋯\033[0m %-26s %s\n' "тесты" "пропущены (TARNET_SKIP_TESTS=1)"
+    return
+  fi
+  run_suite "dpouw" "${TARNET_TEST_TIMEOUT_DPOUW:-900}" "node test-dpouw.js --test" dpouw
+  run_suite "mesh" "${TARNET_TEST_TIMEOUT_MESH:-300}" "node test-mesh.js" mesh
+  run_suite "treasury" "${TARNET_TEST_TIMEOUT_TREASURY:-300}" "node proof-treasury-gate.js" treasury
+}
+
 printf '\nTarNet verify — сверка VPS с GitHub\n'
 printf 'репозиторий: %s\n\n' "$REPO_DIR"
 
 cd "$REPO_DIR" || { echo "нет каталога $REPO_DIR"; exit 2; }
+
+# Быстрый режим только для тестов: полный verify ходит по SSH к VPS и GitHub,
+# а проверять детектор падений нужно без этой сети.
+if [ "${TARNET_TESTS_ONLY:-0}" = "1" ]; then
+  printf '\nTarNet verify — только тестовые наборы\n\n'
+  verify_tests
+  printf '\n'
+  if [ "$FAIL" -eq 0 ]; then
+    printf '\033[32mТЕСТЫ ЗЕЛЁНЫЕ\033[0m\n\n'; exit 0
+  fi
+  printf '\033[31mПРОБЛЕМ: %d\033[0m\n\n' "$FAIL"; exit 1
+fi
 
 # ---------- 1. локально и на GitHub ----------
 LOCAL_HEAD=$(git rev-parse HEAD)
@@ -236,6 +295,9 @@ else
     fi
   fi
 fi
+
+# ---------- 3.9 тестовые наборы ----------
+verify_tests
 
 # ---------- 4. сервис и эндпоинты ----------
 if [ "$VPS_ACTIVE" = "active" ]; then

@@ -1,0 +1,48 @@
+[Unit]
+# Образец серверного юнита. До 2026-10-30 в репозитории его не было вовсе:
+# на проде жил файл, которого никто не версионировал, а в `deploy/systemd`
+# лежали только drop-in'ы. Любая переустановка с нуля восстанавливала сервис
+# «по памяти», то есть с расхождениями.
+#
+# Сверено с живым прод-юнитом 30.10.2026 (systemd 259, Ubuntu).
+Description=TarNet backend-api (dPoUW v2.1)
+Documentation=file:///opt/tarnet/backend-api/MANIFEST.v3.4-UNIFIED.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tarnet/backend-api
+
+Environment=NODE_ENV=production
+Environment=PORT=3001
+Environment=TARNET_DB=/var/lib/tarnet/tarnet.db
+Environment=TARNET_SECRETS_DIR=/var/lib/tarnet/secrets
+
+# TTL задачи воркера — ЗДЕСЬ, а не в юните воркера.
+#
+# Переменную читает сервер (`server.js:5564`), в `worker-demo.js` её нет
+# ни разу. Директива 30.10 предлагала положить её в `tarnet-worker.service`;
+# там она не прочиталась бы никем, осталось бы 30 с по умолчанию, а отчёт
+# сказал бы «поставили, проверили». Проверяется снаружи:
+#   curl -s $URL/health | grep -o 'worker_task_ttl_ms[^,]*'
+# Живой прод на 30.10: `worker_task_ttl_ms":150000`.
+#
+# 150 с, а не 30: задача 7B-модели на CPU-хосте думает дольше дефолта,
+# и задача истекала бы раньше ответа.
+Environment=WORKER_TASK_TTL_MS=150000
+
+ExecStart=/usr/bin/node server.js
+
+# always, а не on-failure: падение по SIGKILL/OOM не оставляет кода отказа,
+# и on-failure оставил бы сервис лежать.
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tarnet
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

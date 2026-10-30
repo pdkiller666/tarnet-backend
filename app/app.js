@@ -188,6 +188,22 @@ async function call(path, opts = {}) {
 }
 
 const fmt = (n, d = 6) => (Number(n) || 0).toFixed(d);
+
+/* Цена одного вызова при оплате из внутреннего баланса TAR.
+ *
+ * Зеркалит `ORCHESTRATION_FEE_TAR` из `config.js:38`. `/config` эту цифру
+ * наружу не отдаёт (там только `fee.protocol/burn/treasury/loraRoyalty`),
+ * а выводить её «на глаз» в подписи нельзя: человек считает деньги, и
+ * подпись обязана совпадать со списанием. При смене ставки правится здесь
+ * И в `config.js` — расхождение видно по тексту ниже.
+ *
+ * НЕ BYOK -ставка: та (0.0005 → 0.0001) живёт в Tier 6 и ждёт ONNX. */
+const TAR_UTIL_FEE = 0.0005;
+
+/* Последний прочитанный баланс. `null` = ещё не знаем (запрос не пришёл
+ * или упал сетью). Отличать «баланс неизвестен» от «баланс 0» обязательно:
+ * во втором случае галочку надо гасить, в первом — не врать про нехватку. */
+let TAR_BALANCE = null;
 const short = (a) => (a ? `${a.slice(0, 8)}…${a.slice(-6)}` : '—');
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
@@ -447,13 +463,28 @@ function syncContourToModel() {
    * заставлять ставить его заново. */
   const tarUtil = $('tarUtil');
   if (tarUtil) {
-    tarUtil.disabled = cloud;
-    const label = tarUtil.parentElement && tarUtil.parentElement.querySelector('span');
+    const label = $('tarUtilLabel');
+    /* Три состояния, а не два: облачная модель, не хватает баланса,
+     * всё в порядке. Пока их смешивали, галочка либо была активна при
+     * пустом счёте (человек включал и получал отказ), либо молчала о том,
+     * что режим недоступен вовсе. */
+    const notEnough = TAR_BALANCE !== null && TAR_BALANCE < TAR_UTIL_FEE;
+    tarUtil.disabled = cloud || notEnough;
     if (label) {
-      label.textContent = cloud
-        ? 'Оплата из баланса TAR — только для локальных моделей'
-        : 'Платить из баланса TAR — комиссия 2% вместо 5%';
+      if (cloud) {
+        label.textContent = 'Оплата из баланса TAR — только для локальных моделей';
+      } else if (notEnough) {
+        /* Сумма названа, а не «недостаточно средств»: человеку нужно знать,
+         * сколько добрать, иначе следующий шаг — догадка. */
+        label.textContent = `Недостаточно TAR: на счёте ${fmt(TAR_BALANCE)} из ${fmt(TAR_UTIL_FEE)}`;
+      } else {
+        label.textContent = `Платить из баланса TAR — комиссия 2% вместо 5% (вызов ${fmt(TAR_UTIL_FEE)} TAR)`;
+      }
     }
+    /* Включённая галочка, ставшая недоступной, обязана сняться: иначе она
+     * осталась бы `checked`, а подпись говорила бы «недостаточно TAR» —
+     * то есть отправка прошла бы с заведомо невыполнимым намерением. */
+    if (tarUtil.disabled && tarUtil.checked) tarUtil.checked = false;
   }
 }
 
@@ -1149,7 +1180,14 @@ async function sendPrompt(prompt, opts = {}) {
      * которой не будет. */
     const tarUtilEl = $('tarUtil');
     const isCloudModel = modelId ? MODEL_INFO.get(modelId)?.tier === 6 : false;
-    if (tarUtilEl && tarUtilEl.checked && !isCloudModel) {
+    /* Гейт по `disabled`, а не только по `checked`.
+     *
+     * Галочка гасится при пустом балансе и снимается через `checked = false`,
+     * но полагаться только на это нельзя: `disabled` — единственное поле,
+     * которое ставит сам браузер, и только оно переживает любую будущую
+     * правку текста выше. Отправить `TAR_UTILITY` с счёта, где денег меньше
+     * цены вызова, значит обещать списание, которое сервер не выполнит. */
+    if (tarUtilEl && tarUtilEl.checked && !tarUtilEl.disabled && !isCloudModel) {
       body.paymentMethod = 'TAR';
       body.paymentMode = 'TAR_UTILITY';
     }
@@ -1268,14 +1306,24 @@ async function refreshBalance() {
   try {
     const b = await call(`/balance/${ADDR}`);
     $('balanceVal').textContent = fmt(b.balanceTar);
+    TAR_BALANCE = Number(b.balanceTar) || 0;
   } catch (e) {
     // 404 = узла ещё нет в сети: это нормальное состояние нового устройства.
     if (e.status === 404) {
       $('balanceVal').textContent = '0.000000';
+      TAR_BALANCE = 0;
     } else {
+      /* Сетевой отказ — это НЕ «ноль на счету». Оставляем `null`, чтобы
+       * галочка не погасла с текстом про нехватку денег, которых мы не
+       * проверяли. */
       $('balanceVal').textContent = '—';
+      TAR_BALANCE = null;
     }
   }
+  /* Пересчёт галочки идёт ЗДЕСЬ, а не в понеле вкладки: баланс меняется
+   * после faucet'а и после каждого списания, а подпись про цену вызова
+   * должна отражать именно его. */
+  syncContourToModel();
   /* Сайдбар читает УЖЕ отрисованное значение, а не ходит в /balance второй
    * раз: две цифры из двух запросов на одном экране могут разойтись, и
    * человек увидит два разных баланса сразу. */

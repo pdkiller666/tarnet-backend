@@ -1,0 +1,50 @@
+[Unit]
+# Образец юнита воркера. Раньше его не существовало: `worker-demo.js`
+# запускали руками из консоли, поэтому `active_workers` падал до нуля при
+# каждом разрыве SSH, а `/health` честно показывал `deterministic_fallback`.
+Description=TarNet worker (dPoUW v2.1)
+Documentation=file:///opt/tarnet/backend-api/MANIFEST.v3.4-UNIFIED.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tarnet/backend-api
+
+# Адрес узла обязан пережить рестарт.
+#
+# `workerAddress()` берёт адрес из `TARNET_WORKER_ADDRESS`/`WORKER_ADDRESS`,
+# иначе читает `~/.tarnet/worker.json`, а если файла нет — генерирует новый.
+# При `User=root` домашний каталог — `/root`, и смена `HOME` (или запуск под
+# другим пользователем) молча выдала бы узлу НОВЫЙ адрес: старые чеки и
+# баланс остались бы на прежнем, а новый стартовал бы с нуля.
+# `StateDirectory` даёт стабильный каталог, который systemd создаёт сам.
+StateDirectory=tarnet-worker
+StateDirectoryMode=0700
+Environment=HOME=/var/lib/tarnet-worker
+
+Environment=TARNET_API_URL=https://v1107336.hosted-by-vdsina.com
+# Класс железа, а не ставка CWU. Прод — 1 vCPU / 1642 MB, поэтому `nano`.
+# `expert` здесь был бы заявкой на мощность, которой нет, и веса маршрутизации
+# (4 вместо 0.1) уводили бы на этот узел чужие задачи.
+Environment=TARNET_TIER=nano
+Environment=TARNET_POLL_MS=2000
+Environment=OLLAMA_URL=http://127.0.0.1:11434
+
+# ВНИМАНИЕ: WORKER_TASK_TTL_MS здесь НЕ ставится намеренно. Переменную читает
+# сервер, а не воркер (`grep -c WORKER_TASK_TTL_MS worker-demo.js` → 0).
+# Она живёт в `tarnet.service`.
+
+ExecStart=/usr/bin/node worker-demo.js
+
+# always: воркер — долгоживущий процесс опроса. Один сетевой сбой не должен
+# оставлять узел вне сети до ручного вмешательства.
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tarnet-worker
+
+[Install]
+WantedBy=multi-user.target
