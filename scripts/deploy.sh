@@ -23,7 +23,16 @@ set -uo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="main"
 REPO_SLUG="pdkiller666/tarnet-backend"
-GH_CREDS="${TARNET_GH_CREDS:-/home/node/.openclaw/credentials/github/personal/ghp_d000abcd8efeb474c2425f28f1b0a409/hosts.yml}"
+# Путь к GitHub-креденшелам — только из окружения или поиском по каталогу.
+#
+# Был жёсткий путь с `ghp_...` в имени каталога — то есть часть идентификатора
+# ключа в исходнике. Тот же класс дефекта, что в verify.sh.
+GH_CREDS="${TARNET_GH_CREDS:-}"
+if [ -z "$GH_CREDS" ]; then
+  for _c in "$HOME"/.openclaw/credentials/github/personal/*/hosts.yml; do
+    [ -r "$_c" ] && { GH_CREDS="$_c"; break; }
+  done
+fi
 VPS="${TARNET_VPS:-root@195.63.131.172}"
 SSH_KEY="${TARNET_SSH_KEY:-$HOME/.ssh/tarnet_vps}"
 REMOTE_DIR="${TARNET_REMOTE_DIR:-/opt/tarnet/backend-api}"
@@ -140,7 +149,8 @@ if [ -f "$HISTORY_FILE" ]; then
 fi
 
 # ---------- 2. GitHub ----------
-[ -r "$GH_CREDS" ] || die "нет credential-файла $GH_CREDS"
+[ -r "$GH_CREDS" ] || die "нет credential-файла${GH_CREDS:+ $GH_CREDS}
+Задайте TARNET_GH_CREDS или положите hosts.yml в \$HOME/.openclaw/credentials/github/personal/<id>/"
 TOKEN=$(grep -m1 '^  oauth_token:' "$GH_CREDS" | sed 's/^  oauth_token: *//' | tr -d '"' | tr -d ' ')
 [ ${#TOKEN} -ge 20 ] || die "не разобрал токен GitHub в $GH_CREDS"
 PUSH_URL="https://x-access-token:${TOKEN}@github.com/${REPO_SLUG}.git"
