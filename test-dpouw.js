@@ -4052,8 +4052,10 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     global.fetch = realFetch;
 
     /* 29.9 Арифметика кэшбэка — КОНТРАКТ ИНВАРИАНТА, а не пересказ ТЗ.
-     * ТЗ просило 0.0005 комиссии + 0.0001 кэшбэка при сплите 50/50, и эти
-     * три числа дают delta = +0.0001. Проверяем, что реализация держит ноль. */
+     * Исходное ТЗ просило 0.0005 комиссии + 0.0001 кэшбэка при сплите 50/50,
+     * и эти три числа давали delta = +0.0001. С v2.17.8 действует ставка B′:
+     * комиссия 0.0002, из которых 0.0001 — кэшбэк, а остаток поровну сожжён
+     * и отдан в казну. Проверяем, что реализация держит ноль. */
     const { TIER6 } = require('./config');
     const fee = TIER6.ORCHESTRATION_FEE_TAR;
     const cb = TIER6.CASHBACK_TAR;
@@ -4064,7 +4066,10 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       Math.abs((cb + burn + treas) - fee) < 1e-9,
       { fee, cb, burn: Number(burn.toFixed(6)), treas: Number(treas.toFixed(6)), delta: (cb + burn + treas) - fee });
     ok('29.9 кэшбэк равен 0.0001 TAR', Math.abs(cb - 0.0001) < 1e-12, cb);
-    ok('29.9 комиссия равна 0.0005 TAR', Math.abs(fee - 0.0005) < 1e-12, fee);
+    ok('29.9 комиссия равна 0.0002 TAR (ставка B′)', Math.abs(fee - 0.0002) < 1e-12, fee);
+    ok('29.9 burn и treasury равны по 0.00005 TAR',
+      Math.abs(burn - 0.00005) < 1e-12 && Math.abs(treas - 0.00005) < 1e-12,
+      { burn: Number(burn.toFixed(6)), treasury: Number(treas.toFixed(6)) });
 
     /* 29.10 HTTP: PII блокируется ДО сети и до проверки ключа. Порядок
      * важен: с ключом и с PII клиент должен увидеть PII_BLOCKED, а не 200. */
@@ -4233,18 +4238,18 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
         Math.abs(Number(okCall.body?.cashback_tar) - 0.0001) < 1e-12, okCall.body?.cashback_tar);
       ok('29.13 delta одного вызова = 0',
         Number(okCall.body?.economics?.delta) === 0, okCall.body?.economics?.delta);
-      ok('29.13 burn + treasury = 0.0004 TAR',
-        Math.abs(Number(okCall.body?.economics?.burn_tar) + Number(okCall.body?.economics?.treasury_tar) - 0.0004) < 1e-12,
+      ok('29.13 burn + treasury = 0.0001 TAR',
+        Math.abs(Number(okCall.body?.economics?.burn_tar) + Number(okCall.body?.economics?.treasury_tar) - 0.0001) < 1e-12,
         { burn: okCall.body?.economics?.burn_tar, treasury: okCall.body?.economics?.treasury_tar });
       ok('29.13 usage взят от провайдера, а не оценён',
         okCall.body?.tokens_used === 33 && okCall.body?.tokens_source === 'provider',
         { tokens: okCall.body?.tokens_used, source: okCall.body?.tokens_source });
 
       /* Деньги в БД: комиссия списана, кэшбэк зачислен, резерв пуст.
-       * Нетто-изменение = −0.0005 + 0.0001 = −0.0004. */
+       * Нетто-изменение = −0.0002 + 0.0001 = −0.0001. */
       const moneyAfter = readMoney(t6.dir, t6client);
-      ok('29.13 с клиента списано ровно 0.0004 TAR нетто',
-        Math.abs((0.01 - moneyAfter.balanceTar) - 0.0004) < 1e-9, moneyAfter.balanceTar);
+      ok('29.13 с клиента списано ровно 0.0001 TAR нетто',
+        Math.abs((0.01 - moneyAfter.balanceTar) - 0.0001) < 1e-9, moneyAfter.balanceTar);
       ok('29.13 резерв после успеха освобождён',
         moneyAfter.reservedTar === 0, moneyAfter.reservedTar);
 
@@ -5454,12 +5459,12 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       ok('34.1 инвариант вызова сохранён (cashback + burn + treasury === fee)',
         Number(byOwner.body?.economics?.delta) === 0, byOwner.body?.economics?.delta);
 
-      /* Деньги: нетто −0.0004 у владельца, у устройства — ноль. Второе не
+      /* Деньги: нетто −0.0001 у владельца, у устройства — ноль. Второе не
        * менее важно первого: иначе списание ушло бы не с того кошелька. */
       const ownerAfter = money(OWN);
       const devAfter = money(DEV);
-      ok('34.1 списано с владельца ровно 0.0004 TAR нетто',
-        Math.abs((0.009995 - ownerAfter.balanceTar) - 0.0004) < 1e-9, ownerAfter.balanceTar);
+      ok('34.1 списано с владельца ровно 0.0001 TAR нетто',
+        Math.abs((0.009995 - ownerAfter.balanceTar) - 0.0001) < 1e-9, ownerAfter.balanceTar);
       ok('34.1 у устройства баланс не изменился',
         devAfter.balanceTar === 0 && devAfter.reservedTar === 0, devAfter);
       ok('34.1 резерв владельца освобождён',
@@ -5763,7 +5768,7 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
         { status: call.status, error: call.body?.error });
 
       const burnT6 = Number(call.body?.economics?.burn_tar ?? 0);
-      ok('36.2 сжигание Tier 6 равно 0.0002 TAR', Math.abs(burnT6 - 0.0002) < 1e-12, burnT6);
+      ok('36.2 сжигание Tier 6 равно 0.00005 TAR', Math.abs(burnT6 - 0.00005) < 1e-12, burnT6);
 
       const after = (await apiAt(s36.base, '/summary')).body;
 

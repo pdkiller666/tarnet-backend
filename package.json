@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.17.6-pii-confirm",
+  "version": "2.17.8-byok-pricing-b",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {
