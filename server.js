@@ -2817,6 +2817,24 @@ app.get('/config', (_req, res) => {
     tierWeights: TIER_WEIGHTS,
     price: { usdPer1MTokens: CONFIG.PRICE_USD_PER_1M_TOKENS, usdPerTar: CONFIG.USD_PER_TAR },
     fee: { protocol: CONFIG.PROTOCOL_FEE_RATE, burn: CONFIG.BURN_RATE, treasury: CONFIG.TREASURY_RATE, loraRoyalty: CONFIG.LORA_ROYALTY_RATE },
+    /* Комиссия Tier 6 (BYOK) — ставка B′.
+     *
+     * ПОЧЕМУ ЭТОТ БЛОК ВООБЩЕ ПОЯВИЛСЯ. В 2.17.8 ставка была изменена
+     * (0.0005 → 0.0002), /health отдавал новый buildVersion, а проверить
+     * сами числа было нечем: /config знал только fee/emission. По Code-First
+     * Rule («работает то, что отдаётся endpoint'ом») экономика Tier 6
+     * оказывалась неподтверждаемой снаружи — только `grep` по config.js.
+     *
+     * Имена полей оставлены КАПСОМ, как в config.js, намеренно: тогда
+     * аудитор сравнивает config.js и /config построчно, без перевода
+     * camelCase ↔ UPPER_SNAKE и без шанса перепутать похожие ключи.
+     * Это расходится с camelCase остального payload — осознанный размен
+     * в пользу буквального diff'а при сверке ставки. */
+    TIER6: {
+      ORCHESTRATION_FEE_TAR: TIER6.ORCHESTRATION_FEE_TAR,
+      CASHBACK_TAR: TIER6.CASHBACK_TAR,
+      cashbackRate: TIER6.cashbackRate,
+    },
     emission: { initialBlockReward: CONFIG.INITIAL_BLOCK_REWARD, epochDurationSec: CONFIG.EPOCH_DURATION_SEC, halvingPeriodEpochs: CONFIG.HALVING_PERIOD_EPOCHS, genesisTs: CONFIG.GENESIS_TS },
     settlementIntervalSec: CONFIG.SETTLEMENT_INTERVAL_SEC,
     decimals: CONFIG.DECIMALS,

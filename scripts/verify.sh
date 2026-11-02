@@ -346,6 +346,36 @@ H_APP=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/app/")
 H_DL=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/download/worker.js")
 [ "$H_DL" = "200" ] && ok "/download/worker.js" "HTTP 200" || no "/download/worker.js" "HTTP $H_DL"
 
+# ---------- 4.5 /config отдаёт ставку Tier 6 ----------
+# В 2.17.8 ставка B′ (0.0005 → 0.0002) была изменена, но проверить её снаружи
+# было нечем: /config знал только fee/emission. Это ломало Code-First Rule —
+# работающее должно быть видно в endpoint'е, а не только в `grep` по config.js.
+#
+# Проверка СРАВНИВАЕТ ответ с константами в config.js, а не ищет "0.0002"
+# литералом: литерал прошел бы и в том случае, если бы /config отдавал
+# захаРДкоженное число, разошедшееся с реальной комиссией. Ловим именно
+# расхождение endpoint ↔ код.
+CFG_JSON=$(curl -s -m 20 "$PUBLIC_URL/config" 2>/dev/null)
+CFG_VERDICT=$(printf '%s' "$CFG_JSON" | node -e '
+let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+  try{
+    const cfg=JSON.parse(s);
+    const {TIER6}=require(process.argv[1]+"/config.js");
+    const t=cfg.TIER6;
+    if(!t){console.log("NO_TIER6|в ответе нет блока TIER6");return;}
+    const bad=[];
+    if(t.ORCHESTRATION_FEE_TAR!==TIER6.ORCHESTRATION_FEE_TAR)bad.push("fee "+t.ORCHESTRATION_FEE_TAR+"≠"+TIER6.ORCHESTRATION_FEE_TAR);
+    if(t.CASHBACK_TAR!==TIER6.CASHBACK_TAR)bad.push("cashback "+t.CASHBACK_TAR+"≠"+TIER6.CASHBACK_TAR);
+    if(Math.abs(t.cashbackRate-TIER6.cashbackRate)>1e-9)bad.push("rate "+t.cashbackRate+"≠"+TIER6.cashbackRate);
+    if(bad.length){console.log("MISMATCH|"+bad.join(", "));return;}
+    console.log("OK|fee="+t.ORCHESTRATION_FEE_TAR+" cashback="+t.CASHBACK_TAR+" rate="+t.cashbackRate);
+  }catch(e){console.log("PARSE_ERR|"+e.message);}
+});' "$REPO_DIR" 2>&1)
+case "$CFG_VERDICT" in
+  OK\|*) ok "/config TIER6" "${CFG_VERDICT#OK|} (= config.js)" ;;
+  *)     no "/config TIER6" "${CFG_VERDICT}" ;;
+esac
+
 # ---------- 3.8 документы в корне воркспейса ----------
 # Корень workspace не под git: документы живут в backend-api/docs/, а инвестору
 # уходят копии из корня. Раньше копии разъезжались молча (29.10 EMAIL-TEMPLATE
