@@ -270,7 +270,24 @@ async function askOllama(prompt, requestedModel) {
     }),
     signal: AbortSignal.timeout(120000),
   });
-  if (!res.ok) throw new Error(`ollama HTTP ${res.status}`);
+  /* Тело ошибки ОБЯЗАТЕЛЬНО, а не только код.
+   *
+   * Столкновение с этим было живым: на ПК владельца Ollama отвечала
+   * `500 llama-server binary not found (checked: ...)`, а воркер писал в лог
+   * и в `worker_tasks.error` голое `ollama HTTP 500`. Причины не было ни в
+   * логе воркера, ни в PWA — человек пошёл искать её руками, хотя ответ
+   * лежал в теле. `askCloud` рядом читал тело с самого начала; здесь это
+   * забыли.
+   *
+   * 200 символов — не «сколько влезет»: сообщение Ollama начинается с
+   * причины и перечисляет проверенные пути, так что начало информативнее
+   * хвоста. Читаем через text(), а не json(): при 500 тело может быть
+   * обычным текстом, и парсер упал бы вместо того, чтобы показать причину. */
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 200); } catch (_e) { detail = ''; }
+    throw new Error(`ollama HTTP ${res.status}${detail ? `: ${detail}` : ''}`);
+  }
   const j = await res.json();
   const response = j.message?.content || j.response || '';
   if (!response.trim()) throw new Error('ollama вернул пустой ответ');
@@ -341,7 +358,7 @@ async function askCloud(prompt, requestedModel) {
 }
 
 /* ---------- 3. Честный fallback ---------- */
-function askFallback(prompt, errorCode) {
+function askFallback(prompt, errorCode, errorDetail) {
   const response =
     `Воркер получил запрос: «${String(prompt).slice(0, 160)}».\n\n` +
     'Модель на этом ПК не настроена, поэтому текст собран по шаблону. ' +
@@ -354,6 +371,11 @@ function askFallback(prompt, errorCode) {
      * только «модели нет», и человек идёт проверять модель вместо того,
      * чтобы запустить Ollama. null — причина неизвестна, врать не будем. */
     error: errorCode || null,
+    /* Дословная причина от Ollama, когда она есть: «500» без текста
+     * заставляет человека лезть в исходники воркера, а «500: llama-server
+     * binary not found» — сразу говорит, что переустановить. 200 символов
+     * уже обрезаны при чтении тела, здесь только доставка. */
+    errorDetail: errorDetail ? String(errorDetail).slice(0, 200) : null,
     usage: { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
   };
 }
@@ -370,11 +392,35 @@ function askFallback(prompt, errorCode) {
  * 30 с — компромисс: достаточно, чтобы не ждать таймаут на каждой задаче,
  * и мало, чтобы человек, поставивший модель, увидел результат сразу. */
 const OLLAMA_RETRY_MS = 30000;
+/* Пауза после ОТВЕТА С ОШИБКОЙ (500/501), короче паузы после «не запущена».
+ *
+ * Столкновение на живом ПК: Ollama жива и отвечает на /api/tags, значит
+ * `ollamaOnline: true`, но генерация падает — нет `llama-server.exe`. Такой
+ * запрос занимает НЕ мгновение: Ollama ищет бинарник по шести путям и
+ * отвечает через 138 с (замерено). Без паузы каждая следующая задача снова
+ * платит эти 138 с и умирает по TTL в 150 с — ровно то, что видел человек:
+ * «ответ не приходит».
+ *
+ * 5 с хватает, чтобы не ждать минуты на повторной задаче, и мало, чтобы
+ * человек, починивший Ollama, увидел ответ сразу после перезапуска воркера.
+ * Полная пауза здесь была бы вредна: 500 может быть и случайным сбоем на
+ * одной модели, а следующий запрос — к другой. */
+const OLLAMA_RETRY_ERROR_MS = 5000;
 let ollamaDeadUntil = 0;
+/* Причина последней неудачи. Отдаётся клиенту, когда задача уже не должна
+ * ждать ещё одного таймаута: код отказа и его текст доезжают до PWA и
+ * `worker_tasks.error` вместо голого «модель не подключена». */
+let lastOllamaFailure = null;
 
 /* Отличаем «Ollama не запущена» от «Ollama ответила ошибкой». Лечатся они
  * по-разному: первое — запустить программу, второе — смотреть её лог и
- * модель. Один общий код заставил бы человека угадывать. */
+ * модель. Один общий код заставил бы человека угадывать.
+ *
+ * ВАЖНО: этот код — СТАБИЛЬНОЕ имя причины, а не сообщение. По нему PWA
+ * выбирает текст кнопки и подсказку. Текст ошибки едет отдельным полем
+ * `errorDetail`: если сложить их в одну строку, словарь перестанет
+ * совпадать, и человек увиждит сырое «OLLAMA_HTTP_ERROR: ...» вместо
+ * объяснения, что делать. */
 function ollamaErrorCode(e) {
   const m = String((e && e.message) || '');
   if (/fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|network/i.test(m)) return 'OLLAMA_NOT_RUNNING';
@@ -399,7 +445,12 @@ async function generate(prompt, requestedModel) {
         ollamaDeadUntil = Date.now() + OLLAMA_RETRY_MS;
         log(`Ollama недоступна (${e.message}) — другой бэкенд на ${OLLAMA_RETRY_MS / 1000} с [${ollamaErr}]`);
       } else {
-        log(`Ollama ответила ошибкой (${e.message}) [${ollamaErr}]`);
+        /* Ошибку от живой Ollama тоже помним, но пауза короче и, главное,
+         * текст сохраняется: именно он объясняет «llama-server binary not
+         * found» вместо бесполезного HTTP 500 в отчёте. */
+        ollamaDeadUntil = Date.now() + OLLAMA_RETRY_ERROR_MS;
+        lastOllamaFailure = { code: ollamaErr, detail: e.message };
+        log(`Ollama ответила ошибкой (${e.message}) [${ollamaErr}] — пауза ${OLLAMA_RETRY_ERROR_MS / 1000} с`);
       }
     }
   }
@@ -410,7 +461,9 @@ async function generate(prompt, requestedModel) {
       log(`облачный API не ответил (${e.message})`);
     }
   }
-  return askFallback(prompt, ollamaErr || 'MODEL_NOT_CONFIGURED');
+  return askFallback(prompt, ollamaErr || 'MODEL_NOT_CONFIGURED',
+    ollamaErr ? (lastOllamaFailure && lastOllamaFailure.code === ollamaErr
+      ? lastOllamaFailure.detail : null) : null);
 }
 
 /* ---------- Шифрование задачи ----------
@@ -619,6 +672,7 @@ function onWsTask(task) {
       usage: out.gen.usage,
       source: out.gen.source,
       ...(out.gen.error ? { error: out.gen.error } : {}),
+      ...(out.gen.errorDetail ? { errorDetail: out.gen.errorDetail } : {}),
       /* Объявляем модель, которую бэкенд реально запустил: расхождение
        * «просили 7b, считали 1.5b» должно быть видно в отчёте. */
       model: out.gen.model || MODEL,
@@ -638,6 +692,7 @@ function onWsTask(task) {
         usage: out.gen.usage,
         source: out.gen.source,
         ...(out.gen.error ? { error: out.gen.error } : {}),
+        ...(out.gen.errorDetail ? { errorDetail: out.gen.errorDetail } : {}),
         model: out.gen.model || MODEL,
       });
       if (sub.ok) submitted += 1;
@@ -835,6 +890,7 @@ async function pollOnce() {
     usage: gen.usage,
     source: gen.source,
     ...(gen.error ? { error: gen.error } : {}),
+    ...(gen.errorDetail ? { errorDetail: gen.errorDetail } : {}),
     model: gen.model || MODEL,
   });
 

@@ -7238,6 +7238,259 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     }
   }
 
+  /* ===== 45. Ошибка Ollama доходит до отчёта, задача не теряется =====
+   *
+   * Три дефекта, которые на живом ПК владельца сложились в «ответ не
+   * приходит»:
+   *   — воркер выбрасывал тело ответа Ollama, и в `worker_tasks.error`
+   *     оставалось голое `ollama HTTP 500` без причины;
+   *   — сервер рвал сокет через 35 с молчания, даже если на нём была задача
+   *     в работе (модель на CPU думает минуты);
+   *   — разорванная задача оставалась 'claimed' до TTL и умирала как
+   *     'expired', хотя её мог посчитать другой узел.
+   *
+   * Проверяется поведение каждого по отдельности, а не наличие строк. */
+  section('45. Тело ошибки Ollama, живой сокет при генерации, возврат задачи (v2.17.10)');
+  {
+    /* --- 45.1–45.2: тело ответа Ollama ---
+     * Отдельный процесс, а не require в этом: модуль воркера кэширован
+     * секцией 42 с другим OLLAMA_URL, и повторный require вернул бы старый
+     * адрес — тест проверял бы не то, что думает. */
+    const http45 = require('http');
+    const port45 = await freePort();
+    const OLLAMA_BODY_45 = 'error starting llama-server: llama-server binary not found '
+      + '(checked: C:\\Users\\Z-Boss\\AppData\\Local\\Programs\\Ollama\\llama-server.exe)';
+    const fakeOllama45 = http45.createServer((req, res) => {
+      if (req.url === '/api/tags') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ models: [{ name: 'qwen2.5-coder:1.5b' }] }));
+        return;
+      }
+      /* Ровно тот ответ, который получил владелец: Ollama жива, модель в
+       * списке есть, а генерация падает. */
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end(OLLAMA_BODY_45);
+    });
+    await new Promise((r) => fakeOllama45.listen(port45, '127.0.0.1', r));
+    try {
+      const script45 = `
+        const w = require(${JSON.stringify(path.join(__dirname, 'worker-demo.js'))});
+        w.generate('проверка тела ошибки', 'qwen2.5-coder:1.5b')
+          .then((g) => process.stdout.write('@@OUT@@' + JSON.stringify({ ok: true, gen: g }) + '\\n'))
+          .catch((e) => process.stdout.write('@@OUT@@' + JSON.stringify({ ok: false, err: e.message }) + '\\n'));
+      `;
+      const out45 = await new Promise((resolve) => {
+        const p45 = spawn(process.execPath, ['-e', script45], {
+          cwd: __dirname,
+          env: {
+            ...process.env,
+            OLLAMA_URL: `http://127.0.0.1:${port45}`,
+            TARNET_WORKER_ADDRESS: '0x' + (RUN + 'a5').padEnd(40, '0').slice(0, 40),
+            OLLAMA_MODEL: 'qwen2.5-coder:1.5b',
+            GROQ_API_KEY: '',
+            OPENROUTER_API_KEY: '',
+          },
+        });
+        let buf45 = '';
+        p45.stdout.on('data', (d) => { buf45 += d.toString(); });
+        p45.on('close', () => resolve(buf45));
+      });
+      /* Воркер пишет в stdout свои логи («Ollama ответила ошибкой…»), и
+       * голый JSON.parse по всему потоку падал бы на них. Метка отделяет
+       * результат от журнала — тест не должен зависеть от того, что воркер
+       * решил напечатать. */
+      const marked45 = out45.split('\n').filter((l) => l.startsWith('@@OUT@@'));
+      let parsed45 = null;
+      try {
+        parsed45 = marked45.length ? JSON.parse(marked45[marked45.length - 1].slice(7)) : null;
+      } catch (_e) { parsed45 = null; }
+      const gen45 = parsed45 && parsed45.ok ? parsed45.gen : null;
+      ok('45.1 тело ответа Ollama доезжает до результата генерации',
+        Boolean(gen45 && /llama-server binary not found/.test(String(gen45.errorDetail || ''))),
+        gen45 ? gen45.errorDetail : out45.slice(-300));
+      ok('45.2 код причины остаётся стабильным (OLLAMA_HTTP_ERROR)',
+        Boolean(gen45 && gen45.error === 'OLLAMA_HTTP_ERROR'),
+        gen45 ? gen45.error : null);
+      ok('45.3 текст ошибки ограничен 200 символами, а не тащит весь лог',
+        Boolean(gen45 && String(gen45.errorDetail || '').length <= 200),
+        gen45 ? String(gen45.errorDetail || '').length : null);
+    } finally {
+      await new Promise((r) => fakeOllama45.close(r));
+    }
+  }
+
+  {
+    /* --- 45.4–45.6: порог молчания зависит от наличия задачи ---
+     * Юнит-проверка _sweep: настоящий сокет здесь не нужен, а с ним и
+     * недетерминированность (клиент ws отвечает на ping сам, и «молчание»
+     * пришлось бы имитировать обходным путём). Смотрим ровно на решение
+     * разрывать или нет. */
+    delete require.cache[require.resolve('./ws-inbound')];
+    const saved45 = {
+      WS_PONG_DEAD_MS: process.env.WS_PONG_DEAD_MS,
+      WS_INFLIGHT_DEAD_MS: process.env.WS_INFLIGHT_DEAD_MS,
+    };
+    process.env.WS_PONG_DEAD_MS = '1000';
+    process.env.WS_INFLIGHT_DEAD_MS = '3000';
+    const wsIn45 = require('./ws-inbound');
+    for (const [k, v] of Object.entries(saved45)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+
+    const lost45 = [];
+    const inbound45 = new wsIn45.WsInbound({
+      get: () => undefined,
+      run: () => {},
+      all: () => [],
+      onWorkerLost: (_addr, taskId) => lost45.push(taskId),
+      log: () => {},
+    });
+    const fakeWs45 = () => ({
+      readyState: 1,
+      ping() {},
+      terminate() { this.terminated = true; },
+    });
+
+    /* Без задачи: молчание дольше pong_dead = мёртвый узел. */
+    const wsA45 = fakeWs45();
+    inbound45.workers.set('0x' + 'a'.repeat(40), {
+      ws: wsA45, meta: { connectedAt: Date.now(), model: 'm' },
+      inflight: new Set(), lastPong: Date.now() - 1500,
+    });
+    /* С задачей: то же молчание, но оно означает «считает». */
+    const wsB45 = fakeWs45();
+    inbound45.workers.set('0x' + 'b'.repeat(40), {
+      ws: wsB45, meta: { connectedAt: Date.now(), model: 'm' },
+      inflight: new Set(['wt_test_inflight']), lastPong: Date.now() - 1500,
+    });
+    inbound45._sweep();
+    ok('45.4 молчащий сокет без задачи разрывается по прежнему порогу',
+      wsA45.terminated === true && !inbound45.workers.has('0x' + 'a'.repeat(40)),
+      { terminated: Boolean(wsA45.terminated) });
+    ok('45.5 молчащий сокет С задачей в работе не разрывается до её дедлайна',
+      wsB45.terminated !== true && inbound45.workers.has('0x' + 'b'.repeat(40)),
+      { terminated: Boolean(wsB45.terminated) });
+
+    /* Дольше inflight-порога — задача возвращается владельцу очереди,
+     * а не пропадает вместе с сокетом. */
+    const wC45 = inbound45.workers.get('0x' + 'b'.repeat(40));
+    wC45.lastPong = Date.now() - 4000;
+    inbound45._sweep();
+    ok('45.6 потеря сокета с задачей отдаёт taskId на возврат в очередь',
+      lost45.length === 1 && lost45[0] === 'wt_test_inflight',
+      lost45);
+  }
+
+  {
+    /* --- 45.7–45.9: возврат задачи в очередь на живом сервере ---
+     * Задача уходит WS-воркеру, сокет умирает, и её обязан подхватить
+     * другой воркер через опрос. Раньше она висела 'claimed' и умирала
+     * 'expired' — ровно сценарий владельца. */
+    if (typeof WebSocket !== 'function') {
+      skip('45.7–45.9 возврат задачи в очередь', 'в этой версии Node нет глобального WebSocket');
+    } else {
+      const s45 = await spawnServer({ WORKER_TASK_TTL_MS: '20000' });
+      try {
+        const workerMod45 = require('./worker-demo');
+        const crypto45 = require('crypto');
+        const w45 = '0x' + (RUN + 'b5').padEnd(40, '0').slice(0, 40);
+        const w45b = '0x' + (RUN + 'c5').padEnd(40, '0').slice(0, 40);
+        const keys45 = workerMod45.ed25519FromSeed(crypto45.randomBytes(32));
+        const wsBase45 = s45.base.replace(/^http:/i, 'ws:');
+        const sleep45 = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        const waitFrame45 = (ws, want, timeoutMs = 8000) => new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            ws.removeEventListener('message', onMsg45);
+            resolve(null);
+          }, timeoutMs);
+          const onMsg45 = (ev) => {
+            let f = null;
+            try { f = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); } catch (_e) { return; }
+            if (!f || f.type !== want) return;
+            clearTimeout(timer);
+            ws.removeEventListener('message', onMsg45);
+            resolve(f);
+          };
+          ws.addEventListener('message', onMsg45);
+        });
+
+        const sock45 = new WebSocket(wsBase45 + '/p2p/worker');
+        const ch45 = await waitFrame45(sock45, 'HELLO_CHALLENGE');
+        if (!ch45) {
+          skip('45.7–45.9 возврат задачи в очередь', 'нет HELLO_CHALLENGE от изолированного сервера');
+          try { sock45.close(); } catch (_e) { /* уже закрыт */ }
+        } else {
+          const ts45 = Date.now();
+          const pl45 = `TARNET_WS_AUTH:${ch45.nonce}:${w45}:${ts45}`;
+          sock45.send(JSON.stringify({
+            type: 'AUTH_RESPONSE',
+            workerAddress: w45,
+            pubkey: keys45.pubHex,
+            signature: crypto45.sign(null, Buffer.from(pl45, 'utf8'), keys45.priv).toString('base64'),
+            timestamp: ts45,
+            model: 'qwen2.5-coder:1.5b',
+            installedModels: ['qwen2.5-coder:1.5b'],
+            ollamaOnline: true,
+          }));
+          const auth45 = await waitFrame45(sock45, 'AUTH_OK');
+          ok('45.7 WS-воркер авторизован на изолированном сервере',
+            Boolean(auth45), auth45 ? 'AUTH_OK' : 'нет AUTH_OK');
+
+          /* Сокет и таблица `nodes` — разные вещи: WS-рукопожатие даёт
+           * присутствие, а `pickWorker` читает `nodes`. Без регистрации
+           * /inference отвечает 503 'No worker nodes available' ещё до
+           * выбора канала доставки, и тест проверял бы отказ, а не
+           * возврат задачи в очередь. */
+          await apiAt(s45.base, '/node', 'POST', { address: w45, stake: 50000, reputation: 0.9 });
+          await apiAt(s45.base, '/node', 'POST', { address: w45b, stake: 50000, reputation: 0.9 });
+
+          /* /inference не ждём: задача должна уйти кадром, пока запрос жив. */
+          const inflight45 = apiAt(s45.base, '/inference', 'POST', {
+            prompt: 'задача для проверки возврата в очередь',
+          });
+          const frame45 = await waitFrame45(sock45, 'TASK');
+          ok('45.8 задача доставлена воркеру кадром TASK',
+            Boolean(frame45 && frame45.task && frame45.task.taskId),
+            frame45 ? frame45.task?.taskId : 'кадр не пришёл');
+
+          /* Сокет умирает до ответа — так это и выглядит на живом ПК. */
+          try { sock45.close(); } catch (_e) { /* уже закрыт */ }
+          await sleep45(600);
+
+          /* Второй воркер забирает задачу обычным опросом. */
+          let picked45 = null;
+          for (let i = 0; i < 40 && !picked45; i++) {
+            const p45 = await apiAt(s45.base,
+              `/worker/poll?workerAddress=${w45b}&model=qwen2.5-coder:1.5b`);
+            if (p45.body?.task) picked45 = p45.body.task;
+            else await sleep45(100);
+          }
+          ok('45.9 после потери сокета задача вернулась в очередь и досталась другому воркеру',
+            Boolean(picked45 && picked45.taskId === (frame45?.task?.taskId)),
+            picked45 ? picked45.taskId : 'никто не забрал');
+
+          if (picked45) {
+            const sub45 = await apiAt(s45.base, '/worker/submit', 'POST', {
+              taskId: picked45.taskId,
+              workerAddress: w45b,
+              response: 'ответ второго воркера',
+              model: 'qwen2.5-coder:1.5b',
+              source: 'ollama',
+              usage: { completion_tokens: 5, total_tokens: 9 },
+            });
+            const res45 = await inflight45;
+            ok('45.10 ответ второго воркера дошёл до клиента',
+              sub45.status === 200 && /ответ второго воркера/.test(String(res45.body?.response || '')),
+              { submit: sub45.status, response: res45.body?.response });
+          }
+        }
+      } finally {
+        s45.stop();
+      }
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

@@ -35,6 +35,20 @@ const AUTH_TIMEOUT_MS = Number(process.env.WS_AUTH_TIMEOUT_MS || 5000);
 const MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 1024 * 1024);
 const PING_INTERVAL_MS = Number(process.env.WS_PING_INTERVAL_MS || 15000);
 const PONG_DEAD_MS = Number(process.env.WS_PONG_DEAD_MS || 35000);
+/* Потолок молчания для сокета, на котором ЕСТЬ задача в работе.
+ *
+ * Раньше порог был один — 35 с — и он не знал, чем занят воркер. На живом ПК
+ * владельца это дало два отказа подряд: задача ушла воркеру в 17:44:20,
+ * через 45 с сокет был разорван как «молчащий», а в 17:46:50 задача истекла
+ * по TTL — ответ не пришёл никому, хотя ПК считал именно её. Модель на CPU
+ * (и особенно Ollama, поднимающая отсутствующий llama-server) думает минуты,
+ * и молчание во время генерации — это НОРМА, а не признак мёртвого узла.
+ *
+ * 160 с — заметно больше любого TTL задачи (150 с на проде): сокет не
+ * переживёт собственный дедлайн, и разрыв не «украдёт» результат. Число
+ * настраивается отдельно именно потому, что TTL задачи меняется без
+ * пересборки, а этот запас должен ехать вместе с ним. */
+const INFLIGHT_DEAD_MS = Number(process.env.WS_INFLIGHT_DEAD_MS || 160000);
 
 /* Окно свежести timestamp. Подпись со старым временем — это повтор уже
  * показанного кадра; nonce привязан к соединению, но время закрывает дыру
@@ -47,11 +61,17 @@ const ADDRESS_RE = /^0x[0-9a-f]{40}$/;
 class WsInbound {
   /* Зависимости внедряются, а не импортируются: server.js уже требует этот
    * модуль, и обратный require дал бы цикл. */
-  constructor({ get, run, all, onResult, log } = {}) {
+  constructor({ get, run, all, onResult, onWorkerLost, log } = {}) {
     this.get = get || (() => undefined);
     this.run = run || (() => {});
     this.all = all || (() => []);
     this.onResult = onResult || (() => {});
+    /* Что делать с задачей, которая была в работе на этом сокете, когда он
+     * умер. Без этого задача оставалась 'claimed' до истечения TTL и
+     * пропадала: воркер уже не пришлёт результат, а другой узел её не
+     * увидит, потому что строка занята. Возврат в 'pending' — единственный
+     * способ не потерять работу, которая ещё может быть посчитана. */
+    this.onWorkerLost = onWorkerLost || (() => {});
     this.log = log || (() => {});
 
     this.wss = null;
@@ -129,6 +149,7 @@ class WsInbound {
       max_payload_bytes: MAX_PAYLOAD_BYTES,
       ping_interval_ms: PING_INTERVAL_MS,
       pong_dead_ms: PONG_DEAD_MS,
+      inflight_dead_ms: INFLIGHT_DEAD_MS,
       auth_timeout_ms: AUTH_TIMEOUT_MS,
       stats: { ...this.stats },
       workers,
@@ -446,7 +467,43 @@ class WsInbound {
     const w = this.workers.get(st.address);
     /* Удаляем только если это тот же сокет: переподключение могло уже
      * положить в Map новый. Иначе close старого выкинул бы живого. */
-    if (w && w.ws === ws) this.workers.delete(st.address);
+    if (w && w.ws === ws) {
+      this._releaseInflight(st.address, w);
+      this.workers.delete(st.address);
+    }
+  }
+
+  /* Задача была отдана этому сокету и ответа по нему не пришло. Возвращаем
+   * её владельцу очереди — решение «переотправить или оставить истекать»
+   * принимает сервер, а не транспорт: у него есть статус строки и TTL. */
+  _releaseInflight(addr, w) {
+    if (!w.inflight || !w.inflight.size) return;
+    const lost = Array.from(w.inflight);
+    w.inflight.clear();
+    for (const taskId of lost) {
+      try {
+        this.onWorkerLost(addr, taskId);
+      } catch (e) {
+        this.log(`ws: задача ${taskId} не возвращена в очередь (${e.message})`);
+      }
+    }
+  }
+
+  /* Продление жизни сокета извне — по HTTP-пульсу /worker/poll?heartbeat=1.
+   *
+   * Зачем это нужно, если есть ping/pong: pong приходит на уровне протокола,
+   * а воркер в это время занят генерацией и в JS-цикле не появляется. На
+   * практике связка «pong есть» → «воркер жив» уже один раз соврала: сокет
+   * разорвали через 44 с, пока ПК считал задачу. HTTP-пульс идёт каждые 7 с
+   * из того же процесса и доказывает жизнь тем же способом, каким воркер
+   * продлевает присутствие в БД. */
+  touchAddress(workerAddress) {
+    const addr = String(workerAddress || '').toLowerCase();
+    const w = this.workers.get(addr);
+    if (!w) return false;
+    w.lastPong = Date.now();
+    this._markPresence(addr, { model: w.meta.model });
+    return true;
   }
 
   _safeTerminate(ws) {
@@ -472,9 +529,17 @@ class WsInbound {
         this.workers.delete(addr);
         continue;
       }
-      if (now - w.lastPong > PONG_DEAD_MS) {
+      /* Порог зависит от того, есть ли на сокете задача в работе. Молчащий
+       * ПК без задачи — это мёртвый узел, его надо отпустить за 35 с, иначе
+       * он держит запись и получает задачи, которые не посчитает. Тот же ПК
+       * с задачей в работе почти наверняка считает её: разрывать раньше
+       * дедлайна задачи значило бы гарантированно потерять результат. */
+      const deadAfterMs = w.inflight.size ? Math.max(PONG_DEAD_MS, INFLIGHT_DEAD_MS) : PONG_DEAD_MS;
+      if (now - w.lastPong > deadAfterMs) {
         this.stats.terminatedStale++;
-        this.log(`ws: воркер ${addr.slice(0, 10)}… молчит ${now - w.lastPong} мс — разрываю`);
+        this.log(`ws: воркер ${addr.slice(0, 10)}… молчит ${now - w.lastPong} мс`
+          + `${w.inflight.size ? ` (в работе ${w.inflight.size} задач)` : ''} — разрываю`);
+        this._releaseInflight(addr, w);
         this._safeTerminate(w.ws);
         this.workers.delete(addr);
         continue;
@@ -496,5 +561,6 @@ module.exports = {
   MAX_PAYLOAD_BYTES,
   PING_INTERVAL_MS,
   PONG_DEAD_MS,
+  INFLIGHT_DEAD_MS,
   AUTH_SKEW_MS,
 };

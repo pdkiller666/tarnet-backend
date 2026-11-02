@@ -457,6 +457,18 @@ function parseInstalledModels(raw) {
  * Без этой колонки код терялся на /worker/submit, и PWA показывал
  * «модель не загружена» вместо «запустите Ollama». */
 ensureColumn('worker_tasks', 'error', 'error TEXT');
+/* Сколько раз задача возвращалась в очередь после потери воркера.
+ *
+ * Колонка, а не вычисление по claimedAt: при перезапуске сервера и
+ * повторных claim'ах история теряется, а счётчик должен пережить всё.
+ * Именно он не даёт бесконечно пересылать одну задачу, если какой-то узел
+ * берёт её и молча умирает каждую попытку. */
+ensureColumn('worker_tasks', 'requeues', 'requeues INTEGER DEFAULT 0');
+/* Дословный текст ошибки от Ollama («llama-server binary not found»),
+ * а не только её код. Код говорит, ЧТО сломалось, текст — ЧЕМ это лечить.
+ * Одно поле кода на живом ПК оказалось достаточно, чтобы человек пошёл
+ * искать причину руками, хотя она была в теле ответа Ollama. */
+ensureColumn('worker_tasks', 'errorDetail', 'errorDetail TEXT');
 
 /* ===== Миграция: burn-строки без fromAddress =====
  *
@@ -5628,6 +5640,13 @@ app.get('/summary', (_req, res) => {
  * Это Вариант А по важности, а не запасной: первый настоящий узел сети
  * должен быть виден, поэтому /health показывает активных воркеров. */
 const WORKER_TASK_TTL_MS = Number(process.env.WORKER_TASK_TTL_MS || 30000);
+/* Сколько раз задачу можно вернуть в очередь после потери воркера.
+ *
+ * Без этого счётчика «возврат в pending» при живом, но зацикленном воркере
+ * дал бы бесконечную пересылку одного и того же запроса. Одна повторная
+ * попытка — это лечение разрыва сокета; вторая подряд означает, что дело не
+ * в канале, и честнее отпустить задачу по TTL, чем гонять её вечно. */
+const WORKER_TASK_MAX_REQUEUES = Number(process.env.WORKER_TASK_MAX_REQUEUES || 1);
 /* Окно присутствия: сколько воркер считается живым после последнего опроса.
  * 15 с при опросе раз в секунду дают запас 15x, а уснувший ПК виден как
  * отсутствующий уже через 15 с, а не через две минуты. Держится только
@@ -5710,6 +5729,36 @@ const wsInbound = createWsInbound({
       /* Не роняем сокет: один плохой результат не повод рвать канал, по
        * которому пойдут следующие задачи. Воркер получит ERROR и решит сам. */
       console.log(`ws: результат ${frame.taskId} отклонён (${out.status}) ${JSON.stringify(out.body)}`);
+    }
+  },
+  /* Сокет воркера умер, а задача осталась у него в работе.
+   *
+   * Раньше такая строка просто висела в 'claimed' до TTL и умирала как
+   * 'expired': воркер уже не пришлёт результат, а опрос её не видит, потому
+   * что статус не 'pending'. На живом ПК владельца это и произошло — задача
+   * wt_2e1514… ушла в 17:44:20, сокет разорван в 17:45:05, в 17:46:50
+   * 'expired' при полностью рабочем сервере.
+   *
+   * Возвращаем в очередь ТОЛЬКО если дедлайн ещё не прошёл и попыток было
+   * меньше лимита: иначе получили бы бесконечную пересылку одной задачи
+   * между узлами, которые на ней падают. */
+  onWorkerLost: (workerAddress, taskId) => {
+    const row = get('SELECT status, expiresAt, requeues FROM worker_tasks WHERE taskId = ?', [taskId]);
+    if (!row || row.status !== 'claimed') return;
+    if (Date.now() >= Number(row.expiresAt)) return;
+    const tries = Number(row.requeues || 0);
+    if (tries >= WORKER_TASK_MAX_REQUEUES) {
+      console.log(`ws: задача ${taskId} уже возвращалась ${tries} раз — оставляю истекать`);
+      return;
+    }
+    const back = run(
+      `UPDATE worker_tasks SET status = 'pending', claimedAt = NULL, workerAddress = NULL,
+         requeues = COALESCE(requeues, 0) + 1
+       WHERE taskId = ? AND status = 'claimed'`,
+      [taskId],
+    );
+    if (back && Number(back.changes) === 1) {
+      console.log(`ws: воркер ${String(workerAddress).slice(0, 10)}… потерян — задача ${taskId} возвращена в очередь`);
     }
   },
 });
@@ -5795,6 +5844,10 @@ function enqueueWorkerTask({ prompt, model, tier }) {
           /* Причина заглушки от воркера (OLLAMA_NOT_RUNNING и т.п.).
            * null — воркер причину не назвал. */
           error: row.error || null,
+          /* Дословный текст причины, когда воркер его прислал. PWA показывает
+           * его рядом с переводом кода: код говорит, что делать, текст —
+           * что именно случилось на этом ПК. */
+          errorDetail: row.errorDetail || null,
           workerAddress: row.workerAddress,
         });
       }
@@ -5893,6 +5946,13 @@ app.get('/worker/poll', (req, res) => {
    * принимает работающий воркер за отсутствующий. Задачу не забирает, поэтому
    * пульс не может «украсть» работу у другого опроса. */
   if (String(req.query.heartbeat || '') === '1') {
+    /* Тот же пульс продлевает и WS-сокет, если он есть.
+     *
+     * Одного ping/pong протокола оказалось мало: на живом ПК сокет разорвали
+     * через 44 с молчания, пока модель считала задачу. Воркер шлёт этот пульс
+     * каждые 7 с из того же процесса, поэтому он доказывает жизнь ровно в тот
+     * момент, когда ping/pong молчит. */
+    if (workerAddress) wsInbound.touchAddress(workerAddress);
     return res.json({
       ok: true,
       heartbeat: true,
@@ -6013,13 +6073,20 @@ function ingestWorkerResult(body) {
    * Сохраняем как есть — перевод в человеческий текст делает PWA, чтобы
    * формулировки жили в одном месте и менялись без передеплоя воркера. */
   const declaredError = typeof body.error === 'string' && body.error.length ? body.error : null;
+  /* Дословная причина от воркера. Отдельным полем, а не склейкой с кодом:
+   * PWA переводит код по своему словарю, и суффикс в строке сломал бы
+   * совпадение — человек увидел бы сырое «OLLAMA_HTTP_ERROR: ...» вместо
+   * инструкции. */
+  const declaredErrorDetail = typeof body.errorDetail === 'string' && body.errorDetail.length
+    ? body.errorDetail.slice(0, 200) : null;
   /* encryptedPayload стирается сразу по получении результата: задача
    * завершена, хранить шифротекст больше не для чего. */
   run(
     `UPDATE worker_tasks SET status = 'done', response = ?, tokensGenerated = ?,
-       usageJson = ?, model = ?, source = ?, error = ?, finishedAt = ?, encryptedPayload = NULL
+       usageJson = ?, model = ?, source = ?, error = ?, errorDetail = ?, finishedAt = ?, encryptedPayload = NULL
      WHERE taskId = ?`,
-    [storedResponse, tokens, JSON.stringify(body.usage || null), body.model, declaredSource, declaredError, Date.now(), taskId],
+    [storedResponse, tokens, JSON.stringify(body.usage || null), body.model, declaredSource,
+      declaredError, declaredErrorDetail, Date.now(), taskId],
   );
   /* Ключ НЕ удаляем здесь: его ещё нужен читателю, чтобы расшифровать ответ
    * при выдаче клиенту. Удаление — в enqueueWorkerTask после расшифровки. */

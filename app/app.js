@@ -1243,7 +1243,12 @@ async function sendPrompt(prompt, opts = {}) {
        * вежливой фразой — иначе новая причина станет невидимой. */
       const code = res.fallback_reason;
       const why = code ? (FALLBACK_REASONS[code] || code) : 'модель не подключена (llm_mode = deterministic_fallback)';
-      $('chatHint').textContent = `⚠️ Причина: ${code || 'deterministic_fallback'} (${why})`;
+      /* Дословный текст от Ollama показывается рядом с переводом кода.
+       * Разница практическая: код «OLLAMA_HTTP_ERROR» говорит «посмотрите
+       * лог», а текст «llama-server binary not found» сразу называет
+       * действие — переустановить. Человек не должен искать одно в другом. */
+      const detail = res.errorDetail ? ` — ${res.errorDetail}` : '';
+      $('chatHint').textContent = `⚠️ Причина: ${code || 'deterministic_fallback'} (${why})${detail}`;
     }
   } catch (e) {
     const b = thinking.querySelector('.bubble');
@@ -2493,6 +2498,14 @@ function traceBox(res, ms) {
   if (res.fallback_reason) {
     const why = FALLBACK_REASONS[res.fallback_reason] || res.fallback_reason;
     const el = row('причина', why);
+    el.querySelector('b')?.classList.add('trace-warn');
+    body.appendChild(el);
+  }
+  /* Ответ Ollama дословно. Отдельная строка, а не суффикс к переводу кода:
+   * код — это словарь действий, текст — факт с конкретного ПК. Смешав их,
+   * через месяц не отличить одно от другого. */
+  if (res.errorDetail) {
+    const el = row('ответ Ollama', res.errorDetail);
     el.querySelector('b')?.classList.add('trace-warn');
     body.appendChild(el);
   }
