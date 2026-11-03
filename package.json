@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.17.13-close-exploits",
+  "version": "2.17.14-e2e-network-contract",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

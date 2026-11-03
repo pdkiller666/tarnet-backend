@@ -152,6 +152,36 @@ function skip(name, reason) {
 function section(t) { console.log(`\n${t}`); }
 
 async function apiAt(base, path, method = 'GET', body, extraHeaders) {
+  /* Автоподпись опроса.
+   *
+   * `/worker/poll` требует подпись и привязанный ключ. Вписывать этот ритуал в
+   * каждый из двух десятков вызовов — значит однажды забыть его в одном месте
+   * и получить зелёный тест, который на самом деле упал бы на проде. Здесь
+   * подпись добавляется централизованно: тесты продолжают писать обычный
+   * путь, а проверка отказа остаётся возможной — для неё есть вызов без
+   * `workerAddress` или с явным `sig=`.
+   *
+   * Уже подписанные пути (`sig=` в строке) не трогаются: иначе повторная
+   * подпись перезаписала бы `ts` и сломала проверки окна времени. */
+  if (method === 'GET' && path.startsWith('/worker/poll?') && !/[?&]sig=/.test(path)) {
+    const params = new URLSearchParams(path.slice('/worker/poll?'.length));
+    const addr = params.get('workerAddress');
+    /* `nosig=1` — явный отказ от подписи.
+     *
+     * Без него нельзя проверить главное свойство защиты: попытка «отправить
+     * без подписи» молча получала бы валидную подпись от хелпера, и тест
+     * проверял бы сам себе разрешение. Маркер вырезается из строки, чтобы не
+     * попал на сервер как лишний query-параметр. */
+    if (params.get('nosig') === '1') {
+      params.delete('nosig');
+      const rest = params.toString();
+      path = `/worker/poll?${rest}`;
+    } else if (addr) {
+      params.delete('workerAddress');
+      const rest = params.toString();
+      path = await signedPollPath(addr, rest ? `&${rest}` : '', base);
+    }
+  }
   const res = await fetch(base + path, {
     method,
     headers: {
@@ -181,7 +211,56 @@ async function api(path, method = 'GET', body, extraHeaders) {
  * на «первый/единственный» чек воркера. */
 const RUN = Date.now().toString(16) + process.pid.toString(16).padStart(4, '0');
 const runId = (tag) => `${tag}-${RUN}`;
-const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
+/* Адрес тестового воркера — ВАЛИДНЫЙ hex из 40 символов.
+ *
+ * Раньше здесь был `'0x' + (tag + RUN).padEnd(40,'0')`, то есть адрес вида
+ * `0xhb1a1a…` с буквами вне hex. `/node` такую строку принимал (там нет
+ * проверки формата), но handshake обязан проверять адрес строго — иначе
+ * привязка ключа к произвольной строке не имеет смысла. Поэтому тег
+ * кодируется в hex, а уникальность сохраняется за счёт RUN. */
+const runAddress = (tag) =>
+  '0x' + Buffer.from(`${tag}${RUN}`, 'utf8').toString('hex').padEnd(40, '0').slice(0, 40);
+
+/* --- Подпись опроса воркера ---
+ *
+ * `/worker/poll` теперь отдаёт работу только по подписи, а подписывать можно
+ * лишь после привязки ключа к адресу. Оба шага сделаны автоматическими,
+ * чтобы каждый тест не повторял ритуал: само наличие ручной подготовки в
+ * десятке мест было бы источником "зелено потому что не проверяли". */
+const workerKeys = new Map();
+function workerKeyFor(addr) {
+  const k = String(addr).toLowerCase();
+  let e = workerKeys.get(k);
+  if (!e) { e = crypto.generateKeyPairSync('ed25519'); workerKeys.set(k, e); }
+  return e;
+}
+function rawPubHex(kp) {
+  return Buffer.from(kp.publicKey.export({ format: 'der', type: 'spki' })).slice(-32).toString('hex');
+}
+
+const boundWorkers = new Set();
+async function bindWorker(addr, base = BASE) {
+  const k = String(addr).toLowerCase();
+  if (boundWorkers.has(base + '|' + k)) return true;
+  const kp = workerKeyFor(addr);
+  const ts = Date.now();
+  const sig = crypto.sign(null, Buffer.from(`TARNET_WORKER_POLL:${k}:${ts}`, 'utf8'), kp.privateKey).toString('base64');
+  const r = await apiAt(base, '/worker/handshake', 'POST', {
+    pubkey: rawPubHex(kp), timestamp: ts, signature: sig, claimedAddress: k,
+  });
+  if (r.status === 200) { boundWorkers.add(base + '|' + k); return true; }
+  return false;
+}
+
+async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWorker(addr, base);
+  const kp = workerKeyFor(addr);
+  const ts = Date.now();
+  /* Подписывается ТА ЖЕ строка адреса, что уйдёт в query: сервер собирает
+   * payload из сырого значения параметра, и расхождение в регистре дало бы
+   * BAD_SIGNATURE на ровном месте. */
+  const sig = crypto.sign(null, Buffer.from(`TARNET_WORKER_POLL:${addr}:${ts}`, 'utf8'), kp.privateKey).toString('base64');
+  return `/worker/poll?workerAddress=${encodeURIComponent(addr)}&ts=${ts}&sig=${encodeURIComponent(sig)}${extraQs}`;
+}
 
 (async () => {
   if (TEST_MODE) {
@@ -428,9 +507,13 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
 
   const wStatus = await api('/worker/status');
   ok('/worker/status отвечает', wStatus.status === 200 && wStatus.body.mode !== undefined, wStatus.body);
+  /* Без привязки ключа poll обязан ОТКАЗАТЬ, а не отдать пустую очередь:
+   * иначе первый спросивший получает задачу и ключ сессии. Проверяются оба
+   * состояния — отказ без ключа и нормальный ответ после handshake. */
   const wPoll = await api('/worker/poll');
-  ok('/worker/poll не падает на пустой очереди',
-    wPoll.status === 200 && wPoll.body.task === null, wPoll.body?.task);
+  ok('poll без привязки ключа — 403 HANDSHAKE_REQUIRED',
+    wPoll.status === 403 && wPoll.body?.error === 'HANDSHAKE_REQUIRED',
+    { status: wPoll.status, error: wPoll.body?.error });
 
   // ---------- 8.7a. Окно присутствия и пульс ----------
   section('8.7a. Окно присутствия 60 с и пульс во время генерации');
@@ -444,9 +527,16 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   ok('fallback_reason no_workers без воркеров в presence',
     noW.body.fallback_reason === 'no_workers', noW.body.fallback_reason);
 
+  /* Проверка пустой очереди идёт ПОСЛЕ no_workers: любой опрос записывает
+   * присутствие, и воркер, опрошенный раньше, сделал бы причиной не
+   * no_workers, а worker_timeout — тест падал бы на собственной подготовке. */
+  const wPollBound = await api(await signedPollPath(runAddress('pe')));
+  ok('/worker/poll с подписью не падает на пустой очереди',
+    wPollBound.status === 200 && wPollBound.body.task === null, wPollBound.body?.task);
+
   const wHb = runAddress('hb');
   await api('/node', 'POST', { address: wHb, stake: 30000, reputation: 0.8 });
-  const hb = await api(`/worker/poll?workerAddress=${wHb}&model=test-model&heartbeat=1`);
+  const hb = await api(await signedPollPath(wHb, '&model=test-model&heartbeat=1'));
   ok('пульс отвечает без выдачи задачи',
     hb.status === 200 && hb.body.heartbeat === true && hb.body.task === undefined,
     { heartbeat: hb.body.heartbeat, task: hb.body.task });
@@ -461,7 +551,7 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   });
   let mTask = null;
   for (let i = 0; i < 60 && !mTask; i++) {
-    const p = await api(`/worker/poll?workerAddress=${wHb}&model=test-model`);
+    const p = await api(await signedPollPath(wHb, '&model=test-model'));
     if (p.body?.task) mTask = p.body.task;
     else await new Promise((r) => setTimeout(r, 100));
   }
@@ -481,11 +571,11 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   /* Собственный сервер с коротким TTL: ждать 150 с в приёмке нельзя. */
   const shortTtl = await spawnServer({ WORKER_TASK_TTL_MS: '2000' });
   try {
-    const wTo = '0x' + ('tot' + RUN).padEnd(40, '0');
+    const wTo = runAddress('tot');
     await apiAt(shortTtl.base, '/node', 'POST', { address: wTo, stake: 30000, reputation: 0.8 });
-    await apiAt(shortTtl.base, `/worker/poll?workerAddress=${wTo}&model=m&heartbeat=1`);
+    await apiAt(shortTtl.base, await signedPollPath(wTo, '&model=m&heartbeat=1', shortTtl.base));
     /* Задачу забирает — и молчит: ровно то, что делает уснувший ПК. */
-    const pollTo = await apiAt(shortTtl.base, `/worker/poll?workerAddress=${wTo}&model=m`);
+    const pollTo = await apiAt(shortTtl.base, await signedPollPath(wTo, '&model=m', shortTtl.base));
     const rTo = await apiAt(shortTtl.base, '/inference', 'POST', {
       prompt: 'проверка таймаута', workerAddress: wTo, model: 'm',
     });
@@ -1267,7 +1357,13 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       ok('read: 51-й — 429', readLast.status === 429, readLast.status);
       ok('read: в теле class = read', readLast.body?.class === 'read', readLast.body);
 
-      /* Класс worker: /worker/poll живёт отдельно, воркер ходит раз в секунду. */
+      /* Класс worker: /worker/poll живёт отдельно, воркер ходит раз в секунду.
+       *
+       * Лимит считается на транспорте, ДО проверки подписи, и это правильно:
+       * иначе перебор подписей обходил бы ограничение — тысячи 401 в секунду
+       * бесплатно. Поэтому первые 20 запросов не упираются в лимит (они
+       * отвечают 403 HANDSHAKE_REQUIRED — подпись здесь не передаётся), а
+       * 21-й уже 429. Проверяется граница лимита, а не код авторизации. */
       const wCodes = [];
       let wLast = null;
       for (let i = 0; i < 21; i++) {
@@ -1275,8 +1371,9 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
         wCodes.push(r.status);
         if (i === 20) wLast = await r.json().catch(() => null);
       }
-      ok('worker: 20 опросов — 200', wCodes.slice(0, 20).every((c) => c === 200),
-        wCodes.filter((c) => c !== 200).length + ' отказов');
+      ok('worker: 20 опросов — без 429 (лимит не тронут)',
+        wCodes.slice(0, 20).every((c) => c !== 429),
+        wCodes.filter((c) => c === 429).length + ' отказов по лимиту');
       ok('worker: 21-й — 429', wCodes[20] === 429, wCodes[20]);
       ok('worker: в теле class = worker', wLast?.class === 'worker', wLast);
 
@@ -1617,7 +1714,7 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
   const wBanner = runAddress('bn');
   await api('/node', 'POST', { address: wBanner, stake: 40000, reputation: 0.9 });
   const baseBefore = (await api('/worker/status')).body;
-  await fetch(`${BASE}/worker/poll?workerAddress=${wBanner}&model=qwen2.5-coder%3A1.5b`);
+  await api(await signedPollPath(wBanner, '&model=qwen2.5-coder%3A1.5b'));
   const afterPoll = (await api('/worker/status')).body;
   ok('опрос воркера увеличивает active_workers',
     afterPoll.active_workers > baseBefore.active_workers,
@@ -1644,9 +1741,8 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     unverifiedHealth.llm_mode_reason);
 
   /* Тот же воркер присылает подтверждение: Ollama жива, модель в списке. */
-  await fetch(`${BASE}/worker/poll?workerAddress=${wBanner}`
-    + `&model=qwen2.5-coder%3A1.5b&installedModels=`
-    + `${encodeURIComponent(JSON.stringify(['qwen2.5-coder:1.5b']))}&ollamaOnline=1`);
+  await api(await signedPollPath(wBanner,
+    `&model=qwen2.5-coder%3A1.5b&installedModels=${encodeURIComponent(JSON.stringify(['qwen2.5-coder:1.5b']))}&ollamaOnline=1`));
   const verifiedHealth = (await api('/health')).body;
   ok('8.19.3 подтверждённая модель переключает режим на worker',
     verifiedHealth.llm_mode === 'worker',
@@ -1663,9 +1759,8 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
    * соврала бы в другую сторону: сначала врали «worker» без модели, теперь
    * «модели нет» при живой модели. Случай не гипотетический: на этой машине
    * `OPENROUTER_API_KEY` задан, а Ollama отсутствует. */
-  await fetch(`${BASE}/worker/poll?workerAddress=${wBanner}`
-    + `&model=openrouter%2Fnvidia%2Fnemotron-3.5-lightning%3Afree`
-    + `&installedModels=${encodeURIComponent('[]')}&ollamaOnline=0&cloudBackend=openrouter`);
+  await api(await signedPollPath(wBanner,
+    `&model=openrouter%2Fnvidia%2Fnemotron-3.5-lightning%3Afree&installedModels=${encodeURIComponent('[]')}&ollamaOnline=0&cloudBackend=openrouter`));
   const cloudHealth = (await api('/health')).body;
   ok('8.19.5 воркер с облачным ключом и без Ollama — всё равно worker',
     cloudHealth.llm_mode === 'worker',
@@ -7652,11 +7747,15 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       await apiAt(s46.base, '/node', 'POST', { address: w46, stake: 90000, reputation: 0.99 });
       await apiAt(s46.base, '/node', 'POST', { address: wBad, stake: 90000, reputation: 0.99 });
 
-      /* До привязки ключа опрос без подписи проходит: воркер, который ещё
-       * ни разу не подключался по WS, не должен быть отрезан от сети. */
-      const before46 = await apiAt(s46.base, `/worker/poll?workerAddress=${w46}&model=m`);
-      ok('46.1 до привязки ключа опрос без подписи разрешён',
-        before46.status === 200, before46.status);
+      /* До привязки ключа опрос БЕЗ подписи отрезан: именно это и было
+       * дырой — свежий адрес проходил насквозь и мог забрать задачу вместе с
+       * ключом сессии. Раньше здесь ожидали 200 и тем самым закрепляли
+       * дефект в тесте. Отказ — 403 HANDSHAKE_REQUIRED, потому что ключа
+       * ещё нет: чинить подпись бессмысленно, нужно пройти handshake. */
+      const before46 = await apiAt(s46.base, `/worker/poll?workerAddress=${w46}&model=m&nosig=1`);
+      ok('46.1 до привязки ключа опрос без подписи → 403 HANDSHAKE_REQUIRED',
+        before46.status === 403 && before46.body?.error === 'HANDSHAKE_REQUIRED',
+        { status: before46.status, error: before46.body?.error });
 
       /* Привязка ключа — как её делает WS-рукопожатие (TOFU). */
       const db46 = new DatabaseSync(path.join(s46.dir, 'test.db'));
@@ -7667,7 +7766,7 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       db46.close();
 
       /* 1. Без подписи — отказ. */
-      const noSig46 = await apiAt(s46.base, `/worker/poll?workerAddress=${w46}&model=m`);
+      const noSig46 = await apiAt(s46.base, `/worker/poll?workerAddress=${w46}&model=m&nosig=1`);
       ok('46.2 после привязки ключа опрос без подписи → 401',
         noSig46.status === 401 && noSig46.body?.error === 'SIGNATURE_REQUIRED',
         { status: noSig46.status, error: noSig46.body?.error });

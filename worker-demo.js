@@ -21,6 +21,10 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const nodeCrypto = require('crypto');
+/* Печать/распечатка ключа сессии. Функции продублированы в воркере, а не
+ * импортированы из server.js: воркер ставится отдельно от сервера и не должен
+ * тянуть за собой весь серверный код ради двух функций. */
+const workerBox = require('./worker-box');
 
 /* ---------- Конфигурация ---------- */
 const API = (process.env.TARNET_API_URL || 'http://localhost:3001').replace(/\/+$/, '');
@@ -237,6 +241,42 @@ async function api(method, route, body) {
 /* ---------- Регистрация узла ----------
  * Без неё POST /work для этого адреса падает с UNKNOWN_WORKER, и начисление
  * за посчитанную задачу не создаётся. Регистрация идемпотентна. */
+/* ---------- Привязка ключа к адресу (handshake) ----------
+ *
+ * Зачем отдельным шагом. `/worker/poll` теперь отдаёт работу только тому,
+ * чей ключ привязан к адресу: иначе задача вместе с ключом сессии достаётся
+ * первому спросившему. Привязку можно пройти по WS, но WS поднимается не
+ * всегда (прокси, firewall, старый Node), и без этого шага воркер получал бы
+ * `403 HANDSHAKE_REQUIRED` при каждом опросе.
+ *
+ * claimedAddress передаётся явно: адресом воркера остаётся тот, что лежит в
+ * `~/.tarnet/worker.json`, а не выведенный из ключа. Вывод адреса из ключа
+ * сломал бы накопленную историю начислений — адрес у демо-воркера исторически
+ * случайный. */
+async function bindKey() {
+  const keys = wsState.keys || (wsState.keys = ed25519FromSeed(loadOrCreateSeed()));
+  const ts = Date.now();
+  const payload = `TARNET_WORKER_POLL:${WORKER}:${ts}`;
+  const sig = nodeCrypto.sign(null, Buffer.from(payload, 'utf8'), keys.priv).toString('base64');
+  try {
+    const r = await api('POST', '/worker/handshake', {
+      pubkey: keys.pubHex, timestamp: ts, signature: sig, claimedAddress: WORKER,
+    });
+    if (r.ok) {
+      log(`ключ привязан к адресу ${WORKER.slice(0, 10)}…`);
+      return true;
+    }
+    /* 409 — к адресу уже привязан ДРУГОЙ ключ. Это не повод молча
+     * перегенерировать свой: так выглядел бы захват чужого адреса. Человек
+     * должен увидеть причину и решить сам. */
+    log(`привязка отклонена: HTTP ${r.status} ${JSON.stringify(r.data).slice(0, 200)}`);
+    return false;
+  } catch (e) {
+    log(`привязка не удалась (${e.message}) — попробую через WS`);
+    return false;
+  }
+}
+
 async function register() {
   const r = await api('POST', '/node', {
     address: WORKER,
@@ -253,7 +293,7 @@ async function register() {
 }
 
 /* ---------- 1. Ollama на этом ПК ---------- */
-async function askOllama(prompt, requestedModel) {
+async function askOllama(prompt, requestedModel, maxTokens = null) {
   /* Модель из задачи имеет приоритет над OLLAMA_MODEL: клиент выбрал её в
    * каталоге, и подменять её своей значило бы врать в ответе. */
   const model = await resolveOllamaModel(requestedModel);
@@ -267,6 +307,11 @@ async function askOllama(prompt, requestedModel) {
         { role: 'system', content: 'Ты полезный ассистент. Отвечай кратко и по существу.' },
         { role: 'user', content: prompt },
       ],
+      /* num_predict — потолок генерации у Ollama. Без него модель пишет,
+       * пока не упрётся в свой контекст: воркер тратит время, сервер держит
+       * чужой запрос, а клиент просил коротко. Значение пришло из
+       * зашифрованного тела задачи — его задал сервер. */
+      ...(maxTokens ? { options: { num_predict: maxTokens } } : {}),
     }),
     signal: AbortSignal.timeout(120000),
   });
@@ -308,7 +353,7 @@ async function askOllama(prompt, requestedModel) {
  * (`qwen2.5-coder-7b`) провайдеру не принадлежит, и отправка его в облако
  * дала бы 404 «model not found» вместо ответа. В таком случае честно
  * считаем дефолтом и объявляем в ответе именно то, что запустили. */
-async function askCloud(prompt, requestedModel) {
+async function askCloud(prompt, requestedModel, maxTokens = null) {
   const conf = GROQ_KEY
     ? { url: 'https://api.groq.com/openai/v1/chat/completions', key: GROQ_KEY,
         model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', name: 'groq', prefix: 'groq/' }
@@ -338,6 +383,7 @@ async function askCloud(prompt, requestedModel) {
         { role: 'system', content: 'Ты полезный ассистент. Отвечай кратко и по существу.' },
         { role: 'user', content: prompt },
       ],
+      ...(maxTokens ? { max_tokens: maxTokens } : {}),
     }),
     signal: AbortSignal.timeout(120000),
   });
@@ -429,11 +475,11 @@ function ollamaErrorCode(e) {
   return 'OLLAMA_ERROR';
 }
 
-async function generate(prompt, requestedModel) {
+async function generate(prompt, requestedModel, maxTokens = null) {
   let ollamaErr = null;
   if (Date.now() >= ollamaDeadUntil) {
     try {
-      return await askOllama(prompt, requestedModel);
+      return await askOllama(prompt, requestedModel, maxTokens);
     } catch (e) {
       ollamaErr = ollamaErrorCode(e);
       /* Отключаем бэкенд НА ВРЕМЯ только при недоступности процесса.
@@ -456,7 +502,7 @@ async function generate(prompt, requestedModel) {
   }
   if (GROQ_KEY || OPENROUTER_KEY) {
     try {
-      return await askCloud(prompt, requestedModel);
+      return await askCloud(prompt, requestedModel, maxTokens);
     } catch (e) {
       log(`облачный API не ответил (${e.message})`);
     }
@@ -612,10 +658,40 @@ const wsState = {
  * поведения, которые расходятся ровно в самом редком случае. */
 async function runTask(task) {
   let prompt;
+  let taskMaxTokens = null;
+  /* Ключ сессии после распечатки.
+   *
+   * Сервер шлёт его запечатанным на наш публичный ключ (`box:v1:...`), чтобы
+   * перехват ответа `/worker/poll` не давал доступа к промпту. Здесь ключ
+   * один раз распечатывается и ДАЛЬШЕ ИСПОЛЬЗУЕТСЯ ВЕЗДЕ — и для расшифровки
+   * задачи, и для шифрования ответа. Если бы вторая часть брала
+   * `task.sessionKey` напрямую, ответ шифровался бы литералом `box:v1:...`,
+   * и сервер не смог бы его прочитать. */
+  let sessionKeyB64 = null;
   try {
-    prompt = task.encryptedPayload && task.sessionKey
-      ? decryptTask(task.encryptedPayload, task.sessionKey)
+    sessionKeyB64 = task.sessionKey
+      ? (task.keyEncryption === 'box:v1'
+        ? workerBox.openFromWorker(loadOrCreateSeed(), task.sessionKey)
+        : task.sessionKey)
+      : null;
+
+    const plain = task.encryptedPayload && sessionKeyB64
+      ? decryptTask(task.encryptedPayload, sessionKeyB64)
       : String(task.prompt || '');
+    /* Тело задачи — JSON `{prompt, maxTokens}`. Старый формат (голая строка)
+     * обязан продолжать работать: в очереди могли остаться строки, созданные
+     * до деплоя, и воркер не должен падать на них после обновления сервера. */
+    let parsed = null;
+    if (typeof plain === 'string' && plain.trim().startsWith('{')) {
+      try { parsed = JSON.parse(plain); } catch (_e) { parsed = null; }
+    }
+    if (parsed && typeof parsed.prompt === 'string') {
+      prompt = parsed.prompt;
+      const mt = Number(parsed.maxTokens);
+      taskMaxTokens = Number.isFinite(mt) && mt > 0 ? Math.trunc(mt) : null;
+    } else {
+      prompt = plain;
+    }
   } catch (e) {
     log(`задача ${task.taskId} не расшифрована (${e.message}) — пропускаю`);
     return { ok: false, reason: 'decrypt_failed', taskId: task.taskId };
@@ -626,7 +702,7 @@ async function runTask(task) {
   const pulse = setInterval(heartbeat, 7000);
   let gen;
   try {
-    gen = await generate(prompt, task.model || null);
+    gen = await generate(prompt, task.model || null, taskMaxTokens);
   } finally {
     clearInterval(pulse);
   }
@@ -640,8 +716,8 @@ async function runTask(task) {
     took,
     /* Ответ шифруется ключом сессии, когда он есть. Ключ пришёл по TLS и
      * живёт только в памяти — на диск не попадает. */
-    payload: task.sessionKey
-      ? { encryptedResponse: encryptResult(gen.response, task.sessionKey) }
+    payload: sessionKeyB64
+      ? { encryptedResponse: encryptResult(gen.response, sessionKeyB64) }
       : { response: gen.response },
   };
 }
@@ -941,6 +1017,11 @@ async function main() {
     log('без регистрации начисления не будет — исправьте причину и перезапустите');
     process.exit(1);
   }
+  /* Привязка ключа — условие допуска к очереди, а не усиление. Без неё
+   * каждый опрос получал бы 403 HANDSHAKE_REQUIRED. Отказ привязки не
+   * останавливает воркер: WS-путь может привязать ключ сам, и запрещать
+   * работать из-за этого было бы хуже, чем попробовать другой транспорт. */
+  await bindKey();
   log('опросите /health на сервере: llm_mode должен стать worker');
   log('Ctrl+C — остановить');
 

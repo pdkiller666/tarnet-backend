@@ -23,6 +23,7 @@ const { classifyDomain, selectModel } = require('./model-router');
 const { CWUCalculator, RewardEngine, verifyQuality, epochEmission, epochIndex, omega } = require('./economics');
 const { CumulativeLedger, receiptPayload, epochState, releasedFor, bumpEpoch } = require('./ledger');
 const { getGenesisHash, receiptPayloadV2, computeReceiptHash, verifyWorkerDagChain } = require('./dag-chain');
+const workerBox = require('./worker-box');
 const LLM = require('./llm-adapter');
 /* Фаза 2.5: консервативный PII-классификатор (regex + ONNX NER для имён).
  * Заменяет голый regex в llm-adapter на гибрид: замер показал, что NER-модель
@@ -5829,15 +5830,23 @@ const wsInbound = createWsInbound({
   },
 });
 
-function enqueueWorkerTask({ prompt, model, tier, workerAddress = null }) {
+function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxTokens = null }) {
   const taskId = 'wt_' + crypto.randomBytes(12).toString('hex');
   const now = Date.now();
   const sessionKey = crypto.randomBytes(32);
   workerTaskKeys.set(taskId, sessionKey);
+  /* Предел генерации едет ВНУТРИ зашифрованной части задачи, а не отдельным
+   * полем в кадре. Иначе потолок, названный сервером, лежал бы открытым
+   * текстом и мог быть подменён на любом посреднике — а смысл потолка в том,
+   * чтобы ограничить именно воркер. */
+  const taskBody = JSON.stringify({
+    prompt,
+    maxTokens: Number(maxTokens) > 0 ? Math.trunc(Number(maxTokens)) : CONFIG.MAX_TOKENS_PER_TASK,
+  });
   run(
     `INSERT INTO worker_tasks (taskId, encryptedPayload, model, tier, status, createdAt, expiresAt, intendedWorker)
      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
-    [taskId, encryptWithKey(prompt, sessionKey), model || null, tier || null, now, now + WORKER_TASK_TTL_MS,
+    [taskId, encryptWithKey(taskBody, sessionKey), model || null, tier || null, now, now + WORKER_TASK_TTL_MS,
       workerAddress ? String(workerAddress).toLowerCase() : null],
   );
 
@@ -5861,7 +5870,11 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null }) {
     if (claimed && Number(claimed.changes) === 1) {
       const sent = wsInbound.sendTask(wsAddr, {
         taskId,
-        encryptedPayload: encryptWithKey(prompt, sessionKey),
+        /* То же тело, что ушло в worker_tasks: промпт и maxTokens вместе.
+         * Раньше здесь шифровался голый prompt, и после перехода на объект
+         * воркер получил бы по WS старый формат, а по poll — новый. Один
+         * транспорт не должен знать больше другого. */
+        encryptedPayload: encryptWithKey(taskBody, sessionKey),
         sessionKey: sessionKey.toString('base64'),
         encryption: 'aes-256-gcm',
         model: model || null,
@@ -5981,6 +5994,96 @@ function pollBoundKey(workerAddress) {
   );
 }
 
+/* Привязка ключа к адресу БЕЗ WebSocket.
+ *
+ * Зачем. После `403 HANDSHAKE_REQUIRED` воркер, у которого WS не поднимается
+ * (старый Node, firewall, прокси), не смог бы получить работу вообще. Но и
+ * разрешать привязку «по заявленному адресу» нельзя: это ровно та дыра, из-за
+ * которой адрес вида `0xd11f08…` можно занять чужим ключом, а вместе с ним
+ * получить очередь настоящего узла.
+ *
+ * Поэтому адрес здесь НЕ принимается от клиента — он ВЫВОДИТСЯ из публичного
+ * ключа (`address = 0x + sha256(SPKI)[0:20]`). Ключ и адрес связаны
+ * криптографически: предъявить один и назвать другой невозможно. Подпись
+ * проверяет владение секретом, TOFU фиксирует первый ключ навсегда.
+ *
+ * `claimedAddress` в теле игнорируется намеренно. Если он не совпадает с
+ * выведенным — это попытка занять чужой адрес, и такой запрос отвергается с
+ * кодом 409, а не «молча привязывается к выведенному»: клиент должен узнать,
+ * что его модель идентичности расходится с серверной. */
+app.post('/worker/handshake', (req, res) => {
+  const body = req.body || {};
+  const pubkeyHex = typeof body.pubkey === 'string' ? body.pubkey.trim() : '';
+  const signature = typeof body.signature === 'string' ? body.signature : '';
+  const timestamp = Number(body.timestamp);
+
+  if (!/^[0-9a-fA-F]{64}$/.test(pubkeyHex)) {
+    return res.status(400).json({ error: 'BAD_PUBKEY', note: 'нужен 64 hex-символа — сырой Ed25519-ключ' });
+  }
+  if (!signature.length) {
+    return res.status(400).json({ error: 'SIGNATURE_REQUIRED', auth_payload_template: `${POLL_AUTH_PREFIX}:<address>:<timestampMs>` });
+  }
+  if (!Number.isFinite(timestamp) || Math.abs(Date.now() - timestamp) > POLL_AUTH_SKEW_MS) {
+    return res.status(401).json({ error: 'TIMESTAMP_OUT_OF_WINDOW', got: timestamp, server: Date.now(), skew_ms: POLL_AUTH_SKEW_MS });
+  }
+
+  /* Адрес берётся ИЗ ЗАЯВКИ и привязывается к ключу по TOFU — ровно так же,
+   * как это делает WS-рукопожатие (`ws-inbound.js`).
+   *
+   * Почему не "вывести адрес из ключа", хотя это строже. Замерено на проде:
+   * у живого воркера адрес `0xe56c…`, а из его же ключа выводится `0xb31f…` —
+   * потому что демо-воркер исторически брал адрес случайными байтами. Строгий
+   * вывод означал бы, что единственный работающий узел не может привязаться,
+   * а его накопленная история начислений пропадает.
+   *
+   * Что при этом не теряется: заявить ЧУЖОЙ адрес по-прежнему нельзя, если к
+   * нему уже привязан ключ (ниже — ADDRESS_KEY_MISMATCH). Захват свободного
+   * адреса не даёт доступа к работе: задача выдаётся только по intendedWorker,
+   * а адрес, который никто не использовал, задач не имеет. */
+  const claimed = typeof body.claimedAddress === 'string' ? body.claimedAddress.trim().toLowerCase() : '';
+  let address;
+  if (claimed) {
+    if (!/^0x[0-9a-f]{40}$/.test(claimed)) {
+      return res.status(400).json({ error: 'BAD_ADDRESS', note: 'claimedAddress: 0x + 40 hex' });
+    }
+    address = claimed;
+  } else {
+    /* Заявки нет — тогда выводим из ключа. Клиент, который хочет
+     * криптографическую привязку адреса, получает её, просто не присылая
+     * claimedAddress. */
+    try {
+      address = tarIdentity.addressFromRawPubkey(Buffer.from(pubkeyHex, 'hex'));
+    } catch (_e) {
+      return res.status(400).json({ error: 'BAD_PUBKEY' });
+    }
+  }
+
+  const payload = `${POLL_AUTH_PREFIX}:${address}:${timestamp}`;
+  let ok = false;
+  try {
+    ok = tarIdentity.verifyWithPubkey(pubkeyHex, payload, signature);
+  } catch (_e) {
+    ok = false;
+  }
+  if (!ok) {
+    return res.status(401).json({ error: 'BAD_SIGNATURE', auth_payload_template: `${POLL_AUTH_PREFIX}:<address>:<timestampMs>` });
+  }
+
+  const bound = pollBoundKey(address);
+  if (bound && String(bound.pubkeyHex).toLowerCase() !== pubkeyHex.toLowerCase()) {
+    return res.status(409).json({
+      error: 'ADDRESS_KEY_MISMATCH',
+      note: 'К адресу уже привязан другой ключ. Восстановление — отдельная процедура у оператора.',
+    });
+  }
+  run(`INSERT INTO ws_worker_auth (workerAddress, pubkeyHex, firstSeenAt, lastSeenAt)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(workerAddress) DO UPDATE SET lastSeenAt = excluded.lastSeenAt`,
+    [address, pubkeyHex.toLowerCase(), Date.now(), Date.now()]);
+
+  res.json({ ok: true, address, boundAt: Date.now() });
+});
+
 app.get('/worker/poll', (req, res) => {
   const workerAddress = typeof req.query.workerAddress === 'string' ? req.query.workerAddress : null;
   const model = typeof req.query.model === 'string' ? req.query.model : null;
@@ -5991,6 +6094,30 @@ app.get('/worker/poll', (req, res) => {
    * чужой человек бесплатно подтверждает существование узла и получает
    * право на его очередь. */
   const boundKey = pollBoundKey(workerAddress);
+  /* Нет привязанного ключа — работа не выдаётся ВООБЩЕ.
+   *
+   * Раньше здесь стояло `if (boundKey)`, то есть отсутствие ключа означало
+   * «проверять нечего, проходи». Замерено на проде: свежий адрес без
+   * WS-истории получал `HTTP 200` и, если бы в очереди была задача, забрал бы
+   * её вместе с `sessionKey`. Привязка ключа — не усиление подписи, а условие
+   * допуска: без неё подписывать нечем, и проверять не у чего.
+   *
+   * 403, а не 401: 401 значит «не указан/не принят секрет», а здесь секрета
+   * ещё не существует — воркер не проходил handshake. Разные коды нужны,
+   * чтобы клиент не пытался чинить подпись там, где нужно сначала привязать
+   * ключ (`POST /worker/handshake` или WS-сессия). */
+  if (!boundKey) {
+    return res.status(403).json({
+      error: 'HANDSHAKE_REQUIRED',
+      note: 'Ключ не привязан к адресу. Пройдите WS-handshake или POST /worker/handshake.',
+      handshake: 'POST /worker/handshake { pubkey, timestamp, signature: sign("TARNET_WORKER_POLL:<address>:<timestampMs>"), claimedAddress? }',
+      /* Подсказка отражает ДВЕ допустимые модели: адрес можно заявить
+       * (claimedAddress, как в WS) или не заявлять вовсе — тогда он будет
+       * выведен из ключа. Раньше здесь был только второй вариант, и воркер
+       * со случайным адресом читал его как единственный и не мог привязаться. */
+      address_rule: 'claimedAddress — привязка к заявленному адресу (TOFU, как в WS); без него адрес выводится из ключа',
+    });
+  }
   if (boundKey) {
     const ts = Number(req.query.ts);
     const sig = typeof req.query.sig === 'string' ? req.query.sig : '';
@@ -6143,12 +6270,34 @@ app.get('/worker/poll', (req, res) => {
     [now, workerAddress, task.taskId]);
 
   /* Промпт уходит шифротекстом: канал может быть TLS, но задача обязана быть
-   * нечитаемой и в логах прокси, и в памяти посредника. */
+   * нечитаемой и в логах прокси, и в памяти посредника.
+   *
+   * КЛЮЧ СЕССИИ ТЕПЕРЬ ЗАПЕЧАТАН НА КЛЮЧ ВОРКЕРА (`box:v1:...`). Раньше он
+   * ехал рядом с шифротекстом открытым: один перехваченный ответ давал и
+   * замок, и ключ. Привязка ключа к адресу обязательна выше (иначе 403),
+   * поэтому публичный ключ здесь всегда есть.
+   *
+   * `keyEncryption` говорит клиенту, как читать `sessionKey`. Если печать
+   * почему-то не удалась, отдаём плain base64 с явным `keyEncryption: 'none'`:
+   * молча подсунуть нечитаемое — хуже, чем честно назвать формат. */
+  let keyField = sessionKey.toString('base64');
+  let keyEncryption = 'none';
+  try {
+    const bound = pollBoundKey(workerAddress);
+    if (bound && bound.pubkeyHex) {
+      keyField = workerBox.sealToWorker(bound.pubkeyHex, sessionKey.toString('base64'));
+      keyEncryption = 'box:v1';
+    }
+  } catch (e) {
+    console.log(`poll: ключ сессии не запечатан (${e.message}) — отдаю открытым`);
+  }
+
   res.json({
     task: {
       taskId: task.taskId,
       encryptedPayload: task.encryptedPayload,
-      sessionKey: sessionKey.toString('base64'),
+      sessionKey: keyField,
+      keyEncryption,
       encryption: 'aes-256-gcm',
       model: task.model,
       tier: task.tier,
@@ -6934,6 +7083,18 @@ async function runInference(req, res) {
     const maxTokens = Math.trunc(Number(body.maxTokens ?? 512));
     if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
       return res.status(400).json({ error: 'maxTokens must be a positive integer', got: body.maxTokens ?? null });
+    }
+    /* Жёсткий потолок на одну задачу. Резерв берётся по maxTokens, поэтому
+     * запрос вида maxTokens = 10_000_000 блокировал бы дневной бюджет целиком
+     * и всё равно вернул бы обрезку по контексту модели. Отказ явный и с
+     * числом, чтобы клиент не гадал, какой предел у сервера. */
+    if (maxTokens > CONFIG.MAX_TOKENS_PER_TASK) {
+      return res.status(400).json({
+        error: 'max_tokens_exceeds_limit',
+        requestedTokens: maxTokens,
+        maxAllowedTokens: CONFIG.MAX_TOKENS_PER_TASK,
+        hint: `один запрос не может превышать ${CONFIG.MAX_TOKENS_PER_TASK} токенов`,
+      });
     }
 
     const actionIdForApproval = typeof body.actionId === 'string' && body.actionId.length
