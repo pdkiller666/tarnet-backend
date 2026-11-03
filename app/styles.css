@@ -1876,6 +1876,15 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
     overflow-x: clip;
     -webkit-overflow-scrolling: touch;
   }
+  /* Ширина сцены обязана быть привязана к колонке, а не к содержимому.
+     Без этого .synapse-stage как grid-элемент раздувался до ширины
+     содержимого (блок кода шириной 570px давал сцену 648px при экране
+     390px), и вместе с ним уезжали шапка, поле ввода и кнопка отправки.
+     Важно: все внутренние max-width:100% считаются от ЭТОЙ ширины, поэтому
+     ограничивать детей было бесполезно — процент от раздутого родителя
+     остаётся больше экрана. Проверено замером scrollWidth в браузере. */
+  .synapse-stage { width: 100%; max-width: 100%; }
+
   .synapse-stage .top-inner { flex-wrap: wrap; padding: 8px 12px; }
   .stage-controls { order: 3; flex-basis: 100%; }
   .stage-controls .field { max-width: none; }
