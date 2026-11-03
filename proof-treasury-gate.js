@@ -24,6 +24,7 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { DatabaseSync } = require('node:sqlite');
 
@@ -31,6 +32,46 @@ const TREASURY = '0x' + 'f'.repeat(40);
 const PORT = 3000 + Math.floor(Math.random() * 900);
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-gate-'));
 const DB = path.join(DIR, 'gate.db');
+
+/* Фикстура обязана проходить handshake, как настоящий воркер.
+ *
+ * Без этого проверка казны ломалась не по делу: `/work` с 2.17.15 требует
+ * привязанный Ed25519-ключ и верную подпись, а тест сдавал работу анонимно
+ * и получал 403 HANDSHAKE_REQUIRED ещё до аудита казны. Шесть падений
+ * выглядели как шесть дефектов гейта, хотя гейт ни разу не запускался.
+ *
+ * Соблазн был ослабить проверку на `/work` — это вернуло бы дыру, ради
+ * закрытия которой версия и выпускалась. Правится фикстура, не продукт. */
+const workerKeys = new Map();
+function workerKeyFor(addr) {
+  const k = String(addr).toLowerCase();
+  let e = workerKeys.get(k);
+  if (!e) { e = crypto.generateKeyPairSync('ed25519'); workerKeys.set(k, e); }
+  return e;
+}
+function rawPubHex(kp) {
+  // Из SPKI DER берём последние 32 байта — это и есть сырой Ed25519-ключ.
+  return Buffer.from(kp.publicKey.export({ format: 'der', type: 'spki' })).slice(-32).toString('hex');
+}
+async function bindWorker(addr) {
+  const k = String(addr).toLowerCase();
+  const kp = workerKeyFor(k);
+  const ts = Date.now();
+  const sig = crypto.sign(null, Buffer.from(`TARNET_WORKER_POLL:${k}:${ts}`, 'utf8'), kp.privateKey).toString('base64');
+  return api('/worker/handshake', 'POST', { pubkey: rawPubHex(kp), timestamp: ts, signature: sig, claimedAddress: k });
+}
+async function signedWork(addr, { tokens, tier, actionId }) {
+  const k = String(addr).toLowerCase();
+  const kp = workerKeyFor(k);
+  const ts = Date.now();
+  /* Payload повторяет серверный байт-в-байт, включая `Number(tokens)` и
+   * `tier ?? 'base'`: любое расхождение даёт BAD_SIGNATURE на ровном месте. */
+  const payload = [
+    'TARNET_WORK_SUBMIT', k, String(Number(tokens)), String(tier ?? 'base'), String(actionId ?? ''), String(ts),
+  ].join(':');
+  const sig = crypto.sign(null, Buffer.from(payload, 'utf8'), kp.privateKey).toString('base64');
+  return api('/work', 'POST', { workerAddress: k, tokens, tier, actionId, worker_ts: ts, worker_signature: sig });
+}
 
 let pass = 0;
 let fail = 0;
@@ -87,7 +128,10 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
     const reg = await api('/node', 'POST', { address: worker, stake: 1, reputation: 1 });
     ok('узел зарегистрирован', reg.status === 200 || reg.status === 201, reg.status);
 
-    const w1 = await api('/work', 'POST', { workerAddress: worker, tokens: 100000, tier: 'base', actionId: 'gate-proof-1' });
+    const hs = await bindWorker(worker);
+    ok('ключ привязан к адресу (handshake)', hs.status === 200, { status: hs.status, error: hs.body?.error });
+
+    const w1 = await signedWork(worker, { tokens: 100000, tier: 'base', actionId: 'gate-proof-1' });
     ok('первая работа начислена', w1.status === 200 || w1.status === 201, { status: w1.status, error: w1.body?.error });
     const receiptsBefore = (await api('/summary')).body.receipts;
     console.log(`  чеков до порчи: ${receiptsBefore}`);
@@ -102,7 +146,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
     ok('баланс казны испорчен на +1', Math.abs((after.balanceTar - before.balanceTar) - 1) < 1e-9);
 
     console.log('\n=== 2) начисление обязано отказать и откатиться ===');
-    const w2 = await api('/work', 'POST', { workerAddress: worker, tokens: 100000, tier: 'base', actionId: 'gate-proof-2' });
+    const w2 = await signedWork(worker, { tokens: 100000, tier: 'base', actionId: 'gate-proof-2' });
     ok('ответ 500', w2.status === 500, { status: w2.status, body: w2.body });
     ok('код TREASURY_AUDIT_FAILED', w2.body?.code === 'TREASURY_AUDIT_FAILED', w2.body);
     ok('в ответе есть audit с expected/actual/delta',
@@ -122,7 +166,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
     const db2 = new DatabaseSync(DB);
     db2.prepare('UPDATE balances SET balanceTar = ? WHERE address = ?').run(before.balanceTar, TREASURY);
     db2.close();
-    const w3 = await api('/work', 'POST', { workerAddress: worker, tokens: 100000, tier: 'base', actionId: 'gate-proof-3' });
+    const w3 = await signedWork(worker, { tokens: 100000, tier: 'base', actionId: 'gate-proof-3' });
     ok('начисление снова проходит (2xx)', w3.status === 200 || w3.status === 201, { status: w3.status, error: w3.body?.error });
     const s3 = (await api('/summary')).body;
     ok('holds: true после возврата', s3.treasuryAudit.holds === true, s3.treasuryAudit);
