@@ -68,7 +68,7 @@
  * v23: сцена больше не растягивается по содержимому. v22 закрывал ось на
  * .stage-scroll, но сцена раздувалась до ширины блока кода, и шапка с полем
  * ввода уезжали вправо. Правка в styles.css — width:100% у .synapse-stage. */
-const CACHE = 'tarnet-app-v23';
+const CACHE = 'tarnet-app-v24';
 
 const ASSETS = [
   '/app/',

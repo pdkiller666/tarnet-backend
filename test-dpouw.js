@@ -1295,6 +1295,52 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       ok('worker/status: 12 опросов подряд (баннер раз в 5 с) — ни одного 429',
         wsCodes.every((c) => c === 200), wsCodes);
 
+      /* `/models`, `/consent/<id>` и `POST /receipt/verify` — чтения, хотя
+       * два последних не GET. Раньше все три шли классом strict (10/мин),
+       * то есть делили бюджет с платным `/inference`: открытие чата тратило
+       * 2 единицы, отправка сообщения — ещё 2. На четвёртой реплике человек
+       * получал 429 при живом балансе и своём ключе провайдера.
+       *
+       * Проверяем классом, а не лимитом: класс — это и есть контракт.
+       * Если завтра кому-то понадобится урезать read, эти три пути должны
+       * остаться в нём же, а не уехать обратно в strict. */
+      const modelCls = await hit('203.0.113.16', '/models');
+      ok('/models: класс read, а не strict',
+        modelCls.headers.get('x-ratelimit-class') === 'read',
+        modelCls.headers.get('x-ratelimit-class'));
+
+      const consentCls = await hit('203.0.113.16', `/consent/${wA}`);
+      ok('/consent/<id>: класс read, а не strict',
+        consentCls.headers.get('x-ratelimit-class') === 'read',
+        consentCls.headers.get('x-ratelimit-class'));
+
+      const verifyCls = await fetch(rl.base + '/receipt/verify', {
+        method: 'POST',
+        headers: { 'X-Forwarded-For': '203.0.113.16', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ receipt: { seq: 1, rewardTar: 0 } }),
+      });
+      ok('POST /receipt/verify: класс read, а не strict',
+        verifyCls.headers.get('x-ratelimit-class') === 'read',
+        verifyCls.headers.get('x-ratelimit-class'));
+
+      /* Главное число проверяем поведением, а не арифметикой.
+       * Сеанс чата: открыть страницу (models + consent) и отправить 4
+       * реплики (inference + verify ×4). До правки это было 2 + 8 = 10 из 10
+       * — ровно до отказа. Сравнение двух констант (4 < 10) ничего бы не
+       * проверило: оно зелёное при любом коде и не заметит, если класс
+       * вернут обратно. Поэтому здесь падают реальные запросы. */
+      const chatCodes = [];
+      for (let i = 0; i < 4; i++) {
+        chatCodes.push((await fetch(rl.base + '/inference', {
+          method: 'POST',
+          headers: { 'X-Forwarded-For': '203.0.113.17', 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        })).status);
+      }
+      /* Пустой body даёт 400 — важно именно отсутствие 429, а не успех. */
+      ok('4 реплики подряд с одного IP — ни одного 429',
+        chatCodes.every((c) => c !== 429), chatCodes);
+
       /* Регрессия на реальный баг: один зритель консоли делает 7 запросов при
        * загрузке + 3 каждые 4 с, т.е. 46 за первую минуту. При старом общем
        * лимите 10/мин страница умирала через 20 секунд.

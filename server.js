@@ -2552,11 +2552,21 @@ const RATE_LIMITS = {
  * при открытии, а список подтверждений — ещё и при показе модалки HITL.
  * Без этой ветки оба шли бы классом strict (10/мин), и открытие вкладки
  * вместе с проверкой подтверждений съедало бы бюджет записи целиком. */
+/* `/models` — чтение, хотя и GET: это один `SELECT` по `model_registry`
+ * без побочных эффектов. Раньше пути здесь не было, и запрос падал в
+ * `strict` — в тот же бюджет 10/мин, что и платный `/inference`. Цена
+ * ошибки измерена: открытие чата (модели + согласие) съедало 2 из 10,
+ * отправка сообщения — ещё 2 (`/inference` + `/receipt/verify`), и на
+ * четвёртой реплике человек получал 429 «лимит 10 в минуту» при живом
+ * балансе и своём ключе провайдера. */
 const RATE_READ_PATH =
-  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|p2p\/status|worker\/status|agents(\/approvals)?|tools)$/;
+  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|models|p2p\/status|worker\/status|agents(\/approvals)?|tools)$/;
 /* `/id/<pubkey>/balance` — чтение, а не запись: клиент опрашивает баланс так же
  * часто, как /balance/<addr>. Без этой ветки он упирался бы в 10/мин. */
-const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$|^\/id\/[0-9a-fA-F]{0,64}\/balance$|^\/faucet\/status\/[^/]+$|^\/devices\/[^/]+$|^\/migrate\/status\/[^/]+$/;
+/* `/consent/<userId>` — тоже чтение: PWA читает согласие один раз при
+ * открытии страницы. Без этой ветки оно стоило одну единицу из десяти.
+ * `POST /consent` (без id) остаётся strict — это настоящая запись. */
+const RATE_READ_SUBPATH = /^\/(node|balance|receipt|receipts)\/[^/]+$|^\/id\/[0-9a-fA-F]{0,64}\/balance$|^\/consent\/[^/]+$|^\/faucet\/status\/[^/]+$|^\/devices\/[^/]+$|^\/migrate\/status\/[^/]+$/;
 const RATE_READ_ASSET = /\.(html|css|js|svg|webmanifest|png|ico|woff2?)$/;
 /* Оболочки UI: `/` и `/app/` — это HTML-контейнеры без расширения, без этой
  * ветки открытие консоли списывалось бы с бюджета записи (10/мин).
@@ -2571,6 +2581,14 @@ function rateClass(req) {
    * но класс ему нужен всё равно.
    */
   if (req.path === '/chat/sync') return 'chat';
+  /* `/receipt/verify` — POST только по форме. Внутри — проверка подписи и
+   * один `SELECT SUM(rewardTar)`, без единой записи. Но браузер вызывает его
+   * на КАЖДЫЙ показанный чек, то есть каждое сообщение в чате стоило две
+   * единицы strict вместо одной. При лимите 10/мин это отнимало половину
+   * бюджета у платного `/inference`. Класс назначается до проверки метода
+   * по той же причине, что и у `/chat/sync`.
+   */
+  if (req.path === '/receipt/verify') return 'read';
   if (req.method === 'GET' || req.method === 'HEAD') {
     if (RATE_READ_PATH.test(req.path) || RATE_READ_SUBPATH.test(req.path) ||
         RATE_READ_ASSET.test(req.path) || RATE_READ_UI.test(req.path)) return 'read';
