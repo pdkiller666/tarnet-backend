@@ -1140,6 +1140,9 @@ pre.cmd {
 
 html, body { height: 100%; }
 body { overflow: hidden; }
+/* iOS сам увеличивает шрифт при повороте, если это не запрещено: текст в
+   ленте вылезал из пузырей после смены ориентации. */
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 
 .app-shell {
   display: grid;
@@ -1861,19 +1864,54 @@ body { overflow: hidden; }
 
 /* --- Телефон --- */
 @media (max-width: 768px) {
-  .stage-scroll { padding: 10px 12px 0; }
+  /* overflow-y:auto у .stage-scroll по спецификации превращает overflow-x
+     из visible в auto. Поэтому один широкий элемент в ответе не показывал
+     обрезанный край, а включал боковой скролл всей ленты — «чат выходит за
+     границы экрана». clip закрывает это на уровне контейнера, а правила
+     ниже гарантируют, что внутри и нечему быть шире сцены. */
+  .stage-scroll {
+    padding: 10px 12px calc(8px + env(safe-area-inset-bottom));
+    /* Каскад: hidden — фолбэк для Safari < 16, где clip не понимают. */
+    overflow-x: hidden;
+    overflow-x: clip;
+    -webkit-overflow-scrolling: touch;
+  }
   .synapse-stage .top-inner { flex-wrap: wrap; padding: 8px 12px; }
   .stage-controls { order: 3; flex-basis: 100%; }
   .stage-controls .field { max-width: none; }
+  /* Шапка не должна расширять сцену: flex-элементы с min-width:auto
+     раздуваются до содержимого, даже если родитель уже width:100%. */
+  .synapse-stage .top-inner, .stage-right { min-width: 0; }
+  .net-status { white-space: normal; }
   .shield { display: none; }
   .omnibox-container { padding-bottom: calc(6px + env(safe-area-inset-bottom)); }
   .bento-grid { grid-template-columns: 1fr 1fr; margin-top: 16px; }
 
+  /* Ответ целиком в ширину экрана. Пузырь уже ограничен 86%, но чек,
+     трасса и блок кода — отдельные элементы вне пузыря, и каждый из них
+     мог растянуть колонку. min-width:0 нужен flex-детям, иначе длинное
+     слово задаёт им минимальную ширину больше экрана. */
+  .msg, .msg.user, .bubble, .code-wrap, .swarm-trace-box, .receipt { max-width: 100%; min-width: 0; }
+  .msg.user .bubble, .msg.bot .bubble { max-width: 100%; }
+  /* Три кнопки под ответом («Редактировать», «Повторить», «Копировать»)
+     в 320px не влезали в строку и вылезали вправо. */
+  .msg-actions { flex-wrap: wrap; }
+  .receipt .row { flex-wrap: wrap; }
+  .receipt .row b { overflow-wrap: anywhere; }
+  .panel { gap: 12px; }
+
   /* Тач-цели: 44px — минимум, при котором промах по кнопке не бесит.
      Пальцем по 34px icon-btn попадать приходилось со второй попытки. */
   .icon-btn { width: var(--tap); height: var(--tap); }
+  .send-btn { width: var(--tap); height: var(--tap); }
   .tab { padding: 11px 12px; }
+  .sidebar-nav .tab { padding: 12px 12px; }
+  .pill { padding: 8px 12px; font-size: 12px; }
   .tiny-btn { padding: 9px 12px; font-size: 12px; }
+
+  /* Поле ввода на телефоне растёт до 120px, а не до 200px: при 200
+     клавиатура + поле оставляли от ленты одну строку. */
+  .omnibox textarea { max-height: 120px; }
 
   /* 16px — не про красоту: iOS Safari зумит страницу при фокусе на поле
      с меньшим шрифтом, и вернуться к масштабу можно только щипком. */
@@ -1890,14 +1928,23 @@ body { overflow: hidden; }
 /* --- Узкий телефон --- */
 @media (max-width: 420px) {
   .bento-grid { grid-template-columns: 1fr; }
-  .stage-scroll { padding: 8px 10px 0; }
+  .stage-scroll { padding: 8px 10px calc(6px + env(safe-area-inset-bottom)); }
   .synapse-stage .top-inner { padding: 8px 10px; gap: 6px; }
-  /* Две вкладки режима в строку ещё влезают, три — уже нет. */
+  /* Две вкладки режима в строку ещё влезают, три — уже нет.
+     Пилюли не сжимаем до 28px: перенос строки лучше, чем промах пальцем. */
   .mode-pills { gap: 4px; }
-  .pill { padding: 5px 8px; font-size: 11px; }
+  .pill { padding: 7px 10px; font-size: 11.5px; }
   .chat-log { gap: 14px; }
   .msg.bot .bubble th,
   .msg.bot .bubble td { padding: 5px 7px; }
+  /* На 320–360px подпись статуса занимала всю строку шапки. Состояние
+     остаётся читаемым по цвету точки, а полный текст — в #workerBanner. */
+  .net-status .net-text { display: none; }
+  .net-status { padding: 4px; }
+  /* Подсказка про Enter актуальна для физической клавиатуры; на телефоне
+     Enter — это кнопка отправки, и строка только отнимает высоту. */
+  .composer-note { display: none; }
+  .receipt, .msg.bot .bubble { font-size: 13.5px; }
 }
 
 /* --- Телефон лёжа: высота важнее ширины ---

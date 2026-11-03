@@ -6379,6 +6379,37 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
     ok('39.15 в отданном CSS есть адаптив под ландшафт',
       servedBody.includes('orientation: landscape'));
     ok('39.15 в отданном CSS есть тач-цель', servedBody.includes('--tap'));
+
+    /* --- 39.16 Лента не едет вбок ---
+     * Симптом со смартфона: чат шире экрана, ленту можно утащить вбок,
+     * и левый край ответа обрезан. Причина не в одном широком блоке, а в
+     * том, что overflow-y:auto у .stage-scroll превращает overflow-x из
+     * visible в auto (CSS Overflow 3). Проверяем именно закрытие оси, а
+     * не отдельные правила: без него любая новая широкая деталь вернёт баг. */
+    ok('39.16 сцена на телефоне закрывает горизонтальную ось',
+      /@media\s*\(max-width:\s*768px\)[\s\S]*?\.stage-scroll\s*\{[^}]*overflow-x:\s*clip/.test(cssNoComments),
+      'у .stage-scroll в phoneBlock нет overflow-x: clip');
+    ok('39.16 чек, трасса и код ограничены шириной экрана',
+      /\.msg,\s*\.msg\.user,\s*\.bubble,\s*\.code-wrap,\s*\.swarm-trace-box,\s*\.receipt\s*\{[^}]*max-width:\s*100%/.test(cssNoComments));
+    ok('39.16 кнопки под ответом переносятся, а не вылезают',
+      /\.msg-actions\s*\{[^}]*flex-wrap:\s*wrap/.test(cssNoComments));
+
+    /* --- 39.17 Клавиатура не выталкивает омнибокс ---
+     * На Android при фокусе в textarea layout viewport не уменьшался, и
+     * поле ввода уходило под клавиатуру — второй смысл «не вмещается». */
+    ok('39.17 viewport просит браузер сжимать контент под клавиатуру',
+      /name="viewport"[^>]*interactive-widget=resizes-content/.test(html),
+      'в meta viewport нет interactive-widget=resizes-content');
+    ok('39.17 на узком экране подпись статуса скрыта, точка осталась',
+      /\.net-status \.net-text\s*\{\s*display:\s*none/.test(cssNoComments));
+
+    /* --- 39.18 Оболочка обновляется на уже установленном PWA ---
+     * Без смены имени кэша телефон продолжал бы отдавать старый styles.css
+     * и «ничего не изменилось» выглядело бы как провал выкладки. */
+    const swSrcMobile = fs.readFileSync(path.join(__dirname, 'app', 'sw.js'), 'utf8');
+    const cacheV22 = (swSrcMobile.match(/const CACHE = 'tarnet-app-v(\d+)'/) || [])[1];
+    ok('39.18 кэш не ниже v22 (мобильная адаптация доедет до клиента)',
+      cacheV22 && Number(cacheV22) >= 22, cacheV22);
   }
 
   /* ===== 40. Tier 6 не попадает в очередь воркера =====

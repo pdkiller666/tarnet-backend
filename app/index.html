@@ -2,7 +2,11 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- interactive-widget=resizes-content: на Android при открытии клавиатуры
+     layout viewport уменьшается, и sticky-омнибокс остаётся у нижнего края.
+     Без этого поле ввода уезжало под клавиатуру, а лента визуально выходила
+     за границы экрана. Chrome 108+, остальные браузеры параметр игнорируют. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>TarNet — Tokenized AI Resource Network</title>
 <meta name="theme-color" content="#090a0f">
 <meta name="description" content="TarNet — Tokenized AI Resource Network. Приватный инференс: промпт не покидает сеть, под каждым ответом подписанный чек.">
