@@ -132,8 +132,15 @@ body {
   background:
     radial-gradient(80rem 40rem at 50% -20%, rgba(77, 124, 254, .07), transparent 70%),
     var(--bg);
+  /* Отступ только под вырез, без добавки «на воздух»: шелл ниже считает
+     свою высоту как 100dvh минус эти же вырезы. Лишние 16px раньше
+     складывались с height:100dvh, и при overflow:hidden низ сцены —
+     вместе с полем ввода — срезало за край экрана. */
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
-  padding-bottom: calc(env(safe-area-inset-bottom) + 16px);
+  /* Нативные контролы (поля, скроллбары, автозаполнение) красятся по этой
+     подсказке. Без неё в тёмной теме всплывали белые полосы и белый фон
+     у выпадающих списков. */
+  color-scheme: dark;
 }
 
 /* ================= Шапка ================= */
@@ -1147,7 +1154,11 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 .app-shell {
   display: grid;
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
-  height: 100dvh;
+  /* Две строки, а не одна: старые браузеры (Safari < 15.4, Firefox < 101)
+     не знают dvh и отбросили бы единственное объявление как невалидное —
+     height стал бы auto, и шелл схлопнулся бы по содержимому. */
+  height: 100vh;
+  height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom));
   overflow: hidden;
 }
 /* Панель артефактов появляется третьей колонкой только когда открыта:
@@ -1515,6 +1526,11 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 }
 
 /* ---------- Bento (нулевое состояние) ----------
+ *
+ * Каждый комментарий ниже закрыт своим терминатором. Без этого шапка секции
+ * съедала открытие .bento-grid: парсер считал объявление частью
+ * комментария вплоть до первого терминатора, и правило не применялось
+ * вообще — плитки шли в один столбец без gap и отступов. */
 
 .bento-grid {
   display: grid;
@@ -2000,4 +2016,26 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   .msg-actions { opacity: 1; }
   .bento:hover { transform: none; }
   .suggest:hover { transform: none; }
+}
+
+/* --- Тач по типу указателя, а не по ширине экрана ---
+ * Тач-цели раньше увеличивались только внутри max-width:768px. Планшет
+ * лёжа (1024–1366px) в этот запрос не попадает, хотя палец у него тот же:
+ * кнопки оставались 34px и по ним приходилось попадать со второй попытки.
+ *
+ * pointer: coarse спрашивает не «какой ширины экран», а «чем нажимают»,
+ * поэтому закрывает планшеты и телефоны в любой ориентации, не задевая
+ * мышь на ноутбуке. any-pointer: coarse — для гибридов с тачскрином,
+ * где основным указателем числится мышь. */
+@media (pointer: coarse), (any-pointer: coarse) {
+  .icon-btn { width: var(--tap); height: var(--tap); }
+  .send-btn { width: var(--tap); height: var(--tap); }
+  .tab { padding: 11px 12px; }
+  .pill { padding: 9px 13px; }
+  .tiny-btn { padding: 9px 12px; }
+  /* Кнопки под ответом на тач-экране бесполезны, пока их не видно. */
+  .msg-actions { opacity: 1; }
+  /* margin-сдвиги при hover на тач-экране залипают после тапа: плитка
+     остаётся приподнятой, пока не тронешь другую. */
+  .bento:hover, .suggest:hover, .chat-history-item:hover { transform: none; }
 }

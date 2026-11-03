@@ -6639,6 +6639,92 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     ok('39.19 сцена на телефоне не растягивается по содержимому',
       /\.synapse-stage\s*\{[^}]*width:\s*100%[^}]*max-width:\s*100%/.test(phoneBlock),
       'у .synapse-stage в phone-блоке нет width:100% + max-width:100%');
+
+    /* --- 39.20 Синтаксис CSS цел, ни одно правило не съедено комментарием ---
+     * Найдено при адаптиве: заголовок секции «Bento» не был закрыт своим
+     * терминатором, и первый же вложенный комментарий закрывал его. Из-за
+     * этого открытие .bento-grid попадало внутрь комментария, а его "}"
+     * оставалось висячим: финальная глубина скобок была -1, и правило сетки
+     * НЕ применялось.
+     * Все проверки «есть ли media-запрос» при этом были зелёными — поэтому
+     * нужен именно счётчик скобок, а не поиск подстрок. */
+    const braceDepth = (() => {
+      const src = fs.readFileSync(path.join(__dirname, 'app', 'styles.css'), 'utf8');
+      let depth = 0;
+      let inComment = false;
+      let inString = null;
+      for (let i = 0; i < src.length; i++) {
+        const ch = src[i];
+        const nx = src[i + 1];
+        if (inComment) {
+          if (ch === '*' && nx === '/') { inComment = false; i++; }
+          continue;
+        }
+        if (inString) {
+          if (ch === '\\') { i++; continue; }
+          if (ch === inString) inString = null;
+          continue;
+        }
+        if (ch === '/' && nx === '*') { inComment = true; i++; continue; }
+        if (ch === '"' || ch === "'") { inString = ch; continue; }
+        if (ch === '{') depth++;
+        if (ch === '}') depth--;
+      }
+      return { depth, inComment };
+    })();
+    ok('39.20 скобки styles.css сбалансированы', braceDepth.depth === 0,
+      `глубина ${braceDepth.depth} — лишняя "}" или съеденное правило`);
+    ok('39.20 ни один комментарий не оставлен открытым', braceDepth.inComment === false);
+    /* Обратный контроль: сетка Bento реально объявлена, а не только запрещена
+     * в медиазапросах. Без него тест 39.20 остался бы зелёным и в том случае,
+     * если правило .bento-grid исчезнет целиком. */
+    ok('39.20 .bento-grid объявлена вне комментариев',
+      /\.bento-grid\s*\{[^}]*display:\s*grid/.test(cssNoComments));
+
+    /* --- 39.21 Шелл занимает экран целиком, низ не срезается ---
+     * body имел min-height:100vh и padding-bottom: safe-area + 16px, а шелл —
+     * height:100dvh. При overflow:hidden эти 16px складывались с полной
+     * высотой, и нижние 16px сцены (полоса омнибокса) уходили за край.
+     * Поэтому проверяем не наличие safe-area (она нужна), а то, что к ней
+     * не добавлена добавка, и что высота шелла вычитает сами вырезы. */
+    const bodyBlock = (cssNoComments.match(/\nbody\s*\{[\s\S]*?\n\}/) || [''])[0];
+    ok('39.21 body не добавляет лишний отступ под safe-area',
+      !/padding-bottom:\s*calc\(env\(safe-area-inset-bottom\)\s*\+\s*\d+px\)/.test(bodyBlock),
+      'к нижнему вырезу добавлены лишние пиксели сверх высоты шелла');
+    ok('39.21 высота шелла вычитает вырезы экрана',
+      /\.app-shell\s*\{[^}]*height:\s*calc\(100dvh\s*-\s*env\(safe-area-inset-top\)/.test(cssNoComments));
+
+    /* --- 39.22 Старые браузеры: фолбэк до dvh ---
+     * Safari < 15.4 и Firefox < 101 не знают dvh и отбрасывают объявление
+     * целиком: height становился auto, и шелл схлопывался по содержимому.
+     * Фолбэк обязан идти ПЕРЕД dvh, иначе он перебьёт рабочее значение. */
+    const shellBlock = (cssNoComments.match(/\.app-shell\s*\{[\s\S]*?\n\}/) || [''])[0];
+    const vhIdx = shellBlock.indexOf('height: 100vh');
+    const dvhIdx = shellBlock.indexOf('100dvh');
+    ok('39.22 у шелла есть фолбэк height:100vh перед dvh',
+      vhIdx !== -1 && dvhIdx !== -1 && vhIdx < dvhIdx,
+      { vh: vhIdx, dvh: dvhIdx });
+
+    /* --- 39.23 Нативные контролы тёмные ---
+     * Без color-scheme: dark браузер рисует светлые скроллбары, белый фон
+     * выпадающих списков и жёлтую заливку автозаполнения — на тёмной теме
+     * это выглядит как чужая вставка. */
+    ok('39.23 объявлен color-scheme: dark',
+      /color-scheme:\s*dark/.test(cssNoComments));
+
+    /* --- 39.24 Тач-цели по типу указателя, а не по ширине экрана ---
+     * Раньше размер кнопок рос только внутри max-width:768px, поэтому
+     * планшет лёжа (1024–1366px) с тем же пальцем получал icon-btn 34px.
+     * pointer: coarse спрашивает «чем нажимают», а не «какой ширины экран». */
+    const coarseBlock = (cssNoComments.match(/@media\s*\(pointer:\s*coarse\)[^{]*\{[\s\S]*?\n\}/) || [''])[0];
+    ok('39.24 есть блок pointer: coarse', coarseBlock.length > 0);
+    ok('39.24 в нём icon-btn растянут до тач-цели',
+      /\.icon-btn\s*\{[^}]*width:\s*var\(--tap\)/.test(coarseBlock));
+    ok('39.24 в нём send-btn растянут до тач-цели',
+      /\.send-btn\s*\{[^}]*width:\s*var\(--tap\)/.test(coarseBlock));
+    /* Гибриды с тачскрином: основным указателем числится мышь, но палец
+     * тоже есть — any-pointer закрывает и этот случай. */
+    ok('39.24 учтён any-pointer: coarse', /any-pointer:\s*coarse/.test(cssNoComments));
   }
 
   /* ===== 40. Tier 6 не попадает в очередь воркера =====
