@@ -407,6 +407,24 @@ CREATE TABLE IF NOT EXISTS ws_worker_auth (
 );
 CREATE INDEX IF NOT EXISTS idx_receipts_worker ON work_receipts (workerAddress, seq);
 CREATE INDEX IF NOT EXISTS idx_receipts_epoch ON work_receipts (epoch);
+/* Заявки на аттестацию железа. Таблица есть, потому что заявку надо ГДЕ-ТО
+ * хранить: эндпоинт, который принимает доказательство и тут же его забывает,
+ * неотличим от эндпоинта, который ничего не проверяет.
+ *
+ * status намеренно не имеет значения 'approved': аппаратной аттестации нет,
+ * и одобрять нечем. Строка живёт в 'pending' как честная запись «заявка есть,
+ * решение не принято». Появление 'approved' стало бы признаком того, что
+ * кто-то выдал expert без проверки. */
+CREATE TABLE IF NOT EXISTS node_attestations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workerAddress TEXT NOT NULL,
+  requestedTier TEXT NOT NULL,
+  method TEXT NOT NULL,
+  evidenceJson TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  createdAt INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attest_address ON node_attestations (workerAddress, createdAt);
 `);
 
 // ===== Migrations (идемпотентно) =====
@@ -4394,6 +4412,140 @@ app.post('/node', (req, res) => {
     publicUrlHost: finalPublicUrl ? new URL(finalPublicUrl).hostname : null });
 });
 
+/* --- Аттестация железа: заявка без выдачи ---------------------------------
+ *
+ * Зачем вообще эндпоинт, если он ничего не одобряет. Без него `tier: expert`
+ * получается ТОЛЬКО backfill'ом по `work_receipts` при старте, то есть узел,
+ * который ещё не выполнял expert-работу, не может в неё попасть никогда.
+ * Замкнутый круг: нет работы → нет тира, нет тира → нет работы. Заявка
+ * разрывает круг, не раздавая привилегий.
+ *
+ * Что он НЕ делает и почему это не лень:
+ *   - не проверяет подпись TPM/SGX/SEV — аппаратной аттестации в проекте нет;
+ *     `isTeeAttested` — это флаг в базе, а не результат проверки (записано в
+ *     PROJECT-HISTORY как ложное утверждение, которое нельзя повторять);
+ *   - не ставит `tier = 'expert'`. Выдать expert за один POST значит вернуть
+ *     дыру `2.17.13`, где клиент сам себе выставлял тир и попадал в пул
+ *     валидаторов. Поэтому статус всегда `pending`: заявка записана, решение
+ *     не принято — это честное состояние, а не недоделка.
+ *
+ * Настоящая проверка железа — отдельная работа (`[SPEC / ROADMAP]`), и ей
+ * нужен не эндпоинт, а доверенная сторона, которая замерит железо. */
+app.post('/node/attest', (req, res) => {
+  const body = req.body || {};
+  const address = typeof body.workerAddress === 'string' ? body.workerAddress.trim().toLowerCase() : '';
+  if (!address) {
+    return res.status(400).json({ error: 'workerAddress is required' });
+  }
+  /* Тот же формат, что в `/node` и handshake. Иначе заявка ляжет в таблицу по
+   * адресу, который не совпадает ни с одной записью `nodes`, и искать её
+   * потом будет не у чего. */
+  if (!/^0x[0-9a-f]{40}$/.test(address)) {
+    return res.status(400).json({ error: 'workerAddress must match 0x + 40 hex', got: address });
+  }
+
+  const ATT_TIERS = ['expert', 'heavy'];
+  const requestedTier = String(body.tier ?? 'expert').trim().toLowerCase();
+  if (!ATT_TIERS.includes(requestedTier)) {
+    return res.status(400).json({
+      error: `tier must be one of ${ATT_TIERS.join('/')}`,
+      got: requestedTier,
+      note: 'nano/base не требуют аттестации: они не дают места в комитете',
+    });
+  }
+
+  /* Метод обязан быть назван клиентом. Свободная строка была бы дырой в
+   * отчётности: «attest: ok» без указания, ЧЕМ проверяли, не отличимо от
+   * вымысла, и через месяц нельзя ответить, что именно заявлял узел. */
+  const METHOD_RE = /^[a-z0-9][a-z0-9._-]{2,40}$/;
+  const method = String(body.method ?? '').trim().toLowerCase();
+  if (!METHOD_RE.test(method)) {
+    return res.status(400).json({
+      error: 'method is required',
+      got: body.method ?? null,
+      allowed_examples: ['user-supplied-report', 'tpm2-quote', 'sev-snp-report'],
+      note: 'назовите, чем замеряли: без этого заявка неотличима от вымысла',
+    });
+  }
+
+  /* Узел должен существовать: заявка на несуществующий адрес не станет
+   * ничем, а молча принять её — значит создавать видимость очереди. */
+  const node = get('SELECT address, tier, stake FROM nodes WHERE LOWER(address) = LOWER(?) LIMIT 1', [address]);
+  if (!node) {
+    return res.status(404).json({
+      error: 'UNKNOWN_NODE',
+      note: 'сначала зарегистрируйте узел через POST /node',
+      workerAddress: address,
+    });
+  }
+
+  /* Доказательство сохраняется как пришло, но не разбирается: разбирать
+   * нечем. NULL допустим: заявка без доказательства тоже заявка, и она
+   * честно останется без доказательства. */
+  let evidenceJson = null;
+  if (body.evidence !== undefined && body.evidence !== null) {
+    try {
+      evidenceJson = JSON.stringify(body.evidence);
+    } catch (_e) {
+      return res.status(400).json({ error: 'evidence must be JSON-serializable' });
+    }
+  }
+
+  const now = Date.now();
+  run(`INSERT INTO node_attestations (workerAddress, requestedTier, method, evidenceJson, status, createdAt)
+       VALUES (?, ?, ?, ?, 'pending', ?)`, [address, requestedTier, method, evidenceJson, now]);
+  const row = get('SELECT id, createdAt FROM node_attestations WHERE workerAddress = ? ORDER BY id DESC LIMIT 1', [address]);
+
+  res.status(202).json({
+    ok: true,
+    accepted: true,
+    /* 202, а не 201: ресурс (одобренный тир) не создан. Заявка принята — это
+     * ровно то, что произошло, и код это отражает. */
+    attestationId: row ? row.id : null,
+    workerAddress: address,
+    requestedTier,
+    method,
+    status: 'pending',
+    approved: false,
+    tierNow: node.tier || 'base',
+    tierChanged: false,
+    /* Главное поле ответа. Клиент должен узнать из ответа, а не из
+     * документации, что тир НЕ выдан: иначе через сутки он будет искать
+     * причину, почему `validatorEligible` всё ещё false. */
+    note: 'Заявка записана со статусом pending. Тир НЕ выдан: аппаратной аттестации в проекте нет, одобрять нечем. expert по-прежнему присваивается только backfill\'ом по work_receipts.',
+    roadmap: '[SPEC / ROADMAP] проверка TPM/SGX/SEV требует доверенной стороны, которая замерит железо',
+  });
+});
+
+app.get('/node/attest/:address', (req, res) => {
+  const address = String(req.params.address || '').trim().toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(address)) {
+    return res.status(400).json({ error: 'address must match 0x + 40 hex' });
+  }
+  /* История, а не только последняя заявка: узел может заявляться повторно
+   * другим методом, и «последняя» скрыла бы предыдущие попытки. */
+  const rows = all(
+    'SELECT id, requestedTier, method, status, createdAt FROM node_attestations WHERE workerAddress = ? ORDER BY id DESC LIMIT 20',
+    [address],
+  );
+  const node = get('SELECT tier FROM nodes WHERE LOWER(address) = LOWER(?) LIMIT 1', [address]);
+  res.json({
+    workerAddress: address,
+    tierNow: node ? (node.tier || 'base') : null,
+    total: rows.length,
+    /* Считаем отдельно, чтобы отсутствие одобренных было видно числом, а
+     * не выводом из пустого списка. */
+    approvedCount: rows.filter(r => r.status === 'approved').length,
+    pendingCount: rows.filter(r => r.status === 'pending').length,
+    attestations: rows.map(r => ({
+      id: r.id, requestedTier: r.requestedTier, method: r.method,
+      status: r.status, createdAt: r.createdAt,
+      createdAtIso: new Date(Number(r.createdAt)).toISOString(),
+    })),
+    note: 'status=approved не выставляется: аппаратной аттестации нет',
+  });
+});
+
 app.get('/nodes', (_req, res) => {
   res.json(all('SELECT address, stake, reputation, routingWeight, isTeeAttested, tier FROM nodes')
     .map(r => ({ address: r.address, stake: r.stake, reputation: r.reputation,
@@ -4777,6 +4929,33 @@ app.delete('/adapter/:adapterId', (req, res) => {
 /* --- Work: единственная точка начисления ---
  * Тело: { workerAddress, tokens, tier, adapterId?, response?, clientAddress?, actionId? }
  * Возвращает детализацию и накопительный чек с подписью Ed25519. */
+/* Ключ, которому принадлежит адрес воркера.
+ *
+ * Два источника, и оба нужны. `ws_worker_auth` — воркер, прошедший
+ * handshake. `tar_id` — устройство/PWA, зарегистрировавшее TarNet ID через
+ * `POST /id/register`. Если смотреть только в первую таблицу, подпись `/work`
+ * закрыла бы работу вместе с дырой: PWA nano-тира зовёт `/work` своим адресом,
+ * и её ключа в `ws_worker_auth` нет.
+ *
+ * `null` значит «ключ не известен» — тогда подписывать нечем, и требование
+ * подписи сделало бы адрес неработоспособным. Такой адрес проходит дальше:
+ * начисление всё равно возможно только на существующий адрес, а чужие
+ * начисления проверяются ниже по `client_signature`. */
+function workAuthKey(workerAddress) {
+  if (!workerAddress) return null;
+  const w = get(
+    'SELECT pubkeyHex FROM ws_worker_auth WHERE LOWER(workerAddress) = LOWER(?) LIMIT 1',
+    [String(workerAddress)],
+  );
+  if (w && w.pubkeyHex) return { pubkeyHex: String(w.pubkeyHex), source: 'ws_worker_auth' };
+  const t = get(
+    'SELECT pubkey FROM tar_id WHERE LOWER(address) = LOWER(?) LIMIT 1',
+    [String(workerAddress)],
+  );
+  if (t && t.pubkey) return { pubkeyHex: String(t.pubkey), source: 'tar_id' };
+  return null;
+}
+
 function handleWork(req, res) {
   const body = req.body || {};
   if (typeof body.workerAddress !== 'string' || !body.workerAddress.length) {
@@ -4792,6 +4971,77 @@ function handleWork(req, res) {
   if (body.actionId !== undefined && body.actionId !== null
       && (typeof body.actionId !== 'string' || !body.actionId.length)) {
     return res.status(400).json({ error: 'actionId must be a non-empty string when provided', actionId: body.actionId });
+  }
+
+  /* Подпись воркера — обязательная.
+   *
+   * До этого `/work` принимал работу от имени ЛЮБОГО адреса без всякой
+   * проверки: адрес виден в публичном `/nodes`, и заявка «я сделал 8192 токена
+   * base-тира» начисляла бы награду чужому или подставному адресу. `/worker/poll`
+   * закрыт подписью в 2.17.14, а `/work` остался открыт — цель та же, обход
+   * дешевле.
+   *
+   * Что именно подписывается: `TARNET_WORK_SUBMIT:<address>:<tokens>:<tier>:<actionId>:<ts>`.
+   * В payload входят tokens, tier и actionId, иначе подпись от работы на 1 токен
+   * подошла бы к заявке на 8192 — подписывать надо то, за что платят.
+   * `ts` ограничивает переигровку во времени, но не делает запрос
+   * идемпотентным: повтор с тем же actionId всё равно вернёт тот же чек.
+   *
+   * Разные коды отказа несут разный смысл. `403 SIGNATURE_REQUIRED` — ключ
+   * известен, но подпись не прислана (чинится на клиенте). `403 HANDSHAKE_REQUIRED`
+   * — ключа нет вовсе (чинится привязкой ключа). `401 BAD_SIGNATURE` — подпись
+   * есть, но не сходится. `401 TIMESTAMP_OUT_OF_WINDOW` — часы клиента уехали. */
+  const workKey = workAuthKey(body.workerAddress);
+  if (!workKey) {
+    return res.status(403).json({
+      error: 'HANDSHAKE_REQUIRED',
+      note: 'К адресу не привязан ключ: сдавать работу без подписи нельзя',
+      handshake: 'POST /worker/handshake { pubkey, timestamp, signature: sign("TARNET_WORKER_POLL:<address>:<timestampMs>"), claimedAddress? }',
+      alternative: 'или POST /id/register { pubkey } для адреса устройства',
+    });
+  }
+
+  const rawWorkSig = body.worker_signature ?? body.workerSignature;
+  const rawWorkTs = Number(body.worker_ts ?? body.workerTs);
+  const workPayloadTemplate = 'TARNET_WORK_SUBMIT:<workerAddress>:<tokens>:<tier>:<actionId>:<timestampMs>';
+  if (typeof rawWorkSig !== 'string' || !rawWorkSig || !Number.isFinite(rawWorkTs)) {
+    return res.status(403).json({
+      error: 'SIGNATURE_REQUIRED',
+      note: 'К адресу привязан ключ: заявка без worker_signature и worker_ts не принимается',
+      key_source: workKey.source,
+      auth_payload_template: workPayloadTemplate,
+      skew_ms: POLL_AUTH_SKEW_MS,
+    });
+  }
+  if (Math.abs(Date.now() - rawWorkTs) > POLL_AUTH_SKEW_MS) {
+    return res.status(401).json({
+      error: 'TIMESTAMP_OUT_OF_WINDOW',
+      got: rawWorkTs, server: Date.now(), skew_ms: POLL_AUTH_SKEW_MS,
+      auth_payload_template: workPayloadTemplate,
+    });
+  }
+
+  const workPayload = [
+    'TARNET_WORK_SUBMIT',
+    String(body.workerAddress).toLowerCase(),
+    String(tokens),
+    String(body.tier ?? 'base'),
+    String(body.actionId ?? ''),
+    String(rawWorkTs),
+  ].join(':');
+  let workSigOk = false;
+  try {
+    workSigOk = tarIdentity.verifyWithPubkey(workKey.pubkeyHex, workPayload, rawWorkSig);
+  } catch (_e) {
+    workSigOk = false;
+  }
+  if (!workSigOk) {
+    return res.status(401).json({
+      error: 'BAD_SIGNATURE',
+      note: 'Подпись не соответствует ключу, привязанному к этому адресу',
+      key_source: workKey.source,
+      auth_payload_template: workPayloadTemplate,
+    });
   }
   /* Подпись клиента, если передана, обязана сойтись. Молча принимать
    * непроверенную подпись хуже, чем не принимать её вовсе. */

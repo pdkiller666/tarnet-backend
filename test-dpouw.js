@@ -182,6 +182,39 @@ async function apiAt(base, path, method = 'GET', body, extraHeaders) {
       path = await signedPollPath(addr, rest ? `&${rest}` : '', base);
     }
   }
+  /* Автоподпись сдачи работы.
+   *
+   * `/work` требует Ed25519-подпись от адреса воркера. Как и с poll, ритуал
+   * централизован здесь: 41 вызов в тестах иначе пришлось бы править вручную,
+   * и один забытый стал бы ложным «зелено».
+   *
+   * Маркер `nosig: true` в теле — явный отказ от подписи для проверки
+   * самого отказа; он вырезается из тела и на сервер не едет.
+   */
+  if (method === 'POST' && path === '/work' && body && typeof body.workerAddress === 'string') {
+    if (body.nosig === true) {
+      const { nosig: _drop, ...rest } = body;
+      body = rest;
+    } else if (!body.worker_signature) {
+      /* Сначала привязка — как в signedPollPath. Подписать без неё нечего:
+       * сервер отвечает 403 HANDSHAKE_REQUIRED ещё до разбора подписи (ключа
+       * нет, сверять не с чем). Отказ привязки не прерывает тест: он и должен
+       * получить 403, если адрес занят другим ключом. */
+      await bindWorker(body.workerAddress, base);
+      const kp = workerKeyFor(body.workerAddress);
+      const ts = Date.now();
+      const payload = [
+        'TARNET_WORK_SUBMIT',
+        String(body.workerAddress).toLowerCase(),
+        String(Number(body.tokens)),
+        String(body.tier ?? 'base'),
+        String(body.actionId ?? ''),
+        String(ts),
+      ].join(':');
+      const sig = crypto.sign(null, Buffer.from(payload, 'utf8'), kp.privateKey).toString('base64');
+      body = { ...body, worker_ts: ts, worker_signature: sig };
+    }
+  }
   const res = await fetch(base + path, {
     method,
     headers: {
@@ -5899,7 +5932,10 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     });
     try {
       const PAYER = '0x' + (RUN + 'b6').padEnd(40, '0').slice(0, 40);
-      const WORKER = '0x' + (RUN + 'w6').padEnd(40, '0').slice(0, 40);
+      /* Суффикс адреса обязан быть hex: `w6` давал `0x…w6…`, то есть невалидный
+       * адрес. Пока `/work` не требовал ключа, это сходило с рук; после
+       * обязательной привязки ключа адрес стал нерабочим, и тест падал на 403. */
+      const WORKER = '0x' + (RUN + 'c6').padEnd(40, '0').slice(0, 40);
 
       const dbWrite36 = (fn) => {
         const sdb = new DatabaseSync(path.join(s36.dir, 'test.db'));
