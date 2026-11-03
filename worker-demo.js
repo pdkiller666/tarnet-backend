@@ -860,6 +860,22 @@ async function presenceQuery({ heartbeatFlag = false } = {}) {
    * сервер различает «не прислал» (NULL) и «прислал пусто» по наличию
    * самого параметра. */
   parts.push(`cloudBackend=${encodeURIComponent(rep.cloudBackend || '')}`);
+
+  /* Подпись опроса. Сервер требует её, если к адресу уже привязан ключ, а он
+   * привязан после первого же WS-рукопожатия. Без этих двух параметров
+   * воркер получил бы 401 SIGNATURE_REQUIRED — и это не гипотетика: именно
+   * этим ключом он подписывает handshake.
+   *
+   * Подписывается адрес и время, а не сама задача: подпись подтверждает, что
+   * спрашивает владелец ключа. Ключ берём тот же, что для WS, — второй ключ
+   * на тот же адрес сервер отверг бы (ADDRESS_KEY_MISMATCH). */
+  const keys = wsState.keys || (wsState.keys = ed25519FromSeed(loadOrCreateSeed()));
+  const ts = Date.now();
+  const payload = `TARNET_WORKER_POLL:${WORKER}:${ts}`;
+  const sig = nodeCrypto.sign(null, Buffer.from(payload, 'utf8'), keys.priv).toString('base64');
+  parts.push(`ts=${ts}`);
+  parts.push(`sig=${encodeURIComponent(sig)}`);
+
   if (heartbeatFlag) parts.push('heartbeat=1');
   return parts.join('&');
 }

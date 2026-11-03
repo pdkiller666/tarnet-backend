@@ -3490,24 +3490,61 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
 
   /* ---------- сидинг валидаторов ---------- */
   /* 6 узлов expert: пять для комитета и один запасной, чтобы проверить, что
-   * выбирается РОВНО пять, а не все подходящие. Балансы пишутся напрямую:
-   * эндпоинта пополнения в этой сборке нет, а блокировка стейка требует
-   * реальных денег на счету (balanceTar − reservedTar >= 10). */
+   * выбирается РОВНО пять, а не все подходящие. Балансы и тир пишутся
+   * напрямую: эндпоинта пополнения в этой сборке нет, блокировка стейка
+   * требует реальных денег на счету (balanceTar − reservedTar >= 10), а
+   * с v2.17.13 `tier` больше НЕ принимается из тела `/node` — иначе клиент
+   * сам себе выставлял expert и попадал в пул валидаторов без проверки
+   * железа. Это и есть смысл того, что здесь приходится лезть в БД. */
   const w7Validators = [];
   for (let i = 0; i < 6; i++) {
     const addr = runAddress('w7v' + i);
     await api('/node', 'POST', {
-      address: addr, stake: 50, reputation: 0.95, tier: 'expert', isTeeAttested: true,
+      address: addr, stake: 50, reputation: 0.95, isTeeAttested: true,
     });
     w7Validators.push(addr);
   }
+  /* Проверка, что вес узла НЕ взялся из тела: здесь прислан stake: 50,
+   * а в БД должен лежать bootstrap, потому что узел новый. */
   if (TEST_MODE && tmpDir) {
     const { DatabaseSync } = require('node:sqlite');
     const fdb = new DatabaseSync(path.join(tmpDir, 'test.db'));
     fdb.exec('PRAGMA busy_timeout = 3000;');
+    const rowW7 = fdb.prepare('SELECT stake, reputation, routingWeight FROM nodes WHERE address = ?')
+      .get(w7Validators[0]);
+    const cfgW7 = require('./config').CONFIG;
+    ok('24.13 stake из тела /node игнорируется (взят BOOTSTRAP_STAKE)',
+      Number(rowW7?.stake) === Number(cfgW7.BOOTSTRAP_STAKE),
+      { прислан: 50, в_БД: rowW7?.stake, ожидалось: cfgW7.BOOTSTRAP_STAKE });
+    ok('24.13 reputation из тела /node игнорируется',
+      Number(rowW7?.reputation) === Number(cfgW7.BOOTSTRAP_REPUTATION),
+      { прислан: 0.95, в_БД: rowW7?.reputation });
+    ok('24.13 новый узел имеет ненулевой routingWeight (сеть жива)',
+      Number(rowW7?.routingWeight) > 0, rowW7?.routingWeight);
+
     const setBal = fdb.prepare(`UPDATE balances SET balanceTar = 50, updatedAt = ?
                                  WHERE address = ?`);
     for (const a of w7Validators) setBal.run(new Date().toISOString(), a);
+    /* Тир, стейк и репутация — только прямой записью.
+     *
+     * Через API их больше не назначить, и это НЕ побочный эффект, а суть
+     * фикса: с v2.17.13 `stake`/`reputation`/`tier` из тела POST /node
+     * игнорируются. Иначе регистрация сама давала бы место в комитете
+     * валидаторов (порог там MIN_VALIDATOR_REPUTATION = 0.8 — низкий).
+     *
+     * Почему не поднять BOOTSTRAP_REPUTATION до 0.9 ради зелёного теста:
+     * это вернуло бы дыру в мягкой форме — новый узел сразу стал бы
+     * валидатором без какой-либо проверки железа или накопленной истории.
+     * Bootstrap даёт МАРШРУТИЗАЦИЮ (routingWeight > 0), но не ГОЛОС.
+     * Репутация валидатора должна быть заслужена, поэтому в тесте она
+     * выставляется как привилегированная фикстура. */
+    const setTier = fdb.prepare(`UPDATE nodes SET tier = 'expert' WHERE address = ?`);
+    for (const a of w7Validators) setTier.run(a);
+    const setValidator = fdb.prepare(
+      `UPDATE nodes SET stake = ?, reputation = ?, routingWeight = ? WHERE address = ?`);
+    const w7Stake = 50, w7Rep = 0.95;
+    const w7Rw = Math.sqrt(w7Stake) * w7Rep;
+    for (const a of w7Validators) setValidator.run(w7Stake, w7Rep, w7Rw, a);
     fdb.close();
   }
 
@@ -7580,6 +7617,132 @@ const runAddress = (tag) => '0x' + (tag + RUN).padEnd(40, '0');
       } finally {
         s45.stop();
       }
+    }
+  }
+
+  // ---------- 46. Задача привязана к воркеру, опрос подписан ----------
+  /* Регрессия на P0, найденную 2026-11-03.
+   *
+   * До этой сборки /worker/poll отдавал любую pending-задачу ПЕРВОМУ
+   * спросившему — вместе с sessionKey в открытом виде. Проверено на копии
+   * боевой БД: чужой адрес забрал задачу и расшифровал промпт целиком, а
+   * честный воркер получил пустую очередь. Шифрование AES-256-GCM не
+   * спасало: ключ ехал в том же ответе, что и шифротекст.
+   *
+   * Проверки ниже ловят ВОЗВРАТ этой дыры: сначала привязка по адресу
+   * (intendedWorker), потом подпись (иначе подмены адреса достаточно). */
+  section('46. Чужой адрес не забирает задачу (утечка промпта через poll)');
+  {
+    const s46 = await spawnServer();
+    try {
+      const idn46 = require('./identity');
+      const { DatabaseSync } = require('node:sqlite');
+
+      /* Адреса из хеша, а не из строки RUN: ADDRESS_RE требует ровно 40
+       * hex-символов, и суффикс прогона в него не всегда попадает. */
+      const w46 = '0x' + crypto.createHash('sha256').update('p0-honest-' + RUN).digest('hex').slice(0, 40);
+      const wBad = '0x' + crypto.createHash('sha256').update('p0-attacker-' + RUN).digest('hex').slice(0, 40);
+      /* masterEntropy обязан быть hex-строкой чётной длины, поэтому
+       * entropy выводится хешем, а не берётся из строки с префиксом. */
+      const ent46 = crypto.createHash('sha256').update('p0-seed-' + RUN).digest('hex');
+      const ent46b = crypto.createHash('sha256').update('p0-other-' + RUN).digest('hex');
+      const keys46 = idn46.deriveTarNetKeys(ent46);
+      const pubHex46 = Buffer.from(idn46.normalizePubkey(keys46.wallet.pub)).toString('hex').toLowerCase();
+
+      await apiAt(s46.base, '/node', 'POST', { address: w46, stake: 90000, reputation: 0.99 });
+      await apiAt(s46.base, '/node', 'POST', { address: wBad, stake: 90000, reputation: 0.99 });
+
+      /* До привязки ключа опрос без подписи проходит: воркер, который ещё
+       * ни разу не подключался по WS, не должен быть отрезан от сети. */
+      const before46 = await apiAt(s46.base, `/worker/poll?workerAddress=${w46}&model=m`);
+      ok('46.1 до привязки ключа опрос без подписи разрешён',
+        before46.status === 200, before46.status);
+
+      /* Привязка ключа — как её делает WS-рукопожатие (TOFU). */
+      const db46 = new DatabaseSync(path.join(s46.dir, 'test.db'));
+      db46.prepare(`INSERT INTO ws_worker_auth (workerAddress, pubkeyHex, firstSeenAt, lastSeenAt)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(workerAddress) DO UPDATE SET pubkeyHex = excluded.pubkeyHex`)
+        .run(w46.toLowerCase(), pubHex46, Date.now(), Date.now());
+      db46.close();
+
+      /* 1. Без подписи — отказ. */
+      const noSig46 = await apiAt(s46.base, `/worker/poll?workerAddress=${w46}&model=m`);
+      ok('46.2 после привязки ключа опрос без подписи → 401',
+        noSig46.status === 401 && noSig46.body?.error === 'SIGNATURE_REQUIRED',
+        { status: noSig46.status, error: noSig46.body?.error });
+
+      /* 2. Подпись чужим ключом — отказ. */
+      const tsBad = Date.now();
+      const otherKeys = idn46.deriveTarNetKeys(ent46b);
+      const sigBad = idn46.signWithSeed(otherKeys.wallet.priv,
+        `TARNET_WORKER_POLL:${w46}:${tsBad}`);
+      const wrongKey46 = await apiAt(s46.base,
+        `/worker/poll?workerAddress=${w46}&model=m&ts=${tsBad}&sig=${encodeURIComponent(sigBad)}`);
+      ok('46.3 подпись чужим ключом → 401',
+        wrongKey46.status === 401 && wrongKey46.body?.error === 'BAD_SIGNATURE',
+        { status: wrongKey46.status, error: wrongKey46.body?.error });
+
+      /* 3. Своя подпись — проходит. */
+      const tsOk = Date.now();
+      const sigOk = idn46.signWithSeed(keys46.wallet.priv,
+        `TARNET_WORKER_POLL:${w46}:${tsOk}`);
+      const own46 = await apiAt(s46.base,
+        `/worker/poll?workerAddress=${w46}&model=m&ts=${tsOk}&sig=${encodeURIComponent(sigOk)}`);
+      ok('46.4 своя подпись → 200', own46.status === 200, own46.status);
+
+      /* 4. ГЛАВНОЕ: задача не уходит чужому адресу.
+       *
+       * Это и есть та самая дыра. Клиент шлёт промпт, честный воркер
+       * объявлен живым — а забирает задачу совсем другой адрес. До фикса
+       * здесь приходил task с расшифровываемым промптом. */
+      const tsLive = Date.now();
+      const sigLive = idn46.signWithSeed(keys46.wallet.priv,
+        `TARNET_WORKER_POLL:${w46}:${tsLive}`);
+      await apiAt(s46.base,
+        `/worker/poll?workerAddress=${w46}&model=m&ts=${tsLive}&sig=${encodeURIComponent(sigLive)}`);
+
+      const inflight46 = apiAt(s46.base, '/inference', 'POST', {
+        prompt: 'P0-СЕКРЕТ: этот текст не должен уйти чужому',
+        tier: 'base', workerAddress: w46, model: 'm',
+      });
+      inflight46.catch(() => {});
+
+      let stolen46 = null;
+      for (let i = 0; i < 40 && !stolen46; i++) {
+        const p = await apiAt(s46.base, `/worker/poll?workerAddress=${wBad}&model=m`);
+        if (p.body?.task) stolen46 = p.body.task;
+        else await new Promise((r) => setTimeout(r, 100));
+      }
+      ok('46.5 чужой адрес НЕ получил задачу', stolen46 === null, stolen46?.taskId);
+
+      /* 5. Честный воркер ту же задачу получает — иначе «фикс» просто
+       * отключил бы выдачу работы вообще. */
+      let ownTask46 = null;
+      for (let i = 0; i < 40 && !ownTask46; i++) {
+        const ts = Date.now();
+        const sig = idn46.signWithSeed(keys46.wallet.priv, `TARNET_WORKER_POLL:${w46}:${ts}`);
+        const p = await apiAt(s46.base,
+          `/worker/poll?workerAddress=${w46}&model=m&ts=${ts}&sig=${encodeURIComponent(sig)}`);
+        if (p.body?.task) ownTask46 = p.body.task;
+        else await new Promise((r) => setTimeout(r, 100));
+      }
+      ok('46.6 честный воркер получил свою задачу', Boolean(ownTask46), ownTask46?.taskId);
+
+      if (ownTask46) {
+        /* Ключ расшифровки приходит воркеру — это нормально и нужно: без него
+         * он не прочитает промпт. Проверяем, что он доходит до ВЛАДЕЛЬЦА
+         * задачи, а не что его нет вовсе. */
+        ok('46.7 задача несёт ключ расшифровки получателю',
+          typeof ownTask46.sessionKey === 'string' && ownTask46.sessionKey.length > 0,
+          ownTask46.sessionKey ? 'present' : 'missing');
+        await apiAt(s46.base, '/worker/submit', 'POST', {
+          taskId: ownTask46.taskId, workerAddress: w46, response: 'ответ',
+          model: 'm', usage: { completion_tokens: 3 },
+        });
+      }
+    } finally {
+      s46.stop();
     }
   }
 

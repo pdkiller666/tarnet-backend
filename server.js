@@ -375,7 +375,8 @@ CREATE TABLE IF NOT EXISTS worker_tasks (
   claimedAt INTEGER,
   finishedAt INTEGER,
   createdAt INTEGER NOT NULL,
-  expiresAt INTEGER NOT NULL
+  expiresAt INTEGER NOT NULL,
+  intendedWorker TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_worker_tasks_status ON worker_tasks (status, createdAt);
 /* Присутствие воркера — отдельно от задач.
@@ -421,6 +422,17 @@ ensureColumn('ledger_txs', 'actionId', 'actionId TEXT');
  * /inference не может отличить model_unavailable от честного live-ответа и
  * выдаёт шаблон воркера за работу модели. */
 ensureColumn('worker_tasks', 'source', 'source TEXT');
+/* Адрес воркера, которому задача НАЗНАЧЕНА.
+ *
+ * Без этой колонки задача не привязана ни к кому: /worker/poll отдавал любую
+ * pending-строку первому спросившему — вместе с ключом расшифровки. Проверено
+ * на копии БД: чужой адрес забрал задачу и прочитал промпт целиком, а честный
+ * воркер после этого получил пустую очередь.
+ *
+ * NULL — задача осиротела (воркер потерян, requeue) или создана до миграции.
+ * Такую может взять любой: иначе она просто истечёт, а клиент получит таймаут
+ * при живых воркерах. */
+ensureColumn('worker_tasks', 'intendedWorker', 'intendedWorker TEXT');
 /* Список моделей, реально установленных на ПК воркера.
  *
  * Хранится JSON-строкой, а не отдельной таблицей: это снимок последнего
@@ -4244,15 +4256,17 @@ app.post('/node', (req, res) => {
   /* tier — КЛАСС ЖЕЛЕЗА узла. Допускаем four: nano/base/expert/heavy.
    * heavy принимается как класс машины, хотя κ для heavy-РАБОТЫ в коде нет
    * (TIER_WEIGHTS: nano/base/expert). Разные вещи: «на чём считают» и
-   * «сколько CWU даёт токен». Для выбора комитета heavy равен expert. */
+   * «сколько CWU даёт токен». Для выбора комитета heavy равен expert.
+   *
+   * Значение ПРОВЕРЯЕТСЯ, но НЕ ЗАПИСЫВАЕТСЯ: иначе клиент сам себе выставлял
+   * `expert` и попадал в пул валидаторов без всякой проверки железа. Сейчас
+   * expert присваивается только backfill'ом по work_receipts при старте. */
   const NODE_TIERS = ['nano', 'base', 'expert', 'heavy'];
-  let nodeTier = null;
   if (tier !== undefined && tier !== null && String(tier).trim() !== '') {
     const t = String(tier).trim().toLowerCase();
     if (!NODE_TIERS.includes(t)) {
       return res.status(400).json({ error: `tier must be one of ${NODE_TIERS.join('/')}`, got: t });
     }
-    nodeTier = t;
   }
   /* publicUrl — адрес, по которому узел достижим СНАРУЖИ (ws://1.2.3.4:4001).
    *
@@ -4314,17 +4328,49 @@ app.post('/node', (req, res) => {
       return res.status(400).json({ error: 'rsaPublicKeyPem is not a valid PEM public key' });
     }
   }
-  const rw = routingWeight(stake, reputation);
+  /* --- Вес узла НЕ берётся из тела запроса -----------------------------
+   * До этой сборки `stake` и `reputation` брались из `req.body` как есть:
+   * клиент писал `stake: 999999` и получал `routingWeight = √999999 × rep` —
+   * произвольный приоритет маршрутизации, а вместе с ним и место в комитете
+   * валидаторов (порог там всего `MIN_STAKE_FOR_COMMITTEE = 1e-9`).
+   *
+   * Теперь:
+   *   - новый узел получает CONFIG.BOOTSTRAP_STAKE / BOOTSTRAP_REPUTATION;
+   *   - существующий узел сохраняет своё значение;
+   *   - значение из тела ИГНОРИРУЕТСЯ всегда, поэтому «назначить себе вес»
+   *     больше нечем.
+   *
+   * Почему порог, а не просто «сохранить как было». На живой БД 2026-11-03
+   * все 3 узла имели `stake = 0, reputation = 0`, то есть `routingWeight = 0`.
+   * Буквальное «сохранять текущий stake» законсервировало бы мёртвую сеть:
+   * `pickWorker` фильтрует `routingWeight > 0` и не вернул бы никого никогда.
+   * Поэтому ноль считается «ещё не назначено» и заменяется на bootstrap. */
+  const existing = get(
+    'SELECT stake, reputation, rsaPublicKeyPem, tier, publicUrl FROM nodes WHERE address = ?',
+    [address]);
+  const finalStake = existing && Number(existing.stake) > 0
+    ? Number(existing.stake)
+    : CONFIG.BOOTSTRAP_STAKE;
+  const finalReputation = existing && Number(existing.reputation) > 0
+    ? Number(existing.reputation)
+    : CONFIG.BOOTSTRAP_REPUTATION;
+  const rw = routingWeight(finalStake, finalReputation);
   /* INSERT OR REPLACE затирает строку целиком. Поле, не переданное в этом
    * запросе, не должно терять ранее сохранённое значение: клиент может
    * перерегистрировать узел, не повторяя ключ или тир. Для tier это особенно
    * важно: backfill выставил expert по факту работы, а клиент, не знающий о
    * тирах, сбросил бы его в base первым же запросом и вывел себя из комитета. */
-  const existing = get('SELECT rsaPublicKeyPem, tier, publicUrl FROM nodes WHERE address = ?', [address]);
   const pubKey = rsaPublicKeyPem !== undefined
     ? (rsaPublicKeyPem || null)
     : (existing ? existing.rsaPublicKeyPem : null);
-  const finalTier = nodeTier !== null ? nodeTier : (existing?.tier || 'base');
+  /* tier — ТОЛЬКО из прежней записи, никогда из тела.
+   * Присланное значение проверяется на допустимость (чтобы опечатка не
+   * проходила молча), но не записывается: иначе клиент сам себе выставлял
+   * `expert` и попадал в пул валидаторов без всякой проверки железа.
+   * Как следствие, единственный путь получить expert сейчас — backfill по
+   * work_receipts при старте сервера. Это ограничение, а не решение:
+   * нужен эндпоинт аттестации (отдельная задача). */
+  const finalTier = existing?.tier || 'base';
   /* publicUrl — та же логика, что у ключа и тира: не передан → сохраняется
    * прежний. Сброс в NULL при перерегистрации стёр бы единственный адрес
    * узла, а клиент, не знающий о поле, сделал бы это первым же запросом. */
@@ -4332,11 +4378,11 @@ app.post('/node', (req, res) => {
     ? nodePublicUrl
     : (existing ? (existing.publicUrl || null) : null);
   run('INSERT OR REPLACE INTO nodes (address, stake, reputation, isTeeAttested, routingWeight, rsaPublicKeyPem, tier, publicUrl) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    [address, Number(stake) || 0, Number(reputation) || 0, isTeeAttested ? 1 : 0, rw, pubKey, finalTier, finalPublicUrl]);
+    [address, finalStake, finalReputation, isTeeAttested ? 1 : 0, rw, pubKey, finalTier, finalPublicUrl]);
   run(`INSERT INTO balances (address, balanceTar, stakedTar, updatedAt) VALUES (?, 0, ?, ?)
        ON CONFLICT(address) DO UPDATE SET stakedTar = excluded.stakedTar, updatedAt = excluded.updatedAt`,
-    [address, Number(stake) || 0, new Date().toISOString()]);
-  res.json({ address, stake: Number(stake) || 0, reputation: Number(reputation) || 0,
+    [address, finalStake, new Date().toISOString()]);
+  res.json({ address, stake: finalStake, reputation: finalReputation,
     isTeeAttested: !!isTeeAttested, routingWeight: rw, tier: finalTier,
     validatorEligible: ['expert', 'heavy'].includes(finalTier),
     onionCapable: Boolean(pubKey),
@@ -5769,9 +5815,11 @@ const wsInbound = createWsInbound({
       console.log(`ws: задача ${taskId} уже возвращалась ${tries} раз — оставляю истекать`);
       return;
     }
+    /* intendedWorker сбрасывается вместе с claimedAt: воркера больше нет, и
+     * держать задачу за ним — значит дать ей истечь при живых узлах. */
     const back = run(
       `UPDATE worker_tasks SET status = 'pending', claimedAt = NULL, workerAddress = NULL,
-         requeues = COALESCE(requeues, 0) + 1
+         intendedWorker = NULL, requeues = COALESCE(requeues, 0) + 1
        WHERE taskId = ? AND status = 'claimed'`,
       [taskId],
     );
@@ -5781,15 +5829,16 @@ const wsInbound = createWsInbound({
   },
 });
 
-function enqueueWorkerTask({ prompt, model, tier }) {
+function enqueueWorkerTask({ prompt, model, tier, workerAddress = null }) {
   const taskId = 'wt_' + crypto.randomBytes(12).toString('hex');
   const now = Date.now();
   const sessionKey = crypto.randomBytes(32);
   workerTaskKeys.set(taskId, sessionKey);
   run(
-    `INSERT INTO worker_tasks (taskId, encryptedPayload, model, tier, status, createdAt, expiresAt)
-     VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
-    [taskId, encryptWithKey(prompt, sessionKey), model || null, tier || null, now, now + WORKER_TASK_TTL_MS],
+    `INSERT INTO worker_tasks (taskId, encryptedPayload, model, tier, status, createdAt, expiresAt, intendedWorker)
+     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
+    [taskId, encryptWithKey(prompt, sessionKey), model || null, tier || null, now, now + WORKER_TASK_TTL_MS,
+      workerAddress ? String(workerAddress).toLowerCase() : null],
   );
 
   /* --- Гибридная отправка: WS, если есть кому, иначе poll ---
@@ -5805,9 +5854,9 @@ function enqueueWorkerTask({ prompt, model, tier }) {
   const wsAddr = wsInbound.pickLeastBusy(tier);
   if (wsAddr) {
     const claimed = run(
-      `UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?
+      `UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?, intendedWorker = ?
        WHERE taskId = ? AND status = 'pending'`,
-      [now, wsAddr, taskId],
+      [now, wsAddr, String(wsAddr).toLowerCase(), taskId],
     );
     if (claimed && Number(claimed.changes) === 1) {
       const sent = wsInbound.sendTask(wsAddr, {
@@ -5825,7 +5874,10 @@ function enqueueWorkerTask({ prompt, model, tier }) {
         /* Сокет закрылся между выбором и отправкой. Возвращаем строку в
          * очередь — иначе задача провисит 'claimed' до TTL и упадёт по
          * таймауту, хотя рабочий воркер есть. */
-        run(`UPDATE worker_tasks SET status = 'pending', claimedAt = NULL, workerAddress = NULL
+        /* Задачу никто не получил — привязку снимаем, иначе строка останется
+         * нацеленной на сокет, которого уже нет, и poll её не отдаст. */
+        run(`UPDATE worker_tasks SET status = 'pending', claimedAt = NULL, workerAddress = NULL,
+               intendedWorker = NULL
              WHERE taskId = ? AND status = 'claimed'`, [taskId]);
       }
     }
@@ -5900,10 +5952,79 @@ function submitRateLimited(workerAddress) {
 }
 
 /* Воркер забирает одну задачу. Пусто = задач нет, это не ошибка. */
+
+/* --- Подпись опроса ---
+ *
+ * Одной привязки задачи к адресу НЕДОСТАТОЧНО: адрес узла виден в /nodes, и
+ * злоумышленник просто называет себя им. Проверено на копии БД уже после
+ * введения intendedWorker — подмена адреса забрала задачу и расшифровала
+ * промпт. Адрес нельзя считать личностью, пока он ничем не подтверждён.
+ *
+ * Подтверждение — тот же Ed25519-ключ, что воркер уже предъявляет в WS-
+ * рукопожатии (ws_worker_auth, TOFU). Если ключ к адресу привязан, опрос без
+ * подписи отвергается: иначе «закрытие» сводится к переименованию атаки.
+ *
+ * Если ключа нет — опрос пропускается. Это осознанный компромисс, а не
+ * недосмотр: привязывать ключ из poll значило бы дать злоумышленнику
+ * возможность занять чужой адрес ПЕРВЫМ и навсегда выпереть владельца
+ * (ADDRESS_KEY_MISMATCH — отказ, а не перезапись). Остаточная дыра честно
+ * названа в отчёте: воркер, который никогда не подключается по WS, остаётся
+ * без подтверждения враждебного к нему опроса. */
+const POLL_AUTH_PREFIX = 'TARNET_WORKER_POLL';
+const POLL_AUTH_SKEW_MS = Number(process.env.POLL_AUTH_SKEW_MS || 300000);
+
+function pollBoundKey(workerAddress) {
+  if (!workerAddress) return null;
+  return get(
+    'SELECT pubkeyHex FROM ws_worker_auth WHERE LOWER(workerAddress) = LOWER(?) LIMIT 1',
+    [String(workerAddress)],
+  );
+}
+
 app.get('/worker/poll', (req, res) => {
   const workerAddress = typeof req.query.workerAddress === 'string' ? req.query.workerAddress : null;
   const model = typeof req.query.model === 'string' ? req.query.model : null;
   const now = Date.now();
+
+  /* Проверка подписи до выдачи задачи и до записи присутствия: неподписанный
+   * опрос не должен ни получать работу, ни делать воркера «живым» — иначе
+   * чужой человек бесплатно подтверждает существование узла и получает
+   * право на его очередь. */
+  const boundKey = pollBoundKey(workerAddress);
+  if (boundKey) {
+    const ts = Number(req.query.ts);
+    const sig = typeof req.query.sig === 'string' ? req.query.sig : '';
+    if (!Number.isFinite(ts) || !sig) {
+      return res.status(401).json({
+        error: 'SIGNATURE_REQUIRED',
+        note: 'К этому адресу привязан ключ: опрос без ts и sig не принимается',
+        auth_payload_template: `${POLL_AUTH_PREFIX}:<workerAddress>:<timestampMs>`,
+        skew_ms: POLL_AUTH_SKEW_MS,
+      });
+    }
+    /* Окно шире, чем у WS: опрос идёт раз в секунду, но часы домашнего ПК
+     * плывут, а повторы здесь не опаснее, чем в рукопожатии. */
+    if (Math.abs(now - ts) > POLL_AUTH_SKEW_MS) {
+      return res.status(401).json({
+        error: 'TIMESTAMP_OUT_OF_WINDOW',
+        got: ts, server: now, skew_ms: POLL_AUTH_SKEW_MS,
+      });
+    }
+    const payload = `${POLL_AUTH_PREFIX}:${workerAddress}:${ts}`;
+    let ok = false;
+    try {
+      ok = tarIdentity.verifyWithPubkey(boundKey.pubkeyHex, payload, sig);
+    } catch (_e) {
+      ok = false;
+    }
+    if (!ok) {
+      return res.status(401).json({
+        error: 'BAD_SIGNATURE',
+        note: 'Подпись не соответствует ключу, привязанному к этому адресу',
+        auth_payload_template: `${POLL_AUTH_PREFIX}:<workerAddress>:<timestampMs>`,
+      });
+    }
+  }
 
   /* Список моделей из пульса. Разбираем аккуратно: строка пришла из query,
    * и битый JSON не должен ронять опрос — воркер тогда просто не отдал бы
@@ -5979,11 +6100,22 @@ app.get('/worker/poll', (req, res) => {
     });
   }
 
+  /* Задача отдаётся только тому, кому назначена.
+   *
+   * Раньше здесь стоял `LIMIT 1` без единого условия на адрес: задачу брал
+   * первый спросивший, и вместе с ней получал sessionKey. Проверено на копии
+   * БД — чужой адрес забрал задачу и расшифровал промпт, честный воркер
+   * остался с пустой очередью. Привязка по адресу закрывает именно это.
+   *
+   * NULL в intendedWorker — осиротевшая задача (воркер потерян) или строка до
+   * миграции: её может взять любой, иначе она истечёт при живых узлах. */
   const task = get(
     `SELECT taskId, encryptedPayload, model, tier, createdAt, expiresAt
-     FROM worker_tasks WHERE status = 'pending' AND expiresAt > ?
+     FROM worker_tasks
+     WHERE status = 'pending' AND expiresAt > ?
+       AND (intendedWorker IS NULL OR intendedWorker = LOWER(?))
      ORDER BY createdAt ASC LIMIT 1`,
-    [now],
+    [now, String(workerAddress || '')],
   );
   if (!task) {
     return res.json({
@@ -7015,7 +7147,12 @@ async function runInference(req, res) {
        * modelId`, то есть свободная строка перебивала выбор из каталога.
        * Порядок восстановлен, и на нём держится приёмочный тест «два разных
        * modelId дают два разных model в ответе». */
-      const w = await enqueueWorkerTask({ prompt, model: modelId || body.model || null, tier });
+      /* Адрес передаётся обязательно: именно он становится intendedWorker, и
+       * по нему /worker/poll решает, кому строку отдавать. Без него задача
+       * снова окажется «ничьей» и достанется первому спросившему. */
+      const w = await enqueueWorkerTask({
+        prompt, model: modelId || body.model || null, tier, workerAddress,
+      });
       result = {
         source: 'live_llm',
         provider: 'home_worker',
