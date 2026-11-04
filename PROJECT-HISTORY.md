@@ -719,6 +719,34 @@
 - **Приёмка:** `1020 ✅ / 0 ❌`, `EXIT=0` до и после правки фикстуры. Аттестация проверена вживую, не по коду: `404` без узла → `202` с заявкой → `approved: false`, `tierNow: base`, `tierChanged: false`; `GET /node/attest/:address` отдаёт `approvedCount: 0`.
 - **Деплой `2.17.14` прошёл полностью:** `verify.sh` — `ВСЁ ЗЕЛЁНОЕ`, VPS = GitHub = `0b42e45`, `buildVersion` на проде сменился на `2.17.14-e2e-network-contract`, `/health` → 200, тесты на VPS `1020/25/12` без единого ❌.
 
+### 2026-11-03 (22:10) — `2.17.15` раскатан, reality check по четырём векторам
+
+- **`ec94a46` на проде.** `2.17.15-work-sig-attest`: VPS = GitHub = локально, `verify.sh` — всё зелёное, sha256 **91/91**, systemd drop-in 2 файла = репозиторию. `/health` на VPS и снаружи — 200.
+- **Фикстура treasury-тестов починена, а не проверка ослаблена.** `proof-treasury-gate.js` падал `6 ✅ / 6 ❌` после введения обязательной подписи `/work`: в фикстуре не было handshake и Ed25519-подписи. Добавлен handshake + подпись — теперь **13 ✅ / 0 ❌**. Проверка гейта не тронута.
+- **Проверено 11 предпосылок директивы по четырём векторам; 7 не подтвердились.** Главные:
+  - **JCS-подписей нет.** `grep -c 'canonicalize\|JCS\|8785'` по коду → **0**. Подпись `/work` — Ed25519 над позиционной склейкой `TARNET_WORK_SUBMIT:<address>:<tokens>:<tier>:<actionId>:<ts>` (`server.js:4984-5025`), а не канонизация JSON.
+  - **Утилизация применялась 3 раза**, а не «ни разу»: `totalUtilizedTar: 1.2e-05`, `totalUtilizedCount: 3`.
+  - **`TAR_UTILITY_FEE_BPS` — мёртвая константа** (`config.js:129`, 0 чтений). Ставка берётся из `TAR_UTILITY_BURN_RATE`/`TAR_UTILITY_TREASURY_RATE` в `economics.js:115-116`.
+  - **Три ссылки в документах протухли:** `server.js:2215` — `below_min_payout`, `4698` — `license_restricted`, `6940` — fallback-цепочка моделей. Ни одна не про ставку.
+  - **Комиссия Tier 6 `0.0002`, а не `0.0005`** (ставка B′ с 2.17.8).
+  - **`Planner`/`MapReduce` — 0 вхождений.** `model-router.js` 124 строки: `classifyDomain` + `selectModel`, `Promise.all` → 0.
+  - **Ключ BYOK идёт через наш VPS:** `app/app.js:1226` → `server.js:6805` → `llm-adapter.js:108`. Не напрямую из браузера (CORS), значит концепт «ключ не покидает устройство» не выполняется.
+  - **Теги не отстают:** 44 = 44, `diff` даёт только порядок строки `v2.1.0-stable`.
+- **Баг 402 — реальный дефект другой, чем в директиве.** Новый адрес не блокируется (faucet `0.01 TAR` в 50× больше комиссии `0.0002`); есть второй плательщик — владелец из `device_links` (`server.js:6845-6858`). Настоящая дыра: **PWA не обрабатывает 402 вообще** — `grep -c '402\|INSUFFICIENT_FUNDS' app/app.js` → **0**.
+- **P2P подтверждён как локальный стенд:** `listenHost: 127.0.0.1`, `announced_public: false`, `registry: {total: 0}`, у всех трёх узлов `framesIn/framesOut/requests/responses` = 0. `P2P_*` в systemd не заданы. При этом код умеет внешние соединения (`wildcardBind` для `0.0.0.0`, `p2p-transport.js:157`) — **возможность есть, конфигурация её не включает**.
+- **Диск агента — блокер: 26 МБ свободно (100%).** `overlay 9.8G / 9.6G used`. Виновники: `openclaw-agent.sqlite` **1.5G**, `ip-city-*.mmdb` 122M, `p2p-node/node_modules` 106M. Inodes 41% — упор в байты. Следующий `npm install` упадёт.
+- **Тега `v2.17.15` нет.** Последний — `v2.17.14-e2e-network-contract`, при `buildVersion: 2.17.15-work-sig-attest`. Сборка живёт без метки в git.
+- **Инструментальный сбой в процессе:** `exec` отдавал `GitHub Identity launcher is unavailable` на любой команде, начиная примерно с 22:05. Запись в документы велась файловыми инструментами; коммит не делался. Восстановление — рестарт OpenClaw, без него деплой невозможен.
+- **Живые цифры среза 21:45:** чеков `774`, адресов `91`, CWU `754 300 692`, выплачено `109.56319 TAR`, казна `0.19815` (`critical`), `active_workers: 0`, `llm_mode: deterministic_fallback`, `conservation.delta: 0`. Block `102.410739` против Fee `~7.15` — эмиссия по-прежнему доминирует.
+
+### 2026-11-04 (14:20) — чек с ПК владельца после среза фейкового стейка: `seq 776`
+
+- **`seq 776` подтверждён живым запросом, а не памятью.** `GET /receipts/0xe56c6f0c2cbd6b4f25f4bf472b14128b20239aba` → `workerSeq 26`, `cwu 154`, `tier base`, `blockRewardTar 0.033431`, `rewardTar 0.033433`, `omega 1.5811388300841898`, `adapterId lora-coder-v1`, `demo false`, `timestamp 2026-11-03T19:32:09Z` (22:32 MSK). Тот же адрес получил `payout 0.033433` в `ledger` (`id 2276`).
+- **Вес посчитан от реального стейка.** `omega = √stake × reputation`; при `reputation 0.5` значение `1.5811` даёт `stake = 10`. Соседний чек `seq 769` от того же адреса имеет `omega 15.8114` (`stake = 1000`) — то есть срез фейкового стейка применяется, и применяется избирательно, а не глобально занижает.
+- **Чего чек НЕ доказывает.** Модель `qwen2.5-coder:1.5b` и время генерации ~34 с в чеке отсутствуют: `source`/`emulated` лежат в `inferenceLogs`, которая наружу не отдаётся, а `work_receipts` их не дублирует. Утверждать «34 секунды» по чеку нельзя — это журнал воркера на ПК.
+- **Диск контейнера: 26 МБ → 516 МБ (98% → 95%).** Освобождено: `p2p-node/node_modules` 106 МБ (воспроизводимо из `package.json`), `.codex/.tmp` 103 МБ, `cache/control-ui-assets` 48 МБ, сброс производного индекса памяти `openclaw memory reset` (−110 МБ страниц) + `PRAGMA incremental_vacuum` вернул их ОС: `openclaw-agent.sqlite` 1.1 ГБ → 972 МБ. Файл был 1.1 ГБ, а не 1.5 ГБ — расхождение с директивой.
+- **Прод отстаёт от локального HEAD.** `/health` → `buildVersion: 2.17.15-work-sig-attest`; локально `HEAD 088f1c7` («2.17.16: buildVersion поднят до 2.17.16-responsive-pointer-targets»), впереди `origin/main` на 2 коммита. Раскатки не было: в контейнере нет `~/.ssh` вовсе, а `deploy.sh` требует `$HOME/.ssh/tarnet_vps`.
+
 ---
 
 ## 2. Решения

@@ -45,7 +45,7 @@
 | **Tier 3: Heavy** | GPU-узлы и риги (1×–2× RTX 3090/4090, A5000, HiveOS/RaveOS) | Экспертный инференс 7B–70B + LoRA, `Benchmark Gate`, `Critic-Aggregator` | `κ = 4.0` (expert)<br>**$0.80 / 1M** | `Private`, `Enterprise` | **1× RTX 4090** (120, 50%): **$118.20 / мес**<br>**2× RTX 4090** (240, 50%): **$236.39 / мес** |
 | **Tier 4: Client** | Любое устройство (`Synapse Chat` Web/Desktop/Mobile, OpenAI-совместимый SDK) | `DAG Planner`, локальный `PII-фильтр`, сборка ответа, фидбек | Плательщик (`N/A`) | выбор в UI | Скидки стейкинга до 20% + Free Tier за свой вклад |
 | **Tier 5: Cloud Anchor** `[SPEC Фаза 3]` | Облачные анклавы (`AWS Nitro`, Confidential VMs) через `Synapse Labs` | SLA 99.99%, пики, модели 70B+ | `κ = 10.0`<br>**$2.00 / 1M**<br>`[SPEC]` — в коде нет | **только `Enterprise`** *(в `Private` запрещён)* | Фиат по SLA + обязательный `Buyback & Burn $TAR` |
-| **Tier 6: External API** `[SPEC Фаза 2.5]` | Внешние API (`Gemini`, `OpenAI`, `Claude`, `DeepSeek`) по ключу пользователя (`BYOK`) | Мета-оркестрация (`Best-of-Breed`) для не-PII задач | по тарифу провайдера | **только `Extended`** *(бинарный structured-PII гейт: совпадение → `422`, см. §Б.8 и `docs/PII-DECISION.md`)* | `$TAR`-потребление: **5% Orchestration Fee** (2.5% Burn + 2.5% Treasury) |
+| **Tier 6: External API** `[SPEC Фаза 2.5]` | Внешние API (`Gemini`, `OpenAI`, `Claude`, `DeepSeek`) по ключу пользователя (`BYOK`) | Мета-оркестрация (`Best-of-Breed`) для не-PII задач | по тарифу провайдера | **только `Extended`** *(бинарный structured-PII гейт: совпадение → `422`, см. §Б.8 и `docs/PII-DECISION.md`)* | `$TAR`-потребление: **ставка B′ — `ORCHESTRATION_FEE_TAR: 0.0002`** (кэшбэк `0.0001`), с 2.17.8. ~~5% Orchestration Fee (2.5% + 2.5%)~~ — **устарело**, это доля от fee, а не фиксированная сумма TAR |
 
 > **Сноска к Tier 3.** Тир «heavy» (`κ = 10.0` → `$2.00/1M`) и доход `$330+/мес` **в коде отсутствуют**: `TIER_WEIGHTS = { nano: 0.1, base: 1.0, expert: 4.0 }`, потолок — `$0.80/1M`. Даже при `κ = 5.0` 2× RTX 4090 дают **$295.49/мес**, а не `$330`. Tier 3 Heavy (70B) — Фаза 3 `[SPEC]`, отдельный тариф по рыночному прайсу. Повышение `κ` — решение владельца, а не факт кода. ~~Tier 6 в коде отсутствует (grep `tier6|orchestration|byok` → 0 совпадений).~~ **[устарело, см. §Б.8]** Tier 6 реализован: таблицы `tier6_calls` / `tier6_receipts` / `tier6_reserves`, `reserveTier6Fee` (`server.js:1747`, вызов `6246`); на 30.10 — `conservationTier6 {calls:12, holds:true}`.
 
@@ -93,7 +93,8 @@
 | Идемпотентность `actionId` | ✅ работает: `POST /work` — ключ, а не подсказка. Повтор → `200 {duplicate:true, existing:'receipt'}` (тот же `seq`, без второго начисления); повтор короткой работы → `202 {reason:'already_pending'}`, накопление не удваивается; повтор работы из `batchedFrom` → тот чек, `batchedInto = seq`; тот же ключ на другого воркера → `409`; без `actionId` ключа нет — два одинаковых запроса дают две работы | `POST /work` → раздел 8.11 приёмки |
 | Soft delete адаптеров | ✅ `DELETE /adapter/:id` ставит `deleted_at`; физического удаления нет, история роялти цела, новые работы → 409 | `GET /adapters` → `deleted_at`; чек несёт `adapterDeletedAt` |
 | Реальный LLM-инференс | ⚠️ **механика работает, сеть не постоянна**: на замере 29.10 14:41 — `active_workers: 1`, `llm_mode: worker` (воркер `0xe56c…`, `qwen2.5-coder:1.5b`, 4343 опроса). Окно жизни воркера — 60 с, поэтому «сейчас 1» не значит «сеть». Это по-прежнему **один узел, включаемый руками** | `GET /worker/status`, `GET /health` → `llm_mode`. Сквозной путь доказан 28.10 (телефон → VPS → дом → Ollama) |
-| **Внутренняя утилизация токена (`TAR_UTILITY`)** | ✅ **в коде с 2.17.0**: `paymentMode: TAR_UTILITY` в `POST /work` и `/inference` списывает **2%** (`TAR_UTILITY_FEE_BPS: 200`), поровну в burn и казну (`BURN_RATE: 0.01`, `TREASURY_RATE: 0.01`) | `config.js:122-124`; `server.js:2215, 4698, 6940`; приёмка 43.14. ~~**Экономически не использован:** `/summary` → `totalUtilizedTar: 0`, `totalUtilizedCount: 0`~~ **[устарело, см. §Б.8]** На 30.10 утилизация сработала: `totalUtilizedTar: 0.00001`, `totalUtilizedCount: 1` |
+| **Внутренняя утилизация токена (`TAR_UTILITY`)** | ✅ **в коде с 2.17.0**: `paymentMode: TAR_UTILITY` в `POST /work` и `/inference` списывает **2%**, поровну в burn и казну. **Ставка берётся НЕ из `TAR_UTILITY_FEE_BPS`:** эта константа объявлена в `config.js:129`, но не читается нигде (`grep` по всему репо → 1 вхождение, само объявление). Рабочие константы — `TAR_UTILITY_BURN_RATE: 0.01` + `TAR_UTILITY_TREASURY_RATE: 0.01` (`config.js:130-131`), единственное место применения — `economics.js:115-116` | `economics.js:115-116`; ~~`config.js:122-124`; `server.js:2215, 4698, 6940`~~ **ссылки протухли 03.11: 2215 = `below_min_payout`, 4698 = `license_restricted`, 6940 = fallback-цепочка моделей, ни одна не про ставку**; приёмка 43.14. **[срез 03.11]** `totalUtilizedTar: 1.2e-05`, `totalUtilizedCount: 3` — механизм сработал трижды |
+| **Подпись `POST /work`** | ✅ **в коде с 2.17.15**: Ed25519 над `TARNET_WORK_SUBMIT:<address>:<tokens>:<tier>:<actionId>:<ts>`; без подписи — `403 HANDSHAKE_REQUIRED`. **Это НЕ JCS (RFC 8785):** `grep -c 'canonicalize\|JCS\|8785'` по коду → **0**, канонизации JSON нет, подпись считается над позиционной склейкой через `:` | `server.js:4984-5025` |
 | **Входящий WS воркера (`/p2p/worker`)** | ✅ **в коде с 2.17.0**: `ws-inbound.js` — Ed25519-хендшейк с nonce (`AUTH_PREFIX = TARNET_WS_AUTH`), TOFU по адресу (`ADDRESS_KEY_MISMATCH` при подмене ключа). Воркер держит **исходящее** соединение и получает задачу кадром `TASK`, фолбэк на `/worker/poll` сохранён | `ws-inbound.js`; `worker-demo.js:671` (`new WebSocket`); `GET /worker/ws`. Портов воркер не открывает → `registry.total: 0` остаётся верным |
 | Onion Routing | ✅ работает: `onion.js` (289 строк) — RSA-2048-OAEP-SHA256 шифрует 32-байтный ключ AES, нагрузка идёт AES-256-GCM; TTL слоя, защита от replay, шифрование обратного пути. `app/` — полная PWA (веб-манифест, service worker, 3 иконки). Остаётся: `archive/python-app/crypto.py` — `Wallet`, `generate_wallet()`, `sign_message()` на **SHA-256** (хеш-заглушка, **не Ed25519**) | `POST /inference/onion` → `delivered: true`, `hops: 3`; `test-mesh.js` → 25 ✅ |
 | Аппаратная проверка TEE Quote | ⏳ Фаза 2–3, в БД лишь флаг `isTeeAttested` | `nodes.isTeeAttested` |
@@ -389,3 +390,54 @@ string» на `messages[]` теперь `400 {error:"expected_field_prompt", exp
 `conservationTier6 {calls:13, gross:0.0065, delta:0, holds:true, fundedByClient:13, fundedByEmission:0}` ·
 чеков `759`, воркеров `91` · автотесты **`988 + 25 + 12 = 1025`**, три набора, `RC=0`.
 `active_workers: 0` — живых узлов по-прежнему нет, это не изменилось.
+
+### Б.10. Срез 03.11.2026 — проверка директивы по четырём векторам
+
+Срез `03.11.2026 21:45 MSK`, сборка **`2.17.15-work-sig-attest`** (HEAD `ec94a46`, VPS = GitHub = локально,
+`verify.sh` зелёный, sha256 91/91). Проверено **11 предпосылок директивы**; **7 не подтвердились**.
+
+| Тема | В директиве | Факт кода / прода | Источник |
+| :--- | :--- | :--- | :--- |
+| Подпись `/work` | «JCS-подписи (RFC 8785)» | **JCS нет.** `grep -c 'canonicalize\|JCS\|8785'` по коду → **0**. Подпись — Ed25519 над позиционной склейкой `TARNET_WORK_SUBMIT:<address>:<tokens>:<tier>:<actionId>:<ts>` | `server.js:4984-5025` |
+| Утилизация `TAR_UTILITY` | «ни разу не применилась» | **Применялась 3 раза**: `totalUtilizedTar: 1.2e-05`, `totalUtilizedCount: 3` | `/summary` |
+| Ставка утилизации | `TAR_UTILITY_FEE_BPS` = рабочая | **Мёртвая константа** (`config.js:129`, 0 чтений). Работают `TAR_UTILITY_BURN_RATE` / `TAR_UTILITY_TREASURY_RATE` в `economics.js:115-116` | `grep` по всему репо |
+| Комиссия Tier 6 | `0.0005 TAR` | **`0.0002`** (ставка B′ с 2.17.8), кэшбэк `0.0001` | `config.js:44` |
+| `Planner` / `Map-Reduce` | есть в системе | **Нет кода.** `grep` → 0. `model-router.js` — 124 строки, только `classifyDomain` + `selectModel`; `Promise.all` → 0 | `model-router.js` |
+| Ключ BYOK | идёт из браузера напрямую | **Идёт через наш VPS**: `X-Provider-Key` → `server.js:6805` → `Authorization: Bearer` провайдеру | `app/app.js:1226`, `llm-adapter.js:108` |
+| Теги на VPS | отстают | **44 = 44, наборы идентичны** (`diff` — только порядок строки `v2.1.0-stable`) | `git tag` локально и на VPS |
+| Диск | `/dev/vda2`, риск | Устройство — **`overlay`**; `9.8G / 9.6G used / **26M avail** / 100%`. Inodes 41% — упор в байты | `df -h /`, `df -i /` |
+
+**P2P подтверждён как локальный стенд:** `listenHost: "127.0.0.1"`, `publicUrl: "ws://127.0.0.1:4001"`,
+`announced_public: false`, `registry: {total: 0, has_public_nodes: false}`; у всех трёх узлов
+`framesIn`/`framesOut`/`requests`/`responses` = **0**. `P2P_*` в systemd не заданы. Код при этом умеет
+внешние соединения — `wildcardBind` для `0.0.0.0` (`p2p-transport.js:157`), приоритет
+`P2P_PUBLIC_URL → P2P_ADVERTISE_IP` (`:220-225`) — **возможность есть, конфигурация её не включает**.
+
+**Приватность.** Ключ BYOK проходит через наш сервер в открытом виде — концепт «ключ не покидает
+устройство» не выполняется (прямого вызова из браузера не может быть из-за CORS). Сделано правильно:
+`endpointFor()` разрешает подмену адреса только на loopback (`llm-adapter.js:195-225`), ключ не попадает
+в историю и кэш (`app/app.js:1217`), серверных ключей нет. Ed25519 живёт в `localStorage`
+(`app/app.js:25`) — любой XSS его читает; в `app/agents.js:73` ключ импортируется `extractable: true`
+и `:79` делает `exportKey('jwk')`. Таблица `device_links` с nonce-защитой **существует**
+(`server.js:573, 582`) — утверждение «механизма привязки нет» неверно.
+
+**Баг 402 — реальный дефект другой.** Новый адрес не блокируется: faucet `0.01 TAR` в 50 раз больше
+комиссии `0.0002`; есть второй плательщик — владелец из `device_links` (`server.js:6845-6858`).
+Настоящий дефект: **PWA не обрабатывает 402 вообще** (`grep -c '402\|INSUFFICIENT_FUNDS' app/app.js` → **0**) —
+пользователь видит отказ без причины и без кнопки faucet.
+
+**Инварианты на 03.11:** `conservation {delta: 0, holds: true}` · чеков `774` · адресов `91` ·
+CWU `754 300 692` · выплачено `109.56319 TAR` · Block `102.410739` против Fee `~7.15` — условие
+«спрос > эмиссия» **не выполнено**, эмиссия доминирует · казна `0.19815 TAR`, `reserveStatus: critical` ·
+`active_workers: 0`, `llm_mode: deterministic_fallback`.
+
+**Протухшие ссылки, исправленные в этом срезе.** `config.js:122-124` и `server.js:2215, 4698, 6940`
+указывались как место применения ставки `TAR_UTILITY`. Проверено построчно: `2215` — `below_min_payout`,
+`4698` — `license_restricted`, `6940` — fallback-цепочка моделей. **Ни одна не про ставку.**
+
+**Чего в репозитории нет, но директивы считают готовым:** JCS-канонизация (0 вхождений),
+`Planner`/`MapReduce` (0), WebRTC в клиенте (0). Всё это — `[SPEC / ROADMAP]`.
+
+**Осталось после среза:** тега `v2.17.15` **нет** (последний — `v2.17.14-e2e-network-contract`);
+диск 26 МБ — блокер для следующего `npm install`; `TAR_UTILITY_FEE_BPS` — удалить либо начать читать;
+402 в PWA — обработать.

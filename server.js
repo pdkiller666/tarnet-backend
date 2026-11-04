@@ -6584,6 +6584,26 @@ function ingestWorkerResult(body) {
   const row = get('SELECT * FROM worker_tasks WHERE taskId = ?', [taskId]);
   if (!row) return { status: 404, body: { error: 'Unknown taskId' } };
   if (row.status === 'done') return { status: 409, body: { error: 'Task already submitted', taskId } };
+  /* Прислать результат вправе только тот, кому задача ВЫДАНА.
+   *
+   * Выдача уже ограничена `intendedWorker` (см. /worker/poll), но приём не
+   * проверял ничего: зная taskId, результат мог отправить любой адрес, в том
+   * числе по НЕвыданной задаче в статусе 'pending'. Задача выдаётся ровно
+   * одному воркеру, и `workerAddress` записывается в строку в момент
+   * 'claimed' — это и есть доказательство, что результат принадлежит ему.
+   *
+   * Сверяем с `workerAddress`, а не с `intendedWorker`: после requeue
+   * `intendedWorker` сброшен в NULL, а статус вернулся в 'pending', и такая
+   * задача ещё никому не выдана — принимать по ней результат не от кого.
+   *
+   * Оба случая — 409, а не 403: адрес не «не тот ключ», а задача не в том
+   * состоянии, в котором её можно закрыть. */
+  if (row.status !== 'claimed') {
+    return { status: 409, body: { error: 'Task is not claimed', taskId, status: row.status } };
+  }
+  if (!row.workerAddress || String(row.workerAddress).toLowerCase() !== workerAddress.toLowerCase()) {
+    return { status: 409, body: { error: 'Task was issued to another worker', taskId } };
+  }
   if (Date.now() > row.expiresAt) {
     run(`UPDATE worker_tasks SET status = 'expired' WHERE taskId = ?`, [taskId]);
     return { status: 410, body: { error: 'Task expired', taskId } };
