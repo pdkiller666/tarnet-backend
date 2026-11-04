@@ -19,7 +19,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 
 const { CONFIG, TIER6, FAUCET, TIER_WEIGHTS, normalizeTier, round } = require('./config');
-const { classifyDomain, selectModel } = require('./model-router');
+const { classifyDomain, selectModel, selectSwarmModels } = require('./model-router');
 const { CWUCalculator, RewardEngine, verifyQuality, epochEmission, epochIndex, omega } = require('./economics');
 const { CumulativeLedger, receiptPayload, epochState, releasedFor, bumpEpoch } = require('./ledger');
 const { getGenesisHash, receiptPayloadV2, computeReceiptHash, verifyWorkerDagChain } = require('./dag-chain');
@@ -588,6 +588,34 @@ CREATE TABLE IF NOT EXISTS device_link_nonces (
   usedAt        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_device_link_nonces_usedAt ON device_link_nonces (usedAt);
+
+/* Короткие коды привязки (2.18.0). Зачем отдельная таблица, если уже есть
+ * подпись владельца: подпись требует знать адрес ПК, а человек, глядя на
+ * окно воркера, видит адрес и всё равно ошибается в одном символе из 40.
+ * Код из шести цифр переносит «что привязать» из головы человека в машину.
+ *
+ * Почему код НЕ заменяет подпись, а дополняет её. Код — это МАНДАТ
+ * владельца: он выпускается только по Ed25519-подписи владельца (scope
+ * 'link-code') и живёт 5 минут. Привязку закрывает ПОДПИСЬ ПК своим ключом
+ * (ws_worker_auth): перехвативший код не может привязать свой компьютер к
+ * чужому аккаунту, потому что не подпишет от имени того ПК, а подписать
+ * от имени своего — значит привязать свой ПК, то есть потратить код. Система
+ * без второй подписи превратила бы шесть цифр в единственный секрет, а
+ * 10^6 вариантов перебираются.
+ *
+ * attempts — счётчик промахов по ЖИВОМУ коду. Гасить его обязательно: без
+ * него перебор кода упирался бы только в rate-limit по IP, а тот обходится
+ * сменой адреса. После LINK_CODE_MAX_ATTEMPTS код уничтожается, и владелец
+ * выпускает новый. */
+CREATE TABLE IF NOT EXISTS device_link_codes (
+  code          TEXT PRIMARY KEY,
+  ownerAddress  TEXT NOT NULL,
+  createdAt     INTEGER NOT NULL,
+  expiresAt     INTEGER NOT NULL,
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  consumedAt    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_device_link_codes_owner ON device_link_codes (ownerAddress);
 
 /* Клейм старого баланса. PK по старому адресу — это и есть защита от
  * повторного клейма: второй INSERT упадёт на PRIMARY KEY, а не перенесёт
@@ -3566,6 +3594,171 @@ function checkLinkSignature({ scope, owner, device, body }) {
   return { ok: true, payload };
 }
 
+/* ===== Короткие коды привязки (2.18.0) =====
+ *
+ * Две операции, и ни одна из них не отдаёт владение:
+ *   POST /devices/link-code  — ВЛАДЕЛЕЦ выпускает код (подпись владельца)
+ *   POST /devices/link/claim — ПК гасит код (подпись ПК своим ключом)
+ *
+ * Почему нужны обе подписи. Код из шести цифр — 10^6 вариантов; одной
+ * подписи ПК хватило бы, чтобы любой запустивший воркер привязал свой ПК
+ * к чужому аккаунту, а `tier6PayerChain` разрешает устройству тратить
+ * баланс владельцев. Вместе с подписью владельца код перестаёт быть
+ * секретом доступа и становится мандатом: его нельзя ни угадать (нет
+ * выпуска), ни переиспользовать (consumedAt), ни перебрать (attempts). */
+const LINK_CODE_TTL_MS = 5 * 60 * 1000;
+const LINK_CODE_MAX_ATTEMPTS = 5;
+
+/* Выпуск кода. Только владелец аккаунта: подпись над
+ * `link-code:<owner>:<nonce>`. Подпись ПК здесь не нужна — она понадобится
+ * при погашении, и требовать её дважды значило бы заставлять человека
+ * держать окно воркера открытым до самого конца. */
+app.post('/devices/link-code', (req, res) => {
+  const body = req.body || {};
+  const owner = String(body.ownerAddress || '').trim().toLowerCase();
+  const sig = body.signature ?? body.linkSignature;
+  const nonce = String(body.nonce ?? '').trim();
+
+  if (!INSTALL_ADDR_RE.test(owner)) {
+    return res.status(400).json({ error: 'ownerAddress invalid' });
+  }
+  if (!sig || !nonce || !LINK_NONCE_RE.test(nonce)) {
+    return res.status(400).json({
+      error: 'SIGNATURE_REQUIRED',
+      detail: 'нужны signature и nonce (8–128 символов [A-Za-z0-9_-]): код выпускает только владелец',
+    });
+  }
+
+  const w = get('SELECT publicKeyPem FROM wallets WHERE address = ?', [owner]);
+  if (!w || !w.publicKeyPem) {
+    return res.status(403).json({
+      error: 'DEVICE_NOT_OWNED',
+      detail: 'у адреса владельца нет публичного ключа: сначала POST /id/register',
+    });
+  }
+
+  const payload = ['link-code', owner, nonce].join(':');
+  if (!verifyPayload(payload, String(sig), w.publicKeyPem)) {
+    return res.status(403).json({ error: 'DEVICE_NOT_OWNED', detail: 'подпись не сходится с ключом владельца', payload });
+  }
+
+  const now = Date.now();
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+
+  /* Один живой код на аккаунт. Иначе на экране висели бы три кода, и
+   * человек не мог бы сказать, какой из них гасить. Старые гасим здесь же. */
+  const created = tx(() => {
+    run('DELETE FROM device_link_codes WHERE ownerAddress = ? AND consumedAt IS NULL', [owner]);
+    run('DELETE FROM device_link_codes WHERE expiresAt < ?', [now - LINK_CODE_TTL_MS]);
+    run(`INSERT INTO device_link_codes (code, ownerAddress, createdAt, expiresAt, attempts)
+         VALUES (?, ?, ?, ?, 0)`, [code, owner, now, now + LINK_CODE_TTL_MS]);
+    return true;
+  });
+
+  res.json({
+    ok: true, code,
+    ownerAddress: owner,
+    expiresAt: now + LINK_CODE_TTL_MS,
+    ttlSeconds: Math.floor(LINK_CODE_TTL_MS / 1000),
+    note: created
+      ? 'Введите этот код в окне воркера на ПК. Код одноразовый и живёт 5 минут.'
+      : undefined,
+  });
+});
+
+/* Погашение кода ПК. Подпись — ключом ПК над `link-claim:<device>:<code>:<nonce>`:
+ * код входит в строку, поэтому подпись, снятая для одного кода, не подойдёт
+ * к другому. Ключ ПК берём из `ws_worker_auth`: это TOFU-ключ из живого
+ * handshake, единственный, который у сервера вообще есть для воркера. */
+app.post('/devices/link/claim', (req, res) => {
+  const body = req.body || {};
+  const device = String(body.deviceAddress || '').trim().toLowerCase();
+  const code = String(body.code ?? '').trim();
+  const sig = body.signature ?? body.linkSignature;
+  const nonce = String(body.nonce ?? '').trim();
+
+  if (!INSTALL_ADDR_RE.test(device)) {
+    return res.status(400).json({ error: 'deviceAddress invalid' });
+  }
+  if (!/^[0-9]{6}$/.test(code)) {
+    return res.status(400).json({ error: 'CODE_INVALID', detail: 'код — ровно 6 цифр' });
+  }
+  if (!sig || !nonce || !LINK_NONCE_RE.test(nonce)) {
+    return res.status(400).json({
+      error: 'SIGNATURE_REQUIRED',
+      detail: 'нужны signature и nonce: код гасится только с подписью ПК',
+    });
+  }
+
+  const wk = get('SELECT pubkeyHex FROM ws_worker_auth WHERE LOWER(workerAddress) = ? LIMIT 1', [device]);
+  if (!wk || !wk.pubkeyHex) {
+    return res.status(403).json({
+      error: 'DEVICE_KEY_UNKNOWN',
+      detail: 'у этого адреса нет привязанного ключа: сначала POST /worker/handshake или WS-handshake',
+    });
+  }
+
+  const payload = ['link-claim', device, code, nonce].join(':');
+  const pem = tarIdentity.rawPubToPem(Buffer.from(String(wk.pubkeyHex), 'hex'));
+  if (!verifyPayload(payload, String(sig), pem)) {
+    return res.status(403).json({ error: 'DEVICE_NOT_OWNED', detail: 'подпись не сходится с ключом ПК', payload });
+  }
+
+  const now = Date.now();
+
+  /* Вся проверка и расход кода — в одной транзакции с BEGIN IMMEDIATE.
+   * Разнесённые на два запроса COUNT и UPDATE дали бы двум одновременным
+   * погашениям обоим пройти проверку attempts, то есть счётчик перебора
+   * не работал бы именно тогда, когда он нужен. */
+  const outcome = tx(() => {
+    const row = get('SELECT * FROM device_link_codes WHERE code = ?', [code]);
+    if (!row) {
+      return { status: 404, error: 'CODE_NOT_FOUND', detail: 'такого кода нет или он уже погашен' };
+    }
+    if (row.ownerAddress === device) {
+      return { status: 400, error: 'SAME_ADDRESS', detail: 'адрес ПК совпадает с адресом аккаунта' };
+    }
+    if (row.consumedAt) {
+      return { status: 409, error: 'CODE_ALREADY_USED', detail: 'этот код уже использован: выпустите новый' };
+    }
+    if (Number(row.expiresAt) < now) {
+      return { status: 410, error: 'CODE_EXPIRED', detail: 'код истёк: выпустите новый в приложении' };
+    }
+    if (Number(row.attempts) >= LINK_CODE_MAX_ATTEMPTS) {
+      return { status: 429, error: 'CODE_EXHAUSTED', detail: 'слишком много попыток: выпустите новый код' };
+    }
+
+    /* Устройство должно быть известно сети — иначе привязка несуществующего
+     * адреса даёт зелёную строку над пустотой, ровно как в /devices/link. */
+    const seen = get('SELECT 1 AS ok FROM worker_presence WHERE lower(workerAddress) = ?', [device])
+      || get('SELECT 1 AS ok FROM work_receipts WHERE lower(workerAddress) = ? LIMIT 1', [device])
+      || get('SELECT 1 AS ok FROM nodes WHERE lower(address) = ?', [device]);
+    if (!seen) {
+      run('UPDATE device_link_codes SET attempts = attempts + 1 WHERE code = ?', [code]);
+      return {
+        status: 404, error: 'DEVICE_UNKNOWN',
+        detail: 'этот адрес ещё не появлялся в сети: запустите воркер и повторите',
+      };
+    }
+
+    run('UPDATE device_link_codes SET consumedAt = ? WHERE code = ?', [now, code]);
+    const prev = get(`SELECT createdAt FROM device_links
+                      WHERE ownerAddress = ? AND deviceAddress = ?`, [row.ownerAddress, device]);
+    const stamp = new Date(now).toISOString();
+    if (!prev) {
+      run(`INSERT INTO device_links (ownerAddress, deviceAddress, createdAt)
+           VALUES (?, ?, ?)`, [row.ownerAddress, device, stamp]);
+    }
+    return {
+      ok: true, ownerAddress: row.ownerAddress, deviceAddress: device,
+      linkedAt: prev ? prev.createdAt : stamp, created: !prev,
+    };
+  });
+
+  if (!outcome.ok) return res.status(outcome.status).json(outcome);
+  res.json(outcome);
+});
+
 app.post('/devices/link', (req, res) => {
   const body = req.body || {};
   const owner = String(body.ownerAddress || '').trim().toLowerCase();
@@ -6080,7 +6273,7 @@ const wsInbound = createWsInbound({
   },
 });
 
-function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxTokens = null }) {
+function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxTokens = null, excludeWsAddr = null, forceWsAddr = null, onEnqueued = null }) {
   const taskId = 'wt_' + crypto.randomBytes(12).toString('hex');
   const now = Date.now();
   const sessionKey = crypto.randomBytes(32);
@@ -6100,6 +6293,13 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
       workerAddress ? String(workerAddress).toLowerCase() : null],
   );
 
+  /* Коллбек отдаёт taskId СРАЗУ после INSERT, а не в resolve. Private Swarm
+   * отменяет проигравшую задачу, пока победитель ещё думает; из resolve он
+   * узнал бы его только после ответа, то есть когда отменять уже бессмысленно. */
+  if (typeof onEnqueued === 'function') {
+    try { onEnqueued(taskId); } catch (_e) { /* коллбек не должен ломать отправку */ }
+  }
+
   /* --- Гибридная отправка: WS, если есть кому, иначе poll ---
    *
    * Задача уже лежит в worker_tasks строкой 'pending' — это и есть путь
@@ -6110,7 +6310,18 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
    * кадром и ближайшим /worker/poll — и посчитать дважды. Между UPDATE и
    * send есть окно, но оно безопасно: строка уже 'claimed', и poll её не
    * увидит; если send упадёт, мы вернём 'pending' и полл подхватит. */
-  const wsAddr = wsInbound.pickLeastBusy(tier);
+  /* `forceWsAddr` — отдать задачу ИМЕННО этому сокету, без повторного выбора.
+   * Нужен только Private Swarm: адреса там выбираются заранее (два разных), и
+   * второй pickLeastBusy мог бы вернуть того же воркера, которого уже занял
+   * первый вызов — особенно если первый к этому моменту стал наименее занятым.
+   *
+   * `excludeWsAddr` — адрес, которому задачу отдавать НЕЛЬЗЯ. Простая защита
+   * на случай вызова без forceWsAddr: две задачи на один промпт обязаны уйти
+   * разным воркерам, иначе «параллельно двум» окажется дважды одному. */
+  const excludeSet = excludeWsAddr ? new Set([String(excludeWsAddr).toLowerCase()]) : null;
+  const wsAddr = forceWsAddr
+    ? String(forceWsAddr).toLowerCase()
+    : wsInbound.pickLeastBusy(tier, excludeSet);
 
   /* КЛЮЧ СЕССИИ В WS-КАДРЕ ЗАПЕЧАТАН, А НЕ ПЕРЕДАН ОТКРЫТЫМ.
    *
@@ -6225,6 +6436,11 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
         });
       }
       if (row.status === 'failed') return reject(new Error('worker reported failure'));
+      /* Задачу снял Private Swarm: победил другой воркер, и эта больше не нужна.
+       * Отдельная ветка, а не общий таймаут: истёкшая по TTL и отменённая —
+       * разные причины, и вызывающий должен их различать, иначе «swarm отменил»
+       * выглядело бы как мёртвый воркер. */
+      if (row.status === 'cancelled') return reject(new Error('task cancelled'));
       if (Date.now() > row.expiresAt) {
         run(`UPDATE worker_tasks SET status = 'expired' WHERE taskId = ?`, [taskId]);
         return reject(new Error('worker timeout'));
@@ -6861,7 +7077,7 @@ async function runInference(req, res) {
        *   2. Ключ вторым: 401 без него, до любого сетевого вызова.
        *   3. Только потом — сеть.
        * Если поменять 1 и 2 местами, клиент без ключа получит 401 вместо
-       * PI­I_BLOCKED и решит, что дело в ключе. */
+       * PII_BLOCKED и решит, что дело в ключе. */
       const byokKey = typeof req.get('x-provider-key') === 'string'
         ? req.get('x-provider-key').trim()
         : '';
@@ -7561,6 +7777,11 @@ async function runInference(req, res) {
    * бы мимо Onion (флаг «уже пробовали»). Именно поэтому объявлено здесь,
    * в области видимости запроса, а не рядом с вызовом. */
   let onionAttempt = null;
+  /* Метаданные Private Swarm для ответа клиенту. `let` в области видимости
+   * ЗАПРОСА, а не внутри try: блок собирается в ветке воркера, а читается при
+   * формировании JSON-ответа ниже. Внутри try он был бы не виден снаружи, и
+   * клиент не узнал бы, состоялась ли параллель. */
+  let swarmBlock = null;
 
   /* Один шаг транспорта: worker -> external_api -> deterministic_fallback.
    *
@@ -7610,6 +7831,139 @@ async function runInference(req, res) {
   if (hasActiveWorker()) {
     // Режим A: домашний узел забирает задачу и присылает результат.
     try {
+      /* ===== Private Swarm (2.18.0) =====
+       * Две задачи на ОДИН промпт, двум РАЗНЫМ воркерам, параллельно. Первый
+       * успешный ответ уходит клиенту, вторая задача снимается.
+       *
+       * Почему две задачи, а не одна с двумя адресатами. `ingestWorkerResult`
+       * принимает результат только от того адреса, что записан в
+       * `worker_tasks.workerAddress`: одна строка = один владелец. Отправить
+       * одну задачу двоим значило бы, что второй получит 409 и работа
+       * пропадёт впустую.
+       *
+       * Почему это не двойная оплата. `ingestWorkerResult` только СОХРАНЯЕТ
+       * ответ; деньги начисляет `recordWork` ниже, ОДИН раз, и адрес берётся
+       * у победителя. Проигравший не получает ничего — его ответ не был
+       * использован. Цена — потраченное им время, а не деньги клиента.
+       *
+       * Почему «первый ответ», а не консенсус. Сверять два текста на
+       * совпадение бессмысленно: две разные модели никогда не дадут
+       * побайтово равный ответ, и «консенсус» превратился бы в лотерею.
+       * Здесь заявлена ровно та гарантия, которую код выполняет: отказ
+       * одного узла не роняет запрос, пока жив второй. */
+      if (body.swarm === true) {
+        const first = wsInbound.pickLeastBusy(tier, null);
+        const second = first ? wsInbound.pickLeastBusy(tier, new Set([first])) : null;
+        /* Пара нужна НАСТОЯЩАЯ: два разных адреса. Один воркер, получивший
+         * две задачи, — это не параллель, а очередь на одном ПК. */
+        if (first && second && first !== second) {
+          /* Модели под две ветки. Две разные из каталога, если он даёт пару;
+           * иначе обе ветки на одной модели — разные УЗЛЫ всё равно дают
+           * независимость от падения одного ПК. */
+          let modelsForSwarm = [];
+          try {
+            const rows = all(`SELECT modelId, tier, isAvailable, isFree, strengths
+              FROM model_registry ORDER BY tier, modelId`);
+            modelsForSwarm = selectSwarmModels(rows, classifyDomain(prompt), 2);
+          } catch (_e) { modelsForSwarm = []; }
+          const swarmModelIds = modelsForSwarm.map(m => m.modelId).filter(Boolean);
+          const fallbackModel = modelId || body.model || null;
+
+          const taskIds = [];
+          const arm = (addr, modelForArm) => enqueueWorkerTask({
+            prompt,
+            model: modelForArm || fallbackModel,
+            tier,
+            workerAddress: addr,
+            forceWsAddr: addr,
+            onEnqueued: (tid) => taskIds.push(tid),
+          }).then(res => ({ ok: true, res, addr, taskId: res.taskId }))
+            .catch(err => ({ ok: false, err, addr }));
+
+          const p1 = arm(first, swarmModelIds[0]);
+          const p2 = arm(second, swarmModelIds[1]);
+
+          /* Ждём первую УСПЕШНУЮ ветку. `Promise.any` здесь не годится: он
+           * отвергает запрос только когда упали ОБЕ, и мы не узнаём, какая
+           * именно победила, — а снять надо именно проигравшую. */
+          const winner = await new Promise((resolve) => {
+            let settled = false;
+            let failed = 0;
+            const settle = (v) => {
+              if (settled) return;
+              if (v && v.ok) { settled = true; resolve(v); return; }
+              failed += 1;
+              if (failed >= 2) { settled = true; resolve(null); }
+            };
+            p1.then(settle, settle);
+            p2.then(settle, settle);
+          });
+
+          if (winner) {
+            /* Снимаем проигравшую задачу сразу, а не оставляем истекать: она
+             * уже не нужна, а её воркер всё ещё считает — пусть освободит
+             * слот. `cancelled` — отдельный статус, чтобы в отчёте было
+             * видно «снята swarm», а не «умерла по TTL». */
+            const loserIds = taskIds.filter(tid => tid !== winner.taskId);
+            for (const tid of loserIds) {
+              try {
+                run(`UPDATE worker_tasks SET status = 'cancelled', finishedAt = ?
+                     WHERE taskId = ? AND status IN ('pending', 'claimed')`, [Date.now(), tid]);
+                workerTaskKeys.delete(tid);
+              } catch (_e) { /* снятие не должно ломать уже полученный ответ */ }
+            }
+            const w = winner.res;
+            result = {
+              source: 'live_llm',
+              provider: 'home_worker',
+              model: w.model || null,
+              response: w.response,
+              usage: w.usage || null,
+              tokensGenerated: Math.max(1, Math.floor(Number(w.tokensGenerated) || 1)),
+              emulated: false,
+              workerTaskId: w.taskId,
+            };
+            /* Оплата — победителю, один раз. Это единственное место, где
+             * адрес переписывается на фактического исполнителя. */
+            if (w.workerAddress) workerAddress = w.workerAddress;
+            if (w.source === 'deterministic_fallback') {
+              fallbackReason = w.error || 'model_unavailable';
+              result.emulated = true;
+              result.warning = w.error === 'OLLAMA_NOT_RUNNING'
+                ? 'Ollama не запущена на ПК воркера — запустите её или выберите «Свой ключ»'
+                : 'Воркер подключён, но модель на его ПК не загружена — ответ собран шаблоном воркера';
+            }
+            swarmBlock = {
+              enabled: true,
+              parallel: true,
+              requested: true,
+              workers: [first, second],
+              winnerWorker: winner.addr,
+              winnerTaskId: winner.taskId,
+              loserTaskIds: loserIds,
+              cancelled: loserIds.length,
+              models: swarmModelIds.length ? swarmModelIds.slice(0, 2) : [fallbackModel],
+            };
+          }
+        }
+
+        /* Пара не нашлась или обе ветки упали — swarm не состоялся. Запрос
+         * при этом не роняем: идём обычным путём и честно говорим, почему
+         * параллели не было. Молчаливая подмена на одну задачу выглядела бы
+         * как работающий swarm в отчёте. */
+        if (!swarmBlock) {
+          swarmBlock = {
+            enabled: false,
+            requested: true,
+            reason: (first && second && first !== second)
+              ? 'all_swarm_arms_failed'
+              : 'need_two_workers',
+          };
+        }
+      }
+
+      if (!result) {
+
       /* modelId имеет приоритет над body.model: клиент назвал модель из
        * каталога, и воркер должен получить именно её имя, а не свободную
        * строку. Иначе выбор из реестра ничего бы не значил.
@@ -7649,6 +8003,7 @@ async function runInference(req, res) {
         result.warning = w.error === 'OLLAMA_NOT_RUNNING'
           ? 'Ollama не запущена на ПК воркера — запустите её или выберите «Свой ключ»'
           : 'Воркер подключён, но модель на его ПК не загружена — ответ собран шаблоном воркера';
+      }
       }
     } catch (e) {
       /* Таймаут отделён от прочих сбоёв: "модель думала слишком долго" и
@@ -7914,6 +8269,11 @@ async function runInference(req, res) {
     worker: workerAddress,
     workerAddress,
     routing,
+    /* Private Swarm: что реально произошло. null = клиент не просил. При
+     * запросе поле есть всегда: либо состоявшаяся параллель с победителем и
+     * снятыми задачами, либо честная причина, почему её не было. Молчание
+     * здесь выдало бы одну задачу за две. */
+    swarm: swarmBlock,
     /* Onion-путь: что реально произошло. null = клиент не просил Onion.
      * Если просил, но не вышло — здесь честная причина, а не тишина:
      * поле попытки важнее красивого маршрута, которого не было. */

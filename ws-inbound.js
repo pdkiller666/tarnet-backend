@@ -176,11 +176,18 @@ class WsInbound {
 
   /* Выбор воркера под задачу. Приоритет — наименее загруженный по inflight,
    * при равенстве — по адресу, чтобы порядок был воспроизводим и тест не
-   * зависел от порядка вставки в Map. */
-  pickLeastBusy(tier) {
+   * зависел от порядка вставки в Map.
+   *
+   * `exclude` — множество адресов, которые брать нельзя. Появилось для
+   * Private Swarm (2.18.0): второй вызов должен вернуть ДРУГОГО воркера, иначе
+   * «параллельно двум» окажется дважды одному. Без явного исключения второй
+   * вызов отсортировал бы тех же кандидатов и вернул того же самого. */
+  pickLeastBusy(tier, exclude = null) {
+    const skip = exclude instanceof Set ? exclude : null;
     const candidates = [];
     for (const [addr, w] of this.workers) {
       if (w.ws.readyState !== WebSocket.OPEN) continue;
+      if (skip && skip.has(addr)) continue;
       candidates.push({ addr, inflight: w.inflight.size, meta: w.meta });
     }
     if (!candidates.length) return null;

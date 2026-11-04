@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.17.21-agent-entropy-hkdf",
+  "version": "2.18.0-private-swarm",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

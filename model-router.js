@@ -121,4 +121,46 @@ function selectModel(models, domain) {
   return best;
 }
 
-module.exports = { classifyDomain, selectModel, DOMAINS };
+/* Выбор НЕСКОЛЬКИХ моделей под Private Swarm (2.18.0, фундамент).
+ *
+ * Зачем отдельная функция, а не флаг у `selectModel`. Контракт `selectModel` —
+ * «одна строка реестра или null»; менять его на «строка или массив» значило бы
+ * заставить каждого вызывающего проверять тип. Здесь отдельное имя и отдельный
+ * возврат: массив строк, от лучшей к худшей.
+ *
+ * Почему не просто «первые две». Вторая модель должна быть ДРУГОЙ: две записи
+ * каталога могут указывать на одну модель под разными провайдерами, и тогда
+ * swarm окажется одним воркером с двойной оплатой. Поэтому дубликаты по
+ * `modelId` отбрасываются, а при равных весах порядок задаёт `modelId` — иначе
+ * результат зависел бы от порядка строк в таблице.
+ *
+ * Возвращает [] — если подходящих меньше `count`. Пустой массив здесь честнее
+ * одного элемента: вызывающий должен увидеть, что swarm невозможен, а не
+ * молча отправить одну задачу и назвать это параллелью. */
+function selectSwarmModels(models, domain, count = 2) {
+  const list = Array.isArray(models) ? models : [];
+  const scored = [];
+  for (const m of list) {
+    if (m.isAvailable !== undefined && Number(m.isAvailable) !== 1 && m.isAvailable !== true) continue;
+    const strengths = String(m.strengths ?? '').toLowerCase().split(',').map(s => s.trim());
+    let score = 0;
+    if (domain !== 'general' && strengths.includes(domain)) score += 10;
+    if (Number(m.isFree) === 1 || m.isFree === true) score += 5;
+    if (Number(m.tier) <= 3) score += 3;
+    scored.push({ m, score, key: String(m.modelId ?? '') });
+  }
+  scored.sort((a, b) => (b.score - a.score) || a.key.localeCompare(b.key));
+
+  const want = Math.max(1, Math.trunc(Number(count)) || 2);
+  const picked = [];
+  const seen = new Set();
+  for (const s of scored) {
+    if (seen.has(s.key)) continue;
+    seen.add(s.key);
+    picked.push(s.m);
+    if (picked.length >= want) break;
+  }
+  return picked.length >= want ? picked : [];
+}
+
+module.exports = { classifyDomain, selectModel, selectSwarmModels, DOMAINS };

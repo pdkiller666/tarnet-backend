@@ -246,6 +246,20 @@ async function signLink(scope, owner, device, nonce) {
   return idToB64(sig);
 }
 
+/** Подпись для выпуска кода привязки (2.18.0): `link-code:owner:nonce`.
+ * Отдельная функция, а не signLink с пустым device: там строка была бы
+ * `link-code:owner::nonce` с двойным двоеточием, и серверная проверка
+ * ожидала бы другой текст. Расхождение строки и проверки — это не
+ * косметика, а несовпадение подписи без понятной ошибки. */
+async function signLinkCode(owner, nonce) {
+  if (!IDENTITY?.privKey) return null;
+  const payload = ['link-code', owner.toLowerCase(), nonce].join(':');
+  const sig = await crypto.subtle.sign(
+    { name: 'Ed25519' }, IDENTITY.privKey, new TextEncoder().encode(payload),
+  );
+  return idToB64(sig);
+}
+
 /* Старый демо-адрес — только на случай, когда WebCrypto Ed25519 недоступен
  * (Safari < 17). Тогда PWA остаётся читалкой: подписи нет, привязка получит
  * 403 от сервера. Возвращать фейковый ключ вместо неё было бы обманом. */
@@ -357,7 +371,7 @@ document.querySelectorAll('.tab').forEach((tab) => {
      * agents.js. Прячем здесь, а событием ниже сообщаем, что пора грузить
      * данные — иначе вкладка открывалась бы пустой до первого клика. */
     if ($('tab-agents')) $('tab-agents').hidden = name !== 'agents';
-    if (name === 'devices') { refreshBalance(); refreshFaucet(); refreshCrossCompute(); }
+    if (name === 'devices') { refreshBalance(); refreshFaucet(); refreshCrossCompute(); refreshEarn(true); }
     document.dispatchEvent(new CustomEvent('tarnet:tab', { detail: name }));
   });
 });
@@ -412,6 +426,28 @@ function setNetStatus(state) {
   if (label) label.textContent = NET_LABEL[state] || state;
 }
 
+/* Private Swarm требует ДВУХ живых воркеров: две задачи на один промпт уходят
+ * разным адресам, и одному узлу отдать обе значило бы выстроить очередь на
+ * одном ПК и назвать это параллелью.
+ *
+ * При меньшем числе галочка гасится, а не просто игнорируется при отправке:
+ * видимая, но не работающая настройка — обещание, которого код не выполнит.
+ * `checked` снимается вместе с `disabled`, иначе после включения второго
+ * воркера остался бы включённый флажок, которого человек не ставил. */
+function syncSwarmGate(activeWorkers) {
+  const el = $('swarmMode');
+  if (!el) return;
+  const enough = Number(activeWorkers) >= 2;
+  el.disabled = !enough;
+  if (!enough && el.checked) el.checked = false;
+  const label = $('swarmModeLabel');
+  if (label) {
+    label.textContent = enough
+      ? 'Private Swarm — две модели параллельно, ответ берётся от первой'
+      : 'Private Swarm — нужны два воркера в сети (сейчас меньше)';
+  }
+}
+
 async function refreshWorkerBanner() {
   const box = $('workerBanner');
   const text = $('workerBannerText');
@@ -435,6 +471,7 @@ async function refreshWorkerBanner() {
   const active = Number(health.active_workers ?? 0);
   const mode = health.llm_mode || 'unknown';
   $('modeLine').textContent = `${MODES[mode] || mode} · воркеров: ${active}`;
+  syncSwarmGate(active);
 
   if (mode === 'deterministic_fallback' || active === 0) {
     box.hidden = false;
@@ -1296,6 +1333,13 @@ async function sendPrompt(prompt, opts = {}) {
     const modelId = $('model')?.value;
     if (modelId) body.modelId = modelId;
 
+    /* Private Swarm: флаг отправляется ТОЛЬКО когда человек его включил и
+     * галочка не погашена. Погашенная галочка (меньше двух воркеров) означает
+     * «параллели сейчас не будет» — отправлять её всё равно значило бы
+     * обещать её в интерфейсе. Поле `swarm` сервер читает строго как === true. */
+    const swarmEl = $('swarmMode');
+    if (swarmEl && swarmEl.checked && !swarmEl.disabled) body.swarm = true;
+
     /* Оплата из внутреннего баланса TAR: комиссия 2% вместо 5%.
      *
      * Сервер принимает режим только при названном клиенте и явном
@@ -1521,6 +1565,88 @@ async function refreshCrossCompute() {
     $('ccNote').textContent = 'Не удалось получить данные: сервер не ответил.';
   }
 }
+
+/* ---------- Мои заработанные TAR (2.18.0) ----------
+ * Зачем: `/receipts/:worker` существует с самого леджера, но PWA его не
+ * вызывал. Человек видел итог «Заработано» и не мог проверить, из чего он
+ * сложился: четыре задачи и тысяча выглядят одинаково.
+ *
+ * Порядок в списке — по `workerSeq` этого адреса, а не по глобальному `seq`:
+ * между двумя чеками одного воркера вклиниваются десятки чужих, и нумерация
+ * с дырами читается как пропущенные выплаты. */
+const EARN_PAGE = 25;
+let earnLimit = EARN_PAGE;
+
+function earnRow(r) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.style.flexDirection = 'column';
+  row.style.alignItems = 'flex-start';
+  row.style.gap = '2px';
+
+  const title = document.createElement('p');
+  title.className = 'mono tiny';
+  title.style.margin = '0';
+  /* textContent везде: adapterId и tier приходят с сервера, и вставка их
+   * как разметки позволила бы подсунуть тег через имя модели. */
+  title.textContent = `+${fmt(r.rewardTar)} TAR · CWU ${r.cwu} · ${r.tier}`;
+
+  /* Дату показываем в местной зоне: `timestamp` — мс UTC, и «03.11 22:32»
+   * на экране должно совпадать с тем, что человек помнит, а не с UTC. */
+  const d = new Date(Number(r.timestamp) || 0);
+  const when = Number.isFinite(d.getTime())
+    ? d.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+    : '—';
+  const sub = document.createElement('p');
+  sub.className = 'dim tiny addr-line';
+  sub.style.margin = '0';
+  /* `workerSeq` может быть null у очень старых чеков — тогда номер не
+   * выводим вовсе, а не печатаем «null» рядом с датой. */
+  const pos = r.workerSeq === null || r.workerSeq === undefined ? '' : `#${r.workerSeq} · `;
+  const model = r.adapterId ? ` · ${r.adapterId}` : '';
+  sub.textContent = `${pos}${when}${model}`;
+
+  row.appendChild(title);
+  row.appendChild(sub);
+  return row;
+}
+
+async function refreshEarn(reset) {
+  const box = $('earnList');
+  const st = $('earnState');
+  const more = $('earnMore');
+  const cnt = $('earnCount');
+  if (!box || !ADDR) return;
+  if (reset) { earnLimit = EARN_PAGE; box.textContent = ''; }
+
+  try {
+    const rows = await call(`/receipts/${ADDR}?limit=${earnLimit}`);
+    const list = Array.isArray(rows) ? rows : [];
+    box.textContent = '';
+    if (!list.length) {
+      if (st) st.textContent = 'чеков пока нет: подключите воркер, и здесь появятся выполненные задачи';
+      if (cnt) cnt.textContent = '0';
+      if (more) more.hidden = true;
+      return;
+    }
+    list.forEach((r) => box.appendChild(earnRow(r)));
+    /* Сумму за показанную страницу не печатаем как итог: при пагинации
+     * «итого» по неполному списку было бы заниженным и выглядело бы как
+     * потерянные деньги. Итог живёт в Cross-Compute выше. */
+    if (cnt) cnt.textContent = `чеков: ${list.length}${list.length >= earnLimit ? '+' : ''}`;
+    if (st) st.textContent = '';
+    if (more) more.hidden = list.length < earnLimit;
+  } catch (e) {
+    /* Сбой сети — это «не знаю», а не «не заработал»: пустой список без
+     * пояснения читался бы как ноль начислений. */
+    if (st) st.textContent = e.code === 'RATE_LIMIT' ? e.message : `не смог прочитать историю: ${e.message}`;
+  }
+}
+
+$('earnMore')?.addEventListener('click', async () => {
+  earnLimit += EARN_PAGE;
+  await refreshEarn(false);
+});
 
 /* ---------- Faucet ----------
  * Состояние читается из /faucet/status, а не из localStorage: выдачу
@@ -1928,6 +2054,63 @@ $('linkBtn')?.addEventListener('click', async () => {
 });
 
 $('linkRefresh')?.addEventListener('click', refreshLinks);
+
+/* ---------- Выпуск кода привязки (2.18.0) ----------
+ * Код выпускает ВЛАДЕЛЕЦ аккаунта: подпись над `link-code:owner:nonce`.
+ * Подпись ПК понадобится потом, когда воркер будет гасить код у себя в
+ * консоли. Разделение намеренное: экран PWA и окно воркера — разные
+ * машины, и требовать обе подписи в одном действии значило бы держать
+ * два окна открытыми одновременно. */
+let linkCodeTimer = null;
+
+function stopLinkCodeTimer() {
+  if (linkCodeTimer) { clearInterval(linkCodeTimer); linkCodeTimer = null; }
+}
+
+$('linkCodeBtn')?.addEventListener('click', async () => {
+  const st = $('linkCodeState');
+  const val = $('linkCodeValue');
+  const hint = $('linkCodeHint');
+  stopLinkCodeTimer();
+  if (val) val.textContent = '';
+  if (hint) hint.textContent = '';
+  if (st) st.textContent = 'выпускаю…';
+
+  try {
+    const nonce = makeNonce();
+    const signature = await signLinkCode(ADDR, nonce);
+    if (!signature) {
+      /* Тот же честный отказ, что и у обычной привязки: без WebCrypto
+       * Ed25519 подписи нет, а выдать код без неё — значит выпустить
+       * мандат, который сервер всё равно не примет. */
+      if (st) st.textContent = 'нет ключа подписи в этом браузере: выпуск кода недоступен';
+      return;
+    }
+    const r = await call('/devices/link-code', {
+      method: 'POST',
+      body: { ownerAddress: ADDR, signature, nonce },
+    });
+
+    if (val) val.textContent = String(r.code).split('').join(' ');
+    const ttl = Number(r.ttlSeconds) || 300;
+    const until = Date.now() + ttl * 1000;
+    const tick = () => {
+      const left = Math.max(0, Math.ceil((until - Date.now()) / 1000));
+      if (st) st.textContent = left > 0
+        ? `действует ещё ${left} с — введите в окне воркера`
+        : 'код истёк — выпустите новый';
+      if (left <= 0) stopLinkCodeTimer();
+    };
+    tick();
+    linkCodeTimer = setInterval(tick, 1000);
+    if (hint) hint.textContent = 'В окне воркера: перезапустите его и введите код на вопрос, или запустите с --link <код>.';
+    /* Список обновляем не сразу: погашение делает воркер, и оно придёт
+     * отдельным запросом. Обновление здесь показало бы старое состояние
+     * как «ничего не произошло». */
+  } catch (e) {
+    if (st) st.textContent = e.code === 'RATE_LIMIT' ? e.message : (e.message || 'не получилось выпустить код');
+  }
+});
 
 /* ---------- Перенос баланса со старого кошелька ----------
  * Старый адрес ключа не имеет — доказать владение им нельзя в принципе.
@@ -2623,6 +2806,25 @@ function traceBox(res, ms) {
   /* routing.mode приходит с сервера ('weighted'); в демо-ответе он тоже
      есть, поэтому показываем как есть, а не прячем. */
   if (res.routing && res.routing.mode) body.appendChild(row('маршрут', res.routing.mode));
+  /* Private Swarm. Три состояния, а не два: не просили (поля нет), просили и
+   * вышло, просили и НЕ вышло. Последнее обязано быть видно: молчание клиент
+   * прочитает как «параллель была», а её не было. */
+  if (res.swarm) {
+    if (res.swarm.enabled === true) {
+      const won = short(res.swarm.winnerWorker || '');
+      const lost = Number(res.swarm.cancelled || 0);
+      body.appendChild(row('swarm', `два узла параллельно · победил ${won}${lost ? `, снято ${lost}` : ''}`));
+    } else {
+      const why = res.swarm.reason === 'need_two_workers'
+        ? 'нужны два воркера в сети'
+        : res.swarm.reason === 'all_swarm_arms_failed'
+          ? 'обе ветки не ответили'
+          : (res.swarm.reason || 'не состоялся');
+      const el = row('swarm', why);
+      el.querySelector('b')?.classList.add('trace-warn');
+      body.appendChild(el);
+    }
+  }
   if (res.model_tier != null) body.appendChild(row('уровень', String(res.model_tier)));
   if (res.tokensGenerated != null) body.appendChild(row('токенов', String(res.tokensGenerated)));
   if (res.workerAddress) body.appendChild(row('воркер', short(res.workerAddress)));

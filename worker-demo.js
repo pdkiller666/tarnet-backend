@@ -21,6 +21,10 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const nodeCrypto = require('crypto');
+/* readline нужен только для ввода кода привязки из консоли (2.18.0).
+ * Импорт ленивый в том смысле, что интерфейс не создаётся до вопроса:
+ * просто подключение модуля не держит stdin открытым. */
+const readline = require('readline');
 /* Печать/распечатка ключа сессии. Функции продублированы в воркере, а не
  * импортированы из server.js: воркер ставится отдельно от сервера и не должен
  * тянуть за собой весь серверный код ради двух функций. */
@@ -1022,6 +1026,18 @@ async function main() {
    * останавливает воркер: WS-путь может привязать ключ сам, и запрещать
    * работать из-за этого было бы хуже, чем попробовать другой транспорт. */
   await bindKey();
+
+  /* Привязка кодом — сразу после handshake и до цикла опроса. Место именно
+   * такое: `bindKey` только что зафиксировал ключ ПК в `ws_worker_auth`, а
+   * без этой записи сервер не может проверить подпись ПК при погашении.
+   * Блок обёрнут в try: сломанный stdin или недоступный сервер не должны
+   * оставить человека без работающего воркера. */
+  try {
+    await linkFromCli();
+  } catch (e) {
+    log(`привязка кодом не удалась (${e.message}) — продолжаю без неё`);
+  }
+
   log('опросите /health на сервере: llm_mode должен стать worker');
   log('Ctrl+C — остановить');
 
@@ -1098,11 +1114,75 @@ async function main() {
 
 /* Экспорт для юнит-тестов: разрешение имён моделей проверяется без сети и
  * без запуска воркера. */
+/* ---------- Погашение кода привязки (2.18.0) ----------
+ *
+ * Владелец выпускает шестизначный код в PWA (`POST /devices/link-code`,
+ * подпись владельца), человек вводит его здесь, и воркер гасит код СВОЕЙ
+ * подписью (`POST /devices/link/claim`). Две подписи намеренно: одна
+ * подтверждает, что аккаунт согласен принять ПК, вторая — что ПК действительно
+ * этот. Одной шестизначной цифры не хватает: 10^6 вариантов перебираются,
+ * а `tier6PayerChain` разрешает устройству тратить баланс владельца.
+ *
+ * Код входит в подписываемую строку, поэтому перехваченная подпись \«от
+ * погашения\» бесполезна на другом коде. nonce — свой на каждую попытку. */
+async function claimLinkCode(code) {
+  const digits = String(code ?? '').replace(/\s+/g, '');
+  if (!/^[0-9]{6}$/.test(digits)) {
+    return { ok: false, error: 'CODE_FORMAT', message: 'код — ровно 6 цифр' };
+  }
+  const keys = wsState.keys || (wsState.keys = ed25519FromSeed(loadOrCreateSeed()));
+  const nonce = nodeCrypto.randomBytes(16).toString('hex');
+  const payload = ['link-claim', WORKER, digits, nonce].join(':');
+  const signature = nodeCrypto.sign(null, Buffer.from(payload, 'utf8'), keys.priv).toString('base64');
+
+  const r = await api('POST', '/devices/link/claim', {
+    deviceAddress: WORKER, code: digits, signature, nonce,
+  });
+  if (r.ok) return { ok: true, data: r.data };
+  return {
+    ok: false,
+    error: r.data?.error || `HTTP_${r.status}`,
+    message: r.data?.detail || r.data?.note || `HTTP ${r.status}`,
+    status: r.status,
+  };
+}
+
+/* Читает код из аргумента, переменной окружения или stdin — в этом порядке.
+ * Порядок такой, чтобы работало и в скрипте (`--link 123456`), и у человека
+ * без TTY. Без stdin в pipe ввод не ждём: висящий воркер на вопросе\«введите
+ * код\» — это поломка запуска, а не интерактив. */
+async function linkFromCli(argv = process.argv.slice(2)) {
+  const flagIdx = argv.findIndex((a) => a === '--link' || a === '--link-code');
+  let code = flagIdx >= 0 ? argv[flagIdx + 1] : '';
+  if (!code && process.env.TARNET_LINK_CODE) code = process.env.TARNET_LINK_CODE;
+  if (!code && process.stdin.isTTY) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    code = await new Promise((resolve) => {
+      rl.question('  Код привязки из PWA (6 цифр, пусто — пропустить): ', (a) => {
+        rl.close(); resolve(String(a || '').trim());
+      });
+    });
+  }
+  if (!code) return null;
+
+  log(`погашаю код ${String(code).replace(/\D/g, '').padEnd(6, '•')}…`);
+  const res = await claimLinkCode(code);
+  if (res.ok) {
+    log(`ПК привязан к аккаунту ${res.data.ownerAddress.slice(0, 10)}…`);
+    return res;
+  }
+  /* Отказ не останавливает воркер: код мог истечь, а работа и начисления
+   * от привязки не зависят — она нужна только чтобы PWA видела этот ПК как
+   * свой и могла платить с аккаунта. */
+  log(`привязка не удалась: ${res.error} — ${res.message}`);
+  return res;
+}
+
 module.exports = {
   normalizeModelName, resolveOllamaModel, ollamaTags, workerModelReport, generate, main,
   /* Экспорт транспорта — для тестов handshake без запуска цикла опроса. */
   connectWs, signAuth, ed25519FromSeed, loadOrCreateSeed, wsState, wsUrl, wsSupported,
-  runTask, AUTH_PREFIX,
+  runTask, AUTH_PREFIX, claimLinkCode, linkFromCli,
 };
 
 if (require.main === module) {

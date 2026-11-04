@@ -5176,6 +5176,150 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
         ghostUnsigned.status === 400,
         { status: ghostUnsigned.status, error: ghostUnsigned.body?.error });
 
+      /* ===== 2.18.0: привязка коротким кодом =====
+       * Проверяем не «код работает», а что без КАЖДОЙ из двух подписей он
+       * не работает. Тест на счастливый путь закрепил бы ровно ту дыру,
+       * ради которой вторая подпись и появилась: шесть цифр — 10^6
+       * вариантов, и при одной подписи ПК чужой ПК привязался бы к
+       * чужому аккаунту, а `tier6PayerChain` разрешает устройству тратить
+       * баланс владельцев. */
+      const devKeys = idn.deriveTarNetKeys(idc.randomBytes(32));
+      const devPubHex = Buffer.from(idn.normalizePubkey(devKeys.wallet.pub)).toString('hex').toLowerCase();
+      const DEV2 = '0x' + '66'.repeat(20);
+      const DEVNOKEY = '0x' + '67'.repeat(20);
+
+      /* След в сети + ключ в ws_worker_auth (TOFU). Без ключа сервер не
+       * может проверить подпись ПК: ws_worker_auth — единственное место,
+       * где у него вообще есть публичный ключ воркера. */
+      const cdb = new DatabaseSync(path.join(lp.dir, 'test.db'));
+      cdb.exec('PRAGMA busy_timeout = 3000;');
+      const markSeen = cdb.prepare(`INSERT OR REPLACE INTO worker_presence
+        (workerAddress, model, lastSeenAt, polls) VALUES (?, ?, ?, ?)`);
+      markSeen.run(DEV2, 'qwen2.5-coder:1.5b', Date.now(), 3);
+      /* DEVNOKEY есть в сети, но ключа не имеет — на нём проверяется
+       * отказ DEVICE_KEY_UNKNOWN, а не «нет такого адреса». */
+      markSeen.run(DEVNOKEY, 'm', Date.now(), 1);
+      cdb.prepare(`INSERT INTO ws_worker_auth (workerAddress, pubkeyHex, firstSeenAt, lastSeenAt)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(workerAddress) DO UPDATE SET pubkeyHex = excluded.pubkeyHex`)
+        .run(DEV2, devPubHex, Date.now(), Date.now());
+
+      const issueCode = (opts = {}) => {
+        const nonce = opts.nonce !== undefined ? opts.nonce : idc.randomBytes(12).toString('base64url');
+        const payload = ['link-code', String(opts.owner || OWN).toLowerCase(), nonce].join(':');
+        const signature = opts.signature !== undefined ? opts.signature
+          : idn.signWithSeed(ownerKeys.wallet.priv, payload);
+        const body = { ownerAddress: opts.owner || OWN };
+        if (nonce !== null) body.nonce = nonce;
+        if (signature !== null) body.signature = signature;
+        return apiAt(lp.base, '/devices/link-code', 'POST', body);
+      };
+
+      const noSigCode = await issueCode({ signature: null });
+      ok('30.26 выпуск кода без подписи владельца → 400 SIGNATURE_REQUIRED',
+        noSigCode.status === 400 && noSigCode.body?.error === 'SIGNATURE_REQUIRED',
+        { status: noSigCode.status, error: noSigCode.body?.error });
+
+      const issued = await issueCode();
+      ok('30.27 владелец выпускает код: 6 цифр, TTL 300 с',
+        issued.status === 200 && /^\d{6}$/.test(String(issued.body?.code))
+          && Number(issued.body?.ttlSeconds) === 300,
+        { status: issued.status, code: issued.body?.code, ttl: issued.body?.ttlSeconds });
+
+      const code = String(issued.body?.code || '');
+
+      const claimWith = (opts = {}) => {
+        const nonce = opts.nonce !== undefined ? opts.nonce : idc.randomBytes(12).toString('base64url');
+        const c = opts.code !== undefined ? opts.code : code;
+        const device = opts.device || DEV2;
+        const payload = ['link-claim', String(device).toLowerCase(), c, nonce].join(':');
+        const signature = opts.signature !== undefined ? opts.signature
+          : idn.signWithSeed(opts.signSeed || devKeys.wallet.priv, payload);
+        const body = { deviceAddress: device, code: c };
+        if (nonce !== null) body.nonce = nonce;
+        if (signature !== null) body.signature = signature;
+        return apiAt(lp.base, '/devices/link/claim', 'POST', body);
+      };
+
+      /* Отрицательный контроль №1: подпись ВЛАДЕЛЬЦА вместо ключа ПК.
+       * Если бы проходила, код стал бы полным мандатом одного человека,
+       * и вторая подпись была бы фикцией. */
+      const ownerSigClaim = await claimWith({ signSeed: ownerKeys.wallet.priv });
+      ok('30.28 погашение подписью владельца, а не ПК → 403 DEVICE_NOT_OWNED',
+        ownerSigClaim.status === 403 && ownerSigClaim.body?.error === 'DEVICE_NOT_OWNED',
+        { status: ownerSigClaim.status, error: ownerSigClaim.body?.error });
+
+      /* Отрицательный контроль №2: устройство без привязанного ключа. */
+      const noKeyClaim = await claimWith({ device: DEVNOKEY });
+      ok('30.29 погашение с адреса без ключа в ws_worker_auth → 403 DEVICE_KEY_UNKNOWN',
+        noKeyClaim.status === 403 && noKeyClaim.body?.error === 'DEVICE_KEY_UNKNOWN',
+        { status: noKeyClaim.status, error: noKeyClaim.body?.error });
+
+      const badFormat = await claimWith({ code: '12345' });
+      ok('30.30 код из 5 цифр → 400 CODE_INVALID',
+        badFormat.status === 400 && badFormat.body?.error === 'CODE_INVALID',
+        { status: badFormat.status, error: badFormat.body?.error });
+
+      const noClaimSig = await claimWith({ signature: null });
+      ok('30.31 погашение без подписи → 400 SIGNATURE_REQUIRED',
+        noClaimSig.status === 400 && noClaimSig.body?.error === 'SIGNATURE_REQUIRED',
+        { status: noClaimSig.status, error: noClaimSig.body?.error });
+
+      /* Счастливый путь — и он же проверка, что ПРИВЯЗКА появилась. */
+      const claimed = await claimWith();
+      ok('30.32 погашение подписью ПК → привязка создана владельцем аккаунта',
+        claimed.status === 200 && claimed.body?.ownerAddress === OWN
+          && claimed.body?.deviceAddress === DEV2 && claimed.body?.created === true,
+        { status: claimed.status, body: claimed.body });
+
+      const linkRows = cdb.prepare(`SELECT ownerAddress, deviceAddress FROM device_links
+                                     WHERE lower(deviceAddress) = ?`).all(DEV2);
+      ok('30.33 в device_links появилась ровно одна запись на этого ПК',
+        linkRows.length === 1 && String(linkRows[0].ownerAddress).toLowerCase() === OWN.toLowerCase(),
+        linkRows);
+
+      const reuse = await claimWith();
+      ok('30.34 повтор погашения того же кода → 409 CODE_ALREADY_USED',
+        reuse.status === 409 && reuse.body?.error === 'CODE_ALREADY_USED',
+        { status: reuse.status, error: reuse.body?.error });
+
+      /* Просроченный код: сдвигаем expiresAt в прошлое напрямую в БД,
+       * потому что ждать 5 минут в тесте нельзя, а подменять TTL в
+       * серверной константе — значит проверять другую систему. */
+      const expired = await issueCode();
+      const expiredCode = String(expired.body?.code || '');
+      cdb.prepare('UPDATE device_link_codes SET expiresAt = ? WHERE code = ?')
+        .run(Date.now() - 1000, expiredCode);
+      const expiredClaim = await claimWith({ code: expiredCode });
+      ok('30.35 просроченный код → 410 CODE_EXPIRED',
+        expiredClaim.status === 410 && expiredClaim.body?.error === 'CODE_EXPIRED',
+        { status: expiredClaim.status, error: expiredClaim.body?.error });
+
+      /* Исчерпанные попытки: счётчик должен реально защищать от перебора,
+       * а не просто существовать в схеме. */
+      const exhaust = await issueCode();
+      const exhaustCode = String(exhaust.body?.code || '');
+      cdb.prepare('UPDATE device_link_codes SET attempts = 5 WHERE code = ?').run(exhaustCode);
+      const exhaustedClaim = await claimWith({ code: exhaustCode });
+      ok('30.36 после 5 промахов код уничтожен → 429 CODE_EXHAUSTED',
+        exhaustedClaim.status === 429 && exhaustedClaim.body?.error === 'CODE_EXHAUSTED',
+        { status: exhaustedClaim.status, error: exhaustedClaim.body?.error });
+
+      /* Новый код на аккаунт вытесняет старый: иначе на экране висели бы
+       * несколько кодов и человек не знал бы, какой гасить. Проверяем
+       * именно вытеснение, а не «оба живы»: сервер удаляет незакрытые
+       * коды того же владельца при выпуске нового. */
+      const codeA = await issueCode();
+      const codeAValue = String(codeA.body?.code || '');
+      const codeB = await issueCode();
+      const staleClaim = await claimWith({ code: codeAValue });
+      ok('30.37 новый код вытесняет предыдущий: старый → 404 CODE_NOT_FOUND',
+        codeA.status === 200 && codeB.status === 200
+          && staleClaim.status === 404 && staleClaim.body?.error === 'CODE_NOT_FOUND',
+        { first: codeA.status, second: codeB.status, claimOld: staleClaim.status, err: staleClaim.body?.error });
+
+      cdb.close();
+
       const alive = await apiAt(lp.base, '/health');
       ok('30.25 после всех путей привязки сервер ЖИВ', alive.status === 200, alive.status);
     } finally {
@@ -8006,6 +8150,196 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       }
     } finally {
       s46.stop();
+    }
+  }
+
+  /* ===== 47. Private Swarm: две задачи, один ответ =====
+   *
+   * Проверяется не "функция вернула массив", а весь путь: два живых WS-воркера,
+   * один промпт, две задачи, победитель платится, проигравшая снимается.
+   * Без этого swarm остался бы заявлением в комментарии. */
+  {
+    const workerMod47 = require('./worker-demo');
+    const crypto47 = require('crypto');
+
+    /* Подключение воркера с буфером задач.
+     *
+     * Кадры TASK собираются ДО того, как тест попросит их: иначе первый TASK
+     * пришёл бы между отправкой запроса и подпиской, и ожидание смотрело бы
+     * в пустоту. Поэтому обработчик ставится в момент подключения, а
+     * nextTask() только забирает уже пришедшее или ждёт следующего. */
+    const connectWorker47 = async (wsBase, label, autoReply) => {
+      const addr = '0x' + crypto47.createHash('sha256')
+        .update('swarm-' + label + '-' + RUN).digest('hex').slice(0, 40);
+      const keys = workerMod47.ed25519FromSeed(crypto47.randomBytes(32));
+      const w = { addr, sock: null, tasks: [], waiters: [] };
+
+      const waitFrame = (want, timeoutMs = 8000) => new Promise((resolve) => {
+        const timer = setTimeout(() => { w.sock.removeEventListener('message', onMsg); resolve(null); }, timeoutMs);
+        const onMsg = (ev) => {
+          let f = null;
+          try { f = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); } catch (_e) { return; }
+          if (!f || f.type !== want) return;
+          clearTimeout(timer);
+          w.sock.removeEventListener('message', onMsg);
+          resolve(f);
+        };
+        w.sock.addEventListener('message', onMsg);
+      });
+
+      w.sock = new WebSocket(wsBase + '/p2p/worker');
+      const ch = await waitFrame('HELLO_CHALLENGE');
+      if (!ch) { try { w.sock.close(); } catch (_e) { /* уже закрыт */ } return null; }
+      const ts = Date.now();
+      const pl = `TARNET_WS_AUTH:${ch.nonce}:${addr}:${ts}`;
+      w.sock.send(JSON.stringify({
+        type: 'AUTH_RESPONSE',
+        workerAddress: addr,
+        pubkey: keys.pubHex,
+        signature: crypto47.sign(null, Buffer.from(pl, 'utf8'), keys.priv).toString('base64'),
+        timestamp: ts,
+        model: 'qwen2.5-coder:1.5b',
+        installedModels: ['qwen2.5-coder:1.5b'],
+        ollamaOnline: true,
+      }));
+      const okay = await waitFrame('AUTH_OK');
+      if (!okay) { try { w.sock.close(); } catch (_e) { /* уже закрыт */ } return null; }
+
+      /* Постоянный сборщик TASK — ставится ДО запроса к /inference. */
+      w.sock.addEventListener('message', (ev) => {
+        let f = null;
+        try { f = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); } catch (_e) { return; }
+        if (!f || f.type !== 'TASK' || !f.task) return;
+        if (autoReply) {
+          w.sock.send(JSON.stringify({
+            type: 'RESULT', taskId: f.task.taskId, workerAddress: addr,
+            response: 'ответ ' + label, usage: { completion_tokens: 4 },
+            model: 'qwen2.5-coder:1.5b', source: 'ollama',
+          }));
+          return;
+        }
+        w.tasks.push(f.task);
+        w.waiters.splice(0).forEach((r) => r(f.task));
+      });
+
+      w.nextTask = (timeoutMs = 8000) => new Promise((resolve) => {
+        if (w.tasks.length) return resolve(w.tasks.shift());
+        const timer = setTimeout(() => resolve(null), timeoutMs);
+        w.waiters.push((task) => { clearTimeout(timer); resolve(task); });
+      });
+      w.reply = (task) => w.sock.send(JSON.stringify({
+        type: 'RESULT', taskId: task.taskId, workerAddress: w.addr,
+        response: 'ответ ' + label, usage: { completion_tokens: 4 },
+        model: 'qwen2.5-coder:1.5b', source: 'ollama',
+      }));
+      w.close = () => { try { w.sock.close(); } catch (_e) { /* уже закрыт */ } };
+      return w;
+    };
+
+    if (typeof WebSocket !== 'function') {
+      skip('47.1–47.6 Private Swarm', 'в этой версии Node нет глобального WebSocket');
+    } else {
+      /* --- 47.1: один воркер — параллели быть не может, и это сказано ЯВНО.
+       * Молчаливая подмена на одну задачу выглядела бы в отчёте как работающий
+       * swarm, поэтому причина отдаётся полем reason. --- */
+      const s47a = await spawnServer();
+      try {
+        const wsA = s47a.base.replace(/^http:/i, 'ws:');
+        const solo = await connectWorker47(wsA, 'solo', true);
+        if (!solo) {
+          skip('47.1 swarm с одним воркером', 'воркер не прошёл handshake');
+        } else {
+          await apiAt(s47a.base, '/node', 'POST', { address: solo.addr, stake: 90000, reputation: 0.99 });
+          await new Promise((r) => setTimeout(r, 300));
+          const r47a = await apiAt(s47a.base, '/inference', 'POST', {
+            prompt: 'swarm solo', tier: 'base', swarm: true,
+          });
+          const sw47a = r47a.body?.swarm;
+          ok('47.1 один воркер → swarm не состоялся, причина названа',
+            r47a.status === 200 && sw47a && sw47a.enabled === false
+              && sw47a.reason === 'need_two_workers',
+            { status: r47a.status, swarm: sw47a });
+          solo.close();
+        }
+      } finally {
+        s47a.stop();
+      }
+
+      /* --- 47.2–47.5: два воркера — настоящая параллель. --- */
+      const s47b = await spawnServer();
+      try {
+        const wsB = s47b.base.replace(/^http:/i, 'ws:');
+        /* autoReply=false: отвечать будем вручную и ТОЛЬКО на одну задачу,
+         * иначе обе закроются как 'done' и снимать будет нечего. */
+        const wa = await connectWorker47(wsB, 'aa', false);
+        const wb = await connectWorker47(wsB, 'bb', false);
+
+        if (!wa || !wb) {
+          skip('47.2–47.6 Private Swarm', 'не оба воркера прошли handshake');
+        } else {
+          await apiAt(s47b.base, '/node', 'POST', { address: wa.addr, stake: 90000, reputation: 0.99 });
+          await apiAt(s47b.base, '/node', 'POST', { address: wb.addr, stake: 90000, reputation: 0.99 });
+          await new Promise((r) => setTimeout(r, 300));
+
+          const req = apiAt(s47b.base, '/inference', 'POST', {
+            prompt: 'swarm two arms', tier: 'base', swarm: true,
+          });
+          const tA = await wa.nextTask();
+          const tB = await wb.nextTask();
+
+          ok('47.2 оба воркера получили по задаче', Boolean(tA && tB && tA.taskId !== tB.taskId),
+            { a: tA?.taskId, b: tB?.taskId });
+
+          /* Отвечает только wa — вторая задача остаётся 'claimed' и должна
+           * быть снята сервером. */
+          if (tA) wa.reply(tA);
+          const resp47 = await req;
+          const sw47 = resp47.body?.swarm;
+
+          ok('47.3 swarm состоялся: enabled, parallel, два разных воркера',
+            resp47.status === 200 && sw47 && sw47.enabled === true && sw47.parallel === true
+              && Array.isArray(sw47.workers) && sw47.workers.length === 2
+              && sw47.workers[0] !== sw47.workers[1],
+            { status: resp47.status, swarm: sw47 });
+
+          ok('47.4 оплата ушла победителю, а не обоим',
+            Boolean(sw47) && sw47.winnerWorker === wa.addr
+              && String(resp47.body?.workerAddress).toLowerCase() === wa.addr.toLowerCase(),
+            { winner: sw47?.winnerWorker, paidTo: resp47.body?.workerAddress });
+
+          /* Проигравшая задача снята в БД, а не оставлена истекать. */
+          let loserStatus = null;
+          if (tB) {
+            try {
+              const { DatabaseSync } = require('node:sqlite');
+              const db47 = new DatabaseSync(path.join(s47b.dir, 'test.db'));
+              const row47 = db47.prepare('SELECT status FROM worker_tasks WHERE taskId = ?').get(tB.taskId);
+              loserStatus = row47 ? row47.status : null;
+              db47.close();
+            } catch (_e) { loserStatus = 'db_error'; }
+          }
+          ok('47.5 проигравшая задача снята со статусом cancelled',
+            loserStatus === 'cancelled', { taskId: tB?.taskId, status: loserStatus });
+
+          /* 47.6 — без флага swarm поведение прежнее: одна задача, поле null.
+           * Регрессия, которую легко не заметить: параллель включилась бы
+           * всем и молча удвоила нагрузку на узлы. */
+          const reqPlain = apiAt(s47b.base, '/inference', 'POST', {
+            prompt: 'plain one', tier: 'base',
+          });
+          const tPlain = await wa.nextTask();
+          if (tPlain) wa.reply(tPlain);
+          const respPlain = await reqPlain;
+          ok('47.6 без swarm — одна задача и swarm: null',
+            respPlain.status === 200 && respPlain.body?.swarm === null,
+            { status: respPlain.status, swarm: respPlain.body?.swarm });
+
+          wa.close();
+          wb.close();
+        }
+      } finally {
+        s47b.stop();
+      }
     }
   }
 
