@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.17.18-client-key-indexeddb",
+  "version": "2.17.21-agent-entropy-hkdf",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

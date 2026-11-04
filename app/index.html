@@ -537,9 +537,10 @@
             <button id="genEntropy" class="ghost small" type="button">Сгенерировать</button>
             <button id="createIdBtn" class="btn small" type="button">Создать ID</button>
           </div>
-          <p class="hint">Энтропия сохраняется в localStorage этого браузера: без неё
-            HITL-подпись требовала бы вводить фразу на каждое подтверждение. Это
-            компромисс стенда, а не боевая схема хранения.</p>
+          <p class="hint">Энтропия хранится в этом браузере как <strong>неизвлекаемый ключ</strong>
+            (IndexedDB): выгрузить её сырые байты нельзя. Кнопка «Забыть ключ»
+            стирает её с устройства. Это по-прежнему не passkey/SE: от активного
+            XSS на этой же странице такая схема не защищает.</p>
         </div>
 
         <div id="agentMain" hidden>
@@ -644,6 +645,10 @@
      потому что CDN запрещён: без сети PWA должен работать целиком. -->
 <script src="/app/vendor/marked.min.js"></script>
 <script src="/app/vendor/highlight.min.js"></script>
+<!-- Ed25519 для вкладки «Агенты»: из seed считается публичный ключ. Именно
+     поэтому ключ агента может быть неизвлекаемым — exportKey('jwk') больше
+     не нужен. Подключён ДО agents.js: тот берёт globalThis.TarnetEd25519. -->
+<script src="/app/vendor/ed25519.js"></script>
 <script src="/app/app.js"></script>
 <script src="/app/agents.js"></script>
 <!-- HITL: подтверждение траты выше порога. Вне <section>, потому что это

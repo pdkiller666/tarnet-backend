@@ -6111,7 +6111,45 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
    * send есть окно, но оно безопасно: строка уже 'claimed', и poll её не
    * увидит; если send упадёт, мы вернём 'pending' и полл подхватит. */
   const wsAddr = wsInbound.pickLeastBusy(tier);
+
+  /* КЛЮЧ СЕССИИ В WS-КАДРЕ ЗАПЕЧАТАН, А НЕ ПЕРЕДАН ОТКРЫТЫМ.
+   *
+   * Что было. Здесь стояло `sessionKey: sessionKey.toString('base64')` —
+   * голый ключ рядом с шифротекстом в одном и том же кадре. То есть шифрование
+   * промпта не защищало ничего: перехвативший кадр (или посредник, или лог
+   * прокси на пути сокета) получал и замок, и ключ к нему. `/worker/poll` этот
+   * класс закрыл раньше — там ключ печатается на публичный ключ воркера
+   * (`box:v1`), — а WS-путь остался с прошлым поведением. Один транспорт
+   * обязан быть не мягче другого, поэтому дыра закрывается здесь тем же
+   * механизмом `worker-box`, а не вторым, «похожим».
+   *
+   * Почему это всегда возможно именно на WS. Адрес сюда попадает только из
+   * `wsInbound.workers`, а туда воркер попадает единственным путём — через
+   * рукопожатие с подписью, где `ws_worker_auth` фиксирует его `pubkeyHex`
+   * (`ws-inbound.js:345-357`). Значит привязанный ключ есть по построению.
+   *
+   * Почему при неудаче печати задача НЕ уходит по WS. Соблазн был повторить
+   * поведение poll: отдать голый base64 с честным `keyEncryption: 'none'`.
+   * Но это означало бы, что дыра, которую мы закрываем, продолжает жить в
+   * аварийной ветке, — а аварийная ветка и есть то, что срабатывает при
+   * поломке. Вместо этого кадр не отправляется вовсе: строка остаётся
+   * `pending`, и задачу заберёт `/worker/poll` своим путём. Задача не теряется
+   * (TTL 150 с, воркер опрашивает), а открытый ключ не уезжает никогда. */
+  let wsKeyField = null;
   if (wsAddr) {
+    try {
+      const boundWs = pollBoundKey(wsAddr);
+      if (boundWs && boundWs.pubkeyHex) {
+        wsKeyField = workerBox.sealToWorker(boundWs.pubkeyHex, sessionKey.toString('base64'));
+      } else {
+        console.log(`ws: у ${String(wsAddr).slice(0, 10)}… нет привязанного ключа — задача уйдёт через poll`);
+      }
+    } catch (e) {
+      console.log(`ws: ключ сессии не запечатан (${e.message}) — задача уйдёт через poll`);
+    }
+  }
+
+  if (wsAddr && wsKeyField) {
     const claimed = run(
       `UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?, intendedWorker = ?
        WHERE taskId = ? AND status = 'pending'`,
@@ -6125,7 +6163,9 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
          * воркер получил бы по WS старый формат, а по poll — новый. Один
          * транспорт не должен знать больше другого. */
         encryptedPayload: encryptWithKey(taskBody, sessionKey),
-        sessionKey: sessionKey.toString('base64'),
+        /* Запечатанный ключ + формат, чтобы клиент знал, как читать. */
+        sessionKey: wsKeyField,
+        keyEncryption: 'box:v1',
         encryption: 'aes-256-gcm',
         model: model || null,
         tier: tier || null,

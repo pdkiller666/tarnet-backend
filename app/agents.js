@@ -15,6 +15,15 @@
  *    здесь должен быть passkey/SE, а не localStorage. Кнопка «Забыть ключ»
  *    стирает энтропию и адрес.
  *
+ *    ПРЯМО О ТОМ, ЧТО ЭТО ЗНАЧИТ ДЛЯ КЛЮЧА АГЕНТА. С 2.17.19 ключ агента
+ *    импортируется с `extractable: false`: `exportKey` на нём отвечает
+ *    `InvalidAccessError` (проверено запуском), то есть выгрузить ключевой
+ *    материал в строку и унести с машины нельзя. Но мастер-энтропия по-прежнему
+ *    лежит в localStorage и является входом HKDF, поэтому XSS на этой же
+ *    странице может ПОВТОРИТЬ вывод ключа, а не украсть готовый. Закрыт вынос
+ *    ключевого объекта, не весь контур: пока энтропия в localStorage, полного
+ *    закрытия нет. Это долг, а не «сделано».
+ *
  * 3. Лог «Think → Act → Observe» НЕ рисуется. POST /inference не вызывает
  *    agent-runtime.runAgent: шаги возвращает только runAgent, а через HTTP
  *    он не выставлен. Показываем то, что сервер реально отдал (статус,
@@ -45,6 +54,11 @@
     return out;
   }
   const bytesToHex = (b) => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+  /* Вендорный noble-ed25519 подключён classic-скриптом (/app/vendor/ed25519.js)
+   * ДО этого файла. Нужен ровно для одного: вычислить публичный ключ из seed.
+   * `exportKey('jwk')` для этого больше не годится — ключ неизвлекаемый. */
+  const ed = globalThis.TarnetEd25519;
+
   const concat = (a, b) => {
     const out = new Uint8Array(a.length + b.length);
     out.set(a, 0);
@@ -53,10 +67,6 @@
   };
   const utf8 = (s) => new TextEncoder().encode(s);
   const b64 = (bytes) => btoa(String.fromCharCode(...bytes));
-  const b64urlToBytes = (v) => {
-    const s = v.replace(/-/g, '+').replace(/_/g, '/');
-    return Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
-  };
 
   async function hkdfSeed(entropyBytes, info) {
     const base = await crypto.subtle.importKey('raw', entropyBytes, 'HKDF', false, ['deriveBits']);
@@ -69,15 +79,30 @@
   }
 
   async function importSeed(seed) {
+    /* `extractable: false` — принципиально: такой ключ нельзя выгрузить ни
+     * через exportKey('jwk'), ни через exportKey('pkcs8') — WebCrypto отвечает
+     * InvalidAccessError (проверено запуском, а не по документации). Подпись
+     * им работает: crypto.subtle.sign не требует извлекаемости. */
     const pkcs8 = concat(PKCS8_PREFIX, seed);
-    return crypto.subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, true, ['sign']);
+    return crypto.subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, false, ['sign']);
   }
 
-  async function pubHexOf(privKey) {
-    /* Публичный ключ берём из JWK: exportKey('spki') на ПРИВАТНОМ ключе
-     * бросает NotSupportedError (проверено фактическим запуском). */
-    const jwk = await crypto.subtle.exportKey('jwk', privKey);
-    return bytesToHex(b64urlToBytes(jwk.x));
+  async function pubHexOfSeed(seed) {
+    /* Публичный ключ СЧИТАЕТСЯ из seed, а не выпрашивается экспортом приватного.
+     *
+     * Почему не exportKey('jwk', privKey), как было до 2.17.19: на неизвлекаемом
+     * ключе он бросает InvalidAccessError, а exportKey('spki') на приватном
+     * ключе не поддерживается вовсе (NotSupportedError — проверено запуском).
+     * Поэтому JWK-путь и неизвлекаемость несовместимы, и один из двух надо
+     * было выбрать. Выбран ключ.
+     *
+     * noble даёт ровно те же 32 байта, что лежали в jwk.x: это RFC 8032, а
+     * сходимость проверяет proof-agent-key.js на четырёх seed'ах (включая
+     * граничные 00… и ff…) — публичный ключ, адрес и подпись совпадают. */
+    if (!ed || typeof ed.getPublicKeyAsync !== 'function') {
+      throw new Error('нет /app/vendor/ed25519.js: публичный ключ не вычислить (ключ при этом не тронут)');
+    }
+    return bytesToHex(await ed.getPublicKeyAsync(seed));
   }
 
   async function addressOf(rawPubBytes) {
@@ -89,12 +114,15 @@
   /* Полный вывод аккаунта из мастер-энтропии: кошелёк владельца (он же
    * TarNet ID и userId для /agents) + ключ агента. */
   async function deriveAccount(entropyHex) {
-    const ikm = hexToBytes(entropyHex);
+    /* Принимает и hex-строку, и готовые байты: вызывающий может уже иметь
+     * IKM на руках. Сигнатура со строкой сохранена, потому что на ней стоит
+     * стенд proof-agent-key.js. */
+    const ikm = typeof entropyHex === 'string' ? hexToBytes(entropyHex) : entropyHex;
     if (ikm.length < 16) throw new Error('энтропия короче 16 байт — сервер такую не примет');
 
     const walletSeed = await hkdfSeed(ikm, HKDF_INFO_WALLET);
     const walletPriv = await importSeed(walletSeed);
-    const walletPubHex = await pubHexOf(walletPriv);
+    const walletPubHex = await pubHexOfSeed(walletSeed);
     const address = await addressOf(hexToBytes(walletPubHex));
 
     return { walletPriv, walletPubHex, address, ikm };
@@ -105,7 +133,7 @@
   async function deriveAgentKey(ikm) {
     const seed = await hkdfSeed(ikm, HKDF_INFO_AGENT);
     const priv = await importSeed(seed);
-    const pubHex = await pubHexOf(priv);
+    const pubHex = await pubHexOfSeed(seed);
     return { priv, agentId: pubHex };
   }
 
@@ -114,13 +142,141 @@
     return b64(sig);
   }
 
+  /* ===== Вывод из КЛЮЧА, а не из байтов (2.17.21) =====
+   *
+   * Эти три функции лежат ЗДЕСЬ, в крипто-блоке, а не рядом с хранилищем,
+   * намеренно: стенд `proof-agent-key.js` вырезает блок от
+   * `const HKDF_INFO_WALLET` до маркера «Состояние» и исполняет в vm. Всё,
+   * что оказалось бы ниже маркера, не проверялось бы вообще — зелёный стенд
+   * при непроверенном коде. Поэтому здесь только чистая криптография, без
+   * IndexedDB и localStorage.
+   */
+
+  /* Импорт энтропии сразу неизвлекаемым ключом. `deriveBits` ему разрешён,
+   * `exportKey` — нет. */
+  async function importMasterKey(entropyBytes) {
+    return crypto.subtle.importKey('raw', entropyBytes, { name: 'HKDF' }, false, ['deriveBits']);
+  }
+
+  async function deriveAccountFromKey(ikmKey) {
+    const walletSeed = new Uint8Array(await crypto.subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: utf8(HKDF_INFO_WALLET) },
+      ikmKey, 256,
+    ));
+    const walletPriv = await importSeed(walletSeed);
+    const walletPubHex = await pubHexOfSeed(walletSeed);
+    const address = await addressOf(hexToBytes(walletPubHex));
+    return { walletPriv, walletPubHex, address, ikmKey };
+  }
+
+  async function deriveAgentKeyFromKey(ikmKey) {
+    const seed = new Uint8Array(await crypto.subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: utf8(HKDF_INFO_AGENT) },
+      ikmKey, 256,
+    ));
+    const priv = await importSeed(seed);
+    const pubHex = await pubHexOfSeed(seed);
+    return { priv, agentId: pubHex };
+  }
+
   /* ===== Состояние ===== */
 
   const LS_ENTROPY = 'tarnet.masterEntropy';
   const LS_ADDRESS = 'tarnet.id.address';
   const LS_LAST_AGENT = 'tarnet.agent.last';
 
-  let account = null; // { walletPriv, walletPubHex, address, ikm }
+  let account = null; // { walletPriv, walletPubHex, address, ikmKey }
+
+  /* ===== Хранилище мастер-энтропии: IndexedDB и неизвлекаемый ключ =====
+   *
+   * Что было и почему это было плохо. Мастер-энтропия лежала в localStorage
+   * открытой hex-строкой (`tarnet.masterEntropy`). localStorage — это ровно
+   * то, что читает XSS одной строкой, и ровно то, что попадает в дампы
+   * диска, бэкапы профиля и расширения с доступом к странице. То есть
+   * компрометация хранилища отдавала ВЕСЬ аккаунт: и кошелёк, и ключ агента
+   * выводятся из этой строки.
+   *
+   * Что стало. В localStorage сырых байт больше нет. Энтропия импортируется
+   * как ключ HKDF с `extractable: false` и кладётся в IndexedDB. IndexedDB
+   * умеет хранить объекты (structured clone), поэтому CryptoKey переживает
+   * перезагрузку, не теряя флаг. Обе производные величины считать по-прежнему
+   * можно: `deriveBits` на неизвлекаемом ключе работает, извлекаемость нужна
+   * только для `exportKey`.
+   *
+   * ЧЕГО ЭТО НЕ ДАЁТ — и делать вид, что даёт, я не буду. Пока XSS выполняется
+   * НА ЖИВОЙ СТРАНИЦЕ, он вызовет `deriveBits` и получит те же seed'ы: ключ
+   * защищает от кражи ХРАНИМОГО материала, а не от активной инъекции. Разница
+   * реальна и измерима, но она уже́: «унесли то, что лежало» → «нужно быть
+   * внутри работающей вкладки». Полное закрытие — passkey/SE, не хранилище.
+   *
+   * Почему отдельная база, а не хранилище app.js. У вкладки «Кошелёк» своя
+   * запись (`tarnet-identity`/`keys`/`device`) с ДРУГИМ ключом. Одна общая
+   * запись означала бы, что сохранение агентской энтропии затирает ключ
+   * кошелька или наоборот — это тихая потеря аккаунта, а не косметика. */
+  const IDB_NAME = 'tarnet-agents';
+  const IDB_STORE = 'keys';
+  const IDB_RECORD = 'master';
+
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      if (!globalThis.indexedDB) return reject(new Error('IndexedDB недоступен'));
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error || new Error('IndexedDB не открылась'));
+    });
+  }
+
+  async function idbGet() {
+    const db = await idbOpen();
+    try {
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readonly');
+        const req = tx.objectStore(IDB_STORE).get(IDB_RECORD);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+    } finally { db.close(); }
+  }
+
+  async function idbPut(rec) {
+    const db = await idbOpen();
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        tx.objectStore(IDB_STORE).put(rec, IDB_RECORD);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('запись отклонена'));
+        tx.onabort = () => reject(tx.error || new Error('запись отменена'));
+      });
+    } finally { db.close(); }
+  }
+
+  async function idbDel() {
+    const db = await idbOpen();
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        tx.objectStore(IDB_STORE).delete(IDB_RECORD);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('удаление отклонено'));
+      });
+    } finally { db.close(); }
+  }
+
+  /* Сверка выведенного адреса с сохранённым. Если формула вывода когда-нибудь
+   * изменится, пользователь увидит расхождение, а не начнёт молча работать
+   * под чужим кошельком. */
+  async function assertAddress(acc) {
+    const known = localStorage.getItem(LS_ADDRESS);
+    if (known && known !== acc.address) {
+      throw new Error(`адрес из энтропии (${short(acc.address)}) не совпал с сохранённым (${short(known)}): вывод ключей изменился`);
+    }
+    localStorage.setItem(LS_ADDRESS, acc.address);
+  }
   let agents = [];
   let tools = [];
   let currentAgentId = null;
@@ -168,21 +324,42 @@
     const supported = typeof crypto !== 'undefined' && crypto.subtle;
     if (!supported) throw new Error('WebCrypto недоступен: нужен https или localhost');
 
-    const saved = localStorage.getItem(LS_ENTROPY);
-    if (!saved) return null;
-
     try {
-      const acc = await deriveAccount(saved);
-      /* Сверяем с сохранённым адресом: если алгоритм вывода когда-нибудь
-       * изменится, пользователь увидит «адрес не совпал», а не молча
-       * начнёт работать под чужим кошельком. */
-      const known = localStorage.getItem(LS_ADDRESS);
-      if (known && known !== acc.address) {
-        throw new Error(`адрес из энтропии (${short(acc.address)}) не совпал с сохранённым (${short(known)}): вывод ключей изменился`);
+      /* 1. Обычный путь: неизвлекаемый HKDF-ключ в IndexedDB. */
+      const rec = await idbGet().catch((e) => {
+        console.warn('IndexedDB недоступна:', e.message);
+        return null;
+      });
+      if (rec && rec.ikmKey) {
+        const acc = await deriveAccountFromKey(rec.ikmKey);
+        await assertAddress(acc);
+        account = acc;
+        return acc;
       }
-      localStorage.setItem(LS_ADDRESS, acc.address);
-      account = acc;
-      return acc;
+
+      /* 2. Миграция с прежнего хранилища. Строка лежала в localStorage
+       * открытой — импортируем её сразу неизвлекаемой, пишем в IndexedDB и
+       * только ПОСЛЕ успешной записи стираем из localStorage. Обратный
+       * порядок при сбое IndexedDB оставил бы пользователя без ключа. */
+      const legacy = localStorage.getItem(LS_ENTROPY);
+      if (legacy) {
+        const ikmKey = await importMasterKey(hexToBytes(legacy));
+        const acc = await deriveAccountFromKey(ikmKey);
+        await assertAddress(acc);
+        try {
+          await idbPut({ ikmKey, address: acc.address });
+          localStorage.removeItem(LS_ENTROPY);
+          console.info('мастер-энтропия перенесена в IndexedDB как неизвлекаемый ключ');
+        } catch (e) {
+          /* Запись не принята — оставляем прежнее хранилище нетронутым,
+           * иначе аккаунт был бы потерян молча. Работаем как раньше. */
+          console.warn('перенос энтропии не удался, остаётся прежнее хранилище:', e.message);
+        }
+        account = acc;
+        return acc;
+      }
+
+      return null;
     } catch (e) {
       status(`Ключ не восстановлен: ${e.message}`, 'danger');
       return null;
@@ -190,7 +367,8 @@
   }
 
   async function registerIdentity(entropyHex) {
-    const acc = await deriveAccount(entropyHex);
+    const ikmKey = await importMasterKey(hexToBytes(entropyHex));
+    const acc = await deriveAccountFromKey(ikmKey);
     /* Отправляем ТОЛЬКО публичный ключ: мастер-энтропия остаётся на
      * устройстве. Путь { masterEntropy } существует, но он отладочный —
      * идти им значило бы отдать серверу ключ от всех контуров аккаунта. */
@@ -201,7 +379,16 @@
     if (r.address !== acc.address) {
       throw new Error(`сервер вернул другой адрес: ${short(r.address)} вместо ${short(acc.address)}`);
     }
-    localStorage.setItem(LS_ENTROPY, entropyHex);
+    try {
+      await idbPut({ ikmKey, address: acc.address });
+      localStorage.removeItem(LS_ENTROPY);
+    } catch (e) {
+      /* IndexedDB не приняла ключ. Аккаунт на сервере УЖЕ создан, поэтому
+       * молча оставить пользователя без ключа нельзя — откатываемся на
+       * прежнее хранилище и честно говорим об этом в консоли. */
+      console.warn('IndexedDB не приняла ключ, энтропия остаётся в localStorage:', e.message);
+      localStorage.setItem(LS_ENTROPY, entropyHex);
+    }
     localStorage.setItem(LS_ADDRESS, acc.address);
     account = acc;
     return r;
@@ -234,7 +421,7 @@
      * POST /agents НЕ принимает: он ставит дефолты из config.js. Поэтому
      * лимиты из формы применяем отдельным шагом не можем — и не делаем
      * вид, что применяем (см. примечание в UI). */
-    const agentKey = await deriveAgentKey(account.ikm);
+    const agentKey = await deriveAgentKeyFromKey(account.ikmKey);
     const r = await api('/agents', {
       method: 'POST',
       body: {
@@ -534,6 +721,9 @@
     const forgetBtn = $a('forgetKey');
     if (forgetBtn) {
       forgetBtn.addEventListener('click', () => {
+        /* Стираем оба контура: и запись в IndexedDB, и возможный остаток
+         * строки в localStorage (у аккаунтов, созданных до 2.17.21). */
+        idbDel().catch((e) => console.warn('IndexedDB: запись не удалена:', e.message));
         localStorage.removeItem(LS_ENTROPY);
         localStorage.removeItem(LS_ADDRESS);
         localStorage.removeItem(LS_LAST_AGENT);

@@ -30,6 +30,7 @@ const piiModule = require('./pii-classifier');
  * pii-classifier, и тест ловит момент, когда кто-то снова скопирует список. */
 const LLM = require('./llm-adapter');
 const p2pTransport = require('./p2p-transport');
+const workerBox = require('./worker-box');
 
 /* Флаг --test поднимает собственный изолированный сервер на временной БД и
  * свободном порту. Позиционный аргумент (URL) сохраняется для прогона против
@@ -7217,11 +7218,52 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
             && typeof got43.task.encryptedPayload === 'string',
           got43?.task ? { taskId: got43.task.taskId } : 'кадр не пришёл');
 
+        /* 43.6b — КЛЮЧ СЕССИИ В КАДРЕ ЗАПЕЧАТАН.
+         *
+         * Это проверка того самого дефекта, ради которого правился server.js:
+         * раньше `sessionKey` ехал голым base64 рядом с шифротекстом, то есть
+         * перехваченный кадр давал и замок, и ключ. Теперь он обязан быть
+         * `box:v1:...` — открываемым ТОЛЬКО приватным ключом этого воркера.
+         *
+         * Проверка двусторонняя, иначе она ничего не стоит: (а) формат
+         * именно box:v1 и голого base64 в поле нет; (б) ключ реально
+         * открывается seed'ом воркера и даёт 32 байта, которыми
+         * расшифровывается payload. Одно «поле начинается с box:v1» зеленело
+         * бы и на мусоре. */
+        let keyFromBox43 = null;
+        if (got43 && got43.task) {
+          const t = got43.task;
+          const looksSealed = typeof t.sessionKey === 'string' && /^box:v1:/.test(t.sessionKey);
+          try {
+            /* seed43 — тот самый seed, чей pubkey ушёл в AUTH_RESPONSE. */
+            keyFromBox43 = workerBox.openFromWorker(seed43, t.sessionKey);
+          } catch (e) {
+            keyFromBox43 = null;
+          }
+          ok('43.6b ключ сессии запечатан box:v1 и открывается ключом воркера',
+            looksSealed && t.keyEncryption === 'box:v1'
+              && typeof keyFromBox43 === 'string' && Buffer.from(keyFromBox43, 'base64').length === 32,
+            { sealed: looksSealed, keyEncryption: t.keyEncryption, bytes: keyFromBox43 ? Buffer.from(keyFromBox43, 'base64').length : 0 });
+
+          /* Отрицательный контроль: чужим seed'ом этот же box не открывается.
+           * Без него «открылось» могло бы значить, что шифрования нет вовсе. */
+          let strangerOpen = null;
+          try {
+            strangerOpen = workerBox.openFromWorker(crypto43.randomBytes(32), t.sessionKey);
+          } catch (_e) {
+            strangerOpen = null;
+          }
+          ok('43.6c чужой ключ НЕ открывает запечатанный ключ сессии',
+            strangerOpen === null, strangerOpen === null ? 'отказ' : 'ОТКРЫЛОСЬ чужим ключом');
+        }
+
         /* Задачу надо закрыть, иначе /inference провисит до таймаута и
          * испортит время прогона. Отвечаем минимальным валидным RESULT. */
         if (got43 && got43.task) {
           const t43 = got43.task;
-          const key43 = Buffer.from(t43.sessionKey, 'base64');
+          /* Ключ берём из распечатанного box, а не из поля напрямую: это
+           * ровно то, что сделал бы настоящий воркер. */
+          const key43 = Buffer.from(keyFromBox43 || '', 'base64');
           const iv43 = crypto43.randomBytes(12);
           const ci43 = crypto43.createCipheriv('aes-256-gcm', key43, iv43);
           const ct43 = Buffer.concat([ci43.update('ответ по ws', 'utf8'), ci43.final()]);
