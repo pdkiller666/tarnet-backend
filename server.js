@@ -36,6 +36,9 @@ const { startDemoMesh, describeMesh } = require('./p2p-demo');
  * Спека-источник — v2.2.2 (v2.2.1 отозвана: недетерминированные ключи + wrtc). */
 const tarIdentity = require('./identity');
 const jcs = require('./jcs');
+/* Выбор лучшего из двух ответов роя (2.19.1). Модуль чистый: ни БД, ни сети —
+ * поэтому проверяется обычными юнит-тестами, без поднятия сервера. */
+const swarmSynth = require('./swarm-synthesis');
 const chatSync = require('./chat-sync');
 const knowledgeLoop = require('./knowledge-loop');
 /* Волна 4: лимиты агента, резерв и цикл Think→Act→Observe.
@@ -8286,6 +8289,20 @@ async function runInference(req, res) {
       if (body.swarm === true) {
         const first = wsInbound.pickLeastBusy(tier, null);
         const second = first ? wsInbound.pickLeastBusy(tier, new Set([first])) : null;
+        /* Режим роя объявлен ЗДЕСЬ, а не внутри проверки пары, и это не
+         * стилистика. Блок «swarm не состоялся» ниже читает `swarmMode`,
+         * чтобы назвать причину (`need_two_workers` против
+         * `both_answers_empty`) — а он лежит СНАРУЖИ проверки пары.
+         * Объявление внутри дало бы ReferenceError именно в случае
+         * «воркеров меньше двух», то есть на самом частом пути. Ловится
+         * не `node --check` (тот видит только синтаксис), а тестами 47.0
+         * и 47.1 — они ходят с 0 и 1 воркером. */
+        const swarmMode = String(body.swarmMode || '').toLowerCase() === 'synthesis'
+          ? 'synthesis'
+          : 'race';
+        /* Итог сравнения двух ответов. `null` означает «сравнения не было»:
+         * гонка, или пара не нашлась, или обе ветки упали. */
+        let synthesis = null;
         /* Пара нужна НАСТОЯЩАЯ: два разных адреса. Один воркер, получивший
          * две задачи, — это не параллель, а очередь на одном ПК. */
         if (first && second && first !== second) {
@@ -8315,28 +8332,95 @@ async function runInference(req, res) {
           const p1 = arm(first, swarmModelIds[0]);
           const p2 = arm(second, swarmModelIds[1]);
 
-          /* Ждём первую УСПЕШНУЮ ветку. `Promise.any` здесь не годится: он
-           * отвергает запрос только когда упали ОБЕ, и мы не узнаём, какая
-           * именно победила, — а снять надо именно проигравшую. */
-          const winner = await new Promise((resolve) => {
-            let settled = false;
-            let failed = 0;
-            const settle = (v) => {
-              if (settled) return;
-              if (v && v.ok) { settled = true; resolve(v); return; }
-              failed += 1;
-              if (failed >= 2) { settled = true; resolve(null); }
-            };
-            p1.then(settle, settle);
-            p2.then(settle, settle);
-          });
+          /* ===== Режим роя (2.19.1) =====
+           *
+           * `race` (по умолчанию) — первый успешный ответ, как в 2.18.0.
+           * `synthesis` — ждём ОБА ответа и выбираем лучший.
+           *
+           * ПОЧЕМУ СИНТЕЗ НЕ ВКЛЮЧЁН ПО УМОЛЧАНИЮ. Он меняет не только
+           * качество, но и время ответа: запрос ждёт самую МЕДЛЕННУЮ ветку, а
+           * не самую быструю. Молчаливое включение сделало бы каждый роевой
+           * запрос вдвое дольше без согласия вызывающего — это цена, которую
+           * должен выбирать клиент, а не сервер за него.
+           *
+           * ПРИЁМКА 47.3 ТРЕБУЕТ ГОНКУ: там отвечает только один воркер, и
+           * запрос обязан завершиться, не дожидаясь второго. Поэтому
+           * умолчание — `race`: иначе тест повис бы на TTL. */
+          /* Отказ одной ветки не должен ронять Promise.all: приводим оба
+           * исхода к значениям. Иначе `synthesis` падал бы на первой же
+           * ошибке воркера, хотя вторая ветка жива. */
+          const settledArm = (p) => p.then(v => v, v => v);
+
+          let winner = null;
+
+          if (swarmMode === 'synthesis') {
+            /* Ждём ОБЕ ветки. Каждая уже ограничена TTL задачи, поэтому
+             * отдельный таймер здесь не нужен: зависание невозможно. */
+            const both = await Promise.all([settledArm(p1), settledArm(p2)]);
+            const okArms = both.filter(a => a && a.ok);
+
+            if (okArms.length === 1) {
+              /* Вторая упала — возвращаем живую. Это правило 3 из директивы
+               * и оно же поведение гонки: отказ одного узла не роняет запрос. */
+              winner = okArms[0];
+              synthesis = {
+                mode: 'synthesis',
+                pick: okArms[0].addr === first ? 'first' : 'second',
+                reason: 'one_arm_failed',
+                similarity: null,
+              };
+            } else if (okArms.length === 2) {
+              const decision = swarmSynth.synthesize(
+                okArms[0].res && okArms[0].res.response,
+                okArms[1].res && okArms[1].res.response,
+              );
+              /* `pick: null` — оба ответа пустые. Тогда брать нечего, и это
+               * честнее показать как есть, чем выбрать «первый пустой». */
+              const idx = decision.pick === 'second' ? 1 : 0;
+              winner = decision.pick ? okArms[idx] : null;
+              synthesis = {
+                mode: 'synthesis',
+                pick: decision.pick,
+                reason: decision.reason,
+                similarity: decision.similarity,
+                lengths: decision.lengths,
+                syntax: decision.syntax,
+              };
+            }
+            /* okArms.length === 0 — обе упали; winner остаётся null и ниже
+             * сработает общая ветка «swarm не состоялся». */
+          } else {
+            /* Ждём первую УСПЕШНУЮ ветку. `Promise.any` здесь не годится: он
+             * отвергает запрос только когда упали ОБЕ, и мы не узнаём, какая
+             * именно победила, — а снять надо именно проигравшую. */
+            winner = await new Promise((resolve) => {
+              let settled = false;
+              let failed = 0;
+              const settle = (v) => {
+                if (settled) return;
+                if (v && v.ok) { settled = true; resolve(v); return; }
+                failed += 1;
+                if (failed >= 2) { settled = true; resolve(null); }
+              };
+              p1.then(settle, settle);
+              p2.then(settle, settle);
+            });
+          }
 
           if (winner) {
-            /* Снимаем проигравшую задачу сразу, а не оставляем истекать: она
-             * уже не нужна, а её воркер всё ещё считает — пусть освободит
-             * слот. `cancelled` — отдельный статус, чтобы в отчёте было
-             * видно «снята swarm», а не «умерла по TTL». */
-            const loserIds = taskIds.filter(tid => tid !== winner.taskId);
+            /* Снимаем проигравшую задачу ТОЛЬКО в режиме гонки. В синтезе
+             * второго ответа нельзя назвать проигравшим: он был прочитан
+             * и взвешен при выборе, его воркер работу выполнил. Отправлять
+             * его в `cancelled` значило бы записать в отчёт «задача снята,
+             * результат не понадобился» — прямая неправда.
+             *
+             * В гонке снятие нужно, и вот почему: там ответ проигравшего
+             * не читается вообще, а его воркер всё ещё считает — пусть
+             * освободит слот. `cancelled` — отдельный статус, чтобы в
+             * отчёте было видно «снята swarm», а не «умерла по TTL». */
+            const loserIds = swarmMode === 'synthesis'
+              ? []
+              : taskIds.filter(tid => tid !== winner.taskId);
             for (const tid of loserIds) {
               try {
                 run(`UPDATE worker_tasks SET status = 'cancelled', finishedAt = ?
@@ -8369,11 +8453,18 @@ async function runInference(req, res) {
               enabled: true,
               parallel: true,
               requested: true,
+              /* Режим, в котором рой реально работал. Без него клиент не
+               * отличит гонку от синтеза: в обоих случаях `parallel: true`
+               * и два воркера, а поведение и время ответа разные. */
+              mode: swarmMode,
               workers: [first, second],
               winnerWorker: winner.addr,
               winnerTaskId: winner.taskId,
               loserTaskIds: loserIds,
               cancelled: loserIds.length,
+              /* Обоснование выбора — только в синтезе. В гонке обоснования
+               * нет: там победило время, а не качество. */
+              synthesis,
               models: swarmModelIds.length ? swarmModelIds.slice(0, 2) : [fallbackModel],
             };
           }
@@ -8384,12 +8475,23 @@ async function runInference(req, res) {
          * параллели не было. Молчаливая подмена на одну задачу выглядела бы
          * как работающий swarm в отчёте. */
         if (!swarmBlock) {
+          /* Три разные причины, а не одна «не вышло». В синтезе возможен
+           * случай, которого в гонке нет: ОБЕ ветки ответили успешно, но
+           * текстом из одних пробелов — `synthesize` вернул `pick: null`.
+           * Назвать это `all_swarm_arms_failed` значило бы соврать про
+           * причину: воркеры не падали, они ответили пусто. Тот, кто
+           * разбирается по логу, ищет разные вещи. */
+          const bothEmptied = swarmMode === 'synthesis'
+            && synthesis && synthesis.reason === 'both_empty';
           swarmBlock = {
             enabled: false,
             requested: true,
-            reason: (first && second && first !== second)
-              ? 'all_swarm_arms_failed'
-              : 'need_two_workers',
+            mode: swarmMode,
+            reason: bothEmptied
+              ? 'both_answers_empty'
+              : ((first && second && first !== second)
+                ? 'all_swarm_arms_failed'
+                : 'need_two_workers'),
           };
         }
       }

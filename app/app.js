@@ -447,6 +447,11 @@ function syncSwarmGate(activeWorkers) {
       ? 'Private Swarm — две модели параллельно, ответ берётся от первой'
       : 'Private Swarm — нужны два воркера в сети (сейчас меньше)';
   }
+  /* Синтез живёт ТОЛЬКО внутри Swarm: он сравнивает два ответа, а без
+   * параллели сравнивать нечего. Поэтому галочка синтеза зависит от двух
+   * условий сразу — хватает узлов И включён сам Swarm. Погашенная галочка
+   * без объяснения читалась бы как поломка интерфейса. */
+  syncSynthesisGate(enough);
   /* Плашка отвечает на вопрос «работает ли рой СЕЙЧАС», а не «что делает
    * галочка». Сервер уже называет причину отказа (`swarm.reason`), и
    * повторять здесь только «недоступно» значило бы заставлять человека
@@ -470,6 +475,51 @@ function syncSwarmGate(activeWorkers) {
         : `Swarm Mode недоступен: нужен второй узел (сейчас ${n})`);
   }
 }
+
+/* Галочка синтеза зависит от двух условий: хватает узлов И включён Swarm.
+ *
+ * Почему отдельная функция, а не строка внутри `syncSwarmGate`: состояние
+ * меняется двумя разными событиями — пришёл ответ `/health` (узлов стало
+ * больше или меньше) или человек поставил галочку Swarm. Одна функция на
+ * два триггера; размазанная копия разошлась бы при первой же правке.
+ *
+ * `swarmEnabled` передаётся явно, а не читается из DOM: при первом
+ * обновлении баннера галочка ещё не тронута человеком, и `checked` в этот
+ * момент не значит «Swarm включён сознательно». */
+function syncSynthesisGate (enoughWorkers = null, swarmEnabled = null) {
+  const synth = $('swarmSynthesis');
+  if (!synth) return;
+
+  const swarmEl = $('swarmMode');
+  const hasNodes = enoughWorkers == null
+    ? (swarmEl ? !swarmEl.disabled : false)
+    : Boolean(enoughWorkers);
+  const swarmOn = swarmEnabled == null
+    ? Boolean(swarmEl && swarmEl.checked)
+    : Boolean(swarmEnabled);
+
+  const allowed = hasNodes && swarmOn;
+  synth.disabled = !allowed;
+  /* Снимаем галочку вместе с гашением. Иначе после выключения Swarm в
+   * DOM остался бы включённый флажок синтеза, и при следующем включении
+   * Swarm человек получил бы режим, которого не выбирал. */
+  if (!allowed && synth.checked) synth.checked = false;
+
+  const label = $('swarmSynthesisLabel');
+  if (label) {
+    label.textContent = allowed
+      ? 'Swarm Synthesis — дождаться обоих ответов и выбрать лучший'
+      : (hasNodes
+        ? 'Swarm Synthesis — доступно при включённом Private Swarm'
+        : 'Swarm Synthesis — нужны два воркера в сети');
+  }
+}
+
+/* Человек включил или выключил Swarm — синтез обязан отреагировать сразу.
+ * Без этого слушателя галочка синтеза осталась бы погашенной до
+ * следующего опроса `/health`, то есть до 15 секунд, и выглядела бы
+ * сломанной ровно в момент, когда её ищут. */
+$('swarmMode')?.addEventListener('change', () => syncSynthesisGate());
 
 async function refreshWorkerBanner() {
   const box = $('workerBanner');
@@ -1362,6 +1412,21 @@ async function sendPrompt(prompt, opts = {}) {
      * обещать её в интерфейсе. Поле `swarm` сервер читает строго как === true. */
     const swarmEl = $('swarmMode');
     if (swarmEl && swarmEl.checked && !swarmEl.disabled) body.swarm = true;
+
+    /* Режим синтеза отправляется ТОЛЬКО вместе с самим Swarm.
+     *
+     * Сервер по умолчанию работает в `race` — первый ответ побеждает,
+     * второй снимается. `synthesis` ждёт оба и выбирает лучший по
+     * правилам `swarm-synthesis.js`. Отправить режим без флага `swarm`
+     * значило бы просить сравнение, которого не будет: сервер вернёт
+     * обычный одиночный ответ, а интерфейс покажет выбранный режим.
+     *
+     * Проверяем `body.swarm`, а не галочку заново: между двумя чтениями
+     * DOM состояние могло измениться, и два поля ушли бы вразнобой. */
+    const synthEl = $('swarmSynthesis');
+    if (body.swarm === true && synthEl && synthEl.checked && !synthEl.disabled) {
+      body.swarmMode = 'synthesis';
+    }
 
     /* Оплата из внутреннего баланса TAR: комиссия 2% вместо 5%.
      *

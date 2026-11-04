@@ -102,7 +102,7 @@
  * Faucet прямо в пузыре ошибки 402. Без подъёма кэша человек при нехватке
  * баланса увидит старый текст «INSUFFICIENT_FUNDS» и не найдёт кнопку:
  * её нет ни в старом app.js, ни в старом styles.css. */
-const CACHE = 'tarnet-app-v31';
+const CACHE = 'tarnet-app-v32';
 
 const ASSETS = [
   '/app/',

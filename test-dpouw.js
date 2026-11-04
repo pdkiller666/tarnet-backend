@@ -8526,6 +8526,204 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       { count: links.body?.count, dev: devRow });
   }
 
+  /* ===== 49. Swarm Synthesis: выбор лучшего из двух ответов (2.19.1) =====
+   *
+   * Что доказывается: рой умеет не только гонку. В режиме `synthesis` он
+   * дожидается ОБОИХ ответов, сравнивает их и возвращает лучший по названному
+   * правилу. Проверяются все четыре правила выбора и то, что режим по
+   * умолчанию не изменился: иначе цена синтеза (ждать медленную ветку) легла
+   * бы на все запросы без согласия клиента.
+   *
+   * Почему воркеры отвечают вручную, а не автоответом: при автоответе обе
+   * ветки дают одинаковый текст, и проверялось бы только правило согласия.
+   * Три остальных правила остались бы непроверенными. */
+  {
+    const workerMod49 = require('./worker-demo');
+    const crypto49 = require('crypto');
+
+    const connectWorker49 = async (wsBase, label) => {
+      const addr = '0x' + crypto49.createHash('sha256')
+        .update('synth-' + label + '-' + RUN).digest('hex').slice(0, 40);
+      const keys = workerMod49.ed25519FromSeed(crypto49.randomBytes(32));
+      const w = { addr, sock: null, tasks: [], waiters: [] };
+
+      const waitFrame = (want, timeoutMs = 8000) => new Promise((resolve) => {
+        const timer = setTimeout(() => { w.sock.removeEventListener('message', onMsg); resolve(null); }, timeoutMs);
+        const onMsg = (ev) => {
+          let f = null;
+          try { f = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); } catch (_e) { return; }
+          if (!f || f.type !== want) return;
+          clearTimeout(timer);
+          w.sock.removeEventListener('message', onMsg);
+          resolve(f);
+        };
+        w.sock.addEventListener('message', onMsg);
+      });
+
+      w.sock = new WebSocket(wsBase + '/p2p/worker');
+      const ch = await waitFrame('HELLO_CHALLENGE');
+      if (!ch) { try { w.sock.close(); } catch (_e) { /* уже закрыт */ } return null; }
+      const ts = Date.now();
+      const pl = `TARNET_WS_AUTH:${ch.nonce}:${addr}:${ts}`;
+      w.sock.send(JSON.stringify({
+        type: 'AUTH_RESPONSE',
+        workerAddress: addr,
+        pubkey: keys.pubHex,
+        signature: crypto49.sign(null, Buffer.from(pl, 'utf8'), keys.priv).toString('base64'),
+        timestamp: ts,
+        model: 'qwen2.5-coder:1.5b',
+        installedModels: ['qwen2.5-coder:1.5b'],
+        ollamaOnline: true,
+      }));
+      const okay = await waitFrame('AUTH_OK');
+      if (!okay) { try { w.sock.close(); } catch (_e) { /* уже закрыт */ } return null; }
+
+      w.sock.addEventListener('message', (ev) => {
+        let f = null;
+        try { f = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); } catch (_e) { return; }
+        if (!f || f.type !== 'TASK' || !f.task) return;
+        w.tasks.push(f.task);
+        w.waiters.splice(0).forEach((r) => r(f.task));
+      });
+
+      w.nextTask = (timeoutMs = 8000) => new Promise((resolve) => {
+        if (w.tasks.length) return resolve(w.tasks.shift());
+        const timer = setTimeout(() => resolve(null), timeoutMs);
+        w.waiters.push((task) => { clearTimeout(timer); resolve(task); });
+      });
+      w.reply = (task, text) => w.sock.send(JSON.stringify({
+        type: 'RESULT', taskId: task.taskId, workerAddress: w.addr,
+        response: text, usage: { completion_tokens: 8 },
+        model: 'qwen2.5-coder:1.5b', source: 'ollama',
+      }));
+      /* Кадр ERROR — штатный способ воркера сказать «не смог». Тесту он нужен,
+       * чтобы проверить ветку «одна рука упала» без ожидания TTL. */
+      w.fail = (task) => w.sock.send(JSON.stringify({
+        type: 'ERROR', taskId: task.taskId, workerAddress: w.addr,
+        error: 'OLLAMA_NOT_RUNNING',
+      }));
+      w.close = () => { try { w.sock.close(); } catch (_e) { /* уже закрыт */ } };
+      return w;
+    };
+
+    if (typeof WebSocket !== 'function') {
+      skip('49.1–49.7 Swarm Synthesis', 'в этой версии Node нет глобального WebSocket');
+    } else {
+      const s49 = await spawnServer();
+      try {
+        const wsBase49 = s49.base.replace(/^http:/i, 'ws:');
+
+        /* Один прогон: два воркера, одна задача, заданные ответы.
+         * `textB === null` означает «вторая ветка падает», а не «молчит»:
+         * молчание проверяло бы TTL, а не обработку отказа. */
+        const runPair = async (tag, textA, textB, mode = 'synthesis') => {
+          const a = await connectWorker49(wsBase49, tag + 'a');
+          const b = await connectWorker49(wsBase49, tag + 'b');
+          if (!a || !b) return { a, b, resp: null };
+          await apiAt(s49.base, '/node', 'POST', { address: a.addr, stake: 90000, reputation: 0.99 });
+          await apiAt(s49.base, '/node', 'POST', { address: b.addr, stake: 90000, reputation: 0.99 });
+          await new Promise((r) => setTimeout(r, 250));
+
+          const payload = { prompt: 'synth ' + tag, tier: 'base', swarm: true };
+          if (mode) payload.swarmMode = mode;
+          const req = apiAt(s49.base, '/inference', 'POST', payload);
+
+          const tA = await a.nextTask();
+          const tB = await b.nextTask();
+          if (tA) a.reply(tA, textA);
+          if (tB) { if (textB === null) b.fail(tB); else b.reply(tB, textB); }
+          const resp = await req;
+
+          /* Закрываем пару сразу: иначе следующие прогоны выберут этих же
+           * воркеров как «наименее занятых», и проверка адресов станет
+           * случайной. */
+          a.close(); b.close();
+          await new Promise((r) => setTimeout(r, 150));
+          return { a, b, resp };
+        };
+
+        /* --- 49.1–49.3: разные по объёму ответы → выбирается полный --- */
+        const shortA = 'Коротко.';
+        const longB = 'Развёрнутый ответ на ту же тему другими словами: здесь больше деталей о том, '
+          + 'как устроен выбор между ветками, и почему длина не равна правильности.';
+        const r1 = await runPair('longer', shortA, longB);
+        const sw1 = r1.resp?.body?.swarm;
+        /* ПОЧЕМУ ПРОВЕРКА ПО ТЕКСТУ, А НЕ ПО `pick`. Какую руку получит
+         * воркер `a`, решает `pickLeastBusy`, а не порядок подключения: он
+         * отдаёт задачу наименее занятому. Первая версия этого теста
+         * требовала `pick === 'second'` и падала при обратном назначении,
+         * хотя продукт отвечал верно. Проверять надо СОДЕРЖИМОЕ выбранного
+         * ответа, которое не зависит от порядка рук. */
+        ok('49.1 синтез выбирает более полный ответ (reason=longer)',
+          r1.resp?.status === 200 && sw1?.mode === 'synthesis'
+          && sw1?.synthesis?.reason === 'longer'
+          && r1.resp?.body?.response === longB,
+          { status: r1.resp?.status, swarm: sw1 });
+
+        /* Адрес-победитель выводится из `pick`: `workers[0]` — это первая
+         * рука, `workers[1]` — вторая (см. swarmBlock). */
+        const winnerAddr1 = sw1?.synthesis?.pick === 'first' ? sw1?.workers?.[0] : sw1?.workers?.[1];
+        ok('49.2 в синтезе оплачен выбранный воркер, а не первый ответивший',
+          Boolean(winnerAddr1)
+          && String(r1.resp?.body?.workerAddress || '').toLowerCase() === String(winnerAddr1).toLowerCase(),
+          { paidTo: r1.resp?.body?.workerAddress, winnerAddr: winnerAddr1, pick: sw1?.synthesis?.pick });
+
+        ok('49.3 в синтезе вторая задача НЕ снимается: её ответ был прочитан',
+          sw1?.cancelled === 0 && Array.isArray(sw1?.loserTaskIds) && sw1.loserTaskIds.length === 0,
+          { cancelled: sw1?.cancelled, loserTaskIds: sw1?.loserTaskIds });
+
+        /* --- 49.4: совпадающие ответы → первый, без поощрения многословия --- */
+        const same = 'Одинаковый ответ от обеих веток роя.';
+        const r2 = await runPair('agree', same, same);
+        const sw2 = r2.resp?.body?.swarm;
+        ok('49.4 одинаковые ответы → reason=agree, выбран первый',
+          sw2?.synthesis?.reason === 'agree' && sw2?.synthesis?.pick === 'first'
+          && sw2?.synthesis?.similarity >= 0.8,
+          { synthesis: sw2?.synthesis });
+
+        /* --- 49.5: код. Битый обязан проиграть разбираемому ---
+         * Это проверка того самого дефекта, который нашёлся при разработке:
+         * два варианта кода совпадают по словам на 95%, и при проверке
+         * согласия РАНЬШЕ синтаксиса возвращался битый ответ. */
+        const brokenCode = '```js\nfunction f( { return 1 }\n```';
+        const validCode = '```js\nfunction f(){ return 1 }\n```';
+        const r3 = await runPair('syntax', brokenCode, validCode);
+        const sw3 = r3.resp?.body?.swarm;
+        /* Порядок рук неизвестен, поэтому проверяются два независимых
+         * факта: вернулся РАЗБИРАЕМЫЙ код и ровно одна рука не прошла
+         * парсер. Требовать конкретный индекс значило бы зависеть от
+         * назначения `pickLeastBusy`. */
+        ok('49.5 битый код проигрывает разбираемому (reason=syntax)',
+          sw3?.synthesis?.reason === 'syntax'
+          && r3.resp?.body?.response === validCode
+          && [sw3?.synthesis?.syntax?.first?.ok, sw3?.synthesis?.syntax?.second?.ok]
+            .filter(v => v === true).length === 1
+          && [sw3?.synthesis?.syntax?.first?.ok, sw3?.synthesis?.syntax?.second?.ok]
+            .filter(v => v === false).length === 1,
+          { synthesis: sw3?.synthesis });
+
+        /* --- 49.6: падение одной ветки не роняет запрос --- */
+        const r4 = await runPair('onefail', 'Живой ответ первой ветки роя.', null);
+        const sw4 = r4.resp?.body?.swarm;
+        ok('49.6 падение одной ветки → ответ второй (reason=one_arm_failed)',
+          r4.resp?.status === 200 && sw4?.synthesis?.reason === 'one_arm_failed'
+          && String(sw4?.winnerWorker || '').toLowerCase() === String(r4.a?.addr || '').toLowerCase(),
+          { status: r4.resp?.status, swarm: sw4 });
+
+        /* --- 49.7: без swarmMode режим прежний — гонка ---
+         * Регрессия, которую легко не заметить: синтез включился бы всем и
+         * молча удвоил время ответа. */
+        const r5 = await runPair('race', 'Первый ответ.', 'Второй ответ другой длины.', null);
+        const sw5 = r5.resp?.body?.swarm;
+        ok('49.7 без swarmMode режим = race, сравнения нет',
+          sw5?.mode === 'race' && sw5?.synthesis === null,
+          { mode: sw5?.mode, synthesis: sw5?.synthesis });
+      } finally {
+        s49.stop();
+      }
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {
