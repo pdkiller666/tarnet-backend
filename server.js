@@ -35,6 +35,7 @@ const { startDemoMesh, describeMesh } = require('./p2p-demo');
 /* Фаза 2: TarNet ID, оффлайн-синхронизация чатов, Knowledge Loop.
  * Спека-источник — v2.2.2 (v2.2.1 отозвана: недетерминированные ключи + wrtc). */
 const tarIdentity = require('./identity');
+const jcs = require('./jcs');
 const chatSync = require('./chat-sync');
 const knowledgeLoop = require('./knowledge-loop');
 /* Волна 4: лимиты агента, резерв и цикл Think→Act→Observe.
@@ -616,6 +617,40 @@ CREATE TABLE IF NOT EXISTS device_link_codes (
   consumedAt    INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_device_link_codes_owner ON device_link_codes (ownerAddress);
+
+/* Челленджи привязки по JCS-подписи (2.19.0).
+ *
+ * Зачем рядом с кодами, а не вместо них. Код из шести цифр — это 10^6
+ * вариантов и мандат, который человек ПЕРЕНОСИТ глазами; он остаётся для
+ * случая «стою у чужого ПК». Челлендж решает другую задачу: браузер и ПК
+ * обмениваются одноразовым nonce, который подписывается ключом ПК вместе с
+ * адресами обеих сторон. Перебрать тут нечего — подпись либо сходится с
+ * ключом ПК, либо нет, а nonce живёт 5 минут и гасится атомарно.
+ *
+ * ПОЧЕМУ nonce И challengeId РАЗНЫЕ. challengeId — это имя строки, по нему
+ * ищут; nonce — это то, что попадает в подпись. Если бы в подпись шёл
+ * challengeId, то подсмотренный идентификатор давал бы право на подпись,
+ * а с nonce нужно ещё и видеть сам челлендж.
+ *
+ * consumedAt — атомарное гашение. Повторная отправка той же подписи — это
+ * replay: подпись верна, но мандат уже исполнен. Отказ 409, а не 403:
+ * ключ правильный, а запрос уже был.
+ *
+ * ownerAddress — кому привязываем (браузер), deviceAddress — кто
+ * подписывает (ПК). Обе стороны в строке челленджа, потому что подпись
+ * ПК подтверждает ИМЕННО пару, а не «какой-нибудь владелец». */
+CREATE TABLE IF NOT EXISTS device_link_challenges (
+  challengeId   TEXT PRIMARY KEY,
+  nonce         TEXT NOT NULL,
+  ownerAddress  TEXT NOT NULL,
+  deviceAddress TEXT,
+  createdAt     INTEGER NOT NULL,
+  expiresAt     INTEGER NOT NULL,
+  consumedAt    INTEGER,
+  attempts      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_device_link_challenges_owner ON device_link_challenges (ownerAddress);
+CREATE INDEX IF NOT EXISTS idx_device_link_challenges_exp ON device_link_challenges (expiresAt);
 
 /* Клейм старого баланса. PK по старому адресу — это и есть защита от
  * повторного клейма: второй INSERT упадёт на PRIMARY KEY, а не перенесёт
@@ -3760,8 +3795,7 @@ app.post('/devices/link/claim', (req, res) => {
 });
 
 app.post('/devices/link', (req, res) => {
-  const body = req.body || {};
-  const owner = String(body.ownerAddress || '').trim().toLowerCase();
+  const body = req.body || {};  const owner = String(body.ownerAddress || '').trim().toLowerCase();
   const device = String(body.deviceAddress || '').trim().toLowerCase();
 
   if (!INSTALL_ADDR_RE.test(owner)) {
@@ -3865,6 +3899,281 @@ app.get('/devices/:owner', (req, res) => {
   });
 
   res.json({ ownerAddress: owner, count: devices.length, devices });
+});
+
+/* ===== Device Linking по JCS-подписи (2.19.0) =====
+ *
+ * ЧТО ЭТО ЗАМЕНЯЕТ И ЧТО СОХРАНЯЕТ. Коды из шести цифр остаются: их удобно
+ * переносить глазами, когда ПК чужой. Здесь второй путь для обычного случая
+ * («мой ПК рядом, браузер открыт») — без переноса цифр и без 10^6 вариантов.
+ *
+ * ПОЧЕМУ NONCE, А НЕ КОД. Код угадывается: 10^6 — это часы перебора, а
+ * гасится он только при успехе. Nonce здесь 32 байта из CSPRNG, и угадать его
+ * нельзя. Перебирать нечего, поэтому и replay закрывается не счётчиком
+ * попыток, а одноразовостью строки.
+ *
+ * ПОЧЕМУ ПОДПИСЬ НА ШАГЕ 1 — ПОДПИСЬ ВЛАДЕЛЬЦА, ХОТЯ ДИРЕКТИВА ЕЁ НЕ ТРЕБУЕТ.
+ * `tier6PayerChain` (`server.js:1896`) берёт владельца ИЗ `device_links` и
+ * разрешает устройству списывать с его баланса. Значит привязка — это право
+ * на чужие деньги. Если бы челлендж создавался по одному `browserAddress`
+ * без доказательства, любой человек подписал бы СВОЙ ПК и привязал его к
+ * чужому кошельку, а потом потратил чужой баланс через Tier 6. Требование
+ * подписи владельца закрывает это на входе, а не на выходе.
+ *
+ * ПОЧЕМУ JCS, А НЕ СКЛЕЙКА ЧЕРЕЗ ':'`. В подписываемом объекте шесть полей,
+ * среди них адреса и два идентификатора. Позиционная строка ломается от
+ * любого пропущенного разделителя, и поломка выглядит как «подпись не
+ * сходится» без указания места. JCS даёт ровно одну байтовую
+ * последовательность на объект (см. `jcs.js`). */
+const LINK_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const LINK_CHALLENGE_MAX_ATTEMPTS = 5;
+
+app.post('/devices/link/challenge', (req, res) => {
+  const body = req.body || {};
+  const owner = String(body.ownerAddress || '').trim().toLowerCase();
+  const sig = body.signature ?? body.linkSignature;
+  const nonce = String(body.nonce ?? '').trim();
+
+  if (!INSTALL_ADDR_RE.test(owner)) {
+    return res.status(400).json({ error: 'ownerAddress invalid', detail: '0x и 40 hex-символов' });
+  }
+  if (!sig || !nonce || !LINK_NONCE_RE.test(nonce)) {
+    return res.status(400).json({
+      error: 'SIGNATURE_REQUIRED',
+      detail: 'нужны signature и nonce: челлендж выпускает только владелец аккаунта',
+      payload_template: `link-challenge:${owner}:<nonce>`,
+    });
+  }
+
+  const w = get('SELECT publicKeyPem FROM wallets WHERE address = ?', [owner]);
+  if (!w || !w.publicKeyPem) {
+    return res.status(403).json({
+      error: 'DEVICE_NOT_OWNED',
+      detail: 'у адреса нет публичного ключа: сначала POST /id/register',
+    });
+  }
+  const payload = ['link-challenge', owner, nonce].join(':');
+  if (!verifyPayload(payload, String(sig), w.publicKeyPem)) {
+    return res.status(403).json({
+      error: 'DEVICE_NOT_OWNED', payload,
+      detail: 'подпись не сходится с ключом владельца',
+    });
+  }
+
+  const now = Date.now();
+  const challengeId = 'lc_' + crypto.randomBytes(12).toString('hex');
+  /* Отдельный nonce, а не тот, что в подписи владельца: подписанный nonce
+   * клиент присылает САМ, а в челлендж должен попасть секрет, которого
+   * клиент до ответа сервера не знал. Иначе «nonce» можно было бы задать
+   * заранее и переиспользовать подпись между сессиями. */
+  const challengeNonce = crypto.randomBytes(32).toString('base64url');
+  const expiresAt = now + LINK_CHALLENGE_TTL_MS;
+
+  tx(() => {
+    /* Просроченные чистим здесь, а не отдельным автоматом: строки живут
+     * минуты, и отдельный джоб ради них был бы дороже хранения. */
+    run('DELETE FROM device_link_challenges WHERE expiresAt < ?', [now - LINK_CHALLENGE_TTL_MS]);
+    run(`INSERT INTO device_link_challenges
+           (challengeId, nonce, ownerAddress, createdAt, expiresAt, attempts)
+         VALUES (?, ?, ?, ?, ?, 0)`,
+      [challengeId, challengeNonce, owner, now, expiresAt]);
+  });
+
+  res.json({
+    ok: true,
+    challengeId,
+    nonce: challengeNonce,
+    ownerAddress: owner,
+    expiresAt,
+    ttlSeconds: Math.floor(LINK_CHALLENGE_TTL_MS / 1000),
+    /* Шаблон отдаётся целиком, чтобы воркер не собирал объект по памяти: пропущенное
+     * поле выглядело бы как несовпадение подписи, а не как забытый ключ. */
+    linkTemplate: { action: 'link', owner, device: '<адрес этого ПК>', challengeId, nonce: challengeNonce, expiresAt },
+    howTo: 'На ПК: подставьте свой адрес в linkTemplate, подпишите JCS-строку этого объекта ключом ПК и отправьте { link, signature } в POST /devices/link/confirm',
+  });
+});
+
+app.post('/devices/link/confirm', (req, res) => {
+  const body = req.body || {};
+  const link = body.link && typeof body.link === 'object' ? body.link : {
+    action: body.action,
+    owner: body.ownerAddress,
+    device: body.deviceAddress,
+    challengeId: body.challengeId,
+    nonce: body.nonce,
+    expiresAt: body.expiresAt,
+  };
+  const sig = body.signature ?? body.linkSignature;
+
+  const owner = String(link.owner || '').trim().toLowerCase();
+  const device = String(link.device || '').trim().toLowerCase();
+  const challengeId = String(link.challengeId || '').trim();
+
+  if (String(link.action || '') !== 'link') {
+    return res.status(400).json({ error: 'ACTION_INVALID', detail: 'action должен быть "link"' });
+  }
+  if (!INSTALL_ADDR_RE.test(owner)) return res.status(400).json({ error: 'owner invalid' });
+  if (!INSTALL_ADDR_RE.test(device)) {
+    return res.status(400).json({
+      error: 'device invalid',
+      detail: 'адрес ПК: 0x и 40 hex-символов — подставьте его в linkTemplate.device',
+    });
+  }
+  if (!challengeId) return res.status(400).json({ error: 'challengeId is required' });
+  if (!sig) {
+    return res.status(400).json({
+      error: 'SIGNATURE_REQUIRED',
+      detail: 'нужна подпись ПК над JCS-строкой объекта link',
+    });
+  }
+  if (owner === device) {
+    return res.status(400).json({
+      error: 'SAME_ADDRESS',
+      detail: 'адрес ПК совпадает с адресом аккаунта',
+    });
+  }
+
+  const row = get('SELECT * FROM device_link_challenges WHERE challengeId = ?', [challengeId]);
+  if (!row) {
+    return res.status(404).json({ error: 'CHALLENGE_NOT_FOUND', detail: 'такого челленджа нет или он устарел' });
+  }
+  /* Повторное использование ЛЮБОГО поля — это уже ответ на вопрос «можно ли
+   * отправить ещё раз». Отвечаем 409: подпись верна, мандат исполнен. */
+  if (row.consumedAt) {
+    return res.status(409).json({ error: 'CHALLENGE_USED', detail: 'этот челлендж уже погашен' });
+  }
+  const now = Date.now();
+  if (Number(row.expiresAt) < now) {
+    return res.status(410).json({
+      error: 'CHALLENGE_EXPIRED',
+      detail: 'челлендж истёк: создайте новый в браузере',
+      expiredAt: Number(row.expiresAt), serverTime: now,
+    });
+  }
+  if (Number(row.attempts) >= LINK_CHALLENGE_MAX_ATTEMPTS) {
+    return res.status(429).json({ error: 'CHALLENGE_EXHAUSTED', detail: 'слишком много попыток: создайте новый челлендж' });
+  }
+
+  /* Сверка полей с сохранённым челленджем. Это НЕ замена подписи: подпись
+   * доказывает, кто говорит, а сверка — что он говорит про ТОТ челлендж и
+   * ТЕХ участников. Без неё подписанный объект можно было бы приложить к
+   * чужому challengeId. */
+  const mismatch = [];
+  if (String(row.ownerAddress) !== owner) mismatch.push('owner');
+  if (row.deviceAddress && String(row.deviceAddress) !== device) mismatch.push('device');
+  if (String(row.nonce) !== String(link.nonce || '')) mismatch.push('nonce');
+  if (Number(link.expiresAt) !== Number(row.expiresAt)) mismatch.push('expiresAt');
+  if (mismatch.length) {
+    run('UPDATE device_link_challenges SET attempts = attempts + 1 WHERE challengeId = ?', [challengeId]);
+    return res.status(400).json({
+      error: 'CHALLENGE_MISMATCH',
+      fields: mismatch,
+      detail: 'подписанный объект не совпадает с челленджем: сверьте поля с linkTemplate',
+    });
+  }
+
+  /* Ключ ПК — только из `ws_worker_auth`: другого ключа, который сервер
+   * видел у этого адреса, не существует. Принимать ключ из тела значило бы
+   * дать любому подписать «от имени ПК» своим ключом. */
+  const wk = get('SELECT pubkeyHex FROM ws_worker_auth WHERE LOWER(workerAddress) = ? LIMIT 1', [device]);
+  if (!wk || !wk.pubkeyHex) {
+    return res.status(403).json({
+      error: 'DEVICE_KEY_UNKNOWN',
+      detail: 'у этого адреса нет привязанного ключа: сначала запустите воркер (WS-handshake или POST /worker/handshake)',
+    });
+  }
+
+  let payloadStr;
+  try {
+    payloadStr = jcs.stringify(link);
+  } catch (e) {
+    return res.status(400).json({ error: 'LINK_NOT_CANONICAL', detail: e.message });
+  }
+  const pem = tarIdentity.rawPubToPem(Buffer.from(String(wk.pubkeyHex), 'hex'));
+  if (!verifyPayload(payloadStr, String(sig), pem)) {
+    run('UPDATE device_link_challenges SET attempts = attempts + 1 WHERE challengeId = ?', [challengeId]);
+    return res.status(403).json({
+      error: 'SIGNATURE_INVALID',
+      detail: 'подпись не сходится с ключом ПК',
+      /* Каноническая строка в ответе: без неё клиент не может понять, где
+       * разошлась сериализация, и правит подпись наугад. */
+      signed_payload: payloadStr,
+    });
+  }
+
+  /* Устройство должно быть известно сети: строка привязки к никогда не
+   * существовавшему адресу — это зелёная галочка над пустотой. */
+  const seen = get('SELECT 1 AS ok FROM worker_presence WHERE lower(workerAddress) = ?', [device])
+    || get('SELECT 1 AS ok FROM work_receipts WHERE lower(workerAddress) = ? LIMIT 1', [device])
+    || get('SELECT 1 AS ok FROM nodes WHERE lower(address) = ?', [device]);
+  if (!seen) {
+    return res.status(404).json({
+      error: 'DEVICE_UNKNOWN',
+      detail: 'этот адрес ещё не появлялся в сети: запустите воркер и повторите',
+    });
+  }
+
+  /* Гашение и привязка — ОДНА транзакция, и гашение условное (`consumedAt IS
+   * NULL` в WHERE). Два одновременных confirm прочитали бы `consumedAt = NULL`
+   * оба, и оба прошли бы проверку выше; запись `device_links` от этого не
+   * задваивается (PK), но «одноразовый» челлендж перестал бы быть одноразовым. */
+  const outcome = tx(() => {
+    const claimed = run('UPDATE device_link_challenges SET consumedAt = ? WHERE challengeId = ? AND consumedAt IS NULL',
+      [now, challengeId]);
+    if (!claimed || Number(claimed.changes) !== 1) {
+      return { status: 409, error: 'CHALLENGE_USED', detail: 'челлендж погашен параллельным запросом' };
+    }
+    const prev = get(`SELECT createdAt FROM device_links
+                      WHERE ownerAddress = ? AND deviceAddress = ?`, [owner, device]);
+    const stamp = new Date(now).toISOString();
+    if (!prev) {
+      run(`INSERT INTO device_links (ownerAddress, deviceAddress, createdAt)
+           VALUES (?, ?, ?)`, [owner, device, stamp]);
+    }
+    return {
+      ok: true, ownerAddress: owner, deviceAddress: device,
+      linkedAt: prev ? prev.createdAt : stamp, created: !prev,
+      mode: 'jcs-challenge',
+    };
+  });
+
+  if (!outcome.ok) return res.status(outcome.status).json(outcome);
+  res.json(outcome);
+});
+
+/* Что привязано к аккаунту + баланс каждого ПК. Отдельный эндпоинт, а не
+ * поле в /cross-compute: там считаются деньги ОДНОГО адреса, и подмешивать
+ * туда список устройств значило бы отвечать на два вопроса одним ответом. */
+app.get('/devices/links/:owner', (req, res) => {
+  const owner = String(req.params.owner || '').trim().toLowerCase();
+  if (!INSTALL_ADDR_RE.test(owner)) return res.status(400).json({ error: 'owner invalid' });
+
+  const links = all(`SELECT deviceAddress, createdAt FROM device_links
+                      WHERE ownerAddress = ? ORDER BY createdAt ASC, deviceAddress ASC`, [owner]);
+  res.json({
+    ownerAddress: owner,
+    count: links.length,
+    devices: links.map((d) => {
+      const addr = String(d.deviceAddress);
+      const earned = get(
+        `SELECT COALESCE(SUM(rewardTar), 0) AS s, COUNT(*) AS n, COALESCE(SUM(cwu), 0) AS cwu
+           FROM work_receipts WHERE workerAddress = ?`, [addr]);
+      const presence = get('SELECT lastSeenAt, model FROM worker_presence WHERE lower(workerAddress) = ?', [addr.toLowerCase()]);
+      return {
+        deviceAddress: addr,
+        linkedAt: d.createdAt,
+        earnedTar: round(Number(earned.s)),
+        receipts: Number(earned.n),
+        cwu: round(Number(earned.cwu)),
+        /* online — это «виделся недавно», а не «сейчас в сети»: воркер может
+         * быть выключен, и показывать его живым значило бы врать про Earn. */
+        online: presence ? (Date.now() - Number(presence.lastSeenAt)) < WORKER_ACTIVE_WINDOW_MS : false,
+        lastSeenAgoMs: presence ? Date.now() - Number(presence.lastSeenAt) : null,
+        model: presence ? presence.model : null,
+      };
+    }),
+    unit: 'TAR',
+  });
 });
 
 app.delete('/devices/link', (req, res) => {
@@ -6771,31 +7080,58 @@ app.get('/worker/poll', (req, res) => {
     });
   }
 
-  run(`UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?
-       WHERE taskId = ? AND status = 'pending'`,
-    [now, workerAddress, task.taskId]);
-
   /* Промпт уходит шифротекстом: канал может быть TLS, но задача обязана быть
    * нечитаемой и в логах прокси, и в памяти посредника.
    *
-   * КЛЮЧ СЕССИИ ТЕПЕРЬ ЗАПЕЧАТАН НА КЛЮЧ ВОРКЕРА (`box:v1:...`). Раньше он
-   * ехал рядом с шифротекстом открытым: один перехваченный ответ давал и
-   * замок, и ключ. Привязка ключа к адресу обязательна выше (иначе 403),
-   * поэтому публичный ключ здесь всегда есть.
+   * КЛЮЧ СЕССИИ ЗАПЕЧАТАН НА КЛЮЧ ВОРКЕРА (`box:v1:...`). Раньше он ехал
+   * рядом с шифротекстом открытым: один перехваченный ответ давал и замок, и
+   * ключ. Привязка ключа к адресу обязательна выше (иначе 403), поэтому
+   * публичный ключ здесь всегда есть.
    *
-   * `keyEncryption` говорит клиенту, как читать `sessionKey`. Если печать
-   * почему-то не удалась, отдаём плain base64 с явным `keyEncryption: 'none'`:
-   * молча подсунуть нечитаемое — хуже, чем честно назвать формат. */
-  let keyField = sessionKey.toString('base64');
-  let keyEncryption = 'none';
+   * ЗАПЕЧАТКА ИДЁТ ДО `claimed`, А НЕ ПОСЛЕ. Раньше строка помечалась
+   * занятой, и только потом ключ пытались запечатать; при отказе печати
+   * оставалось два плохих выбора — отдать ключ открытым или оставить задачу
+   * в 'claimed' до самого TTL, хотя воркер её не получил. Теперь порядок
+   * обратный: сначала доказательство, что ключ можно спрятать, потом claim.
+   *
+   * FAIL-CLOSED. Прежний fallback отдавал плain base64 с `keyEncryption:
+   * 'none'` — то есть в аварийной ветке открытым ключом уходило ровно то,
+   * что шифрование должно защищать, и срабатывала эта ветка именно при
+   * поломке. Задача теперь НЕ выдаётся (500 `KEY_ENCRYPTION_FAILED`) и
+   * остаётся 'pending': следующий полл попробует снова, а нечитаемого
+   * ключа не увидит никто. */
+  let keyField = null;
   try {
     const bound = pollBoundKey(workerAddress);
-    if (bound && bound.pubkeyHex) {
-      keyField = workerBox.sealToWorker(bound.pubkeyHex, sessionKey.toString('base64'));
-      keyEncryption = 'box:v1';
+    if (!bound || !bound.pubkeyHex) {
+      return res.status(500).json({
+        error: 'KEY_ENCRYPTION_FAILED',
+        detail: 'нет привязанного ключа воркера: ключ сессии не на что запечатать',
+        retry: true,
+      });
     }
+    keyField = workerBox.sealToWorker(bound.pubkeyHex, sessionKey.toString('base64'));
+    if (!keyField) throw new Error('sealToWorker вернул пусто');
   } catch (e) {
-    console.log(`poll: ключ сессии не запечатан (${e.message}) — отдаю открытым`);
+    /* Никакого «отдам как есть»: это и было дырой. */
+    console.log(`poll: ключ сессии не запечатан (${e.message}) — задача остаётся pending`);
+    return res.status(500).json({
+      error: 'KEY_ENCRYPTION_FAILED',
+      detail: `ключ сессии не запечатан: ${e.message}`,
+      retry: true,
+    });
+  }
+
+  const claimed = run(`UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?
+       WHERE taskId = ? AND status = 'pending'`,
+    [now, workerAddress, task.taskId]);
+  if (!claimed || Number(claimed.changes) !== 1) {
+    /* Между SELECT и UPDATE задачу забрал другой полл (или отменил swarm).
+     * Ответ «выдаю» был бы ложью: ключ уже запечатан, но строка не наша. */
+    return res.json({
+      task: null,
+      note: 'Задача ушла другому запросу. Опросите снова.',
+    });
   }
 
   res.json({
@@ -6803,7 +7139,7 @@ app.get('/worker/poll', (req, res) => {
       taskId: task.taskId,
       encryptedPayload: task.encryptedPayload,
       sessionKey: keyField,
-      keyEncryption,
+      keyEncryption: 'box:v1',
       encryption: 'aes-256-gcm',
       model: task.model,
       tier: task.tier,
@@ -6920,10 +7256,100 @@ function ingestWorkerResult(body) {
 }
 
 /* Воркер присылает результат. Токены считаются по его usage, а не по вере
- * на слово: tokensGenerated обязателен и должен быть положительным. */
+ * на слово: tokensGenerated обязателен и должен быть положительным.
+ *
+ * ===== Подпись результата (2.19.0) =====
+ * ЧТО БЫЛО. Приём сверял только совпадение `workerAddress` из тела с тем,
+ * кому выдана задача. Это защищало от чужого адреса, но не от подделки
+ * запроса: тот, кто ЗНАЛ taskId, мог прислать свой текст от имени воркера.
+ * А по этому тексту клиент читает ответ и считается работа.
+ *
+ * ПОЧЕМУ В ПОДПИСЬ ВХОДЯТ ТОКЕНЫ И ХЕШ, А НЕ ТОЛЬКО taskId. Токены — это
+ * ровно то, из чего считается награда. Подпись над одним taskId подтверждала
+ * бы «этот воркер отвечал», но не мешала бы вставить любое число токенов.
+ * Хеш ответа приковывает к подписи содержимое, так что заменить текст после
+ * подписи нельзя даже на один символ.
+ *
+ * ПОЧЕМУ ПОДПИСЬ НЕ ТРЕБУЕТСЯ НА WS-ПУТИ. Сокет уже аутентифицирован на
+ * рукопожатии той же Ed25519-подписью, и кадр идёт внутри этого канала.
+ * Требовать вторую подпись там значило бы просить доказательство дважды ради
+ * симметрии, а не ради защиты. Проверка стоит в HTTP-обёртке — там, где
+ * канал ничем не подтверждён. */
+const SUBMIT_SIG_PREFIX = 'TARNET_WORKER_SUBMIT';
+
+/* Токены считаются ЗДЕСЬ, и HTTP-обёртка и сохранение берут одно и то же
+ * число. Если бы каждая сторона считала по своему, подпись сходилась бы на
+ * тексте и расходилась на оплате — худший вид расхождения. */
+function submitTokensOf(body) {
+  return Math.max(1, Math.floor(Number(body?.usage?.completion_tokens || body?.tokensGenerated) || 0));
+}
+
+function submitResponseHashOf(body) {
+  const text = typeof body?.response === 'string' ? body.response
+    : (typeof body?.encryptedResponse === 'string' ? body.encryptedResponse : '');
+  return crypto.createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+function verifySubmitSignature(body) {
+  const workerAddress = typeof body?.workerAddress === 'string' ? body.workerAddress : null;
+  const taskId = typeof body?.taskId === 'string' ? body.taskId : null;
+  if (!workerAddress || !taskId) return { ok: true }; /* пусть 400 скажет ingest */
+
+  const sig = body.submitSignature ?? body.signature;
+  const ts = Number(body.signedAt ?? body.timestamp);
+  const tokens = submitTokensOf(body);
+  const responseHash = submitResponseHashOf(body);
+  const payload = [SUBMIT_SIG_PREFIX, workerAddress.toLowerCase(), taskId, tokens, responseHash].join(':');
+
+  if (!sig || !Number.isFinite(ts)) {
+    return {
+      ok: false, status: 403,
+      body: {
+        error: 'SIGNATURE_REQUIRED',
+        detail: 'нужны submitSignature и signedAt: результат должен быть подписан ключом воркера',
+        payload_template: `${SUBMIT_SIG_PREFIX}:<workerAddress>:<taskId>:<tokens>:<sha256(response)>`,
+      },
+    };
+  }
+  if (Math.abs(Date.now() - ts) > POLL_AUTH_SKEW_MS) {
+    return {
+      ok: false, status: 403,
+      body: { error: 'TIMESTAMP_OUT_OF_WINDOW', got: ts, server: Date.now(), skew_ms: POLL_AUTH_SKEW_MS },
+    };
+  }
+
+  const wk = pollBoundKey(workerAddress);
+  if (!wk || !wk.pubkeyHex) {
+    return {
+      ok: false, status: 403,
+      body: {
+        error: 'DEVICE_KEY_UNKNOWN',
+        detail: 'у адреса нет привязанного ключа: сначала POST /worker/handshake или WS-handshake',
+      },
+    };
+  }
+  const pem = tarIdentity.rawPubToPem(Buffer.from(String(wk.pubkeyHex), 'hex'));
+  if (!verifyPayload(payload, String(sig), pem)) {
+    return {
+      ok: false, status: 403,
+      body: {
+        error: 'SIGNATURE_INVALID',
+        detail: 'подпись не сходится с ключом воркера',
+        /* Строка в ответе: иначе расхождение в порядке полей или в подсчёте
+         * токенов ищется угадыванием. */
+        signed_payload: payload,
+      },
+    };
+  }
+  return { ok: true };
+}
+
 app.post('/worker/submit', (req, res) => {
-  const { status, body } = ingestWorkerResult(req.body || {});
-  res.status(status).json(body);
+  const body = req.body || {};
+  const gate = verifySubmitSignature(body);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  const { status, body: out } = ingestWorkerResult(body);
+  res.status(status).json(out);
 });
 
 /* Состояние очереди для наблюдаемости. */

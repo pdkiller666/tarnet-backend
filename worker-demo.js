@@ -224,6 +224,27 @@ const WORKER = workerAddress();
  * 429 — рабочее состояние: сервер разрешает 10 отправок в минуту на воркера.
  * Ждём столько, сколько просят, вместо падения. */
 async function api(method, route, body) {
+  /* Подпись результата (2.19.0). `POST /worker/submit` требует Ed25519-подпись
+   * от адреса воркера над `TARNET_WORKER_SUBMIT:<addr>:<taskId>:<tokens>:<sha256(response)>`.
+   *
+   * Подписываем ЗДЕСЬ, а не в двух местах отправки: путей два (после poll и
+   * после закрытия сокета), и правка в одном из них оставила бы второй сдачу
+   * работы без подписи — то есть 403 ровно в аварийной ветке.
+   *
+   * Ключ — тот же, что для handshake и /work: один секрет на воркера. */
+  if (method === 'POST' && route === '/worker/submit' && body && typeof body.workerAddress === 'string'
+      && !body.submitSignature) {
+    const keys = wsState.keys || (wsState.keys = ed25519FromSeed(loadOrCreateSeed()));
+    const tokens = Math.max(1, Math.floor(Number(body.usage?.completion_tokens || body.tokensGenerated) || 0));
+    const text = typeof body.response === 'string' ? body.response
+      : (typeof body.encryptedResponse === 'string' ? body.encryptedResponse : '');
+    const responseHash = nodeCrypto.createHash('sha256').update(text, 'utf8').digest('hex');
+    const signedAt = Date.now();
+    const payload = ['TARNET_WORKER_SUBMIT', String(body.workerAddress).toLowerCase(),
+      String(body.taskId), String(tokens), responseHash].join(':');
+    const submitSignature = nodeCrypto.sign(null, Buffer.from(payload, 'utf8'), keys.priv).toString('base64');
+    body = { ...body, signedAt, submitSignature };
+  }
   const res = await fetch(API + route, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : undefined,

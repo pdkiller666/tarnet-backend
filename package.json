@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.18.1-swarm-refusal",
+  "version": "2.19.0-jcs-device-link",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

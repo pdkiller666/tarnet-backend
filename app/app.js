@@ -437,7 +437,8 @@ function setNetStatus(state) {
 function syncSwarmGate(activeWorkers) {
   const el = $('swarmMode');
   if (!el) return;
-  const enough = Number(activeWorkers) >= 2;
+  const n = Number(activeWorkers) || 0;
+  const enough = n >= 2;
   el.disabled = !enough;
   if (!enough && el.checked) el.checked = false;
   const label = $('swarmModeLabel');
@@ -445,6 +446,28 @@ function syncSwarmGate(activeWorkers) {
     label.textContent = enough
       ? 'Private Swarm — две модели параллельно, ответ берётся от первой'
       : 'Private Swarm — нужны два воркера в сети (сейчас меньше)';
+  }
+  /* Плашка отвечает на вопрос «работает ли рой СЕЙЧАС», а не «что делает
+   * галочка». Сервер уже называет причину отказа (`swarm.reason`), и
+   * повторять здесь только «недоступно» значило бы заставлять человека
+   * сверять число узлов глазами по списку воркеров ниже. */
+  const badge = $('swarmBadge');
+  if (badge) {
+    /* Склонение считаем по-русски: «2 узла», «5 узлов». Подстановка
+     * «узлов» везде читалась бы как машинный текст ровно там, где человек
+     * решает, включать режим или нет. */
+    const mod10 = n % 10;
+    const mod100 = n % 100;
+    const word = (mod10 === 1 && mod100 !== 11) ? 'узел'
+      : (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) ? 'узла'
+        : 'узлов';
+    badge.hidden = false;
+    badge.dataset.state = enough ? 'on' : 'off';
+    badge.textContent = enough
+      ? `Swarm Mode: ${n} ${word} — параллельно`
+      : (n === 0
+        ? 'Swarm Mode недоступен: нет узлов — подключите свой ПК (reason: no_workers)'
+        : `Swarm Mode недоступен: нужен второй узел (сейчас ${n})`);
   }
 }
 
@@ -1438,6 +1461,52 @@ async function sendPrompt(prompt, opts = {}) {
       const why = e.data && typeof e.data.details === 'string' ? e.data.details : '';
       b.textContent = why ? `Ошибка: ${e.message}\n${why}` : `Ошибка: ${e.message}`;
       b.classList.add('error-bubble');
+
+      /* 402 — не поломка, а нехватка тестовых денег на комиссию Tier 6.
+       *
+       * ПОЧЕМУ КНОПКА, А НЕ ТЕКСТ «получите faucet». Раньше человек видел
+       * «INSUFFICIENT_FUNDS» и должен был сам догадаться, что кнопка лежит
+       * в другом блоке страницы, и что она прокручивается ниже. Кнопка здесь
+       * стоит там, где возникла проблема, и делает ровно один шаг.
+       *
+       * Ставим только на 402, а не на любую ошибку: faucet не лечит сбой
+       * сети или чужой ключ, и кнопка рядом с ними была бы ложным советом. */
+      if (Number(e.status) === 402) {
+        const row = document.createElement('div');
+        row.className = 'row faucet-inline';
+        const btnF = document.createElement('button');
+        btnF.type = 'button';
+        btnF.className = 'btn ghost small brand-cta';
+        btnF.textContent = 'Получить Faucet — 0.01 TAR';
+        const noteF = document.createElement('span');
+        noteF.className = 'hint tiny';
+        const need = e.data && Number(e.data.needed_tar);
+        noteF.textContent = need
+          ? `нужно ${fmt(need)} TAR на комиссию — выдача один раз на адрес`
+          : 'не хватает баланса на комиссию — выдача один раз на адрес';
+        btnF.addEventListener('click', async () => {
+          btnF.disabled = true;
+          noteF.textContent = 'запрашиваем…';
+          try {
+            const r = await call('/faucet/claim', { method: 'POST', body: { address: ADDR } });
+            noteF.textContent = `+${fmt(r.creditedTar)} TAR · баланс ${fmt(r.balanceTar)} — повторите запрос`;
+            await refreshBalance();
+            /* Строку faсet в боковой панели тоже обновляем: иначе там
+             * осталась бы живая кнопка, хотя выдача уже была. */
+            if (typeof refreshFaucet === 'function') refreshFaucet();
+          } catch (err) {
+            if (err.data && err.data.error === 'ALREADY_CLAIMED') {
+              noteF.textContent = 'faucet уже получен — деньги на комиссию есть, повторите запрос';
+            } else {
+              noteF.textContent = `не вышло: ${err.message}`;
+              btnF.disabled = false;
+            }
+          }
+        });
+        row.appendChild(btnF);
+        row.appendChild(noteF);
+        thinking.appendChild(row);
+      }
     }
   } finally {
     chatBusy = false;

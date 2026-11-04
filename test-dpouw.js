@@ -216,6 +216,36 @@ async function apiAt(base, path, method = 'GET', body, extraHeaders) {
       body = { ...body, worker_ts: ts, worker_signature: sig };
     }
   }
+  /* Автоподпись сдачи результата воркера (2.19.0).
+   *
+   * `/worker/submit` теперь требует Ed25519-подпись от адреса воркера над
+   * `TARNET_WORKER_SUBMIT:<addr>:<taskId>:<tokens>:<sha256(response)>`.
+   * Как и с poll и /work, ритуал централизован здесь: без этого каждый из
+   * десяти вызовов пришлось бы править вручную, и один забытый стал бы
+   * ложным «зелено».
+   *
+   * Маркер `nosig: true` — явный отказ от подписи для проверки самого отказа;
+   * он вырезается из тела и на сервер не едет. */
+  if (method === 'POST' && path === '/worker/submit' && body && typeof body.workerAddress === 'string') {
+    if (body.nosig === true) {
+      const { nosig: _dropSub, ...restSub } = body;
+      body = restSub;
+    } else if (!body.submitSignature) {
+      await bindWorker(body.workerAddress, base);
+      const kp = workerKeyFor(body.workerAddress);
+      const tokens = Math.max(1, Math.floor(Number(body.usage?.completion_tokens || body.tokensGenerated) || 0));
+      /* Хеш считается по тому же полю, что и на сервере: там сначала
+       * `response`, и только если его нет — `encryptedResponse`. */
+      const text = typeof body.response === 'string' ? body.response
+        : (typeof body.encryptedResponse === 'string' ? body.encryptedResponse : '');
+      const responseHash = crypto.createHash('sha256').update(text, 'utf8').digest('hex');
+      const signedAt = Date.now();
+      const payload = ['TARNET_WORKER_SUBMIT', String(body.workerAddress).toLowerCase(),
+        String(body.taskId), String(tokens), responseHash].join(':');
+      const sig = crypto.sign(null, Buffer.from(payload, 'utf8'), kp.privateKey).toString('base64');
+      body = { ...body, signedAt, submitSignature: sig };
+    }
+  }
   const res = await fetch(base + path, {
     method,
     headers: {
@@ -8369,6 +8399,131 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
         s47b.stop();
       }
     }
+  }
+
+  /* ===== 48. Device Linking по JCS-подписи (2.19.0) =====
+   *
+   * Проверяется ровно то, что заявлено в приёмке: просроченный челлендж и
+   * чужая подпись дают отказ, повторная отправка невозможна. Без этих
+   * проверок «одноразовый челлендж» остался бы обещанием в комментарии. */
+  {
+    console.log('\n48. Device Linking: challenge → JCS-подпись → привязка (v2.19.0)');
+    const jcs = require('./jcs');
+    const ownerKp = crypto.generateKeyPairSync('ed25519');
+    const ownerPubHex = Buffer.from(ownerKp.publicKey.export({ format: 'der', type: 'spki' })).slice(-32).toString('hex');
+    const regOwn = await api('/id/register', 'POST', { pubkey: ownerPubHex });
+    const ownerAddr = String(regOwn.body?.address || '').toLowerCase();
+    ok('48.1 владелец зарегистрирован с известным ключом',
+      regOwn.status === 200 && /^0x[0-9a-f]{40}$/.test(ownerAddr), regOwn.body);
+
+    const devAddr = runAddress('dev48');
+    await bindWorker(devAddr);
+    const nodeR = await api('/node', 'POST', { address: devAddr });
+    ok('48.2 ПК известен сети (есть в nodes)', nodeR.status === 200, nodeR.status);
+
+    /* --- 48.3: челлендж без подписи владельца --- */
+    const chNoSig = await api('/devices/link/challenge', 'POST', { ownerAddress: ownerAddr });
+    ok('48.3 челлендж без подписи владельца → 400 SIGNATURE_REQUIRED',
+      chNoSig.status === 400 && chNoSig.body?.error === 'SIGNATURE_REQUIRED', chNoSig.body);
+
+    /* --- 48.4: подпись чужим ключом --- */
+    const strangerKp = crypto.generateKeyPairSync('ed25519');
+    const nCh = 'nonce48' + RUN;
+    const sigStranger = crypto.sign(null,
+      Buffer.from(['link-challenge', ownerAddr, nCh].join(':'), 'utf8'), strangerKp.privateKey).toString('base64');
+    const chBad = await api('/devices/link/challenge', 'POST',
+      { ownerAddress: ownerAddr, nonce: nCh, signature: sigStranger });
+    ok('48.4 челлендж с чужой подписью → 403 DEVICE_NOT_OWNED',
+      chBad.status === 403 && chBad.body?.error === 'DEVICE_NOT_OWNED', chBad.body);
+
+    /* --- 48.5: настоящий челлендж --- */
+    const sigOwn = crypto.sign(null,
+      Buffer.from(['link-challenge', ownerAddr, nCh].join(':'), 'utf8'), ownerKp.privateKey).toString('base64');
+    const ch = await api('/devices/link/challenge', 'POST',
+      { ownerAddress: ownerAddr, nonce: nCh, signature: sigOwn });
+    const chId = ch.body?.challengeId;
+    const chNonce = ch.body?.nonce;
+    ok('48.5 челлендж выпущен: challengeId, nonce на 32 байта, TTL 5 мин',
+      ch.status === 200 && /^lc_[0-9a-f]{24}$/.test(chId || '') && chNonce
+      && ch.body.ttlSeconds === 300 && ch.body.expiresAt > Date.now(),
+      { status: ch.status, ttl: ch.body?.ttlSeconds });
+
+    const buildLink = (extra = {}) => ({
+      action: 'link',
+      owner: ownerAddr,
+      device: devAddr,
+      challengeId: chId,
+      nonce: chNonce,
+      expiresAt: ch.body.expiresAt,
+      ...extra,
+    });
+    const signLinkJcs = (obj, kp) => crypto.sign(null,
+      Buffer.from(jcs.stringify(obj), 'utf8'), kp.privateKey).toString('base64');
+
+    /* --- 48.6: чужая подпись ПК --- */
+    const linkStranger = buildLink();
+    const confStranger = await api('/devices/link/confirm', 'POST',
+      { link: linkStranger, signature: signLinkJcs(linkStranger, strangerKp) });
+    ok('48.6 confirm с чужим ключом → 403 SIGNATURE_INVALID',
+      confStranger.status === 403 && confStranger.body?.error === 'SIGNATURE_INVALID', confStranger.body);
+
+    /* --- 48.7: подмена nonce в подписанном объекте --- */
+    const linkTampered = buildLink({ nonce: 'x' + chNonce });
+    const confTampered = await api('/devices/link/confirm', 'POST',
+      { link: linkTampered, signature: signLinkJcs(linkTampered, workerKeyFor(devAddr)) });
+    ok('48.7 подписанный объект с чужим nonce → 400 CHALLENGE_MISMATCH',
+      confTampered.status === 400 && confTampered.body?.error === 'CHALLENGE_MISMATCH', confTampered.body);
+
+    /* --- 48.8: успешная привязка --- */
+    const linkOk = buildLink();
+    const conf = await api('/devices/link/confirm', 'POST',
+      { link: linkOk, signature: signLinkJcs(linkOk, workerKeyFor(devAddr)) });
+    ok('48.8 привязка по JCS-подписи создана',
+      conf.status === 200 && conf.body?.created === true
+      && conf.body.ownerAddress === ownerAddr && conf.body.deviceAddress === devAddr
+      && conf.body.mode === 'jcs-challenge', conf.body);
+
+    /* --- 48.9: повтор той же подписи → 409 --- */
+    const replay = await api('/devices/link/confirm', 'POST',
+      { link: linkOk, signature: signLinkJcs(linkOk, workerKeyFor(devAddr)) });
+    ok('48.9 повторная отправка той же подписи → 409 CHALLENGE_USED',
+      replay.status === 409 && replay.body?.error === 'CHALLENGE_USED', replay.body);
+
+    /* --- 48.10: просроченный челлендж → 410 ---
+     * Срок ставим напрямую в БД: ждать пять минут в тесте нельзя, а
+     * подменять TTL через env значило бы проверять не тот код, что работает
+     * на проде. */
+    if (TEST_MODE && tmpDir) {
+      const { DatabaseSync } = require('node:sqlite');
+      const ldb = new DatabaseSync(path.join(tmpDir, 'test.db'));
+      ldb.exec('PRAGMA busy_timeout = 3000;');
+      const nCh2 = 'nonce48b' + RUN;
+      const sigOwn2 = crypto.sign(null,
+        Buffer.from(['link-challenge', ownerAddr, nCh2].join(':'), 'utf8'), ownerKp.privateKey).toString('base64');
+      const ch2 = await api('/devices/link/challenge', 'POST',
+        { ownerAddress: ownerAddr, nonce: nCh2, signature: sigOwn2 });
+      ldb.prepare('UPDATE device_link_challenges SET expiresAt = ? WHERE challengeId = ?')
+        .run(Date.now() - 1000, ch2.body.challengeId);
+      const linkExp = {
+        action: 'link', owner: ownerAddr, device: devAddr,
+        challengeId: ch2.body.challengeId, nonce: ch2.body.nonce, expiresAt: ch2.body.expiresAt,
+      };
+      const confExp = await api('/devices/link/confirm', 'POST',
+        { link: linkExp, signature: signLinkJcs(linkExp, workerKeyFor(devAddr)) });
+      ok('48.10 просроченный челлендж → 410 CHALLENGE_EXPIRED',
+        confExp.status === 410 && confExp.body?.error === 'CHALLENGE_EXPIRED', confExp.body);
+      ldb.close();
+    } else {
+      skip('48.10 просроченный челлендж', 'нет доступа к БД теста');
+    }
+
+    /* --- 48.11: список привязанных устройств с балансом --- */
+    const links = await api(`/devices/links/${ownerAddr}`);
+    const devRow = (links.body?.devices || []).find((d) => String(d.deviceAddress).toLowerCase() === devAddr);
+    ok('48.11 /devices/links показывает привязанный ПК и его заработок',
+      links.status === 200 && links.body.count >= 1 && devRow
+      && typeof devRow.earnedTar === 'number' && typeof devRow.online === 'boolean',
+      { count: links.body?.count, dev: devRow });
   }
 
   console.log('\n' + '─'.repeat(50));
