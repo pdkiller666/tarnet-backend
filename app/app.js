@@ -22,9 +22,26 @@ const API = ''; // тот же origin: PWA раздаётся тем же сер
  *     0x + sha256(SPKI-DER публичного ключа)[0..40]
  * Это ТА ЖЕ формула, что в server.js и identity.js (сходимость проверена
  * запуском: браузерный ключ → тот же адрес, подпись проходит серверный
- * verifyPayload). Приватный ключ хранится ТОЛЬКО здесь, в localStorage, и на
- * сервер не уходит: на сервер отправляется лишь публичный ключ.
+ * verifyPayload). Приватный ключ на сервер не уходит: отправляется лишь
+ * публичный.
  *
+ * ГДЕ ЛЕЖИТ ПРИВАТНЫЙ КЛЮЧ (с 2.17.17). В IndexedDB, объектом CryptoKey с
+ * `extractable: false`. Раньше он лежал в localStorage строкой PKCS#8, то есть
+ * был извлекаемым: любой XSS выгребал `tarnet.identity.v1` и уносил ключ с
+ * собой — вместе с адресом и правом подписывать что угодно от имени
+ * устройства, уже на чужой машине. Неизвлекаемый ключ так унести нельзя:
+ * `exportKey` на нём отвечает `InvalidAccessError` (проверено запуском), и
+ * скопировать материал нечем. Подписывать им по-прежнему можно —
+ * `crypto.subtle.sign` работает, и публичная часть экспортируется свободно.
+ *
+ * ЧЕГО ЭТО НЕ ДАЁТ, и делать вид, что даёт, я не буду: XSS на этой же
+ * странице всё ещё может ПОПРОСИТЬ подпись через `crypto.subtle.sign` — ключ
+ * неизвлекаемый, но не «неиспользуемый». Закрыт именно ВЫНОС ключа: украсть
+ * его и подписывать позже, офлайн, с другого устройства — нельзя.
+ *
+ * Цена перехода: CryptoKey переживает перезагрузку только в IndexedDB. В
+ * localStorage остаются адрес и публичный ключ — этого хватает, чтобы
+ * показать аккаунт, но не подписать.
  * ЧЕГО ЭТО СТОИТ, и я это не скрываю: у адреса меняется значение, поэтом
  * старый демо-адрес теряет роль текущего. Его баланс — демо-начисления,
  * распоряжаться ими было нельзя и раньше (ключа не существовало). Старый
@@ -63,44 +80,146 @@ async function addressFromSpki(spkiDer) {
   return '0x' + idHex(digest).slice(0, 40);
 }
 
-let IDENTITY = null;      // { address, pubKey, privKey } — privKey только в памяти
+let IDENTITY = null;      // { address, privKey, pubSpki } — privKey только в памяти
 let ADDR = '';            // адрес аккаунта; заполняется после identity()
 let LEGACY_ADDR = null;   // старый демо-адрес, только для показа
+
+/* ---------- Хранилище ключа: IndexedDB ----------
+ * Неизвлекаемый CryptoKey нельзя выгрузить в строку, а localStorage умеет
+ * хранить только строки. IndexedDB умеет хранить объекты (structured clone),
+ * и CryptoKey переживает там перезагрузку, не теряя флаг `extractable: false`.
+ * Поэтому ключ живёт здесь, а в localStorage остаются адрес и публичный ключ. */
+const IDB_NAME = 'tarnet-identity';
+const IDB_STORE = 'keys';
+const IDB_RECORD = 'device';
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) return reject(new Error('IndexedDB недоступен'));
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('IndexedDB не открылась'));
+  });
+}
+
+async function idbGet() {
+  const db = await idbOpen();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(IDB_RECORD);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } finally { db.close(); }
+}
+
+async function idbPut(rec) {
+  const db = await idbOpen();
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(rec, IDB_RECORD);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error('запись отклонена'));
+      tx.onabort = () => reject(tx.error || new Error('запись отменена'));
+    });
+  } finally { db.close(); }
+}
+
+/* Запись «чем является этот аккаунт» без приватного ключа. Адрес и публичный
+ * ключ не секрет: адрес и так виден в цепочке, публичный ключ уходит на сервер
+ * при регистрации. */
+function rememberAddress(address, pubSpki) {
+  let prev = null;
+  try { prev = JSON.parse(localStorage.getItem(LS_IDENTITY) || 'null'); } catch (_e) { prev = null; }
+  localStorage.setItem(LS_IDENTITY, JSON.stringify({
+    address,
+    pub: idToB64(pubSpki),
+    createdAt: prev?.createdAt || new Date().toISOString(),
+  }));
+}
 
 /** Загружает или создаёт личность устройства. Возвращает адрес или null. */
 async function ensureIdentity() {
   try {
     if (!crypto?.subtle) return null;
 
-    const saved = localStorage.getItem(LS_IDENTITY);
-    if (saved) {
-      const o = JSON.parse(saved);
-      const privKey = await crypto.subtle.importKey(
-        'pkcs8', idFromB64(o.priv), { name: 'Ed25519' }, false, ['sign'],
-      );
-      const pubSpki = idFromB64(o.pub);
-      /* Адрес пересчитываем, а не берём из записи: если формула когда-нибудь
-       * изменится, сохранённый адрес разойдётся с ключом, и подпись перестанет
-       * сходиться. Пересчёт делает хранилище проверяемым. */
+    /* 1. Ключ уже в IndexedDB — обычный путь после первого открытия. */
+    const rec = await idbGet().catch((e) => {
+      console.warn('IndexedDB недоступна:', e.message);
+      return null;
+    });
+    if (rec?.privKey) {
+      const pubSpki = rec.pubSpki;
       const address = await addressFromSpki(pubSpki);
-      IDENTITY = { address, privKey, pubSpki };
-      if (address !== o.address) {
-        localStorage.setItem(LS_IDENTITY, JSON.stringify({ ...o, address }));
-      }
+      IDENTITY = { address, privKey: rec.privKey, pubSpki };
+      rememberAddress(address, pubSpki);
       return address;
     }
 
-    /* Новая личность. extractable=true нужен, чтобы сохранить ключ между
-     * перезагрузками; без этого PWA терял бы аккаунт при каждом обновлении. */
-    const kp = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
-    const privDer = await crypto.subtle.exportKey('pkcs8', kp.privateKey);
+    /* 2. Миграция с прежнего хранилища. Ключ лежал в localStorage строкой
+     * PKCS#8 — то есть был извлекаемым. Импортируем его СРАЗУ как
+     * неизвлекаемый (`extractable=false`), кладём в IndexedDB и только после
+     * успешной записи стираем строку из localStorage. Порядок именно такой:
+     * при обратном порядке сбой IndexedDB оставил бы пользователя без ключа. */
+    const saved = localStorage.getItem(LS_IDENTITY);
+    if (saved) {
+      const o = JSON.parse(saved);
+      const pubSpki = idFromB64(o.pub);
+      const address = await addressFromSpki(pubSpki);
+
+      if (o.priv) {
+        const privKey = await crypto.subtle.importKey(
+          'pkcs8', idFromB64(o.priv), { name: 'Ed25519' }, false, ['sign'],
+        );
+        let migrated = false;
+        try {
+          await idbPut({ privKey, pubSpki, address });
+          /* Строка с приватным ключом больше не нужна и опасна: на этом же
+           * шаге она уходит из localStorage. Публичная часть остаётся. */
+          rememberAddress(address, pubSpki);
+          migrated = true;
+          console.info('ключ перенесён в IndexedDB как неизвлекаемый');
+        } catch (e) {
+          /* IndexedDB не приняла запись — оставляем старую запись нетронутой,
+           * иначе аккаунт был бы потерян молча. Работаем как раньше. */
+          console.warn('перенос ключа не удался, остаётся прежнее хранилище:', e.message);
+        }
+        IDENTITY = { address, privKey, pubSpki };
+        if (migrated) return address;
+      }
+      /* Адрес пересчитываем, а не берём из записи: если формула когда-нибудь
+       * изменится, сохранённый адрес разойдётся с ключом, и подпись перестанет
+       * сходиться. Пересчёт делает хранилище проверяемым. */
+      if (!IDENTITY.privKey) return null;
+      rememberAddress(address, pubSpki);
+      return address;
+    }
+
+    /* 3. Новая личность. `extractable=false` — принципиально: такой ключ нельзя
+     * выгрузить, и XSS не унесёт его с машины. Публичная часть экспортируется
+     * свободно (проверено: `exportKey('spki', publicKey)` работает и при
+     * неизвлекаемом приватном), поэтому адрес считается как раньше. */
+    const kp = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
     const pubSpki = await crypto.subtle.exportKey('spki', kp.publicKey);
     const rawPub = new Uint8Array(pubSpki).slice(new Uint8Array(pubSpki).length - 32);
     const address = await addressFromSpki(pubSpki);
 
-    localStorage.setItem(LS_IDENTITY, JSON.stringify({
-      address, priv: idToB64(privDer), pub: idToB64(pubSpki), createdAt: new Date().toISOString(),
-    }));
+    /* Ключ обязан попасть в хранилище ДО того, как им начали пользоваться:
+     * иначе после перезагрузки аккаунт оказался бы недоступен, а адрес на
+     * сервере — уже зарегистрирован. */
+    try {
+      await idbPut({ privKey: kp.privateKey, pubSpki, address });
+    } catch (e) {
+      console.warn('IndexedDB не приняла ключ — работа только на чтение:', e.message);
+      return null;
+    }
+    rememberAddress(address, pubSpki);
     IDENTITY = { address, privKey: kp.privateKey, pubSpki };
 
     /* Регистрируем публичный ключ на сервере: без него сервер нечем проверять
