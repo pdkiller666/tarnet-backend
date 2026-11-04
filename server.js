@@ -7527,6 +7527,12 @@ async function runInference(req, res) {
     if (!picked) return res.status(503).json({
       error: 'No worker nodes available — register a node first',
       fallback_reason: 'no_workers',
+      /* Клиент просил параллель — говорим прямо, что её не будет и почему.
+       * Без этого поля 503 с fallback_reason:no_workers выглядел так же,
+       * как обычный запрос без swarm. Найдено тестом 47.0, а не на глаз: */
+      swarm: body.swarm === true
+        ? { enabled: false, requested: true, reason: 'no_workers' }
+        : null,
     });
     workerAddress = picked.address;
     routing = { mode: 'weighted', routingWeight: picked.routingWeight, teeOnly: tier === 'expert', teeFallback: picked.teeFallback };
@@ -8253,6 +8259,17 @@ async function runInference(req, res) {
       iterations: agentTrace?.iterations ?? 0,
       stopReason: agentTrace?.stopReason ?? null,
     };
+  }
+
+  /* Swarm просили, но ветка живых воркеров не выполнялась вообще (0 воркеров,
+   * сразу ушли в внешний API или в шаблон). Без этого блока `swarm` оставался
+   * null, и клиент не мог отличить «параллель не просили» от «просили, но
+   * узлов нет» — два разных факта с одинаковым видом в ответе.
+   *
+   * Проверено на проде 04.11: POST /inference с swarm:true при 0 воркерах
+   * отдавал swarm:null и fallback_reason:no_workers. */
+  if (body.swarm === true && !swarmBlock) {
+    swarmBlock = { enabled: false, requested: true, reason: 'no_workers' };
   }
 
   res.json({

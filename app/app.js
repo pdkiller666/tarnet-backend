@@ -2819,7 +2819,9 @@ function traceBox(res, ms) {
         ? 'нужны два воркера в сети'
         : res.swarm.reason === 'all_swarm_arms_failed'
           ? 'обе ветки не ответили'
-          : (res.swarm.reason || 'не состоялся');
+          : res.swarm.reason === 'no_workers'
+            ? 'воркеров нет в сети'
+            : (res.swarm.reason || 'не состоялся');
       const el = row('swarm', why);
       el.querySelector('b')?.classList.add('trace-warn');
       body.appendChild(el);

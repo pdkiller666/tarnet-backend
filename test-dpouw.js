@@ -8239,6 +8239,34 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     if (typeof WebSocket !== 'function') {
       skip('47.1–47.6 Private Swarm', 'в этой версии Node нет глобального WebSocket');
     } else {
+      /* --- 47.0: swarm просили, а воркеров НЕТ вовсе. Отдельный случай от
+       * «один воркер»: там ветка воркеров выполняется и отвечает
+       * need_two_workers, а здесь запрос уходит мимо неё целиком.
+       *
+       * Именно этот дефект нашёлся на проде 04.11, а не в тестах: сервер
+       * отдавал swarm:null, и клиент не мог отличить «параллель не просили»
+       * от «просили, но узлов нет». Тест закрепляет различие. --- */
+      {
+        const s47z = await spawnServer();
+        try {
+          const r47z = await apiAt(s47z.base, '/inference', 'POST', {
+            prompt: 'swarm nobody', tier: 'base', swarm: true,
+          });
+          const sw47z = r47z.body?.swarm;
+          /* 503 — это честный отказ (некому отдать задачу), а не ошибка теста:
+           * важно не цифра, а что поле swarm есть и причина названа. Принимаем
+           * оба кода, но требуем requested/reason — именно различие с null
+           * и было дефектом. */
+          ok('47.0 ноль воркеров → swarm: reason=no_workers, а не null',
+            (r47z.status === 200 || r47z.status === 503) && sw47z
+              && sw47z.enabled === false && sw47z.requested === true
+              && sw47z.reason === 'no_workers',
+            { status: r47z.status, swarm: sw47z, fallback: r47z.body?.fallback_reason });
+        } finally {
+          s47z.stop();
+        }
+      }
+
       /* --- 47.1: один воркер — параллели быть не может, и это сказано ЯВНО.
        * Молчаливая подмена на одну задачу выглядела бы в отчёте как работающий
        * swarm, поэтому причина отдаётся полем reason. --- */
