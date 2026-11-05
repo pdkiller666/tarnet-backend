@@ -25,6 +25,10 @@ const nodeCrypto = require('crypto');
  * Импорт ленивый в том смысле, что интерфейс не создаётся до вопроса:
  * просто подключение модуля не держит stdin открытым. */
 const readline = require('readline');
+/* http нужен только для локального входа P2P-транспорта (2.22.2):
+ * p2p-процесс живёт отдельно, потому что libp2p — 105 МБ, а сборка
+ * воркера запрещает внешние пакеты. */
+const http = require('http');
 /* Печать/распечатка ключа сессии. Функции продублированы в воркере, а не
  * импортированы из server.js: воркер ставится отдельно от сервера и не должен
  * тянуть за собой весь серверный код ради двух функций. */
@@ -1146,6 +1150,9 @@ async function main() {
   console.log(`  модель:  ${MODEL}`);
   const backend = GROQ_KEY ? 'groq' : (OPENROUTER_KEY ? 'openrouter' : 'ollama (или fallback)');
   console.log(`  бэкенд:  ${backend}`);  console.log('');
+  /* Локальный вход для p2p-транспорта поднимаем ДО сети: он не зависит
+   * от сервера, а p2p-процесс может попросить задачу в любую секунду. */
+  startP2pExecutor();
   log('регистрирую узел…');
   if (!(await register())) {
     log('без регистрации начисления не будет — исправьте причину и перезапустите');
@@ -1407,8 +1414,112 @@ function startLinkListener() {
   return true;
 }
 
+/* ---------- Локальный вход для P2P-транспорта (2.22.2) ----------
+ *
+ * ЗАЧЕМ ОТДЕЛЬНЫЙ СЕРВЕР, А НЕ LIBP2P ЗДЕСЬ.
+ * `build-worker.js` собирает воркер в ОДИН файл и прямо отказывается
+ * собирать, если в исходнике появится внешний `require`. libp2p — 105 МБ
+ * с транзитивными зависимостями, в раздаваемый файл он не влезет
+ * никогда. Поэтому libp2p остаётся в `p2p-node/p2p-worker.js`, а этот
+ * вход — единственный способ дать ему доступ к настоящему исполнению:
+ * модель, ключи сессии и шифрование уже здесь, дублировать их в
+ * p2p-процессе значило бы завести второго исполнителя.
+ *
+ * ПОЧЕМУ 127.0.0.1 И ТОКЕН.
+ * Порт случайный (0) — иначе второй запуск падал бы EADDRINUSE. Токен
+ * обязателен: на машине может работать что угодно от того же человека,
+ * и без него любой локальный процесс мог бы гонять задачи от имени
+ * воркера и портить его статистику. Дескриптор пишется с правами 0600.
+ * Граница доверия — пользователь: процесс того же человека токен прочтёт
+ * и это ожидаемо; защита здесь от чужих запросов, а не от владельца.
+ */
+const P2P_EXEC_HOST = '127.0.0.1';
+const P2P_EXEC_FILE = path.join(os.homedir(), '.tarnet', 'p2p-exec.json');
+let p2pExecServer = null;
+
+function startP2pExecutor() {
+  if (p2pExecServer) return p2pExecServer;
+  const token = nodeCrypto.randomBytes(32).toString('hex');
+
+  const server = http.createServer((req, res) => {
+    const reply = (code, obj) => {
+      try {
+        res.writeHead(code, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(obj));
+      } catch (_e) { /* клиент уже отвалился */ }
+    };
+
+    if (req.method !== 'POST' || req.url !== '/p2p/execute') {
+      return reply(404, { ok: false, error: 'NOT_FOUND' });
+    }
+    if (String(req.headers.authorization || '') !== `Bearer ${token}`) {
+      return reply(401, { ok: false, error: 'BAD_TOKEN' });
+    }
+
+    let raw = '';
+    req.setEncoding('utf8');
+    req.on('data', (c) => {
+      raw += c;
+      /* Промпт с длинным контекстом бывает большим, но 4 МБ — уже
+       * не задача, а попытка занять память воркера. */
+      if (raw.length > 4 * 1024 * 1024) req.destroy();
+    });
+    req.on('end', async () => {
+      let msg;
+      try { msg = JSON.parse(raw); } catch {
+        return reply(400, { ok: false, error: 'BAD_JSON' });
+      }
+      const task = msg && msg.task;
+      if (!task || !task.taskId) {
+        return reply(400, { ok: false, error: 'BAD_TASK' });
+      }
+      try {
+        /* Метка `p2p` — та самая, по которой приёмка отличает этот путь
+         * от `[WS]` и `[HTTP]`. Ставится здесь, а не в p2p-процессе:
+         * транспорт знает только он, а печатает строку тот, кто принял. */
+        const out = await runTask(task, 'p2p');
+        if (!out.ok) {
+          return reply(200, { ok: false, taskId: task.taskId, reason: out.reason });
+        }
+        return reply(200, {
+          ok: true,
+          taskId: out.taskId,
+          payload: out.payload,
+          usage: out.gen.usage,
+          source: out.gen.source,
+          ...(out.gen.error ? { error: out.gen.error } : {}),
+          ...(out.gen.errorDetail ? { errorDetail: out.gen.errorDetail } : {}),
+          model: out.gen.model || MODEL,
+        });
+      } catch (e) {
+        return reply(200, { ok: false, taskId: task.taskId, error: e.message });
+      }
+    });
+  });
+
+  server.on('error', (e) => log(`локальный вход p2p не поднялся: ${e.message}`));
+  server.listen(0, P2P_EXEC_HOST, () => {
+    const port = server.address().port;
+    try {
+      fs.mkdirSync(path.dirname(P2P_EXEC_FILE), { recursive: true });
+      fs.writeFileSync(
+        P2P_EXEC_FILE,
+        JSON.stringify({ port, token, pid: process.pid, at: Date.now() }),
+        { mode: 0o600 },
+      );
+    } catch (e) {
+      log(`не записал ${P2P_EXEC_FILE}: ${e.message} — p2p-путь не увидит воркер`);
+    }
+    log(`локальный вход p2p: ${P2P_EXEC_HOST}:${port} (${P2P_EXEC_FILE})`);
+  });
+
+  p2pExecServer = server;
+  return server;
+}
+
 module.exports = {
   normalizeModelName, resolveOllamaModel, ollamaTags, workerModelReport, generate, main,
+  startP2pExecutor, P2P_EXEC_FILE,
   /* Экспорт транспорта — для тестов handshake без запуска цикла опроса. */
   connectWs, signAuth, ed25519FromSeed, loadOrCreateSeed, wsState, wsUrl, wsSupported,
   runTask, AUTH_PREFIX, claimLinkCode, linkFromCli,

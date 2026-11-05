@@ -32,6 +32,9 @@ import { ping } from '@libp2p/ping'
 import { multiaddr } from '@multiformats/multiaddr'
 import { serveTaskStream, encodeLine, TASK_PROTOCOL } from './task-protocol.js'
 import { loadWorkerIdentity, buildHello } from './peer-hello.js'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 
 const BOOTSTRAP_BASE = (
   process.env.TARNET_PUBLIC_URL || 'https://v1107336.hosted-by-vdsina.com'
@@ -130,9 +133,104 @@ async function startNode() {
 let taskStreamPeer = null
 let lastBridgeMa = null
 
+/* ---------- Исполнение задачи (2.22.2) ----------
+ *
+ * ЗАЧЕМ ПРОКСИ, А НЕ ИСПОЛНЕНИЕ ЗДЕСЬ.
+ * Модель, ключи сессии и шифрование живут в `worker-demo.js` — это
+ * единственный исполнитель, который уже умеет и `box:v1`, и `[WS]`/`[HTTP]`.
+ * Дублировать генерацию сюда значило бы завести ВТОРОГО исполнителя,
+ * и они разъехались бы на первой правке: тот же дефект, от которого
+ * предостерегает шапка этого файла про разделение транспорта и экономики.
+ *
+ * `worker-demo.js` поднимает локальный вход (`startP2pExecutor`) и пишет
+ * дескриптор в `~/.tarnet/p2p-exec.json` (порт + токен, права 0600).
+ * Здесь — только вызов его по 127.0.0.1.
+ *
+ * Дескриптор перечитываем при изменении mtime: воркер перезапускают
+ * (новый порт и токен), а p2p-процесс продолжает жить — с закэшированным
+ * токеном каждая задача падала бы 401, и выглядело бы это как «p2p сломан». */
+const EXEC_FILE = path.join(os.homedir(), '.tarnet', 'p2p-exec.json')
+let execCache = { mtimeMs: -1, port: null, token: null }
+let execWarned = false
+
+function loadExecDescriptor() {
+  let st
+  try { st = fs.statSync(EXEC_FILE) } catch (_e) {
+    if (!execWarned) {
+      log(`локальный исполнитель не найден (${EXEC_FILE}) — p2p-задачи некому выполнять`)
+      execWarned = true
+    }
+    return null
+  }
+  if (st.mtimeMs !== execCache.mtimeMs) {
+    try {
+      const d = JSON.parse(fs.readFileSync(EXEC_FILE, 'utf8'))
+      if (!d || !Number(d.port) || !d.token) return null
+      execCache = { mtimeMs: st.mtimeMs, port: Number(d.port), token: String(d.token) }
+      execWarned = false
+      log(`локальный исполнитель: 127.0.0.1:${execCache.port}`)
+    } catch (_e) { return null }
+  }
+  return execCache.port ? execCache : null
+}
+
+/* Таймаут генерации, а не сети: модель думает десятки секунд. */
+const EXEC_TIMEOUT_MS = Number(process.env.P2P_EXEC_TIMEOUT_MS || 120000)
+
+async function proxyToLocalExecutor(task) {
+  const d = loadExecDescriptor()
+  if (!d) {
+    return {
+      ok: false,
+      error: 'NO_LOCAL_EXECUTOR',
+      detail: `воркер не запущен: ${EXEC_FILE} нет — запустите его рядом с p2p-процессом`
+    }
+  }
+
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), EXEC_TIMEOUT_MS)
+  try {
+    const res = await fetch(`http://127.0.0.1:${d.port}/p2p/execute`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${d.token}`
+      },
+      body: JSON.stringify({ task }),
+      signal: ctrl.signal
+    })
+    const body = await res.json().catch(() => null)
+    if (!body) {
+      /* Не 500 от сервера, а нечитаемый ответ: обычно это старый воркер
+       * без локального входа. Отличаем явно, иначе искать причину в модели. */
+      return { ok: false, error: 'BAD_EXECUTOR_REPLY', status: res.status }
+    }
+    if (res.status === 401) {
+      /* Токен протух — дескриптор перечитается на следующем кадре. */
+      execCache = { mtimeMs: -1, port: null, token: null }
+      return { ok: false, error: 'BAD_TOKEN' }
+    }
+    return body
+  } catch (e) {
+    if (ctrl.signal.aborted) return { ok: false, error: 'EXEC_TIMEOUT', timeout_ms: EXEC_TIMEOUT_MS }
+    return { ok: false, error: 'EXEC_UNREACHABLE', detail: e.message }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 async function handleTask(msg) {
   if (msg && msg.action === 'ping') {
     return { ok: true, action: 'ping', pong: true, via: 'p2p', ts: Date.now() }
+  }
+  /* Задача от сервера: кадр `task` несёт готовое тело с шифротекстом
+   * и запечатанным ключом. Здесь его не разбираем и не логируем —
+   * промпт не должен появляться в логе транспорта. */
+  if (msg && msg.action === 'task' && msg.task && msg.task.taskId) {
+    log(`задача ${msg.task.taskId} → локальный исполнитель`)
+    const out = await proxyToLocalExecutor(msg.task)
+    log(`задача ${msg.task.taskId}: ${out && out.ok ? 'выполнена' : 'отказ'}${out && out.error ? ` (${out.error})` : ''}`)
+    return out
   }
   /* Неизвестная задача — внятный отказ, а не тишина: молчание мост
    * истолкует как таймаут и будет искать проблему в сети, а не в имени. */

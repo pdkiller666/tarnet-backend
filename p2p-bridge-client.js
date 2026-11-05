@@ -84,6 +84,26 @@ function send(command, { socketPath = DEFAULT_SOCKET, timeoutMs = 700 } = {}) {
 }
 
 /**
+ * Отправить задачу ВОРКЕРУ через мост и дождаться ответа.
+ *
+ * Тимаут здесь больше, чем у `send`: генерация занимает секунды, а не
+ * миллисекунды, как `status`. Сокетный дедлайн ставим на две секунды
+ * выше сетевого, чтобы ответ «воркер не уложился» пришёл от моста
+ * с причиной (`TASK_TIMEOUT`), а не как обрыв сокета без объяснения.
+ *
+ * Никогда не бросает: возвращает `{ok:false, error}` — вызывающий решает,
+ * откатиться на HTTP или показать ошибку.
+ */
+async function task(payload, { timeoutMs = 15000, socketPath = DEFAULT_SOCKET } = {}) {
+  const res = await send(
+    { action: 'task', payload, timeoutMs },
+    { socketPath, timeoutMs: timeoutMs + 2000 },
+  );
+  if (!res) return { ok: false, error: 'BRIDGE_UNREACHABLE' };
+  return res;
+}
+
+/**
  * Объявить себя мосту при старте. Никогда не бросает.
  * @param {{enabled?:boolean, quiet?:boolean}} opts
  * @returns {Promise<{ok:boolean, response?:object, reason?:string}>}
@@ -170,4 +190,4 @@ function startAnnounceLoop ({ intervalMs = 60000, enabled = process.env.P2P_BRID
   return timer;
 }
 
-module.exports = { send, announceOnStartup, startAnnounceLoop, nodeIdentity, DEFAULT_SOCKET };
+module.exports = { send, task, announceOnStartup, startAnnounceLoop, nodeIdentity, DEFAULT_SOCKET };

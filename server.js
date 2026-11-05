@@ -6805,6 +6805,174 @@ const wsInbound = createWsInbound({
   },
 });
 
+/* ===== P2P-маршрут доставки задачи (2.22.2) =====
+ *
+ * ПОРЯДОК: WS → P2P → poll. WS остаётся первым: он уже открыт и даёт
+ * доставку без задержки. P2P идёт вторым, потому что к нему надо ещё
+ * сходить в мост за списком каналов. Poll — последнее отступление, он
+ * работает всегда и ничего не требует.
+ *
+ * ПОЧЕМУ FIRE-AND-FORGET. `enqueueWorkerTask` синхронна и обязана
+ * вернуть промис ожидания сразу — на ней висит /inference. Сходить в
+ * мост и дождаться генерации можно только в фоне; результат всё равно
+ * приходит в ту же строку `worker_tasks` через `ingestWorkerResult`.
+ *
+ * ПОЧЕМУ ТАЙМАУТ МЕНЬШЕ TTL. `WORKER_TASK_TTL_MS` = 30 000, а ждущий
+ * цикл отваливается на TTL+5с. Если попросить у моста больше, ответ
+ * придёт после того, как задача уже `expired`, и работа воркера
+ * пропадёт впустую. 25 000 оставляет запас на доставку кадра. */
+const P2P_TASK_ROUTING = process.env.P2P_TASK_ROUTING !== '0';
+const P2P_TASK_TIMEOUT_MS = Number(process.env.P2P_TASK_TIMEOUT_MS || 25000);
+
+/* Отказы, после которых ТОЧНО ничего не исполнялось — такую задачу
+ * можно безопасно вернуть в очередь, и её заберёт poll.
+ *
+ * Чего здесь НЕТ намеренно: `EXEC_TIMEOUT` и `TASK_TIMEOUT`. К этому
+ * моменту воркер уже мог начать генерацию, и возврат в очередь дал бы
+ * вторую генерацию того же промпта — двойная работа и двойной расход.
+ * Такая строка остаётся 'claimed' до TTL: если воркер успеет, результат
+ * ещё примут, а если нет — истечёт без повторов. */
+const P2P_SAFE_TO_REQUEUE = new Set([
+  'BRIDGE_UNREACHABLE', 'NO_TASK_CHANNEL', 'BAD_TOKEN',
+  'NO_LOCAL_EXECUTOR', 'UNKNOWN_TASK', 'CHANNEL_GONE',
+]);
+
+/* Адреса, у которых открыт авторизованный канал задач.
+ * `channels` в ответе моста — единственный способ узнать адрес воркера:
+ * без адреса нечем заполнить `workerAddress` при claim, и приём
+ * результата отклонит его как чужой (409). */
+async function p2pTaskChannels() {
+  const r = await p2pBridge.send({ action: 'channels' }, { timeoutMs: 1500 });
+  if (!r || r.ok !== true || !Array.isArray(r.channels)) return [];
+  return r.channels.filter((c) => c && typeof c.address === 'string');
+}
+
+/**
+ * Попытаться отдать задачу по P2P одному из воркеров с открытым каналом.
+ * Никогда не бросает: любой отказ — это просто «не получилось» и задача
+ * ждёт poll.
+ */
+async function dispatchTaskOverP2p({
+  taskId, taskBody, sessionKey, model, tier, excludeSet = null,
+}) {
+  let channels;
+  try {
+    channels = await p2pTaskChannels();
+  } catch (_e) {
+    return { attempted: false, reason: 'channels_failed' };
+  }
+  if (!channels.length) return { attempted: false, reason: 'no_channel' };
+
+  /* Берём первый подходящий канал. Исключение — Private Swarm: две руки
+   * обязаны уйти разным воркерам, иначе «параллельно» окажется дважды
+   * на одном ПК. */
+  const pick = excludeSet
+    ? channels.find((c) => !excludeSet.has(String(c.address).toLowerCase()))
+    : channels[0];
+  if (!pick) return { attempted: false, reason: 'all_excluded' };
+
+  const addr = String(pick.address).toLowerCase();
+
+  /* Ключ сессии запечатываем на тот же публичный ключ, что и на WS. Это
+   * не мягче WS: открытый ключ не уезжает ни при каком отказе — если
+   * привязанного ключа нет, P2P-доставку не пробуем вообще. */
+  let sealedKey = null;
+  try {
+    const bound = pollBoundKey(addr);
+    if (bound && bound.pubkeyHex) {
+      sealedKey = workerBox.sealToWorker(bound.pubkeyHex, sessionKey.toString('base64'));
+    }
+  } catch (_e) { sealedKey = null; }
+  if (!sealedKey) return { attempted: false, reason: 'no_bound_key', address: addr };
+
+  /* Атомарный claim — до отправки, как и на WS. Иначе воркер мог бы
+   * получить одну задачу и кадром, и опросом, и посчитать дважды. */
+  const claimed = run(
+    `UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?, intendedWorker = ?
+     WHERE taskId = ? AND status = 'pending'`,
+    [Date.now(), addr, addr, taskId],
+  );
+  if (!claimed || Number(claimed.changes) !== 1) {
+    return { attempted: false, reason: 'already_claimed' };
+  }
+
+  const frame = {
+    action: 'task',
+    task: {
+      taskId,
+      encryptedPayload: encryptWithKey(taskBody, sessionKey),
+      sessionKey: sealedKey,
+      keyEncryption: 'box:v1',
+      encryption: 'aes-256-gcm',
+      model: model || null,
+      tier: tier || null,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + WORKER_TASK_TTL_MS,
+      deadlineMs: WORKER_TASK_TTL_MS,
+    },
+  };
+
+  let reply;
+  try {
+    reply = await p2pBridge.task(frame, { timeoutMs: P2P_TASK_TIMEOUT_MS });
+  } catch (e) {
+    reply = { ok: false, error: 'BRIDGE_UNREACHABLE', detail: e.message };
+  }
+
+  /* Отказ, при котором гарантированно ничего не исполнялось. `via`
+   * проверяем отдельно: мост отвечает `via:'p2p'` только когда ответ
+   * реально прошёл по сети. */
+  if (!reply || reply.ok !== true) {
+    const err = (reply && reply.error) || 'UNKNOWN';
+    if (P2P_SAFE_TO_REQUEUE.has(err)) {
+      run(`UPDATE worker_tasks SET status = 'pending', claimedAt = NULL, workerAddress = NULL,
+             intendedWorker = NULL
+           WHERE taskId = ? AND status = 'claimed'`, [taskId]);
+      console.log(`p2p: задача ${taskId} не ушла (${err}) — оставлена в очереди для poll`);
+      return { attempted: true, delivered: false, reason: err };
+    }
+    console.log(`p2p: задача ${taskId} без ответа (${err}) — оставляю claimed до TTL, чтобы не считать дважды`);
+    return { attempted: true, delivered: false, reason: err };
+  }
+
+  /* Ответ воркера — в тот же приём, что HTTP /worker/submit и WS-кадр.
+   * Один транспорт не должен быть мягче другого: правила одинаковые. */
+  const r = reply.result || {};
+  if (r.ok === false) {
+    /* Воркер ответил отказом (модель недоступна и т.п.). Это не работа,
+     * поэтому строку можно вернуть в очередь — но только для отказов,
+     * не связанных с таймаутом исполнения. */
+    const err = r.reason || r.error || 'EXEC_FAILED';
+    if (P2P_SAFE_TO_REQUEUE.has(err)) {
+      run(`UPDATE worker_tasks SET status = 'pending', claimedAt = NULL, workerAddress = NULL,
+             intendedWorker = NULL
+           WHERE taskId = ? AND status = 'claimed'`, [taskId]);
+    } else {
+      run(`UPDATE worker_tasks SET status = 'failed' WHERE taskId = ? AND status = 'claimed'`, [taskId]);
+    }
+    console.log(`p2p: воркер ${addr.slice(0, 10)}… отказал по ${taskId}: ${err}`);
+    return { attempted: true, delivered: true, executed: false, reason: err };
+  }
+
+  const out = ingestWorkerResult({
+    taskId,
+    workerAddress: addr,
+    response: typeof r.payload?.response === 'string' ? r.payload.response : null,
+    encryptedResponse: typeof r.payload?.encryptedResponse === 'string' ? r.payload.encryptedResponse : null,
+    model: r.model,
+    usage: r.usage || null,
+    source: r.source,
+    error: r.error,
+    errorDetail: r.errorDetail,
+  });
+  if (out.status !== 200) {
+    console.log(`p2p: результат ${taskId} отклонён (${out.status}) ${JSON.stringify(out.body)}`);
+  } else {
+    console.log(`p2p: задача ${taskId} выполнена воркером ${addr.slice(0, 10)}…`);
+  }
+  return { attempted: true, delivered: true, executed: true, accepted: out.status === 200 };
+}
+
 function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxTokens = null, excludeWsAddr = null, forceWsAddr = null, onEnqueued = null }) {
   const taskId = 'wt_' + crypto.randomBytes(12).toString('hex');
   const now = Date.now();
@@ -6933,6 +7101,24 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
                intendedWorker = NULL
              WHERE taskId = ? AND status = 'claimed'`, [taskId]);
       }
+    }
+  }
+
+  /* --- P2P-маршрут: после WS, до ожидания результата ---
+   *
+   * Условие — состояние СТРОКИ, а не признак «WS не сработал»:
+   * WS-ветка возвращает задачу в `pending` при закрытом сокете, и
+   * именно там P2P ещё может её доставить. Если строка уже `claimed`,
+   * второй маршрут не пробуем — это дало бы двойную генерацию.
+   *
+   * Не await: /inference ждёт результат из БД, а не возврата этой
+   * функции. Ожидание здесь задержало бы ответ на генерацию, которую
+   * ждёт тот же цикл. */
+  if (P2P_TASK_ROUTING) {
+    const rowNow = get('SELECT status FROM worker_tasks WHERE taskId = ?', [taskId]);
+    if (rowNow && rowNow.status === 'pending') {
+      dispatchTaskOverP2p({ taskId, taskBody, sessionKey, model, tier, excludeSet })
+        .catch((e) => console.log(`p2p: маршрут упал для ${taskId}: ${e.message}`));
     }
   }
 

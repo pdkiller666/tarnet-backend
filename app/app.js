@@ -2207,12 +2207,52 @@ function stopLinkCodeTimer() {
   if (linkCodeTimer) { clearInterval(linkCodeTimer); linkCodeTimer = null; }
 }
 
+/* Код показываем с пробелами для читаемости, а копируем без них.
+ * Пробелы в буфере обмена — не мелочь: их приходилось чистить вручную
+ * при вставке в окно воркера. Копируем ровно то, что ждёт ввод. */
+let lastLinkCode = '';
+
+function setLinkCode(code) {
+  const val = $('linkCodeValue');
+  const copyBtn = $('linkCodeCopy');
+  lastLinkCode = String(code || '');
+  if (val) val.textContent = lastLinkCode ? lastLinkCode.split('').join(' ') : '';
+  if (copyBtn) copyBtn.style.display = lastLinkCode ? '' : 'none';
+}
+
+async function copyLinkCode() {
+  const copyBtn = $('linkCodeCopy');
+  const hint = $('linkCodeHint');
+  if (!lastLinkCode) return;
+  const prevHint = hint ? hint.textContent : '';
+  try {
+    await copyText(lastLinkCode);
+    if (copyBtn) copyBtn.textContent = '✓ Скопировано!';
+    if (hint) hint.textContent = 'Скопировано! Вставьте код в окне программы TarNet на ПК.';
+    setTimeout(() => {
+      if (copyBtn) copyBtn.textContent = 'Копировать';
+      if (hint) hint.textContent = prevHint;
+    }, 1600);
+  } catch (_e) {
+    if (copyBtn) copyBtn.textContent = 'Не удалось';
+    if (hint) hint.textContent = 'Браузер не дал доступ к буферу обмена — выделите цифры и скопируйте вручную.';
+    setTimeout(() => {
+      if (copyBtn) copyBtn.textContent = 'Копировать';
+      if (hint) hint.textContent = prevHint;
+    }, 2600);
+  }
+}
+
+$('linkCodeCopy')?.addEventListener('click', copyLinkCode);
+/* Клик по самим цифрам — тот же результат: кнопку видно не всем. */
+$('linkCodeValue')?.addEventListener('click', () => { if (lastLinkCode) copyLinkCode(); });
+
 $('linkCodeBtn')?.addEventListener('click', async () => {
   const st = $('linkCodeState');
   const val = $('linkCodeValue');
   const hint = $('linkCodeHint');
   stopLinkCodeTimer();
-  if (val) val.textContent = '';
+  setLinkCode('');
   if (hint) hint.textContent = '';
   if (st) st.textContent = 'выпускаю…';
 
@@ -2231,7 +2271,7 @@ $('linkCodeBtn')?.addEventListener('click', async () => {
       body: { ownerAddress: ADDR, signature, nonce },
     });
 
-    if (val) val.textContent = String(r.code).split('').join(' ');
+    setLinkCode(r.code);
     const ttl = Number(r.ttlSeconds) || 300;
     const until = Date.now() + ttl * 1000;
     const tick = () => {

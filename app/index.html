@@ -503,8 +503,11 @@
           </p>
           <div class="row">
             <button id="linkCodeBtn" class="btn">Выпустить код</button>
+            <button id="linkCodeCopy" class="ghost small" style="display:none"
+                    title="Скопировать код без пробелов">Копировать</button>
           </div>
-          <p class="mono" id="linkCodeValue" style="font-size:1.6rem;letter-spacing:.22em;"></p>
+          <p class="mono" id="linkCodeValue" style="font-size:1.6rem;letter-spacing:.22em;cursor:pointer"
+             title="Нажмите, чтобы скопировать"></p>
           <p class="mono dim tiny addr-line" id="linkCodeState">—</p>
           <p class="hint" id="linkCodeHint"></p>
         </div>
