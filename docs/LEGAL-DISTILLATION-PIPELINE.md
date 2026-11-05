@@ -164,6 +164,6 @@ grep -rn -i "legal\|distill" --include=*.js --include=*.md . | grep -v node_modu
 
 ## 5. Как этот файл получить
 
-`backend-api/LEGAL-DISTILLATION-PIPELINE.md` в репозитории и рядом с кодом на
+`backend-api/docs/LEGAL-DISTILLATION-PIPELINE.md` в репозитории и рядом с кодом на
 VPS (`/opt/tarnet/backend-api/`). По HTTP не отдаётся: статика настроена только
 на `/app` и `ui`.

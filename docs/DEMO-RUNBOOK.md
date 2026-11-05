@@ -509,7 +509,7 @@ ssh VPS 'systemctl show tarnet -p Environment | tr " " "\n" | grep TARNET_DB'
 
 ## Где лежит этот файл
 
-`backend-api/DEMO-RUNBOOK.md` в репозитории `pdkiller666/tarnet-backend`, и
+`backend-api/docs/DEMO-RUNBOOK.md` в репозитории `pdkiller666/tarnet-backend`, и
 рядом с кодом на VPS (`/opt/tarnet/backend-api/`). По HTTP не отдаётся —
 статика настроена только на `/app` и `ui`, а лишний публичный маршрут к
 документам на демо-стенде не нужен. Открывать из репозитория или с диска VPS.

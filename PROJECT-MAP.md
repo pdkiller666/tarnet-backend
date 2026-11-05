@@ -155,7 +155,7 @@ SQLite, `/var/lib/tarnet` на проде. 38 таблиц; группы по с
 - **Агенты:** `/agents/*`
 
 **Правило Code-First:** маршрут существует = он есть в `server.js`. Отсутствие в
-`NETWORK-CONTRACT-v1.md` — дефект документа, а не признак отсутствия кода
+`docs/NETWORK-CONTRACT-v1.md` — дефект документа, а не признак отсутствия кода
 (так было с `CANCEL` и `swarm`: в коде есть, в контракте не было).
 
 ---
@@ -168,13 +168,32 @@ SQLite, `/var/lib/tarnet` на проде. 38 таблиц; группы по с
 | `MANIFEST.v3.4-UNIFIED.md` | «что работает сейчас» | при каждой вехе, снимок в Приложении Б |
 | `PROJECT-HISTORY.md` | «как мы сюда пришли» | при каждой вехе |
 | `ROADMAP.md` | «что дальше и в каком порядке» | при смене приоритетов |
-| `BACKLOG.md` | «что отложено и почему» | когда задачу откладывают |
+| `docs/BACKLOG.md` | «что отложено и почему» | когда задачу откладывают |
 | `docs/NETWORK-CONTRACT-v1.md` | контракт воркера и API | при изменении API |
 | `docs/PROJECT-MEMORY.md` | сводка по всем сессиям | по запросу |
 
 **Правило одного источника:** факт о том, что работает, живёт в `MANIFEST`;
 дата и причина — в `PROJECT-HISTORY`; расположение — здесь. Дублирование факта
 в двух местах означает, что одно из них протухнет.
+
+### 11.1. Раскладка папок (с 05.11.2026)
+
+В корне `backend-api/` — **только четыре канонических документа и `README.md`**.
+Всё остальное — в `docs/`. Перенос сделан 05.11.2026 (`git mv`, история сохранена).
+
+| Где | Что |
+| :--- | :--- |
+| корень `backend-api/` | `MANIFEST.v3.4-UNIFIED.md`, `PROJECT-HISTORY.md`, `PROJECT-MAP.md`, `ROADMAP.md`, `README.md` |
+| `docs/` — отчёты и планы | `docs/BACKLOG.md`, `docs/PLAN-WAVE2.md`, `docs/PLAN-AGENT-RUNTIME.md`, `docs/LEGAL-DISTILLATION-PIPELINE.md`, `docs/V2.17.*-REPORT.md`, `docs/V2.17.13-REPORT.md`, `docs/REALITY-CHECK-v2.17.7.md` |
+| `docs/` — инвестору и демо | `docs/ONE-PAGER.md`, `docs/PITCH-DECK.md`, `docs/DEMO-SCRIPT.md`, `docs/DEMO-RUNBOOK.md`, `docs/EMAIL-TEMPLATE.md`, `docs/AUDIT-REALITY.md` |
+| `docs/` — контракты и решения | `docs/NETWORK-CONTRACT-v1.md`, `docs/BYOK-PRICING.md`, `docs/PII-DECISION.md`, `docs/VISION-8-COMPONENTS.md`, `docs/PROJECT-MEMORY.md` |
+
+**Корень workspace** (на уровень выше, вне git) держит **симлинки** на публичные документы.
+Копий намеренно нет: копии разъезжались молча (29.10 `EMAIL-TEMPLATE` в корне был 8080 б
+против 9207 в `docs/`). Проверяет `scripts/verify.sh` → шаг 3.8.
+
+**Ссылки внутри документов указывают путь от `backend-api/`**, то есть на перемещённое —
+через `docs/`: `docs/BACKLOG.md`, `docs/DEMO-RUNBOOK.md`. Голое имя теперь означает файл в корне.
 
 ---
 
@@ -185,5 +204,5 @@ SQLite, `/var/lib/tarnet` на проде. 38 таблиц; группы по с
 | `archive/python-app/crypto.py` | `sign_message()` на SHA-256 — хеш-заглушка, **не Ed25519**. Не использовать |
 | `archive/lottery-tests/` | Отозванная механика лотерей |
 | `node_modules/` | Не читать, не грепать при аудите |
-| `../../MANIFEST.md` (v3.2), `../../MANIFEST.v3.3.md` | Помечены «устарело». Побеждает v3.4-UNIFIED. Лежат на два уровня выше, вне этого репозитория |
+| `../MANIFEST.md` (v3.1), `../MANIFEST.v3.3.md` | Помечены «устарело». Побеждает v3.4-UNIFIED. Лежат **на уровень выше**, в корне workspace, вне этого репозитория |
 | `.model-cache/` | Модели ONNX; на проде отсутствует |

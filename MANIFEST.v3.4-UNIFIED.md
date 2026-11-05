@@ -325,8 +325,8 @@ kэш **105 MB**, пиковый RSS **687 MB** (`VmHWM`), загрузка **4.
 swap `0`, порог `minFreeMb: 900`.
 
 **Решение было принято раньше — 22.10.2026, а не в этой директивой.** ONNX NER выключен
-`ebc461d` (`README.md:129`), `610dcbc` (`DEMO-RUNBOOK.md:444`); границы хранения промптов — `cc570c3`
-(`LEGAL-DISTILLATION-PIPELINE.md:100`, **К1 = вариант A**, владелец). Этот раздел **подтверждает** его
+`ebc461d` (`README.md:129`), `610dcbc` (`docs/DEMO-RUNBOOK.md:444`); границы хранения промптов — `cc570c3`
+(`docs/LEGAL-DISTILLATION-PIPELINE.md:100`, **К1 = вариант A**, владелец). Этот раздел **подтверждает** его
 замером и исправляет два ложных утверждения, живших в документах восемь дней: «с 4+ ГБ RAM включён
 по умолчанию» (авто-включения в коде нет — только `TARNET_PII_ONNX === '1'`, `pii-classifier.js:48`) и
 «532 МБ RSS» (замер — **687 MB**, `VmHWM`).
@@ -351,7 +351,7 @@ Tier 6**: он regex-only по устройству. Порог доступа �
 за отдельным сервисом. Tier 6 нельзя подавать как безопасный для произвольных пользовательских промптов.
 
 **Контракт onion.** `POST /inference/onion` читает `{routeNodes, prompt, clientAddress, model}`
-(`server.js:5090`). Документация **уже верна**: `DEMO-RUNBOOK.md` шаг 4 шлёт `prompt`, PWA тоже
+(`server.js:5090`). Документация **уже верна**: `docs/DEMO-RUNBOOK.md` шаг 4 шлёт `prompt`, PWA тоже
 (`app/app.js:1154`). Вызов с `messages` → `400`; с `prompt` + `routeNodes` → `200 {"delivered":true,"hops":3}`.
 Значит контракт **не менялся** — исправлена только диагностика: вместо общего «prompt must be a non-empty
 string» на `messages[]` теперь `400 {error:"expected_field_prompt", expected:"prompt", received:"messages"}`.
