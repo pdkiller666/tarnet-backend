@@ -2503,11 +2503,45 @@ app.use('/app', express.static(APP_DIR, {
 }));
 
 /* Скачивание воркера одной кнопкой. Content-Disposition: attachment — иначе
- * браузер откроет .js как текст, а не сохранит файл. */
+ * браузер откроет .js как текст, а не сохранит файл.
+ *
+ * Отдаётся СБОРКА (`dist/tarnet-worker.js`), а не исходный `worker-demo.js`.
+ * Причина — реальный отказ: `worker-demo.js` требует `./worker-box`, а
+ * установщик качает ровно один файл, поэтому в `%LOCALAPPDATA%\TarNet`
+ * `worker-box.js` не оказывалось и запуск падал с
+ * `Cannot find module './worker-box'`. Пользователь видел красную ошибку и
+ * удалял программу.
+ *
+ * Если сборки нет (чистый клон, забыли `npm run build:worker`), она делается
+ * на лету — отдавать вместо неё исходник нельзя: это вернуло бы тот же отказ,
+ * только тихо. При невозможности собрать возвращается 503 с внятной причиной:
+ * скачивание заведомо нерабочего файла хуже, чем честный отказ.
+ */
+function workerBundlePath() {
+  return path.join(__dirname, 'dist', 'tarnet-worker.js');
+}
+
+function ensureWorkerBundle() {
+  const file = workerBundlePath();
+  if (fs.existsSync(file)) return file;
+  try {
+    const { build } = require('./build-worker');
+    const out = build();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, out.code);
+    return file;
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
 app.get('/download/worker.js', (_req, res) => {
-  const file = path.join(__dirname, 'worker-demo.js');
+  const file = ensureWorkerBundle();
+  if (typeof file === 'object' && file.error) {
+    return res.status(503).json({ error: 'worker_bundle_failed', detail: file.error });
+  }
   if (!fs.existsSync(file)) {
-    return res.status(404).json({ error: 'worker-demo.js not found on server' });
+    return res.status(503).json({ error: 'worker_bundle_missing' });
   }
   res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="tarnet-worker.js"');

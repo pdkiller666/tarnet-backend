@@ -142,6 +142,19 @@ set "WORKER_JS=%TARNET_DIR%\tarnet-worker.js"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%API%/download/worker.js' -OutFile '%WORKER_JS%'"
 if not exist "%WORKER_JS%" goto fail_worker
 
+rem Verify the downloaded worker ACTUALLY launches here, in the folder it
+rem will run from. Until 2.21.3 the installer shipped a worker that died
+rem with `Cannot find module './worker-box'`: the file was present, the
+rem install looked successful, and the failure surfaced only to the user.
+rem `--self-check` loads the worker modules without touching the network
+rem and exits 0/1, so a bad download stops the install instead of a person.
+rem
+rem This check is meaningful only because the server now sends a bundled
+rem single-file worker. An unbundled worker would need worker-box.js next
+rem to it, and this line would fail exactly where real users used to fail.
+"%NODE_EXE%" "%WORKER_JS%" --self-check >nul 2>nul
+if errorlevel 1 goto fail_selfcheck
+
 rem Launcher for later: after a reboot the worker can be started
 rem again without repeating the whole installation.
 rem
@@ -248,5 +261,11 @@ exit /b 1
 
 :fail_worker
 echo   ERROR: worker download failed from %API%/download/worker.js
+pause
+exit /b 1
+
+:fail_selfcheck
+echo   ERROR: the downloaded worker did not start on this machine.
+echo   Run this for details: "%NODE_EXE%" "%WORKER_JS%" --self-check
 pause
 exit /b 1

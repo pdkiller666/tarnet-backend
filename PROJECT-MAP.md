@@ -41,7 +41,10 @@
 | Модуль | Строк | Роль | Статус |
 | :--- | --: | :--- | :--- |
 | `ws-inbound.js` | 601 | Входящий WS для воркеров: Ed25519-хендшейк, nonce, TOFU, кадры `TASK`/`CANCEL` | ✅ работает |
-| `worker-demo.js` | 1384 | Воркер на ПК владельца: опрос/WS, `fetchAbortable`, `askOllama`/`askCloud`, `MAX_EARLY_CANCELS = 200`, `startLinkListener` — ввод кода привязки в окне воркера | ✅ работает |
+| `worker-demo.js` | 1417 | Воркер на ПК владельца: опрос/WS, `fetchAbortable`, `askOllama`/`askCloud`, `MAX_EARLY_CANCELS = 200`, `startLinkListener` — ввод кода привязки в окне воркера, `--self-check` | ✅ работает |
+| `worker-box.js` | 132 | `openFromWorker` / `sealToWorker`: `sessionKey` шифруется на ключ воркера. **Локальная зависимость воркера** — вшивается сборкой, отдельно не качается | ✅ работает |
+| `build-worker.js` | 188 | Сборщик одного файла: `maskComments`, `localRequireNames`, `stripShebang`; `require('./x')` → `__localRequire('x')` | ✅ работает |
+| `dist/tarnet-worker.js` | — | Готовая сборка, её отдаёт `/download/worker.js`. В `.gitignore`, собирается на лету | 🏗 артефакт |
 | `p2p-transport.js` | 611 | WS между узлами, `wildcardBind`, `P2P_PUBLIC_URL → P2P_ADVERTISE_IP` | ⚠️ настроен только на `127.0.0.1` |
 | `onion.js` | 289 | Onion Routing: RSA-2048-OAEP-SHA256 оборачивает 32-байтный AES, нагрузка AES-256-GCM | ✅ работает (`hops: 3`) |
 | `p2p-demo.js` | 129 | Демонстрация P2P | демо |

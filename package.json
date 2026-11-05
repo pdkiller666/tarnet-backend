@@ -1,11 +1,12 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.21.2-ux-device-link",
+  "version": "2.21.3-fix-installer-p0",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "build:worker": "node build-worker.js"
   },
   "license": "MIT",
   "dependencies": {

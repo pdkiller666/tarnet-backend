@@ -5542,6 +5542,64 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       { empty: batText.includes('if "%ADDR%"=="" goto fail_addr'),
         prefix: batText.includes(':~0,2%'),
         len: batText.includes('if not "%ADDR:~42,1%"=="" goto fail_addr') });
+
+    /* --- Изолированность скачанного воркера (2.21.3) ---
+     *
+     * Живой отказ: установщик качал `/download/worker.js`, сервер отдавал
+     * `worker-demo.js`, тот требует `./worker-box` — и в
+     * `%LOCALAPPDATA%\TarNet` рядом не оказывалось второго файла. Запуск
+     * падал с `Cannot find module './worker-box'`, установка при этом
+     * выглядела успешной. Проверять надо РОВНО то, что получает человек. */
+    const dl = await apiAt(BASE, '/download/worker.js');
+    const dlText = typeof dl.body === 'string' ? dl.body : '';
+
+    /* Ищем локальные require в коде БЕЗ комментариев. В воркере есть
+     * пояснение, где упомянут `require('./worker-demo.js')` — обычный текст.
+     * Сырой поиск по регулярке принимал его за настоящую зависимость и
+     * валил готовую сборку. Это та же ловушка, что в build-worker.js,
+     * поэтому берём оттуда же maskComments, а не пишем третий вариант. */
+    const bw = require('./build-worker');
+    const dlCodeOnly = bw.maskComments(dlText);
+    const dlLocalReqs = bw.localRequireNames(dlCodeOnly);
+
+    ok('31.21 скачиваемый воркер отдаётся и не требует соседних файлов',
+      dl.status === 200 && dlText.length > 1000 && dlLocalReqs.length === 0,
+      { status: dl.status, bytes: dlText.length, localRequires: dlLocalReqs.slice(0, 3) });
+
+    /* Шифрование `sessionKey` обязано быть внутри: без него воркер либо
+     * падает, либо (хуже) работает без защиты ключа сессии. */
+    ok('31.22 worker-box вшит в скачиваемый файл',
+      dlText.includes('sealToWorker') && dlText.includes('openFromWorker'),
+      { seal: dlText.includes('sealToWorker'), open: dlText.includes('openFromWorker') });
+
+    ok('31.23 установщик проверяет запуск воркера до объявления успеха',
+      batText.includes('--self-check') && batText.includes('goto fail_selfcheck')
+      && batText.indexOf('--self-check') < batText.indexOf('start.cmd"'),
+      { hasCheck: batText.includes('--self-check'),
+        hasLabel: batText.includes('fail_selfcheck') });
+
+    /* Главная проверка: файл запускается в ПУСТОЙ папке. Именно так его
+     * увидит пользователь — один файл в `%LOCALAPPDATA%\TarNet`. Тест
+     * воспроизводит это буквально: временный каталог, один файл, запуск
+     * `--self-check`, код выхода. */
+    {
+      const { spawnSync } = require('child_process');
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-isolated-'));
+      let isolated = { code: null, out: '' };
+      try {
+        const oneFile = path.join(dir, 'tarnet-worker.js');
+        fs.writeFileSync(oneFile, dlText);
+        const r = spawnSync(process.execPath, [oneFile, '--self-check'],
+          { cwd: dir, encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] });
+        isolated = { code: r.status, out: `${r.stdout || ''}${r.stderr || ''}`.trim().slice(0, 160),
+          files: fs.readdirSync(dir).length };
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+      ok('31.24 воркер запускается в пустой папке без backend-api',
+        isolated.code === 0 && /self-check: ok/.test(isolated.out) && isolated.files === 1,
+        isolated);
+    }
   }
 
   /* ===== 32. Tier 6 в списке моделей PWA =====
