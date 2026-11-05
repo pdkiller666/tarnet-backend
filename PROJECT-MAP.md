@@ -41,7 +41,7 @@
 | Модуль | Строк | Роль | Статус |
 | :--- | --: | :--- | :--- |
 | `ws-inbound.js` | 601 | Входящий WS для воркеров: Ed25519-хендшейк, nonce, TOFU, кадры `TASK`/`CANCEL` | ✅ работает |
-| `worker-demo.js` | 1314 | Воркер на ПК владельца: опрос/WS, `fetchAbortable`, `askOllama`/`askCloud`, `MAX_EARLY_CANCELS = 200` | ✅ работает |
+| `worker-demo.js` | 1384 | Воркер на ПК владельца: опрос/WS, `fetchAbortable`, `askOllama`/`askCloud`, `MAX_EARLY_CANCELS = 200`, `startLinkListener` — ввод кода привязки в окне воркера | ✅ работает |
 | `p2p-transport.js` | 611 | WS между узлами, `wildcardBind`, `P2P_PUBLIC_URL → P2P_ADVERTISE_IP` | ⚠️ настроен только на `127.0.0.1` |
 | `onion.js` | 289 | Onion Routing: RSA-2048-OAEP-SHA256 оборачивает 32-байтный AES, нагрузка AES-256-GCM | ✅ работает (`hops: 3`) |
 | `p2p-demo.js` | 129 | Демонстрация P2P | демо |
@@ -73,10 +73,11 @@
 | :--- | --: | :--- |
 | `identity.js` | 232 | TarNet ID: детерминированный вывод ключей из мастер-энтропии |
 | `jcs.js` | 74 | RFC 8785. **Применяется только в Device Linking** (`server.js:4108`), не в подписи `/work` |
-| `app/app.js` | 3080 | PWA-клиент: чат, кошелёк, агенты, `CryptoKey` с `extractable: false` в IndexedDB |
+| `app/app.js` | 3082 | PWA-клиент: чат, кошелёк, агенты, `CryptoKey` с `extractable: false` в IndexedDB |
 | `app/agents.js` | 811 | Агенты в браузере, вендорный `noble-ed25519` (`app/vendor/ed25519.js`) |
-| `app/sw.js` | 212 | Service worker, кэш `tarnet-app-v33` |
-| `app/index.html` | 737 | Разметка чата |
+| `app/sw.js` | 212 | Service worker, кэш `tarnet-app-v35` |
+| `app/index.html` | 740 | Разметка чата, инструкция привязки: код вводится в окне воркера |
+| `install/install.bat.tpl` | 252 | Установщик Windows: `start.cmd` запускает `node` в видимом окне (не `start /min`), чистый ASCII |
 | `app/styles.css` | 2067 | Стили |
 | `ui/console.html`, `ui/index.html` | — | Отдельная консоль оператора |
 

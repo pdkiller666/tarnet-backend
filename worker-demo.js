@@ -1154,9 +1154,15 @@ async function main() {
    * Блок обёрнут в try: сломанный stdin или недоступный сервер не должны
    * оставить человека без работающего воркера. */
   try {
-    await linkFromCli();
+    const viaFlag = await linkFromCli();
+    /* Если код не передан флагом или флаг не сработал — включаем ввод
+     * в окне. Условие именно такое: при успехе по флагу подсказка была бы
+     * шумом, при любом другом исходе человек должен видеть, что код можно
+     * ввести здесь же. */
+    if (!viaFlag || !viaFlag.ok) startLinkListener();
   } catch (e) {
     log(`привязка кодом не удалась (${e.message}) — продолжаю без неё`);
+    startLinkListener();
   }
 
   log('опросите /health на сервере: llm_mode должен стать worker');
@@ -1268,35 +1274,96 @@ async function claimLinkCode(code) {
   };
 }
 
-/* Читает код из аргумента, переменной окружения или stdin — в этом порядке.
- * Порядок такой, чтобы работало и в скрипте (`--link 123456`), и у человека
- * без TTY. Без stdin в pipe ввод не ждём: висящий воркер на вопросе\«введите
- * код\» — это поломка запуска, а не интерактив. */
+/* Читает код из аргумента или переменной окружения — путь для скриптов.
+ * Интерактивный ввод живёт отдельно (startLinkListener), чтобы не задерживать
+ * старт цикла работы. Здесь — только --link <код> и TARNET_LINK_CODE: без
+ * них функция возвращает null и ничего не спрашивает у консоли. */
 async function linkFromCli(argv = process.argv.slice(2)) {
   const flagIdx = argv.findIndex((a) => a === '--link' || a === '--link-code');
   let code = flagIdx >= 0 ? argv[flagIdx + 1] : '';
   if (!code && process.env.TARNET_LINK_CODE) code = process.env.TARNET_LINK_CODE;
-  if (!code && process.stdin.isTTY) {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    code = await new Promise((resolve) => {
-      rl.question('  Код привязки из PWA (6 цифр, пусто — пропустить): ', (a) => {
-        rl.close(); resolve(String(a || '').trim());
-      });
-    });
-  }
   if (!code) return null;
+  return applyLinkCode(code);
+}
 
-  log(`погашаю код ${String(code).replace(/\D/g, '').padEnd(6, '•')}…`);
-  const res = await claimLinkCode(code);
+/* ---------- Ввод кода прямо в окне воркера (2.21.2) ----------
+ *
+ * До этой версии код спрашивался ОДИН раз до старта цикла, через
+ * rl.question. Три следствия, все плохие:
+ *   1) окно висело на вопросе, пока человек ищет код в телефоне, — воркер
+ *      в это время не работает и не виден в сети;
+ *   2) второй попытки не было: промахнулся цифрой — перезапускай;
+ *   3) установщик запускал start.cmd через `start /min`, то есть окно было
+ *      СВЁРНУТО, и увидеть любой вопрос было невозможно в принципе.
+ *
+ * Теперь ввод живёт рядом с циклом: подсказка печатается после старта,
+ * строки читаются событием 'line' (опрос не блокируется), а после неудачи
+ * подсказка возвращается — код мог истечь, и повторить можно без
+ * перезапуска воркера.
+ *
+ * Слушатель включается только при TTY. В pipe и в фоне stdin закрыт или
+ * пуст: там ввод не ждём, иначе воркер висел бы на чтении, выглядя живым,
+ * но ничего не опрашивая. Для автоматизации остаётся `--link`.
+ */
+const linkState = { listening: false, linked: false, rl: null };
+
+const LINK_PROMPT = '[Чтобы привязать ПК к аккаунту, введите 6-значный код из PWA и нажмите Enter]';
+
+function printLinkPrompt() {
+  if (linkState.linked) return;
+  console.log(LINK_PROMPT);
+}
+
+/* Одно место погашения для обоих путей — флага и консоли. После удачи
+ * слушатель снимается: код одноразовый, второй раз он всё равно не сработает.
+ * После отказа подсказка остаётся, а воркер продолжает работу — начисления
+ * от привязки не зависят. */
+async function applyLinkCode(code) {
+  const digits = String(code ?? '').replace(/\s+/g, '');
+  log(`погашаю код ${digits.replace(/\D/g, '').padEnd(6, '•')}…`);
+  const res = await claimLinkCode(digits);
   if (res.ok) {
-    log(`ПК привязан к аккаунту ${res.data.ownerAddress.slice(0, 10)}…`);
+    linkState.linked = true;
+    log(`ПК привязан к аккаунту ${String(res.data?.ownerAddress || '').slice(0, 10)}…`);
+    log('привязка выполнена — вводить код больше не нужно');
+    if (linkState.rl) {
+      try { linkState.rl.close(); } catch (_e) { /* уже закрыт */ }
+      linkState.rl = null;
+      linkState.listening = false;
+    }
     return res;
   }
-  /* Отказ не останавливает воркер: код мог истечь, а работа и начисления
-   * от привязки не зависят — она нужна только чтобы PWA видела этот ПК как
-   * свой и могла платить с аккаунта. */
   log(`привязка не удалась: ${res.error} — ${res.message}`);
   return res;
+}
+
+function startLinkListener() {
+  if (linkState.listening || linkState.linked) return true;
+  if (!process.stdin || !process.stdin.isTTY) {
+    /* Не отказ, а другой способ: скрипт и служба кода не вводят. */
+    log('консоль не интерактивна — код привязки передаётся как --link <код>');
+    return false;
+  }
+  linkState.listening = true;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  linkState.rl = rl;
+  rl.on('line', (line) => {
+    if (linkState.linked) return;
+    const raw = String(line || '').trim();
+    if (!raw) { printLinkPrompt(); return; }
+    if (!/^[0-9]{6}$/.test(raw)) {
+      log('это не код: нужно ровно 6 цифр из PWA');
+      printLinkPrompt();
+      return;
+    }
+    /* Без await: пока идёт погашение, цикл опроса продолжается. */
+    applyLinkCode(raw)
+      .catch((e) => log(`привязка кодом упала: ${e.message}`))
+      .then(() => { if (!linkState.linked) printLinkPrompt(); });
+  });
+  rl.on('close', () => { linkState.listening = false; linkState.rl = null; });
+  printLinkPrompt();
+  return true;
 }
 
 module.exports = {
@@ -1304,6 +1371,9 @@ module.exports = {
   /* Экспорт транспорта — для тестов handshake без запуска цикла опроса. */
   connectWs, signAuth, ed25519FromSeed, loadOrCreateSeed, wsState, wsUrl, wsSupported,
   runTask, AUTH_PREFIX, claimLinkCode, linkFromCli,
+  /* Интерактив привязки — наружу для тестов: подсказка, разбор ввода и
+   * состояние слушателя проверяются без запуска цикла опроса. */
+  applyLinkCode, startLinkListener, printLinkPrompt, linkState, LINK_PROMPT,
 };
 
 if (require.main === module) {

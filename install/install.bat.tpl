@@ -144,13 +144,25 @@ if not exist "%WORKER_JS%" goto fail_worker
 
 rem Launcher for later: after a reboot the worker can be started
 rem again without repeating the whole installation.
+rem
+rem The window must stay VISIBLE and node must run in it directly.
+rem Until 2.21.2 this line was `start /min`: the worker ran minimized,
+rem so the link-code prompt existed but nobody could see it or type
+rem into it. `start` also detaches into another process, so the child's
+rem stdin is not the console the user is looking at.
+rem
+rem So no `start` here at all: node IS the interactive program.
+rem `pause` keeps the window open after a crash so the error text stays
+rem readable instead of the window vanishing instantly.
 (
   echo @echo off
+  echo title TarNet Worker
   echo setlocal
   echo set "WORKER_ADDRESS=%ADDR%"
   echo set "TARNET_API_URL=%API%"
   echo set "TARNET_MODEL=%MODEL%"
-  echo start /min "" "%NODE_EXE%" "%WORKER_JS%"
+  echo "%NODE_EXE%" "%WORKER_JS%"
+  echo pause
 ) > "%TARNET_DIR%\start.cmd"
 
 rem ---------- desktop shortcut ----------
@@ -185,15 +197,21 @@ echo   Could not create a Desktop shortcut.
 echo   Run manually: "%TARNET_DIR%\start.cmd"
 
 :shortcut_done
-echo [4/4] Starting worker in background...
-start /min "" "%TARNET_DIR%\start.cmd"
+echo [4/4] Starting worker...
+rem Visible window, not minimized: the worker prints the link-code prompt
+rem and reads the code from this very console (2.21.2). A minimized window
+rem made the prompt unreachable - the feature existed but was unusable.
+start "TarNet Worker" "%TARNET_DIR%\start.cmd"
 
 echo.
 echo ============================================
-echo   Done. The worker is running minimized.
+echo   Done. The worker window is open.
 echo ============================================
-echo   Check it in the PWA, tab "My devices".
-echo   Logs appear in the worker window.
+echo   Bind this PC: open the PWA, press the code button
+echo   and type the 6 digits into the worker window, then Enter.
+echo.
+echo   Check the device list in the PWA, tab "My devices".
+echo   Keep the worker window open while it works.
 echo   Start again later: "%TARNET_DIR%\start.cmd"
 echo   Or use the TarNet shortcut on your Desktop.
 echo.
