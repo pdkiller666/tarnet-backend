@@ -34,6 +34,7 @@ import { fileURLToPath } from 'node:url'
 import { loadOrCreatePeerId, keyFilePath } from './peer-id-store.js'
 import { resolvePublicAddrs, listenMismatch } from './public-addr.js'
 import { createTaskClient, TASK_PROTOCOL } from './task-protocol.js'
+import { loadAllowlist, verifyHello, allowlistPath } from './peer-auth.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
@@ -69,6 +70,24 @@ let peerKeyPath = keyFilePath(DATA_DIR)
 let publicAddrs = []
 let announceNote = null
 
+/* Список тех, кому разрешено открывать поток задач.
+ *
+ * Читается С ДИСКА, а не из базы: у моста нет доступа к `tarnet.db` и не
+ * должно появиться (см. принцип изолированности в index.js). Файл пишет
+ * backend-api из `ws_worker_auth` — единственного места, где живёт связка
+ * «адрес → ключ». Так падение моста не может испортить базу, а падение
+ * сервера не отменяет уже выданные разрешения.
+ *
+ * Перечитывается на КАЖДЫЙ новый поток, а не один раз при старте:
+ * воркер, привязанный минуту назад, обязан получить доступ без
+ * перезапуска моста. Кэш с TTL дал бы окно, в котором он «уже привязан,
+ * но ещё не пущен» — и это выглядело бы как поломка привязки. */
+function currentAllowlist() {
+  const file = allowlistPath(DATA_DIR)
+  const res = loadAllowlist(file)
+  return { file, ...res }
+}
+
 const announced = new Map() // nodeId -> { peerId, at }
 const startedAt = Date.now()
 
@@ -79,7 +98,27 @@ const startedAt = Date.now()
  * (проверено запуском: dial даёт «no valid addresses for peer»). Один поток
  * на воркер, обмен в обе стороны — так задача доходит без второго канала. */
 const taskClient = createTaskClient({
-  log: (m) => console.log(`[bridge] ${m}`)
+  log: (m) => console.log(`[bridge] ${m}`),
+  /* Проверка первого кадра потока. Возвращает вердикт peer-auth:
+   * `{ ok:true, address }` — пускаем, иначе поток закрывается, а канал
+   * в набор не попадает. Отказ именно отсутствием канала, а не флагом:
+   * `send` берёт первый живой канал из набора, и «канал с флагом denied»
+   * рано или поздно кто-то забыл бы проверить. */
+  authorize: (msg) => {
+    const allowed = currentAllowlist()
+    if (allowed.error === 'ALLOWLIST_MISSING') {
+      /* Отдельный код, а не общий отказ: пустой список и отсутствующий
+       * файл — разные причины, и лечатся они по-разному. Без файла никто
+       * не пущен, и в логе должно быть видно ПОЧЕМУ, иначе это выглядит
+       * как «подпись не сошлась». */
+      console.log(
+        `[bridge] отказ: список разрешённых не найден (${allowed.file}) — ` +
+        `никто не будет пущен к задачам`
+      )
+      return { ok: false, error: 'ALLOWLIST_MISSING' }
+    }
+    return verifyHello(msg, allowed.peers)
+  }
 })
 
 async function startLibp2p() {

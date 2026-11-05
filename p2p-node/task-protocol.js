@@ -72,8 +72,9 @@ async function writeLine(stream, obj) {
  * сопоставляется с головой очереди ожидающих, а не по id: воркер отвечает
  * на каждый кадр ровно одним кадром (протокол «запрос-ответ»).
  */
-export function createTaskClient({ log = () => {} } = {}) {
+export function createTaskClient({ log = () => {}, authorize = null } = {}) {
   const channels = new Set()
+  let rejected = 0
 
   /**
    * Принять поток задач от воркера.
@@ -81,11 +82,28 @@ export function createTaskClient({ log = () => {} } = {}) {
    * Воркер открывает его САМ (см. почему — в p2p-worker.js): мост не может
    * набрать воркера, который слушает loopback на случайном порту. Обратное
    * направление проверено и падает с «no valid addresses for peer».
+   *
+   * ПЕРВЫЙ КАДР — `hello` С ПОДПИСЬЮ, И ТОЛЬКО ПОТОМ КАНАЛ.
+   *
+   * Раньше поток присоединялся к набору немедленно, поэтому ЛЮБОЙ пир,
+   * открывший протокол, становился кандидатом на получение задачи: `send`
+   * берёт первый живой канал, и посторонний получил бы чужой промпт.
+   * Теперь до успешной проверки канал в наборе не появляется вовсе, и
+   * `send` его не видит — отказ не «флагом», а отсутствием в списке.
    */
   function attach(stream, peerId) {
-    const ch = { stream, peerId, buf: '', waiters: [], closed: false }
-    channels.add(ch)
-    log(`канал задач от ${peerId} открыт (всего ${channels.size})`)
+    const ch = {
+      stream,
+      peerId,
+      buf: '',
+      waiters: [],
+      closed: false,
+      /* Без `authorize` (тесты транспорта, PoC) канал считается готовым
+       * сразу: иначе проверка, которую не просили, ломала бы прежний
+       * контракт. Настоящий мост всегда передаёт `authorize`. */
+      authorized: !authorize,
+      address: null
+    }
 
     ;(async () => {
       try {
@@ -98,6 +116,32 @@ export function createTaskClient({ log = () => {} } = {}) {
             if (!line.trim()) continue
             let msg
             try { msg = JSON.parse(line) } catch { continue }
+
+            if (!ch.authorized) {
+              const verdict = authorize(msg)
+              if (!verdict || !verdict.ok) {
+                rejected += 1
+                log(
+                  `канал задач отклонён: ${peerId} — ` +
+                  `${(verdict && verdict.error) || 'DENIED'} (всего отказов ${rejected})`
+                )
+                /* Закрываем поток, а не молча игнорируем кадр: иначе
+                 * посторонний удерживал бы соединение и мог слать дальше,
+                 * оставаясь для сети «подключённым воркером». */
+                try { await stream.close() } catch (_e) { /* уже закрыт */ }
+                ch.closed = true
+                return
+              }
+              ch.authorized = true
+              ch.address = verdict.address
+              channels.add(ch)
+              log(
+                `канал задач авторизован: ${verdict.address} (${peerId}), ` +
+                `всего ${channels.size}`
+              )
+              continue
+            }
+
             const w = ch.waiters.shift()
             if (w) {
               clearTimeout(w.timer)
@@ -141,7 +185,14 @@ export function createTaskClient({ log = () => {} } = {}) {
     return answer
   }
 
-  return { attach, send, channels, count: () => channels.size, list: () => [...channels] }
+  return {
+    attach,
+    send,
+    channels,
+    count: () => channels.size,
+    rejected: () => rejected,
+    list: () => [...channels]
+  }
 }
 
 /**

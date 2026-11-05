@@ -30,7 +30,8 @@ import { yamux } from '@libp2p/yamux'
 import { identify } from '@libp2p/identify'
 import { ping } from '@libp2p/ping'
 import { multiaddr } from '@multiformats/multiaddr'
-import { serveTaskStream, TASK_PROTOCOL } from './task-protocol.js'
+import { serveTaskStream, encodeLine, TASK_PROTOCOL } from './task-protocol.js'
+import { loadWorkerIdentity, buildHello } from './peer-hello.js'
 
 const BOOTSTRAP_BASE = (
   process.env.TARNET_PUBLIC_URL || 'https://v1107336.hosted-by-vdsina.com'
@@ -142,6 +143,36 @@ async function openTaskStream(node, ma) {
   if (taskStreamPeer) return true
   try {
     const stream = await node.dialProtocol(ma, TASK_PROTOCOL)
+
+    /* ПЕРВЫЙ КАДР — `hello` С ПОДПИСЬЮ.
+     *
+     * Мост пускает к задачам только авторизованного пира и закрывает
+     * поток после первого неверного кадра. Поэтому `hello` обязан уйти
+     * ДО `serveTaskStream`: иначе мост прочитает первым ответ воркера,
+     * не найдёт в нём `action:'hello'` и закроет соединение, а воркер
+     * будет переоткрывать его по кругу без внятной причины.
+     *
+     * Без ключа поток не открываем вовсе: соединение, которое заведомо
+     * закроют, только засоряет лог моста отказами и мешает отличить
+     * неавторизованного пира от сломанного воркера. */
+    const ident = loadWorkerIdentity()
+    if (ident.error) {
+      log(
+        `поток задач не открываю: ${ident.error} ` +
+        `(адрес: ${ident.sources.address || 'нет'}, ключ: ${ident.sources.seed || 'нет'})`
+      )
+      try { await stream.close() } catch (_e) { /* уже закрыт */ }
+      return false
+    }
+    const hello = buildHello({ address: ident.address, seed: ident.seed })
+    if (!stream.send(encodeLine(hello))) {
+      await new Promise((resolve, reject) => {
+        stream.once('drain', resolve)
+        stream.once('close', () => reject(new Error('TASK_STREAM_CLOSED')))
+      })
+    }
+    log(`hello отправлен от ${ident.address}`)
+
     taskStreamPeer = ma.toString()
     log(`поток задач открыт: ${TASK_PROTOCOL}`)
 

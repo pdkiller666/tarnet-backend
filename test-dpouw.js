@@ -8977,6 +8977,189 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     }
   }
 
+  /* ===== 51. P2P: посторонний пир не получает задачу =====
+   *
+   * Дыра, которую закрываем. `P2P_HOST=0.0.0.0` открывает 4001 наружу, а
+   * `taskClient.attach()` принимал поток от ЛЮБОГО пира и немедленно клал
+   * его в общий набор каналов. `send()` берёт первый живой канал из набора
+   * — значит посторонний, открывший протокол первым, получал промпт,
+   * предназначенный воркеру владельца. Проверки личности не было вовсе.
+   *
+   * Проверяем не «флаг выставлен», а САМО СЛЕДСТВИЕ: у отклонённого пира
+   * канала нет, и задача физически не уходит. Тест на флаг прошёл бы и
+   * тогда, когда `send` его игнорирует.
+   */
+  console.log('\n51. P2P: приём задачи только от привязанного воркера');
+  {
+    const peerAuth = await import('./p2p-node/peer-auth.js');
+    const taskProto = await import('./p2p-node/task-protocol.js');
+    const peerHello = await import('./p2p-node/peer-hello.js');
+
+    const tick = (ms = 25) => new Promise((r) => setTimeout(r, ms));
+
+    /* Поддельный поток libp2p: асинхронно-итерируемый, с `send` и `close`.
+     * Итератор НЕ завершается сам после выданных кадров — иначе цикл в
+     * `attach` закончился бы сразу и канал удалился, а тест «канал есть»
+     * проходил бы по причине, которой в бою не бывает. */
+    function makeStream() {
+      const sent = [];
+      const queue = [];
+      let waiter = null;
+      let isClosed = false;
+
+      const stream = {
+        sent,
+        send(buf) {
+          const b = buf && buf.subarray ? buf.subarray() : buf;
+          sent.push(Buffer.from(b).toString('utf8'));
+          return true;
+        },
+        async close() {
+          isClosed = true;
+          if (waiter) { const w = waiter; waiter = null; w({ done: true, value: undefined }); }
+        },
+        push(text) {
+          const chunk = new TextEncoder().encode(text);
+          if (waiter) { const w = waiter; waiter = null; w({ done: false, value: chunk }); }
+          else queue.push(chunk);
+        },
+        [Symbol.asyncIterator]() {
+          return {
+            next() {
+              if (queue.length) return Promise.resolve({ done: false, value: queue.shift() });
+              if (isClosed) return Promise.resolve({ done: true, value: undefined });
+              return new Promise((resolve) => { waiter = resolve; });
+            }
+          };
+        }
+      };
+      Object.defineProperty(stream, 'closed', { get: () => isClosed });
+      return stream;
+    }
+
+    /* Ключ воркера: тот же PKCS8-префикс, что в `worker-demo.js` и
+     * `peer-hello.js`. `pubkeyHex` в `ws_worker_auth` — это 32 сырых
+     * байта в конце SPKI, поэтому берём хвост DER, а не весь DER. */
+    const seed = crypto.randomBytes(32);
+    const priv = crypto.createPrivateKey({
+      key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]),
+      format: 'der', type: 'pkcs8',
+    });
+    const pubHex = Buffer.from(
+      crypto.createPublicKey(priv).export({ format: 'der', type: 'spki' })
+    ).slice(-32).toString('hex');
+    const addr = '0x' + crypto.randomBytes(20).toString('hex');
+    const peers = new Map([[addr, pubHex]]);
+
+    const hello = peerHello.buildHello({ address: addr, seed });
+    const verdict = peerAuth.verifyHello(hello, peers);
+    ok('51.1 подпись hello принимается и называет того же воркера',
+      verdict.ok === true && verdict.address === addr, verdict);
+
+    ok('51.2 непривязанный адрес не проходит',
+      peerAuth.verifyHello(hello, new Map()).error === 'PEER_NOT_AUTHORIZED');
+
+    ok('51.3 просроченный hello не проходит',
+      peerAuth.verifyHello(hello, peers, Date.now() + 10 * 60 * 1000).error === 'STALE_HELLO');
+
+    /* Подмена адреса при верной форме кадра: подпись считалась по другому
+     * payload, поэтому ключ из allowlist её не подтвердит. Это главный
+     * случай — украсть можно только «свой» адрес, но не чужой. */
+    const otherAddr = '0x' + crypto.randomBytes(20).toString('hex');
+    ok('51.4 подмена адреса при чужом ключе не проходит',
+      peerAuth.verifyHello(
+        { ...hello, address: otherAddr },
+        new Map([[otherAddr, pubHex]])
+      ).error === 'BAD_SIGNATURE');
+
+    /* --- Следствие, а не флаг --- */
+    const client = taskProto.createTaskClient({
+      authorize: (msg) => peerAuth.verifyHello(msg, peers),
+      log: () => {},
+    });
+
+    const bad = makeStream();
+    client.attach(bad, 'peer-postoronniy');
+    bad.push(JSON.stringify({
+      action: 'hello',
+      address: '0x' + '11'.repeat(20),
+      ts: Date.now(),
+      signature: 'AAAA',
+    }) + '\n');
+    await tick();
+
+    let noChannel = false;
+    try {
+      await client.send({ action: 'task', taskId: 'stolen' }, { timeoutMs: 60 });
+    } catch (e) {
+      noChannel = e.message === 'NO_TASK_CHANNEL';
+    }
+    ok('51.5 посторонний не стал каналом и задачу не получил',
+      client.count() === 0 && noChannel && client.rejected() === 1,
+      { channels: client.count(), noChannel, rejected: client.rejected() });
+
+    ok('51.6 поток постороннего закрыт, а не оставлен висеть',
+      bad.closed === true && bad.sent.length === 0,
+      { closed: bad.closed, sentFrames: bad.sent.length });
+
+    /* --- Авторизованный воркер: канал появляется и получает задачу --- */
+    const good = makeStream();
+    client.attach(good, 'peer-vorker');
+    good.push(JSON.stringify(hello) + '\n');
+    await tick();
+    const gotChannel = client.count() === 1;
+
+    const pending = client.send({ action: 'task', taskId: 't1' }, { timeoutMs: 500 });
+    await tick();
+    good.push(JSON.stringify({ action: 'task', taskId: 't1', status: 'done' }) + '\n');
+    let answer = null;
+    try { answer = await pending; } catch (_e) { answer = null; }
+
+    ok('51.7 авторизованный воркер получает задачу и отвечает',
+      gotChannel && answer && answer.status === 'done' && good.sent.length === 1,
+      { gotChannel, answer: answer && answer.status, sentFrames: good.sent.length });
+
+    /* --- Список разрешённых: молчание файла = запрет --- */
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-allow-'));
+    const missing = peerAuth.loadAllowlist(path.join(dir, 'net-takogo.json'));
+    ok('51.8 нет файла — запрет, а не «пустить всех»',
+      missing.error === 'ALLOWLIST_MISSING' && missing.peers.size === 0,
+      { error: missing.error, size: missing.peers.size });
+
+    const brokenFile = path.join(dir, 'broken.json');
+    fs.writeFileSync(brokenFile, '{ eto ne json');
+    const broken = peerAuth.loadAllowlist(brokenFile);
+    ok('51.9 битый JSON — тоже запрет',
+      broken.error === 'ALLOWLIST_BAD_JSON' && broken.peers.size === 0,
+      { error: broken.error, size: broken.peers.size });
+
+    /* Круговой путь: то, что сервер пишет в файл, мост читает и пускает
+     * того же воркера. Проверяет формат, а не только проверку подписи. */
+    const peersFile = path.join(dir, 'peers.json');
+    fs.writeFileSync(peersFile, JSON.stringify({
+      updatedAt: new Date().toISOString(),
+      peers: { [addr]: pubHex },
+    }));
+    const loaded = peerAuth.loadAllowlist(peersFile);
+    const viaFile = peerAuth.verifyHello(hello, loaded.peers);
+    ok('51.10 список с диска пускает того же воркера',
+      loaded.peers.size === 1 && viaFile.ok === true && viaFile.address === addr,
+      { size: loaded.peers.size, viaFile });
+
+    /* Кадр без hello первым: молча пропустить его нельзя — иначе достаточно
+     * прислать задачу раньше рукопожатия и канал откроется «сам». */
+    const sneaky = makeStream();
+    client.attach(sneaky, 'peer-bez-hello');
+    sneaky.push(JSON.stringify({ action: 'task', taskId: 'podmena' }) + '\n');
+    await tick();
+    ok('51.11 кадр без hello закрывает поток',
+      sneaky.closed === true && client.rejected() === 2 && client.count() === 1,
+      { closed: sneaky.closed, rejected: client.rejected(), channels: client.count() });
+
+    try { await good.close(); } catch (_e) { /* уже закрыт */ }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

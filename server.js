@@ -248,6 +248,54 @@ db.exec('PRAGMA journal_mode = WAL;');
 db.exec('PRAGMA secure_delete = ON;');
 db.exec('PRAGMA foreign_keys = ON;');
 
+/* ===== Чекпоинт WAL при старте =====
+ *
+ * WAL не уменьшается сам: контрольная точка по умолчанию срабатывает на
+ * 1000 страниц, но файл при этом НЕ усекается, поэтому после серии
+ * рестартов `-wal` остаётся большим и копится. Замер на проде 05.11.2026:
+ * база 2.2 МБ, а `tarnet.db-wal` — 675 КБ, то есть треть размера базы
+ * лежала в журнале. Резервная копия «одного файла .db» при таком раскладе
+ * теряет последние транзакции — их видно только через WAL.
+ *
+ * TRUNCATE, а не PASSIVE: PASSIVE переписывает страницы в базу, но файл
+ * оставляет прежнего размера. Нам нужно именно усечение, иначе следующая
+ * проверка снова покажет те же байты и «ничего не изменилось».
+ *
+ * Сразу после открытия мы единственное соединение в процессе, поэтому
+ * busy быть не должно; если всё же вернулся busy (старый процесс ещё
+ * дописывает), это НЕ повод не стартовать: журнал валиден, checkpoint
+ * сделает следующий запуск. Поэтому ошибка только логируется.
+ */
+try {
+  /* Размер журнала ДО, а не `log` из ответа: TRUNCATE обнуляет счётчик
+   * в самом вызове, и `log` приходит нулём даже когда журнал был на
+   * 4 МБ (проверено). По `log` нельзя ни отчитаться, ни доказать, что
+   * чекпоинт был нужен — остаётся замер файла. */
+  const walPath = `${DB_PATH}-wal`;
+  let walBefore = 0;
+  try { walBefore = fs.statSync(walPath).size; } catch (_e) { /* журнала нет — WAL пуст */ }
+
+  const ck = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+  const busy = ck && Number(ck.busy) === 1;
+
+  let walAfter = 0;
+  try { walAfter = fs.statSync(walPath).size; } catch (_e) { /* усечён до нуля */ }
+
+  if (busy) {
+    console.log(
+      `🗄️  WAL: checkpoint не завершён (busy) — журнал ${walBefore} Б остался, ` +
+      `сделает следующий старт`
+    );
+  } else if (walBefore > 0) {
+    console.log(
+      `🗄️  WAL: checkpoint при старте, журнал ${walBefore} → ${walAfter} Б ` +
+      `(освобождено ${Math.max(0, walBefore - walAfter)})`
+    );
+  }
+} catch (e) {
+  console.log(`🗄️  WAL: checkpoint при старте не удался — ${e.message}`);
+}
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS wallets (
   address TEXT PRIMARY KEY,
@@ -6963,6 +7011,58 @@ function submitRateLimited(workerAddress) {
 
 /* Воркер забирает одну задачу. Пусто = задач нет, это не ошибка. */
 
+/* --- Публикация списка пиров для моста ---
+ *
+ * Мост пускает к задачам только тех, кто подписал `hello` ключом из
+ * `ws_worker_auth`. Базы у моста нет и не должно появиться, поэтому связка
+ * «адрес → ключ» выгружается в файл, который мост перечитывает на каждый
+ * новый поток.
+ *
+ * Файл пишется ЦЕЛИКОМ через временный + rename. Мост читает его в момент
+ * рукопожатия; дописывание на месте дало бы окно, в котором он видит
+ * половину JSON и отвечает `ALLOWLIST_BAD_JSON` живому воркеру. rename в
+ * пределах одной ФС атомарен, поэтому читатель видит либо старую версию,
+ * либо новую, но не обрывок.
+ *
+ * Ошибку записи не пробрасываем в маршрут: привязка ключа уже состоялась и
+ * записана в базу. Упавший диск — причина не пустить воркера в P2P, но не
+ * причина отменить саму привязку и вернуть ему 500.
+ */
+const P2P_ALLOWLIST_PATH = process.env.P2P_ALLOWLIST
+  || path.join(__dirname, 'p2p-node', 'data', 'authorized-peers.json');
+
+function publishPeerAllowlist() {
+  try {
+    const rows = all(
+      `SELECT workerAddress, pubkeyHex FROM ws_worker_auth
+        WHERE pubkeyHex IS NOT NULL AND LENGTH(pubkeyHex) = 64`
+    );
+    const peers = {};
+    for (const r of rows) {
+      const addr = String(r.workerAddress || '').toLowerCase();
+      const key = String(r.pubkeyHex || '').toLowerCase();
+      /* Фильтр, а не доверие: строка с мусором в базе превратилась бы в
+       * пира, которого мост никогда не пустит, и это выглядело бы как
+       * сломанная подпись у живого воркера. */
+      if (!/^0x[0-9a-f]{40}$/.test(addr) || !/^[0-9a-f]{64}$/.test(key)) continue;
+      peers[addr] = key;
+    }
+
+    fs.mkdirSync(path.dirname(P2P_ALLOWLIST_PATH), { recursive: true, mode: 0o700 });
+    const tmp = `${P2P_ALLOWLIST_PATH}.tmp-${process.pid}`;
+    fs.writeFileSync(
+      tmp,
+      JSON.stringify({ updatedAt: new Date().toISOString(), peers }, null, 2),
+      { mode: 0o600 }
+    );
+    fs.renameSync(tmp, P2P_ALLOWLIST_PATH);
+    return Object.keys(peers).length;
+  } catch (e) {
+    console.log(`🌐 allowlist: запись не удалась (${P2P_ALLOWLIST_PATH}) — ${e.message}`);
+    return null;
+  }
+}
+
 /* --- Подпись опроса ---
  *
  * Одной привязки задачи к адресу НЕДОСТАТОЧНО: адрес узла виден в /nodes, и
@@ -7077,6 +7177,12 @@ app.post('/worker/handshake', (req, res) => {
        VALUES (?, ?, ?, ?)
        ON CONFLICT(workerAddress) DO UPDATE SET lastSeenAt = excluded.lastSeenAt`,
     [address, pubkeyHex.toLowerCase(), Date.now(), Date.now()]);
+
+  /* Публикуем ДО ответа: воркер сразу после 200 идёт открывать поток задач,
+   * и если файл ещё старый, мост закроет соединение как неавторизованное.
+   * Со стороны воркера это выглядело бы как «привязка прошла, а доступа
+   * нет» — самая неприятная форма поломки, потому что обе стороны правы. */
+  publishPeerAllowlist();
 
   res.json({ ok: true, address, boundAt: Date.now() });
 });
@@ -9437,6 +9543,15 @@ if (require.main === module) {
      * без единой ошибки в логе. Цикл пишет ТОЛЬКО при смене состояния,
      * поэтому в журнале не будет одинаковой строки каждую минуту. */
     p2pBridge.startAnnounceLoop();
+
+    /* Публикация allowlist при старте: файл мог не успеть обновиться до
+     * падения процесса, а без свежего списка мост закрывает потоки уже
+     * привязанных воркеров. Пишем ДО объявления — так к моменту, когда
+     * воркеры начнут стучаться, список уже на месте. */
+    const peerCount = publishPeerAllowlist();
+    if (peerCount !== null) {
+      console.log(`🌐 allowlist для моста: ${peerCount} пиров (${P2P_ALLOWLIST_PATH})`);
+    }
   });
 }
 
