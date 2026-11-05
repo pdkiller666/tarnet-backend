@@ -1,0 +1,189 @@
+# PROJECT-MAP — карта кода TarNet / Synapse
+
+**Назначение.** Где что лежит и что чем вызывается. Отвечает на вопрос «в какой файл идти»,
+а не «что работает» (это `MANIFEST.v3.4-UNIFIED.md`) и не «как мы сюда пришли»
+(это `PROJECT-HISTORY.md`).
+
+**Сверено с кодом:** 2026-11-05, сборка `2.19.2-p0-p1-security`. Карта описывает **файлы**,
+поэтому устаревает медленнее манифеста — но при добавлении/удалении модуля правится в тот же день.
+
+---
+
+## 1. Точка входа и запуск
+
+| Что | Где |
+| :--- | :--- |
+| Точка входа | `server.js` (`package.json` → `main`, `scripts.start`) |
+| Команда | `npm start` → `node server.js`; порт `3001` |
+| Приёмка | `node test-dpouw.js --test` — поднимает изолированный сервер на `mktemp`-БД |
+| Прод | systemd `tarnet.service`, каталог `/opt/tarnet/backend-api`, БД `/var/lib/tarnet` |
+| Деплой | `scripts/deploy.sh` — **коммит + пуш + раскатка без `--dry-run`** (см. §8) |
+
+---
+
+## 2. Ядро экономики (читать в этом порядке)
+
+| Модуль | Строк | Роль |
+| :--- | --: | :--- |
+| `config.js` | 257 | **Единственный источник констант.** `PRICE_USD_PER_1M_TOKENS`, `USD_PER_TAR`, `TIER_WEIGHTS`, `PROTOCOL_FEE_RATE`, `TIER6.*`, `FAUCET.*` |
+| `ledger.js` | 336 | `CumulativeLedger` — накопительные чеки, `debit()`/`credit()`, двойная запись, ключи at rest AES-256-GCM |
+| `economics.js` | 232 | CWU, `√stake × reputation`, эмиссия с непрерывным затуханием, ставка `TAR_UTILITY` (единственное место — строки 115-116) |
+| `dag-chain.js` | 185 | SHA-256-сцепка чеков: `prevReceiptHash` / `receiptHash`, `payloadVersion: 2` |
+
+**Цепочка расчёта чека:** `POST /work` → `economics.js` (CWU, fee, block reward) →
+`ledger.js` (запись, `decorate()`) → `dag-chain.js` (хеш-сцепка) → подпись Ed25519.
+
+---
+
+## 3. Сеть и транспорт
+
+| Модуль | Строк | Роль | Статус |
+| :--- | --: | :--- | :--- |
+| `ws-inbound.js` | 601 | Входящий WS для воркеров: Ed25519-хендшейк, nonce, TOFU, кадры `TASK`/`CANCEL` | ✅ работает |
+| `worker-demo.js` | 1314 | Воркер на ПК владельца: опрос/WS, `fetchAbortable`, `askOllama`/`askCloud`, `MAX_EARLY_CANCELS = 200` | ✅ работает |
+| `p2p-transport.js` | 611 | WS между узлами, `wildcardBind`, `P2P_PUBLIC_URL → P2P_ADVERTISE_IP` | ⚠️ настроен только на `127.0.0.1` |
+| `onion.js` | 289 | Onion Routing: RSA-2048-OAEP-SHA256 оборачивает 32-байтный AES, нагрузка AES-256-GCM | ✅ работает (`hops: 3`) |
+| `p2p-demo.js` | 129 | Демонстрация P2P | демо |
+
+**Важно:** воркер держит **исходящее** соединение и не открывает портов, поэтому
+`registry.total: 0` — это корректное состояние, а не поломка.
+
+---
+
+## 4. Инференс и роутинг
+
+| Модуль | Строк | Роль |
+| :--- | --: | :--- |
+| `llm-adapter.js` | 574 | Zero-Disk адаптер: облачные провайдеры, `STRUCTURED_PATTERNS` (PII-гейт, строки 40-56), `endpointFor()` (замена адреса только на loopback) |
+| `model-router.js` | 166 | `classifyDomain` + `selectModel`. **Только это** — `Planner`/`MapReduce` здесь нет |
+| `swarm-synthesis.js` | 251 | Выбор лучшего из двух ответов: сначала проверка синтаксиса кода, потом Dice ≥ 0.8, потом длина |
+| `pii-classifier.js` | 291 | Regex-ветка + ONNX NER за `TARNET_PII_ONNX=1` (по умолчанию `ready: false`) |
+
+---
+
+## 5. Идентичность и клиент
+
+| Модуль | Строк | Роль |
+| :--- | --: | :--- |
+| `identity.js` | 232 | TarNet ID: детерминированный вывод ключей из мастер-энтропии |
+| `jcs.js` | 74 | RFC 8785. **Применяется только в Device Linking** (`server.js:4108`), не в подписи `/work` |
+| `app/app.js` | 3080 | PWA-клиент: чат, кошелёк, агенты, `CryptoKey` с `extractable: false` в IndexedDB |
+| `app/agents.js` | 811 | Агенты в браузере, вендорный `noble-ed25519` (`app/vendor/ed25519.js`) |
+| `app/sw.js` | 212 | Service worker, кэш `tarnet-app-v33` |
+| `app/index.html` | 737 | Разметка чата |
+| `app/styles.css` | 2067 | Стили |
+| `ui/console.html`, `ui/index.html` | — | Отдельная консоль оператора |
+
+---
+
+## 6. Агенты, знания, синхронизация
+
+| Модуль | Строк | Роль |
+| :--- | --: | :--- |
+| `agent-runtime.js` | 285 | Бюджеты агента в токенах, вызовы инструментов |
+| `knowledge-loop.js` | 573 | Сжатие Micro-LoRA (Trim 80% → INT8 → CSR), шлюз валидации |
+| `benchmark-gate.js` | 206 | Benchmark Gate / Proof-of-Learning (Фаза 3) |
+| `chat-sync.js` | 310 | Оффлайн-история: LWW-Element-Set + векторные часы |
+| `seed.js` | 112 | Начальные данные (3 фикстуры адаптеров) |
+
+---
+
+## 7. Тесты и стенды
+
+| Файл | Строк | Проверок | Что покрывает |
+| :--- | --: | --: | :--- |
+| `test-dpouw.js` | 8894 | **1086** | Основная приёмка: экономика, леджер, чеки, API, Private Swarm |
+| `test-mesh.js` | 459 | **25** | Onion, mesh, многоузловой путь |
+| `proof-treasury-gate.js` | 188 | **13** | Казна и гейт |
+| `proof-agent-key.js` | 352 | 57 | Ключ агента: `exportKey` → `InvalidAccessError` |
+| `proof-onion-inference.js` | 125 | — | Onion-инференс |
+| `proof-onion-restart.js` | 161 | — | Переживание рестарта |
+| `test-mesh-worker.js` | 50 | — | Воркер для mesh-теста |
+
+**Итого приёмки: 1124** (1086 + 25 + 13), прогон 05.11 09:20, `RC=0`.
+Гоняет `scripts/verify.sh`.
+
+---
+
+## 8. Скрипты (`scripts/`)
+
+| Скрипт | Что делает | Осторожно |
+| :--- | :--- | :--- |
+| `deploy.sh` | **Коммит + пуш + раскатка.** `--dry-run` НЕТ | Аргумент с `-` отклоняется (`EXIT=2`); повторный `/health` перед откатом |
+| `verify.sh` | Гоняет три набора + сверяет `/config` с `config.js` | Основной вход приёмки |
+| `backup-tarnet-s3.sh` | Бэкап в S3 | — |
+| `make-icons.js` | Иконки PWA | — |
+| `push-tag.js` | Тег | — |
+| `sqlite-tool.js` | Работа с БД | Не на живой state-каталог OpenClaw |
+| `tarnet-guard.sh` | Сторож сервиса | — |
+| `tarnet-supervisor.sh` | Супервизор | — |
+| `tarnet-tunnel*.sh` | Cloudflare-туннель | Эфемерный URL |
+
+---
+
+## 9. База данных
+
+SQLite, `/var/lib/tarnet` на проде. 38 таблиц; группы по смыслу:
+
+| Группа | Таблицы |
+| :--- | :--- |
+| Учёт работы | `work_receipts`, `pending_work`, `ledger_txs`, `balances`, `balance_migrations`, `epoch_state` |
+| Узлы и воркеры | `nodes`, `node_attestations`, `worker_presence`, `worker_tasks`, `ws_worker_auth` |
+| Экономика | `treasury_state`, `faucet_claims`, `onchain_settlements`, `tier6_*` (см. ниже) |
+| Адаптеры | `adapters`, `adapter_versions`, `lora_submissions` |
+| Tier 6 | `tier6_calls`, `tier6_receipts`, `tier6_reserves` |
+| Идентичность | `tar_id`, `wallets`, `user_keys`, `user_consent`, `key_usage`, `key_limits` |
+| Привязка устройств | `device_links`, `device_link_codes`, `device_link_challenges`, `device_link_nonces` |
+| Агенты | `agent_registry`, `agent_wallets`, `agent_spend`, `agent_reservations`, `approvals` |
+| Прочее | `inference`, `model_registry`, `tool_registry`, `benchmark_runs`, `distillation_buffer` |
+
+**`distillation_buffer` объявлена, но промпты туда не пишутся** — Фаза 2.5.
+
+---
+
+## 10. API — 64 маршрута
+
+Разбивка по назначению (полный контракт — `docs/NETWORK-CONTRACT-v1.md`):
+
+- **Работа:** `POST /work`, `POST /worker/submit`, `GET /worker/poll`, `GET /receipt/:worker`
+- **Инференс:** `POST /inference`, `POST /inference/onion`, `GET /models`
+- **Узлы:** `GET /nodes`, `POST /node`, `GET /p2p/status`
+- **Экономика:** `GET /health`, `GET /summary`, `GET /config`, `GET /epoch`, `GET /ledger`, `GET /balances`
+- **Кошелёк:** `POST /faucet/claim`
+- **Tier 6:** `POST /tier6/*`
+- **Устройства:** `/devices/link*`, `/devices/links/:owner`
+- **Агенты:** `/agents/*`
+
+**Правило Code-First:** маршрут существует = он есть в `server.js`. Отсутствие в
+`NETWORK-CONTRACT-v1.md` — дефект документа, а не признак отсутствия кода
+(так было с `CANCEL` и `swarm`: в коде есть, в контракте не было).
+
+---
+
+## 11. Документы — кто за что отвечает
+
+| Документ | Отвечает на вопрос | Обновляется |
+| :--- | :--- | :--- |
+| `PROJECT-MAP.md` (этот) | «в какой файл идти» | при изменении структуры |
+| `MANIFEST.v3.4-UNIFIED.md` | «что работает сейчас» | при каждой вехе, снимок в Приложении Б |
+| `PROJECT-HISTORY.md` | «как мы сюда пришли» | при каждой вехе |
+| `ROADMAP.md` | «что дальше и в каком порядке» | при смене приоритетов |
+| `BACKLOG.md` | «что отложено и почему» | когда задачу откладывают |
+| `docs/NETWORK-CONTRACT-v1.md` | контракт воркера и API | при изменении API |
+| `docs/PROJECT-MEMORY.md` | сводка по всем сессиям | по запросу |
+
+**Правило одного источника:** факт о том, что работает, живёт в `MANIFEST`;
+дата и причина — в `PROJECT-HISTORY`; расположение — здесь. Дублирование факта
+в двух местах означает, что одно из них протухнет.
+
+---
+
+## 12. Куда НЕ идти
+
+| Путь | Почему |
+| :--- | :--- |
+| `archive/python-app/crypto.py` | `sign_message()` на SHA-256 — хеш-заглушка, **не Ed25519**. Не использовать |
+| `archive/lottery-tests/` | Отозванная механика лотерей |
+| `node_modules/` | Не читать, не грепать при аудите |
+| `../../MANIFEST.md` (v3.2), `../../MANIFEST.v3.3.md` | Помечены «устарело». Побеждает v3.4-UNIFIED. Лежат на два уровня выше, вне этого репозитория |
+| `.model-cache/` | Модели ONNX; на проде отсутствует |
