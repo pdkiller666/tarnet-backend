@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.20.0-session-archive",
+  "version": "2.21.0-p2p-bootstrap",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

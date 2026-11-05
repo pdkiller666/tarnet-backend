@@ -182,6 +182,17 @@ const handlers = {
       public_addrs: publicAddrs,
       announce_note: announceNote,
       listen: node ? node.getMultiaddrs().map((m) => m.toString()) : [],
+      /* Живые libp2p-соединения — отдельно от `announced`.
+       *
+       * `announced` считает, сколько раз server.js сказал «я здесь» через
+       * сокет. Это НЕ пиры: один сервер объявится десять раз и даст десять
+       * записей при нуле сетевых соединений. Приёмка «peers: 2» про
+       * соединения, поэтому цифру берём у самого libp2p. При выключенном
+       * узле — null, а не 0: «ноль пиров» и «p2p не поднят» — разные факты. */
+      connections: node ? node.getConnections().length : null,
+      connected_peers: node
+        ? [...new Set(node.getConnections().map((c) => c.remotePeer.toString()))]
+        : [],
       announced_total: announced.size,
       uptime_s: Math.round((Date.now() - startedAt) / 1000),
       socket: SOCKET_PATH
@@ -189,6 +200,10 @@ const handlers = {
   },
 
   peers() {
+    /* Два разных списка в одном ответе, чтобы их нельзя было перепутать:
+     * `announced` — кто представился через сокет, `connected` — с кем есть
+     * живое libp2p-соединение. Приёмка Этапа 3 смотрит на `connected_peers`. */
+    const conns = node ? node.getConnections() : null
     return {
       ok: true,
       action: 'peers',
@@ -196,7 +211,11 @@ const handlers = {
         nodeId,
         peerId: v.peerId,
         age_s: Math.round((Date.now() - v.at) / 1000)
-      }))
+      })),
+      connections: conns ? conns.length : null,
+      connected_peers: conns
+        ? [...new Set(conns.map((c) => c.remotePeer.toString()))]
+        : []
     }
   },
 

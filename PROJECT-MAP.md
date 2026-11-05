@@ -46,8 +46,9 @@
 | `onion.js` | 289 | Onion Routing: RSA-2048-OAEP-SHA256 оборачивает 32-байтный AES, нагрузка AES-256-GCM | ✅ работает (`hops: 3`) |
 | `p2p-demo.js` | 129 | Демонстрация P2P | демо |
 | `p2p-bridge-client.js` | 140 | Клиент моста к libp2p-узлу: `announce` при старте, голый `net`, не бросает; `startAnnounceLoop` — повтор каждые 60 с | ✅ работает на проде |
-| `p2p-node/bridge.js` | 350 | Отдельный процесс. Unix-socket `/tmp/tarnet-p2p-bridge.sock` (0600), JSON Lines, `announce`/`status`/`peers`/`ping` | ✅ работает на проде (`p2p-bridge.service`) |
+| `p2p-node/bridge.js` | 329 | Отдельный процесс. Unix-socket `/tmp/tarnet-p2p-bridge.sock` (0600), JSON Lines, `announce`/`status`/`peers`/`ping` | ✅ работает на проде (`p2p-bridge.service`) |
 | `p2p-node/peer-id-store.js` | 81 | Генерация/чтение ключа узла: `/var/lib/tarnet/p2p/peer-id.bin`, права `0600` | ✅ `peerId` стабилен между рестартами |
+| `p2p-node/p2p-worker.js` | 207 | Воркер-клиент: bootstrap → `dial` → удержание соединения | ESM |
 | `p2p-node/index.js` | 96 | PoC libp2p: tcp+noise+yamux+identify, kad-dht `clientMode` | ✅ поднимается, DHT не опрашивает |
 
 **Важно:** воркер держит **исходящее** соединение и не открывает портов, поэтому

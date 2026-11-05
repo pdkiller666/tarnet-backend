@@ -2678,7 +2678,7 @@ const RATE_LIMITS = {
  * четвёртой реплике человек получал 429 «лимит 10 в минуту» при живом
  * балансе и своём ключе провайдера. */
 const RATE_READ_PATH =
-  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|models|p2p\/status|worker\/status|agents(\/approvals)?|tools)$/;
+  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|models|p2p\/status|p2p\/bootstrap|worker\/status|agents(\/approvals)?|tools)$/;
 /* `/id/<pubkey>/balance` — чтение, а не запись: клиент опрашивает баланс так же
  * часто, как /balance/<addr>. Без этой ветки он упирался бы в 10/мин. */
 /* `/consent/<userId>` — тоже чтение: PWA читает согласие один раз при
@@ -5942,6 +5942,81 @@ app.get('/p2p/status', async (_req, res) => {
       };
     })(),
     client: d.client,
+  });
+});
+
+/* --- GET /p2p/bootstrap: как найти эту сеть извне (Фаза 3, шаг 2) ---
+ *
+ * Зачем эндпоинт вообще нужен.
+ * Воркер на чужой машине не знает ни домена, ни peerId. Зашивать их в
+ * код означало бы, что смена узла ломает всех воркеров сразу, а
+ * захардкоженный адрес невозможно проверить: он «правильный», пока
+ * кто-то не переедет. Здесь адрес берётся у того, кто реально слушает
+ * порт — у моста `p2p-node`, через его же сокет.
+ *
+ * Почему не отдаём адрес из env.
+ * `P2P_PUBLIC_URL` — это желание, а не факт: переменная может быть
+ * задана при выключенном libp2p (`P2P_BRIDGE_LIBP2P` не выставлен), и
+ * тогда мы выдали бы адрес, на котором никто не слушает. Воркер пошёл бы
+ * подключаться в пустоту и сообщал бы таймаут вместо «сеть не готова».
+ * Поэтому источник — `status.listen` живого узла: нет узла — нет адреса.
+ *
+ * Формат ответа совпадает с тем, что печатает `bridge.js` в лог как
+ * «Listen», включая `/p2p/<peerId>` в конце: multiaddr без peerId не
+ * годится для `dial()`, его пришлось бы склеивать на клиенте.
+ */
+app.get('/p2p/bootstrap', async (_req, res) => {
+  /* Таймаут сознательно короткий: это discovery-запрос, который воркер
+   * делает при старте и повторяет по кругу. Ждать мост 5 секунд значило
+   * бы, что при мёртвом мосте воркер стоит дольше, чем работает. */
+  const r = await p2pBridge.send({ action: 'status' }, { timeoutMs: 1200 });
+
+  if (!r || r.ok !== true) {
+    /* 503, а не 200 с пустым списком: пустой список клиент поймёт как
+     * «сеть есть, но пиров нет» и будет ждать вечно. Мост не ответил —
+     * это другой факт, и он должен быть виден. */
+    return res.status(503).json({
+      ok: false,
+      error: 'P2P_BRIDGE_UNAVAILABLE',
+      detail: 'мост p2p-node не отвечает по сокету',
+      socket: p2pBridge.DEFAULT_SOCKET,
+    });
+  }
+
+  const multiaddrs = (Array.isArray(r.listen) ? r.listen : []).filter(Boolean);
+
+  /* Мост жив, но узел не поднят. Отдельная ветка, потому что это самый
+   * вероятный вид поломки: сервис запущен и отвечает, а порт пуст.
+   * Вернуть 200 здесь означало бы соврать про готовность сети. */
+  if (!multiaddrs.length) {
+    return res.status(503).json({
+      ok: false,
+      error: 'P2P_NODE_NOT_LISTENING',
+      detail: 'мост отвечает, но libp2p-узел не слушает ни на одном адресе',
+      libp2p: r.libp2p ?? null,
+      peerId: r.peerId ?? null,
+    });
+  }
+
+  res.json({
+    ok: true,
+    /* `multiaddrs` — массив, потому что адресов может быть несколько
+     * (ipv4 + dns4). Воркер пробует по очереди; поле `multiaddr` — первый,
+     * для тех клиентов, кому достаточно одного. */
+    multiaddr: multiaddrs[0],
+    multiaddrs,
+    peerId: r.peerId ?? null,
+    protocol: 'libp2p',
+    /* Транспорт и шифрование перечислены явно: воркер должен знать, что
+     * TCP+noise — не догадка, а то, что реально поднято на той стороне. */
+    transports: ['tcp'],
+    encryption: ['noise'],
+    /* `connections` — живые соединения узла. Приёмка Этапа 3 смотрит на
+     * этот счётчик: он растёт, когда воркер реально подключился, и не
+     * зависит от того, сколько раз server.js объявился через сокет. */
+    connections: typeof r.connections === 'number' ? r.connections : null,
+    connected_peers: Array.isArray(r.connected_peers) ? r.connected_peers : [],
+    uptime_s: r.uptime_s ?? null,
   });
 });
 
