@@ -1,0 +1,65 @@
+[Unit]
+# Мост между backend-api и libp2p-узлом (p2p-node/bridge.js).
+#
+# ОТДЕЛЬНЫЙ ЮНИТ, А НЕ ЧАСТЬ tarnet.service — намеренно. libp2p тянет 105 МБ
+# зависимостей и падает на старте при любой несовместимости пакетов. Внутри
+# tarnet.service такая ошибка уронила бы HTTP-сервер, который обслуживает
+# прод и приёмку. Здесь падение моста означает только «discovery недоступен»:
+# server.js продолжает работать и пишет об этом одной строкой в лог.
+Description=TarNet p2p bridge (libp2p discovery)
+Documentation=file:///opt/tarnet/backend-api/MANIFEST.v3.4-UNIFIED.md
+
+# network-online.target, а не network.target: узел объявляет внешний адрес
+# и слушает 0.0.0.0:4001. При старте до готовности сети bind проходит, но
+# announce отдаёт адрес, до которого ещё нет маршрута.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tarnet/backend-api/p2p-node
+
+# P2P_BRIDGE_LIBP2P=1 — без него bridge.js работает как заглушка: принимает
+# команды и отвечает, но узла нет, и peerId остаётся unassigned.
+Environment=P2P_BRIDGE_LIBP2P=1
+
+# 0.0.0.0, а не 127.0.0.1: узел должен принимать входящие из сети. Порт
+# открывается в ufw отдельно — bind и firewall это два независимых условия.
+Environment=P2P_HOST=0.0.0.0
+Environment=P2P_PORT=4001
+
+# Внешний адрес, который узел объявляет пирам в identify. Без него сосед
+# получит multiaddr вида /ip4/0.0.0.0/... и не сможет подключиться, хотя
+# Peer ID будет валидным. Порт берётся из P2P_PORT — в URL его нет осознанно:
+# за прокси 443, а libp2p слушает 4001.
+Environment=P2P_PUBLIC_URL=https://v1107336.hosted-by-vdsina.com
+
+# Ключ узла ВНЕ рабочего дерева. Рабочее дерево переписывается `git reset
+# --hard` при каждом деплое; ключ там означал бы, что любая раскатка
+# откатывает идентичность к тому, что было в коммите, а ключ в коммите —
+# это ключ в публичном репозитории. /var/lib/tarnet — уже существующий
+# каталог данных сервиса (рядом лежит tarnet.db).
+Environment=P2P_DATA_DIR=/var/lib/tarnet/p2p
+
+# Сокет моста в /tmp: tarnet.service запущен с PrivateTmp=no (проверено
+# `systemctl show tarnet -p PrivateTmp` → no), поэтому оба процесса видят
+# один и тот же путь. Если PrivateTmp когда-нибудь включат, сокет окажется
+# в разных namespace и server.js перестанет видеть мост — проверять эту
+# пару надо вместе, а не по отдельности.
+Environment=P2P_BRIDGE_SOCKET=/tmp/tarnet-p2p-bridge.sock
+
+ExecStart=/usr/bin/node bridge.js
+
+# on-failure, а не always: штатный выход (SIGTERM при остановке юнита или
+# exit 2 «сокет занят живым мостом») не должен превращаться в цикл
+# перезапусков. Падение с ошибкой — должно.
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tarnet-p2p
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

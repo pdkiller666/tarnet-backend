@@ -85,9 +85,10 @@ function send(command, { socketPath = DEFAULT_SOCKET, timeoutMs = 700 } = {}) {
 
 /**
  * Объявить себя мосту при старте. Никогда не бросает.
+ * @param {{enabled?:boolean, quiet?:boolean}} opts
  * @returns {Promise<{ok:boolean, response?:object, reason?:string}>}
  */
-async function announceOnStartup({ enabled = process.env.P2P_BRIDGE_ENABLED !== '0' } = {}) {
+async function announceOnStartup({ enabled = process.env.P2P_BRIDGE_ENABLED !== '0', quiet = false } = {}) {
   if (!enabled) return { ok: false, reason: 'disabled' };
 
   const nodeId = nodeIdentity();
@@ -96,24 +97,77 @@ async function announceOnStartup({ enabled = process.env.P2P_BRIDGE_ENABLED !== 
   if (!res) {
     /* Одна строка, без стектрейса: отсутствие моста — нормальное
      * состояние, а не сбой. Формулировка говорит, что именно не так. */
-    console.log(`🌐 p2p bridge: не отвечает на ${DEFAULT_SOCKET} — работаю без p2p-discovery`);
+    if (!quiet) console.log(`🌐 p2p bridge: не отвечает на ${DEFAULT_SOCKET} — работаю без p2p-discovery`);
     return { ok: false, reason: 'bridge_unreachable' };
   }
 
   if (!res.ok) {
-    console.log(`🌐 p2p bridge: отказал (${res.error || 'unknown'}) — работаю без p2p-discovery`);
+    if (!quiet) console.log(`🌐 p2p bridge: отказал (${res.error || 'unknown'}) — работаю без p2p-discovery`);
     return { ok: false, reason: res.error || 'rejected', response: res };
   }
 
   /* `assigned: true` — это не успех идентичности, а её отсутствие.
    * Пишем оба факта в одну строку, чтобы в логе не читалось как
    * «peerId получен и всё хорошо». */
-  const peer = res.peerId === 'unassigned'
-    ? 'peerId ещё не назначен (у backend-api нет ключа узла)'
-    : `peerId=${res.peerId}`;
-  console.log(`🌐 p2p bridge: объявлен как ${nodeId}, ${peer} (узлов у моста: ${res.announced_total})`);
+  if (!quiet) {
+    const peer = res.peerId === 'unassigned'
+      ? 'peerId ещё не назначен (у backend-api нет ключа узла)'
+      : `peerId=${res.peerId}`;
+    console.log(`🌐 p2p bridge: объявлен как ${nodeId}, ${peer} (узлов у моста: ${res.announced_total})`);
+  }
 
   return { ok: true, response: res };
 }
 
-module.exports = { send, announceOnStartup, nodeIdentity, DEFAULT_SOCKET };
+/**
+ * Объявляться повторно, пока жив процесс.
+ *
+ * ПОЧЕМУ ПЕРИОДИЧЕСКИ, А НЕ ОДИН РАЗ. Мост — отдельный процесс с его
+ * собственным Restart=on-failure, и карта объявлений (`announced` в
+ * bridge.js) живёт в его памяти. После любого перезапуска моста карта
+ * пуста, а server.js об этом не узнает: он давно объявился и молчит.
+ * Снаружи это выглядит как «server.js не видит мост» без единой ошибки
+ * в логах. Повтор снимает зависимость от порядка рестартов: рано или
+ * поздно объявление дойдёт до живого моста.
+ *
+ * Логируем ТОЛЬКО при смене состояния: иначе каждые 60 с в журнал уходила
+ * бы одинаковая строка, и настоящая смена peerId утонула бы в шуме.
+ *
+ * @param {{intervalMs?:number, enabled?:boolean}} opts
+ * @returns {NodeJS.Timeout|null}
+ */
+function startAnnounceLoop ({ intervalMs = 60000, enabled = process.env.P2P_BRIDGE_ENABLED !== '0' } = {}) {
+  if (!enabled) return null;
+
+  let last = null;
+  const tick = async () => {
+    /* quiet: решение «писать ли» принимает сам цикл, по смене состояния. */
+    const r = await announceOnStartup({ enabled, quiet: true });
+    const state = r.ok
+      ? `ok:${r.response && r.response.peerId}`
+      : `fail:${r.reason || 'unknown'}`;
+    if (state !== last) {
+      const prev = last;
+      last = state;
+      if (r.ok) {
+        const peer = r.response.peerId === 'unassigned'
+          ? 'peerId ещё не назначен (у backend-api нет ключа узла)'
+          : `peerId=${r.response.peerId}`;
+        const why = prev === null ? '' : ` (восстановлено после ${prev})`;
+        console.log(`🌐 p2p bridge: объявлен как ${nodeIdentity()}, ${peer}${why}`);
+      } else if (prev !== null) {
+        console.log(`🌐 p2p bridge: связь потеряна (${r.reason}) — работаю без p2p-discovery`);
+      }
+    }
+  };
+
+  tick().catch(() => {});
+  const timer = setInterval(() => { tick().catch(() => {}); }, intervalMs);
+  /* unref: таймер не должен удерживать процесс живым. Иначе остановка
+   * сервера ждала бы следующего тика, а systemd считал бы остановку
+   * затянувшейся. */
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
+}
+
+module.exports = { send, announceOnStartup, startAnnounceLoop, nodeIdentity, DEFAULT_SOCKET };

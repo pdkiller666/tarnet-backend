@@ -30,10 +30,22 @@ import net from 'node:net'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { loadOrCreatePeerId, keyFilePath } from './peer-id-store.js'
+import { resolvePublicAddrs, listenMismatch } from './public-addr.js'
+
+const HERE = path.dirname(fileURLToPath(import.meta.url))
 
 const SOCKET_PATH =
   process.env.P2P_BRIDGE_SOCKET ||
   path.join(os.tmpdir(), 'tarnet-p2p-bridge.sock')
+
+/* Каталог, где живёт ключ узла. По умолчанию `p2p-node/data` — рядом с
+ * кодом, чтобы путь не зависел от cwd юнита. Выносится через
+ * P2P_DATA_DIR, потому что в systemd cwd один, а при ручном запуске из
+ * другой папки ключ иначе создался бы второй раз и узел сменил бы
+ * идентичность незаметно. */
+const DATA_DIR = process.env.P2P_DATA_DIR || path.join(HERE, 'data')
 
 /* Запускать ли настоящий libp2p-узел. Выключено по умолчанию — см. шапку. */
 const WANT_LIBP2P = process.env.P2P_BRIDGE_LIBP2P === '1'
@@ -45,6 +57,16 @@ const WANT_LIBP2P = process.env.P2P_BRIDGE_LIBP2P === '1'
 let node = null
 let peerId = process.env.P2P_PEER_ID || null
 let libp2pState = 'off'
+/* Создана ли идентичность на этом старте. Отдельная величина, а не
+ * вывод из логов: по ней видно, почему Peer ID отличается от прошлого
+ * запуска — ключ появился впервые или файл не прочитался. */
+let peerIdCreated = null
+let peerKeyPath = keyFilePath(DATA_DIR)
+/* Внешние адреса и замечание о расхождении listen/announce — в status,
+ * чтобы приёмка «узел объявлен наружу» проверялась ответом моста, а не
+ * только разбором лога. */
+let publicAddrs = []
+let announceNote = null
 
 const announced = new Map() // nodeId -> { peerId, at }
 const startedAt = Date.now()
@@ -63,8 +85,32 @@ async function startLibp2p() {
   const port = Number(process.env.P2P_PORT || 4001)
   const host = process.env.P2P_HOST || '127.0.0.1'
 
+  /* Слушать и объявлять — разные вопросы. `P2P_HOST=0.0.0.0` открывает
+   * порт на всех интерфейсах, но в identify узел отдаёт адрес, на котором
+   * СЛУШАЕТ; `0.0.0.0` в multiaddr — не адрес, по которому к нам дойдут.
+   * Поэтому внешний адрес задаётся отдельно через P2P_PUBLIC_URL. */
+  const publicIn = resolvePublicAddrs(process.env.P2P_PUBLIC_URL, port)
+
+  /* Ключ читаем с диска ДО createLibp2p и передаём явно. Без этого
+   * libp2p генерирует новую пару на каждый старт, и Peer ID меняется
+   * после каждого рестарта — для DHT это означает «новый узел», а
+   * прежние записи о нас указывают в пустоту. */
+  const identity = await loadOrCreatePeerId({
+    dataDir: DATA_DIR,
+    log: (m) => console.log(`[bridge] ${m}`)
+  })
+  peerIdCreated = identity.created
+  peerKeyPath = identity.path
+
   node = await createLibp2p({
-    addresses: { listen: [`/ip4/${host}/tcp/${port}`] },
+    privateKey: identity.privateKey,
+    addresses: {
+      listen: [`/ip4/${host}/tcp/${port}`],
+      /* announce нужен, чтобы identify отдавал пирам внешний адрес, а не
+       * 0.0.0.0/loopback. Без него сосед получит неадресуемый
+       * multiaddr при валидном Peer ID. */
+      ...(publicIn.addrs.length ? { announce: publicIn.addrs } : {})
+    },
     transports: [tcp()],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
@@ -73,7 +119,17 @@ async function startLibp2p() {
   await node.start()
   peerId = node.peerId.toString()
   libp2pState = `listening ${host}:${port}`
-  console.log(`[bridge] libp2p поднят: ${peerId}`)
+  publicAddrs = publicIn.addrs
+  announceNote = publicIn.note || listenMismatch(host, publicIn.addrs)
+  console.log(
+    `[bridge] libp2p поднят: ${peerId} ` +
+    `(ключ ${identity.created ? 'создан' : 'прочитан'}: ${identity.path})`
+  )
+  console.log(`[bridge] Listen  : ${host}:${port}`)
+  console.log(
+    `[bridge] WAN     : ${publicIn.addrs.join(', ') || '(не объявлен)'}`
+  )
+  if (announceNote) console.log(`[bridge] WAN note: ${announceNote}`)
 }
 
 function reply(socket, obj) {
@@ -116,6 +172,15 @@ const handlers = {
       action: 'status',
       peerId,
       libp2p: libp2pState,
+      /* Поле «идентичность постоянная» отвечает на вопрос приёмки — по
+       * нему видно, что ключ лежит на диске и узла не пересоздали. Для
+       * выключенного libp2p оно false: обещать постоянство идентичности,
+       * которая не используется, было бы враньём. */
+      peer_id_persistent: libp2pState !== 'off' && peerIdCreated !== null,
+      peer_id_created_on_start: peerIdCreated,
+      peer_key_path: peerKeyPath,
+      public_addrs: publicAddrs,
+      announce_note: announceNote,
       listen: node ? node.getMultiaddrs().map((m) => m.toString()) : [],
       announced_total: announced.size,
       uptime_s: Math.round((Date.now() - startedAt) / 1000),
@@ -221,6 +286,9 @@ async function main() {
     console.log('=== TarNet p2p bridge ===')
     console.log('Сокет   :', SOCKET_PATH)
     console.log('Peer ID :', peerId || '(не назначен, выдаётся при announce)')
+    if (libp2pState !== 'off') {
+      console.log('Ключ    :', peerKeyPath, `(${peerIdCreated ? 'создан' : 'прочитан'} на этом старте)`)
+    }
     console.log('libp2p  :', libp2pState, WANT_LIBP2P ? '' : '(P2P_BRIDGE_LIBP2P≠1)')
     console.log('Команды :', Object.keys(handlers).join(', '))
   })
