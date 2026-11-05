@@ -56,7 +56,7 @@
 | `p2p-node/peer-hello.js` | 153 | Сторона воркера: `loadWorkerIdentity` (env → `~/.tarnet/*.json`), `buildHello` — подпись PKCS8-обёрткой seed, тот же префикс, что в `worker-demo.js`. С 2.22.5: `workerKeyFile({home,env})` (`P2P_WORKER_KEY_FILE`), `waitForWorkerIdentity({timeoutMs,pollMs})` — ключ может появиться позже. **`verifyHello` здесь НЕТ** — он в `peer-auth.js` | ✅ без сети, обычным `node` |
 | `p2p-node/peer-id-store.js` | 81 | Генерация/чтение ключа узла: `/var/lib/tarnet/p2p/peer-id.bin`, права `0600` | ✅ `peerId` стабилен между рестартами |
 | `p2p-node/index.js` | 96 | PoC libp2p: tcp+noise+yamux+identify, kad-dht `clientMode` | ✅ поднимается, DHT не опрашивает |
-| `scripts/archive-transcripts.js` | 225 | Архивация транскриптов агента: gzip → проверка обратным чтением → `DELETE` партиями → `incremental_vacuum`. По умолчанию сухой прогон | ✅ 13431 строка → 9 МБ архива, база 628→605 МБ |
+| `scripts/archive-transcripts.js` | 286 | Архивация транскриптов агента: gzip → проверка обратным чтением → `DELETE` партиями → `incremental_vacuum`. **Потоковая** (2026-11-05): `Readable.from` + `createGzip` + `readline` вместо `.all()`/`gunzipSync` — первая версия убивалась OOM. `--exclude-session=<id>` исключает живую сессию. `PRAGMA busy_timeout=8000` + повтор транзакции на `database is locked`. По умолчанию сухой прогон | ✅ 05.11: 54106 строк → 21 МБ архива, база 597→542 МБ, но **свободное место не выросло** (677→676 МБ) — см. `docs/PROJECT-MEMORY.md` §12.1 |
 
 **Важно:** воркер держит **исходящее** соединение и не открывает портов, поэтому
 `registry.total: 0` — это корректное состояние, а не поломка.

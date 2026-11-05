@@ -34,6 +34,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const zlib = require('node:zlib');
+const readline = require('node:readline');
+const { Readable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 const { DatabaseSync } = require('node:sqlite');
 
 const DEFAULT_DB = '/home/node/.openclaw/agents/main/agent/openclaw-agent.sqlite';
@@ -49,6 +52,17 @@ const APPLY = process.argv.includes('--apply');
 const DAYS = Number(arg('days', 30));
 const DB = arg('db', DEFAULT_DB);
 const KEEP_DAYS_RAW = Number(arg('keep-days', DAYS));
+
+/* Сессия, которую трогать нельзя: --exclude-session=<id>.
+ *
+ * Зачем: агент запускает архивацию на собственной живой базе. Без исключения
+ * под DELETE попадают его же старые события, и текущий контекст теряет опору —
+ * строки в архиве есть, но session_search их уже не найдёт. Порог --days сам
+ * этого не решает: длинная сессия тянется неделями, и её начало всегда старше
+ * любого разумного порога. */
+const EXCLUDE = arg('exclude-session', null);
+const WHERE_OLD = EXCLUDE ? 'created_at < ? AND session_id <> ?' : 'created_at < ?';
+const oldArgs = () => (EXCLUDE ? [cut, EXCLUDE] : [cut]);
 
 if (!Number.isFinite(DAYS) || DAYS < 1) {
   console.error('  ОШИБКА: --days должно быть числом >= 1');
@@ -66,9 +80,17 @@ const cut = Date.now() - DAYS * 86400000;
  * даже брать блокировку на живой базе работающего агента. */
 const db = new DatabaseSync(DB, { readOnly: !APPLY });
 
+/* Ждём чужую блокировку, а не падаем.
+ *
+ * Без этого DELETE на живой базе падал `database is locked` с третьей партии:
+ * агент непрерывно дописывает свои события, и BEGIN IMMEDIATE проигрывал
+ * гонку. busy_timeout заставляет SQLite подождать до 5 с вместо мгновенной
+ * ошибки; окончательный отказ всё равно виден в отчёте. */
+if (APPLY) db.exec('PRAGMA busy_timeout = 5000');
+
 function stats() {
-  const rows = db.prepare('SELECT COUNT(*) c FROM transcript_events WHERE created_at < ?').get(cut);
-  const bytes = db.prepare('SELECT SUM(length(event_json)) s FROM transcript_events WHERE created_at < ?').get(cut);
+  const rows = db.prepare(`SELECT COUNT(*) c FROM transcript_events WHERE ${WHERE_OLD}`).get(...oldArgs());
+  const bytes = db.prepare(`SELECT SUM(length(event_json)) s FROM transcript_events WHERE ${WHERE_OLD}`).get(...oldArgs());
   const total = db.prepare('SELECT COUNT(*) c, SUM(length(event_json)) s FROM transcript_events').get();
   const free = db.prepare('PRAGMA freelist_count').get();
   const ps = db.prepare('PRAGMA page_size').get();
@@ -100,6 +122,7 @@ async function main() {
   console.log('  размер:    ', mb(dbSizeBefore));
   console.log('  строк всего:', before.totalRows, `(${mb(before.totalBytes)} полезных данных)`);
   console.log('  старше', DAYS, 'дн:', before.oldRows, `строк (${mb(before.oldBytes)})`);
+  if (EXCLUDE) console.log('  исключена сессия:', EXCLUDE);
   console.log('  freelist:  ', before.freePages, 'страниц =', mb(before.freePages * before.pageSize));
   if (freeBefore !== null) console.log('  свободно на диске:', mb(freeBefore));
 
@@ -124,58 +147,96 @@ async function main() {
     return 0;
   }
 
-  /* --- 1. Выгружаем строки и пишем архив --- */
+  /* --- 1. Выгружаем строки и пишем архив, НЕ держа их в памяти ---
+   *
+   * ПЕРВАЯ ВЕРСИЯ ПАДАЛА ЗДЕСЬ. Она собирала все строки в .all(), склеивала в
+   * одну строку и потом читала архив обратно целиком через gunzipSync —
+   * ~189 МБ данных в объектах + строка + буфер в одном процессе. На живом
+   * контейнере прогон убило (Killed / OOM) уже ПОСЛЕ записи архива, но ДО
+   * DELETE, поэтому база осталась целой. Стрим держит в памяти один батч. */
   fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const out = path.join(ARCHIVE_DIR, `transcripts-${stamp}-older-than-${DAYS}d.jsonl.gz`);
 
-  const rows = db.prepare(
-    'SELECT session_id, seq, event_json, created_at FROM transcript_events WHERE created_at < ? ORDER BY created_at ASC'
-  ).all(cut);
+  let rowCount = 0;
+  async function* archivedLines() {
+    const it = db.prepare(
+      `SELECT session_id, seq, event_json, created_at FROM transcript_events WHERE ${WHERE_OLD} ORDER BY created_at ASC`
+    ).iterate(...oldArgs());
+    for (const r of it) {
+      rowCount += 1;
+      yield JSON.stringify({
+        session_id: r.session_id,
+        seq: r.seq,
+        event_json: r.event_json,
+        created_at: r.created_at,
+      }) + '\n';
+    }
+  }
 
-  const lines = rows.map((r) => JSON.stringify({
-    session_id: r.session_id,
-    seq: r.seq,
-    event_json: r.event_json,
-    created_at: r.created_at,
-  })).join('\n') + '\n';
+  await pipeline(
+    Readable.from(archivedLines()),
+    zlib.createGzip({ level: 9 }),
+    fs.createWriteStream(out)
+  );
 
-  fs.writeFileSync(out, zlib.gzipSync(Buffer.from(lines, 'utf8'), { level: 9 }));
   const archiveSize = fileSize(out);
   console.log(`\n  архив: ${out}`);
-  console.log(`  строк в архиве: ${rows.length}, на диске: ${mb(archiveSize)}`);
+  console.log(`  строк в архиве: ${rowCount}, на диске: ${mb(archiveSize)}`);
 
   /* --- 2. Проверка архива ДО удаления ---
-   * Читаем обратно и считаем строки. Если число не совпало — выходим, база
-   * остаётся нетронутой. Это единственная защита от «архив пустой, а данные
-   * уже удалены», и она обязательна. */
-  const back = zlib.gunzipSync(fs.readFileSync(out)).toString('utf8')
-    .split('\n').filter(Boolean);
-  if (back.length !== rows.length) {
-    console.error(`  ОШИБКА: в архиве ${back.length} строк, ожидалось ${rows.length}. База не изменена.`);
+   * Читаем обратно ПОСТРОЧНО и считаем строки. Если число не совпало — выходим,
+   * база остаётся нетронутой. Это единственная защита от «архив пустой, а
+   * данные уже удалены», и она обязательна. */
+  let backCount = 0;
+  const rl = readline.createInterface({
+    input: fs.createReadStream(out).pipe(zlib.createGunzip()),
+    crlfDelay: Infinity,
+  });
+  for await (const line of rl) if (line) backCount += 1;
+
+  if (backCount !== rowCount) {
+    console.error(`  ОШИБКА: в архиве ${backCount} строк, ожидалось ${rowCount}. База не изменена.`);
     return 1;
   }
-  console.log(`  проверка архива: ${back.length} строк прочитаны обратно ✅`);
+  console.log(`  проверка архива: ${backCount} строк прочитаны обратно ✅`);
 
   /* --- 3. Удаление партиями ---
    * Одна транзакция на 56k строк держала бы блокировку записи и мешала бы
-   * живому агенту писать свои события. Партии по 5000 короткие. */
+   * живому агенту писать свои события. Партии по 5000 короткие.
+   *
+   * Партии выбираются ЗАПРОСОМ, а не из заранее снятого массива: после DELETE
+   * того же предиката следующие строки сдвигаются, и LIMIT 5000 всегда даёт
+   * ещё не удалённое. Копия всех строк в памяти не нужна. */
   const BATCH = 5000;
   let deleted = 0;
-  while (deleted < rows.length) {
-    const slice = rows.slice(deleted, deleted + BATCH);
-    const del = db.prepare('DELETE FROM transcript_events WHERE session_id = ? AND seq = ?');
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      for (const r of slice) del.run(r.session_id, r.seq);
-      db.exec('COMMIT');
-    } catch (e) {
-      db.exec('ROLLBACK');
-      console.error(`  ОШИБКА удаления на партии ${deleted}: ${e.message}`);
-      return 1;
+  const del = db.prepare('DELETE FROM transcript_events WHERE session_id = ? AND seq = ?');
+  while (true) {
+    const slice = db.prepare(
+      `SELECT session_id, seq FROM transcript_events WHERE ${WHERE_OLD} LIMIT ${BATCH}`
+    ).all(...oldArgs());
+    if (!slice.length) break;
+    /* Транзакция с повтором: `database is locked` — не повод терять партию
+     * и уж точно не повод считать архивацию завершённой. */
+    let attempt = 0;
+    for (;;) {
+      attempt += 1;
+      try {
+        db.exec('BEGIN IMMEDIATE');
+        for (const r of slice) del.run(r.session_id, r.seq);
+        db.exec('COMMIT');
+        break;
+      } catch (e) {
+        try { db.exec('ROLLBACK'); } catch {}
+        if (attempt >= 10) {
+          console.error(`\n  ОШИБКА удаления на партии ${deleted} после ${attempt} попыток: ${e.message}`);
+          return 1;
+        }
+        await new Promise((r) => setTimeout(r, 500 * attempt));
+      }
     }
     deleted += slice.length;
-    process.stdout.write(`\r  удалено: ${deleted} / ${rows.length}`);
+    process.stdout.write(`\r  удалено: ${deleted} / ${rowCount}`);
   }
   console.log('');
 
