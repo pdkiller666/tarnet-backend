@@ -48,6 +48,28 @@ function waitEvent(stream, okEvent, failEvents = []) {
 
 export const TASK_PROTOCOL = '/tarnet/task/1.0.0'
 
+/**
+ * Кадр-сигнал: результат больше не нужен (CANCEL по P2P, 2.22.5).
+ *
+ * ПОЧЕМУ ОТДЕЛЬНЫЙ ТИП КАДРА, А НЕ ФЛАГ В ОТВЕТЕ.
+ * Протокол потока — «запрос-ответ»: мост ставит ожидание в очередь и
+ * сопоставляет ответ с её головой. Отмена по определению приходит, пока
+ * ответа ещё нет, поэтому она обязана быть самостоятельным кадром в
+ * ОБРАТНУЮ сторону. Если бы мост ждал на неё ответ, он встал бы в ту же
+ * очередь и ждал конца той самой задачи, которую отменяет.
+ *
+ * ПОЧЕМУ БЕЗ ОТВЕТА. Ответ на отмену ничего не сообщает: подпись не
+ * проверяется, а «принял» и «уже закончил» для сервера одно и то же —
+ * строка задачи снята ДО отправки кадра. Ожидание ответа стоило бы
+ * таймаута на каждую отмену.
+ */
+export const CONTROL_FRAME = 'cancel'
+
+/** Отличить управляющий кадр от задачи. Один предикат на обе стороны. */
+export function isControlFrame(msg) {
+  return Boolean(msg && msg.action === CONTROL_FRAME)
+}
+
 /** Кадр: один JSON + перевод строки. */
 export function encodeLine(obj) {
   return new TextEncoder().encode(JSON.stringify(obj) + '\n')
@@ -185,9 +207,50 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
     return answer
   }
 
+  /**
+   * Отправить отмену и НЕ ждать ответа.
+   *
+   * Кому: конкретному адресу, если он известен, иначе всем живым каналам.
+   * Адрес приходит из строки задачи, а не из «мы выбирали этого воркера»:
+   * после requeue исполнитель мог смениться, и кадр ушёл бы не туда.
+   *
+   * Возвращает адреса, которым кадр реально записан, — по ним приёмка
+   * отличает «отмена ушла» от «отмена не нашла канал».
+   *
+   * @returns {Promise<string[]>}
+   */
+  async function cancel({ address = null, taskId, reason = 'swarm_loser' } = {}) {
+    const want = address ? String(address).toLowerCase() : null
+    const targets = [...channels].filter((c) => (
+      !c.closed && c.authorized && (!want || String(c.address).toLowerCase() === want)
+    ))
+
+    const frame = {
+      action: CONTROL_FRAME,
+      taskId: taskId ? String(taskId) : null,
+      reason,
+      at: Date.now(),
+    }
+
+    const sentTo = []
+    for (const ch of targets) {
+      try {
+        await writeLine(ch.stream, frame)
+        sentTo.push(String(ch.address).toLowerCase())
+        log(`отмена ${frame.taskId || '(без id)'} → ${ch.address}`)
+      } catch (e) {
+        /* Канал умер между проверкой и записью. Это не ошибка отмены:
+         * результат всё равно не будет оплачен, а строка уже снята. */
+        log(`отмена не ушла в ${ch.address}: ${e.message}`)
+      }
+    }
+    return sentTo
+  }
+
   return {
     attach,
     send,
+    cancel,
     channels,
     count: () => channels.size,
     rejected: () => rejected,
@@ -199,8 +262,29 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
  * Сторона воркера: читать задачи и отвечать на каждую.
  * Возвращается, когда поток закрыт — вызывающий решает, переоткрывать ли.
  */
-export async function serveTaskStream(stream, onTask, { log = () => {} } = {}) {
+export async function serveTaskStream(stream, onTask, { log = () => {}, onControl = null } = {}) {
   let buf = ''
+
+  /* ЗАДАЧИ ИДУТ ЦЕПОЧКОЙ, ЧТЕНИЕ — НЕ ЖДЁТ.
+   *
+   * Раньше цикл делал `await onTask(msg)` прямо в чтении. Пока модель
+   * считала минуту, следующий кадр (в том числе CANCEL) лежал в буфере
+   * сети и не обрабатывался: отмена приходила уже после ответа, то есть
+   * не отменяла ничего. Теперь чтение продолжается, задача встаёт в
+   * очередь, а управляющий кадр обрабатывается немедленно.
+   *
+   * Очередь на задачи сохранена намеренно: на одном CPU две генерации
+   * мешают друг другу, и «параллельно» означало бы вдвое медленнее обе.
+   * Ответы поэтому уходят в порядке задач — ровно то, чего ждёт очередь
+   * ожиданий на стороне моста. */
+  let taskChain = Promise.resolve()
+  let writeChain = Promise.resolve()
+
+  const write = (obj) => {
+    writeChain = writeChain.then(() => writeLine(stream, obj)).catch(() => {})
+    return writeChain
+  }
+
   try {
     for await (const chunk of stream) {
       buf += chunkToText(chunk)
@@ -211,11 +295,34 @@ export async function serveTaskStream(stream, onTask, { log = () => {} } = {}) {
         if (!line.trim()) continue
         let msg
         try { msg = JSON.parse(line) } catch { continue }
-        const reply = await onTask(msg)
-        if (reply !== null && reply !== undefined) await writeLine(stream, reply)
+
+        /* Управляющий кадр — вне очереди задач и без ответа. `await` здесь
+         * свёл бы на нет всё: отмена ждала бы конца отменяемой работы. */
+        if (onControl && isControlFrame(msg)) {
+          Promise.resolve()
+            .then(() => onControl(msg))
+            .catch((e) => log(`управляющий кадр: ${e.message}`))
+          continue
+        }
+
+        const frame = msg
+        taskChain = taskChain.then(async () => {
+          const reply = await onTask(frame)
+          if (reply !== null && reply !== undefined) await write(reply)
+        }).catch((e) => {
+          /* Ошибка одной задачи не должна ронять поток: следующая задача
+           * обязана дождаться своей очереди, а не потеряться вместе с ним. */
+          log(`задача: ${e.message}`)
+        })
       }
     }
   } catch (e) {
     log(`поток задач: ${e.message}`)
   }
+
+  /* Дать начатым работам дописать ответы до закрытия потока. Ждём без
+   * ограничения по времени намеренно: генерация уже оплачена временем
+   * воркера, и обрывать запись на середине значило бы выбросить её. */
+  try { await taskChain } catch (_e) { /* уже залогировано */ }
+  try { await writeChain } catch (_e) { /* поток мог закрыться */ }
 }

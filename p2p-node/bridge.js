@@ -346,6 +346,40 @@ const handlers = {
         elapsed_ms: Date.now() - started
       }
     }
+  },
+
+  /**
+   * Отмена задачи у воркера (CANCEL по P2P, 2.22.5).
+   *
+   * ЗАЧЕМ ЧЕРЕЗ МОСТ, А НЕ НАПРЯМУЮ.
+   * У `server.js` нет адреса воркера в libp2p: воркер слушает loopback на
+   * случайном порту и звонит сам. Отправить кадр может только тот, у кого
+   * открыт поток, то есть мост.
+   *
+   * ПОЧЕМУ `ok: true` — ЭТО НЕ «ВОРКЕР ОСТАНОВИЛСЯ».
+   * Отмена — сигнал, а не подтверждённая остановка (см. комментарий у
+   * `cancelTask` в ws-inbound.js). `ok` значит «кадр записан в канал», а
+   * `cancelled` — сколько адресов его получило. Ноль адресов — честный
+   * ответ «отменять было некому», а не ошибка транспорта.
+   */
+  async cancel(msg) {
+    const taskId = msg && msg.taskId ? String(msg.taskId) : null
+    const address = msg && msg.address ? String(msg.address).toLowerCase() : null
+    const sentTo = await taskClient.cancel({
+      address,
+      taskId,
+      reason: (msg && msg.reason) || 'swarm_loser'
+    })
+    return {
+      ok: true,
+      action: 'cancel',
+      taskId,
+      /* Кому ушло. Сервер по этому списку заполняет `cancelledWorkers`,
+       * и разница с числом снятых задач («воркер уже закрыл поток»)
+       * видна как факт, а не как догадка. */
+      cancelled: sentTo,
+      channels: taskClient.count()
+    }
   }
 }
 

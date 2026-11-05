@@ -8983,8 +8983,31 @@ async function runInference(req, res) {
                  * отменённой задаче и получить 409; это не ошибка, но
                  * лишний отказ в его логе. */
                 if (row && row.status === 'claimed' && row.workerAddress) {
-                  wsInbound.cancelTask(row.workerAddress, tid, 'swarm_loser');
-                  cancelledAddrs.push(String(row.workerAddress).toLowerCase());
+                  const loserAddr = String(row.workerAddress).toLowerCase();
+                  /* Сначала WS: это дешёвый путь и он есть у большинства
+                   * воркеров. P2P — ТОЛЬКО ЕСЛИ WS КАДР НЕ УШЁЛ.
+                   *
+                   * Почему не оба сразу: два кадра об одном и том же
+                   * (`type:'CANCEL'` и `action:'cancel'`) пришли бы на один
+                   * ПК разными путями, и воркер записал бы две отмены на
+                   * одну задачу. Вреда нет, но в отчёте «cancelledWorkers»
+                   * показывал бы двух адресатов там, где воркер один. */
+                  let sent = wsInbound.cancelTask(row.workerAddress, tid, 'swarm_loser');
+                  if (!sent) {
+                    /* Отменять по P2P имеет смысл только если у воркера нет
+                     * живого сокета: при закрытом WS это единственный путь,
+                     * по которому сигнал вообще может дойти. */
+                    const r = await p2pBridge.cancel(
+                      { taskId: tid, address: loserAddr, reason: 'swarm_loser' },
+                      { timeoutMs: 1500 },
+                    ).catch(() => null);
+                    sent = Boolean(r && r.ok && Array.isArray(r.cancelled)
+                      && r.cancelled.includes(loserAddr));
+                  }
+                  /* В список — только реально отправленные. Раньше адрес
+                   * писался независимо от исхода, и «ушло» было обещанием
+                   * там, где доказательства не было. */
+                  if (sent) cancelledAddrs.push(loserAddr);
                 }
               } catch (_e) { /* снятие не должно ломать уже полученный ответ */ }
             }

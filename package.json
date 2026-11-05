@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.22.4-geo-p2p-and-disk",
+  "version": "2.22.5-p2p-key-sync",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

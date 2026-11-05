@@ -26,6 +26,22 @@ const ADDRESS_RE = /^0x[0-9a-f]{40}$/i
 const SEED_RE = /^[0-9a-fA-F]{64}$/
 
 /**
+ * Где лежит ключ воркера.
+ *
+ * ПОЧЕМУ ПУТЬ МОЖНО ЗАДАТЬ СНАРУЖИ. `p2p-worker.js` и `worker-demo.js` —
+ * два процесса. Первый стартует раньше второго (или вообще отдельным
+ * юнитом), и тогда `~/.tarnet` у них должен совпадать. Совпадает он не
+ * всегда: у systemd `HOME` задаётся юнитом, у консольного запуска —
+ * оболочкой. `P2P_WORKER_KEY_FILE` снимает догадку: путь передаётся
+ * явно, и «ключ не найден» перестаёт означать «не тот HOME».
+ */
+export function workerKeyFile({ home = os.homedir(), env = process.env } = {}) {
+  const explicit = String(env.P2P_WORKER_KEY_FILE || env.TARNET_WORKER_KEY_FILE || '').trim()
+  if (explicit) return explicit
+  return path.join(home, '.tarnet', 'worker-key.json')
+}
+
+/**
  * Найти адрес и seed воркера.
  *
  * Порядок: env → файлы. Env первым, потому что тест и контейнер не имеют
@@ -62,7 +78,7 @@ export function loadWorkerIdentity({
     seed = Buffer.from(envSeed, 'hex')
     sources.seed = 'env'
   } else {
-    const file = path.join(home, '.tarnet', 'worker-key.json')
+    const file = workerKeyFile({ home, env })
     try {
       const saved = JSON.parse(fs.readFileSync(file, 'utf8'))
       if (SEED_RE.test(saved.seedHex || '')) {
@@ -76,6 +92,37 @@ export function loadWorkerIdentity({
    * без адреса некуда привязать, без seed нечем подписать. */
   const error = !address ? 'NO_WORKER_ADDRESS' : !seed ? 'NO_WORKER_KEY' : null
   return { address, seed, sources, error }
+}
+
+/**
+ * Дождаться, пока ключ появится на диске.
+ *
+ * ЗАЧЕМ. Ключ создаёт ДРУГОЙ процесс (`worker-demo.js`), и порядок старта
+ * не гарантирован: p2p-процесс может подняться первым. Без ожидания он
+ * получал `NO_WORKER_KEY`, не открывал поток задач и выглядел живым —
+ * мост при этом честно показывал «каналов нет». Это и была «курица и
+ * яйцо»: ключ появляется после рукопожатия, а рукопожатие ждёт ключа.
+ *
+ * ПОЧЕМУ ОГРАНИЧЕННОЕ ОЖИДАНИЕ, А НЕ БЕСКОНЕЧНОЕ. Воркер, который вечно
+ * ждёт файл, неотличим от зависшего. По истечении срока возвращаем
+ * последний результат с ошибкой — вызывающий сам решает, повторять ли
+ * (основной цикл повторяет попытку каждый `P2P_RETRY_MS`).
+ *
+ * @returns {Promise<{address:string|null, seed:Buffer|null, sources:object,
+ *   error:string|null, waited_ms:number}>}
+ */
+export async function waitForWorkerIdentity({
+  timeoutMs = 5000,
+  pollMs = 250,
+  ...opts
+} = {}) {
+  const started = Date.now()
+  let ident = loadWorkerIdentity(opts)
+  while (ident.error && Date.now() - started < timeoutMs) {
+    await new Promise((r) => setTimeout(r, pollMs))
+    ident = loadWorkerIdentity(opts)
+  }
+  return { ...ident, waited_ms: Date.now() - started }
 }
 
 /**

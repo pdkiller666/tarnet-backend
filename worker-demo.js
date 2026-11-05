@@ -642,13 +642,62 @@ function wsKeyFile() {
   return path.join(os.homedir(), '.tarnet', 'worker-key.json');
 }
 
+/**
+ * Сохранить seed в файл, если его там ещё нет.
+ *
+ * Вынесено отдельной функцией, потому что путей два (env и «сгенерировали
+ * сами»), а формат и права обязаны совпадать: 0600 — иначе ключ воркера
+ * читается любым пользователем машины, а он подписывает сдачу работы.
+ *
+ * @returns {boolean} записали ли файл сейчас
+ */
+function writeSeedFile(seed, source = 'generated') {
+  const file = wsKeyFile();
+  try {
+    if (fs.existsSync(file)) {
+      const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (/^[0-9a-fA-F]{64}$/.test(saved.seedHex || '')) return false;
+    }
+  } catch (_e) { /* битый файл — перезапишем */ }
+
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      seedHex: seed.toString('hex'),
+      createdAt: new Date().toISOString(),
+      source,
+    }, null, 2));
+    fs.chmodSync(file, 0o600);
+    return true;
+  } catch (e) {
+    log(`не смог сохранить ключ в ${file} (${e.message}) — p2p-процесс его не увидит`);
+    return false;
+  }
+}
+
 /* Seed создаётся один раз и переживает перезапуск. Если файла нет и создать
  * его нельзя — ключ будет эфемерным, и handshake сломается при первом же
  * рестарте (TOFU увидит другой ключ и ответит ADDRESS_KEY_MISMATCH). Об этом
  * честно пишем в лог, а не делаем вид, что всё в порядке. */
 function loadOrCreateSeed() {
   const fromEnv = String(process.env.TARNET_WORKER_SEED || '').trim();
-  if (/^[0-9a-fA-F]{64}$/.test(fromEnv)) return Buffer.from(fromEnv, 'hex');
+  if (/^[0-9a-fA-F]{64}$/.test(fromEnv)) {
+    const seed = Buffer.from(fromEnv, 'hex');
+    /* СИД ИЗ ОКРУЖЕНИЯ ОБЯЗАН ПОПАСТЬ НА ДИСК (2.22.5).
+     *
+     * Раньше здесь был `return` и файл не создавался вовсе. Пока ключ
+     * нужен был только этому процессу, это работало: он читает env сам.
+     * Но `p2p-worker.js` — ОТДЕЛЬНЫЙ процесс, и он читает только файл.
+     * В systemd (`Environment=TARNET_WORKER_SEED=…`) и в установщике
+     * Windows это давало одновременно работающий WS-воркер и вечный
+     * `NO_WORKER_KEY` у p2p-процесса. Ошибка была тихой: оба живы, оба
+     * правы, мост показывает «каналов нет».
+     *
+     * Пишем только если файла нет: ключ, уже привязанный к адресу, нельзя
+     * перезаписывать — TOFU увидит другой ключ и ответит ADDRESS_KEY_MISMATCH. */
+    writeSeedFile(seed, 'env');
+    return seed;
+  }
 
   const file = wsKeyFile();
   try {
@@ -659,16 +708,7 @@ function loadOrCreateSeed() {
   } catch (_e) { /* битый файл — пересоздадим */ }
 
   const seed = nodeCrypto.randomBytes(32);
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({
-      seedHex: seed.toString('hex'),
-      createdAt: new Date().toISOString(),
-    }, null, 2));
-    fs.chmodSync(file, 0o600);
-  } catch (e) {
-    log(`не смог сохранить ключ WS (${e.message}) — при рестарте handshake отклонится`);
-  }
+  writeSeedFile(seed, 'generated');
   return seed;
 }
 
@@ -1449,7 +1489,7 @@ function startP2pExecutor() {
       } catch (_e) { /* клиент уже отвалился */ }
     };
 
-    if (req.method !== 'POST' || req.url !== '/p2p/execute') {
+    if (req.method !== 'POST' || (req.url !== '/p2p/execute' && req.url !== '/p2p/cancel')) {
       return reply(404, { ok: false, error: 'NOT_FOUND' });
     }
     if (String(req.headers.authorization || '') !== `Bearer ${token}`) {
@@ -1469,6 +1509,27 @@ function startP2pExecutor() {
       try { msg = JSON.parse(raw); } catch {
         return reply(400, { ok: false, error: 'BAD_JSON' });
       }
+
+      /* ОТМЕНА ПО P2P (2.22.5).
+       *
+       * Тот же `noteCancel`, что и у кадра CANCEL по WebSocket: отмена не
+       * должна вести себя по-разному в зависимости от транспорта. Если
+       * задача уже считается — прерывается запрос к Ollama; если ждёт в
+       * цепочке — не начинается вовсе.
+       *
+       * Отвечаем сразу и не ждём исхода: вызывающий (p2p-процесс) ответа
+       * не требует, а `noteCancel` не бросает. Поле `aborted` говорит,
+       * был ли найден живой контроллер — по нему в логе видно «отменили
+       * реально считающееся» против «отмена опоздала». */
+      if (req.url === '/p2p/cancel') {
+        const id = msg && msg.taskId ? String(msg.taskId) : null;
+        if (!id) return reply(400, { ok: false, error: 'BAD_TASK_ID' });
+        const wasRunning = taskAborts.has(id);
+        noteCancel(id);
+        log(`[p2p] CANCEL ${id} (${(msg && msg.reason) || 'без причины'})`);
+        return reply(200, { ok: true, taskId: id, wasRunning });
+      }
+
       const task = msg && msg.task;
       if (!task || !task.taskId) {
         return reply(400, { ok: false, error: 'BAD_TASK' });

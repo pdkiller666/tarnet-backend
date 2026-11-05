@@ -190,4 +190,36 @@ function startAnnounceLoop ({ intervalMs = 60000, enabled = process.env.P2P_BRID
   return timer;
 }
 
-module.exports = { send, task, announceOnStartup, startAnnounceLoop, nodeIdentity, DEFAULT_SOCKET };
+/**
+ * Отменить задачу у P2P-воркера через мост (2.22.5).
+ *
+ * Таймаут короткий намеренно: отмена — это сигнал, а не работа. Если мост
+ * или канал не ответят за пару секунд, ждать дольше бессмысленно — задача
+ * уже снята в базе, и результат по ней не будет оплачен ни при каком исходе.
+ *
+ * Никогда не бросает: возвращает `{ok:false, error, cancelled:[]}`, чтобы
+ * вызывающий мог просто приписать «сколько отмен дошло» без ветвления.
+ *
+ * @returns {Promise<{ok:boolean, cancelled:string[], error?:string}>}
+ */
+async function cancel(
+  { taskId, address = null, reason = 'swarm_loser' },
+  { timeoutMs = 2000, socketPath = DEFAULT_SOCKET } = {},
+) {
+  if (!taskId) return { ok: false, error: 'NO_TASK_ID', cancelled: [] };
+  const res = await send(
+    { action: 'cancel', taskId, address, reason },
+    { socketPath, timeoutMs },
+  );
+  if (!res) return { ok: false, error: 'BRIDGE_UNREACHABLE', cancelled: [] };
+  if (res.ok !== true) {
+    return { ok: false, error: res.error || 'UNKNOWN', cancelled: [] };
+  }
+  return {
+    ok: true,
+    cancelled: Array.isArray(res.cancelled) ? res.cancelled : [],
+    channels: res.channels,
+  };
+}
+
+module.exports = { send, task, cancel, announceOnStartup, startAnnounceLoop, nodeIdentity, DEFAULT_SOCKET };

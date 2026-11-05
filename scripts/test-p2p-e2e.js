@@ -374,6 +374,53 @@ async function main() {
   ), 15000).catch(() => false);
   check('метка [P2P] у исполнителя', !!sawLabel, sawLabel ? 'строка приёма есть' : 'строки нет');
 
+  /* 8. CANCEL по P2P (2.22.5).
+   *
+   * Доказываем СКВОЗНОЙ путь отмены, а не наличие поля в ответе:
+   * мост получил команду → кадр ушёл в поток → воркер проксировал его
+   * локальному исполнителю → исполнитель его применил. Каждый шаг виден
+   * отдельной строкой лога, и проверки идут по ним, а не по обещаниям.
+   *
+   * Задача к этому моменту уже выполнена, поэтому `wasRunning: false` —
+   * это ОЖИДАЕМЫЙ исход, а не провал. Проверяем доставку сигнала, а не
+   * факт прерывания генерации: прерывать уже нечего. */
+  const cancelId = `${taskId}-cancel`;
+  const cancelReply = await client.cancel(
+    { taskId: cancelId, address: ident.address, reason: 'swarm_loser' },
+    { timeoutMs: 5000, socketPath },
+  );
+  check(
+    'CANCEL принят мостом',
+    !!(cancelReply && cancelReply.ok),
+    cancelReply ? `ok=${cancelReply.ok}, error=${cancelReply.error || 'нет'}` : 'ответа нет',
+  );
+  check(
+    'CANCEL адресован живому каналу',
+    !!(cancelReply && Array.isArray(cancelReply.cancelled)
+      && cancelReply.cancelled.includes(ident.address.toLowerCase())),
+    `cancelled=[${(cancelReply && cancelReply.cancelled) || ''}]`,
+  );
+
+  /* Две строки, а не одна: воркер пишет «отмена → исполнитель», исполнитель
+   * пишет «[p2p] CANCEL». Одна доказывала бы только половину пути. */
+  const sawWorkerCancel = await waitFor('отмена в логе воркера', async () => (
+    has(worker, `отмена ${cancelId}`) ? true : null
+  ), 10000).catch(() => false);
+  check(
+    'CANCEL дошёл до воркер-процесса',
+    !!sawWorkerCancel,
+    sawWorkerCancel ? 'строка воркера есть' : 'строки нет',
+  );
+
+  const sawExecCancel = await waitFor('CANCEL в логе исполнителя', async () => (
+    has(exec, `[p2p] CANCEL ${cancelId}`) ? true : null
+  ), 10000).catch(() => false);
+  check(
+    'CANCEL применён локальным исполнителем',
+    !!sawExecCancel,
+    sawExecCancel ? 'строка исполнителя есть' : 'строки нет',
+  );
+
   const failed = checks.filter((c) => !c.ok);
 
   console.log('');

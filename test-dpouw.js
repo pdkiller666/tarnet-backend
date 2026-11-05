@@ -9160,6 +9160,282 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     fs.rmSync(dir, { recursive: true, force: true });
   }
 
+  /* ===== 52. Синхронизация ключа P2P и CANCEL по P2P (2.22.5) =====
+   *
+   * Что здесь проверяется НА САМОМ ДЕЛЕ, а не по коду на глаз:
+   *   1) ключ из `TARNET_WORKER_SEED` попадает на диск — без этого
+   *      p2p-процесс не видит ключ, хотя WS-воркер жив и работает;
+   *   2) уже привязанный ключ не перезаписывается — иначе TOFU увидел бы
+   *      другой ключ и ответил ADDRESS_KEY_MISMATCH всем;
+   *   3) ожидание ключа работает и не висит вечно;
+   *   4) отмена по P2P проходит СКВОЗЬ поток, вне очереди задач.
+   *
+   * Пункт 4 — главный: до 2.22.5 цикл чтения ждал `onTask`, поэтому
+   * CANCEL лежал в буфере, пока модель считала минуту, и отменять было
+   * уже нечего. Тест ловил бы возврат этого поведения. */
+  console.log('\n52. Синхронизация ключа P2P и CANCEL по P2P');
+  {
+    const { spawnSync } = require('child_process');
+    /* Файл лежит рядом с `worker-demo.js`. `__dirname`, а не `process.cwd()`:
+     * тест могут запустить из другого каталога, и тогда путь ушёл бы в
+     * несуществующий файл, а `spawnSync` вернул бы пустой stdout без ошибки. */
+    const ROOT_DIR = __dirname;
+    const peerHello = await import('./p2p-node/peer-hello.js');
+    const taskProto = await import('./p2p-node/task-protocol.js');
+    const tick = (ms = 25) => new Promise((r) => setTimeout(r, ms));
+
+    /* --- 52.1–52.3: ключ из env материализуется на диске --- */
+    const keyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-key-'));
+    const envSeed = crypto.randomBytes(32).toString('hex');
+    const differentSeed = crypto.randomBytes(32).toString('hex');
+
+    /* Подпроцесс, а не require: `worker-demo.js` на загрузке создаёт адрес
+     * и регистрирует обработчики — в основном процессе это был бы побочный
+     * эффект. `HOME` подменён, поэтому настоящий `~/.tarnet` не тронут. */
+    const runSeed = (env) => spawnSync(process.execPath, ['-e', [
+      "const w = require(process.argv[1]);",
+      "const seed = w.loadOrCreateSeed();",
+      "process.stdout.write(seed.toString('hex'));",
+    ].join('\n'), path.join(ROOT_DIR, 'worker-demo.js')], {
+      cwd: ROOT_DIR,
+      env: { ...process.env, HOME: keyHome, ...env },
+      encoding: 'utf8',
+      timeout: 30000,
+    });
+
+    const keyFile = path.join(keyHome, '.tarnet', 'worker-key.json');
+    const first62 = runSeed({ TARNET_WORKER_SEED: envSeed });
+    let saved = null;
+    try { saved = JSON.parse(fs.readFileSync(keyFile, 'utf8')); } catch (_e) { saved = null; }
+
+    ok('52.1 ключ из TARNET_WORKER_SEED записан на диск',
+      Boolean(saved) && saved.seedHex === envSeed,
+      { file: Boolean(saved), sameSeed: Boolean(saved) && saved.seedHex === envSeed,
+        returned: (first62.stdout || '').slice(0, 12), stderr: (first62.stderr || '').slice(0, 120) });
+
+    const keyMode = saved ? (fs.statSync(keyFile).mode & 0o777).toString(8) : 'нет';
+    ok('52.2 права файла ключа 600',
+      keyMode === '600', { mode: keyMode });
+
+    /* Уже существующий ключ НЕ перезаписывается: этого достаточно, чтобы
+     * привязанный к адресу ключ не сменился после правки env. */
+    const second62 = runSeed({ TARNET_WORKER_SEED: differentSeed });
+    let after = null;
+    try { after = JSON.parse(fs.readFileSync(keyFile, 'utf8')); } catch (_e) { after = null; }
+    ok('52.3 существующий ключ не перезаписан',
+      Boolean(after) && after.seedHex === envSeed
+        && (second62.stdout || '') === differentSeed,
+      { fileKept: Boolean(after) && after.seedHex === envSeed,
+        returnedNew: (second62.stdout || '').slice(0, 12) });
+
+    /* --- 52.4: явный путь к ключу --- */
+    const explicitPath = path.join(keyHome, 'elsewhere', 'k.json');
+    ok('52.4 P2P_WORKER_KEY_FILE переопределяет путь',
+      peerHello.workerKeyFile({ home: keyHome, env: { P2P_WORKER_KEY_FILE: explicitPath } }) === explicitPath,
+      { got: peerHello.workerKeyFile({ home: keyHome, env: { P2P_WORKER_KEY_FILE: explicitPath } }) });
+
+    /* --- 52.5–52.6: ожидание появления ключа --- */
+    const lateHome = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-late-'));
+    const lateSeed = crypto.randomBytes(32).toString('hex');
+    const addr62 = '0x' + crypto.randomBytes(20).toString('hex');
+    const writer = (async () => {
+      await tick(400);
+      fs.mkdirSync(path.join(lateHome, '.tarnet'), { recursive: true });
+      fs.writeFileSync(path.join(lateHome, '.tarnet', 'worker.json'),
+        JSON.stringify({ address: addr62 }));
+      fs.writeFileSync(path.join(lateHome, '.tarnet', 'worker-key.json'),
+        JSON.stringify({ seedHex: lateSeed }));
+    })();
+
+    const waited = await peerHello.waitForWorkerIdentity({
+      home: lateHome, env: {}, timeoutMs: 4000, pollMs: 100,
+    });
+    await writer;
+    ok('52.5 ключ, появившийся позже, дождались',
+      waited.error === null && waited.address === addr62
+        && Boolean(waited.seed) && waited.waited_ms > 0,
+      { error: waited.error, waited_ms: waited.waited_ms });
+
+    const emptyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-empty-'));
+    const t0 = Date.now();
+    const timedOut = await peerHello.waitForWorkerIdentity({
+      home: emptyHome, env: {}, timeoutMs: 600, pollMs: 100,
+    });
+    const spent = Date.now() - t0;
+    /* Ждём именно ОГРАНИЧЕННО: вечное ожидание файла неотличимо от зависшего
+     * процесса, и воркер выглядел бы живым, ничего не делая. */
+    ok('52.6 без ключа ожидание завершается по таймауту',
+      timedOut.error === 'NO_WORKER_ADDRESS' && spent < 3000,
+      { error: timedOut.error, spent_ms: spent });
+
+    /* --- 52.7: управляющий кадр отличается от задачи --- */
+    ok('52.7 cancel опознаётся как управляющий кадр, задача — нет',
+      taskProto.isControlFrame({ action: 'cancel' }) === true
+        && taskProto.isControlFrame({ action: 'task', task: {} }) === false,
+      { control: taskProto.isControlFrame({ action: 'cancel' }) });
+
+    /* Поддельный поток — тот же контракт, что у libp2p: `send` и
+     * асинхронная итерация, которая НЕ завершается сама. */
+    function makeStream52() {
+      const sent = [];
+      const queue = [];
+      let waiter = null;
+      let isClosed = false;
+      const stream = {
+        sent,
+        send(buf) {
+          const b = buf && buf.subarray ? buf.subarray() : buf;
+          sent.push(Buffer.from(b).toString('utf8'));
+          return true;
+        },
+        async close() {
+          isClosed = true;
+          if (waiter) { const w = waiter; waiter = null; w({ done: true, value: undefined }); }
+        },
+        push(text) {
+          const chunk = new TextEncoder().encode(text);
+          if (waiter) { const w = waiter; waiter = null; w({ done: false, value: chunk }); }
+          else queue.push(chunk);
+        },
+        [Symbol.asyncIterator]() {
+          return {
+            next() {
+              if (queue.length) return Promise.resolve({ done: false, value: queue.shift() });
+              if (isClosed) return Promise.resolve({ done: true, value: undefined });
+              return new Promise((resolve) => { waiter = resolve; });
+            }
+          };
+        }
+      };
+      return stream;
+    }
+
+    const seed62 = crypto.randomBytes(32);
+    const priv62 = crypto.createPrivateKey({
+      key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed62]),
+      format: 'der', type: 'pkcs8',
+    });
+    const pub62 = Buffer.from(
+      crypto.createPublicKey(priv62).export({ format: 'der', type: 'spki' })
+    ).slice(-32).toString('hex');
+    const cancelAddr = '0x' + crypto.randomBytes(20).toString('hex');
+    const cancelHello = peerHello.buildHello({ address: cancelAddr, seed: seed62 });
+
+    /* --- 52.8–52.9: отмена уходит в канал, не ожидая ответа --- */
+    /* `verifyHello` живёт в `peer-auth.js`, а НЕ в `peer-hello.js`:
+     * первый строит кадр, второй проверяет его по списку ключей. Я один раз
+     * взял его из `peer-hello`, получил `TypeError` внутри `authorize`,
+     * поток закрылся и `channels` остался нулём — тест валился на моей
+     * опечатке, а не на поведении кода. */
+    const peerAuth = await import('./p2p-node/peer-auth.js');
+    const cancelClient = taskProto.createTaskClient({
+      authorize: (msg) => peerAuth.verifyHello(msg, new Map([[cancelAddr, pub62]])),
+      log: () => {},
+    });
+    const s62 = makeStream52();
+    cancelClient.attach(s62, 'peer-cancel');
+    s62.push(JSON.stringify(cancelHello) + '\n');
+    /* Ждём АВТОРИЗАЦИИ, а не фиксированный тик. `tick(60)` иногда
+     * проходил раньше, чем `attach` успевал разобрать `hello`: тогда
+     * канала нет, `cancel` честно возвращает пустой список, и тест
+     * падал по причине, которой в бою не было. */
+    const waitChannel = async (want) => {
+      for (let i = 0; i < 100 && cancelClient.count() !== want; i++) await tick(20);
+      return cancelClient.count();
+    };
+    const channelUp = await waitChannel(1);
+
+    const sentTo = await cancelClient.cancel({
+      address: cancelAddr, taskId: 't-cancel-1', reason: 'swarm_loser',
+    });
+    const frame62 = s62.sent.length
+      ? JSON.parse(String(s62.sent[s62.sent.length - 1]).trim())
+      : null;
+    ok('52.8 cancel пишет кадр в канал и возвращает адрес',
+      sentTo.length === 1 && sentTo[0] === cancelAddr
+        && frame62 && frame62.action === 'cancel' && frame62.taskId === 't-cancel-1'
+        && frame62.reason === 'swarm_loser',
+      { sentTo, frame: frame62 });
+
+    /* Пустой список — честный ответ «отменять было некому», а не ошибка. */
+    const foreign = await cancelClient.cancel({
+      address: '0x' + '22'.repeat(20), taskId: 't-cancel-2',
+    });
+    ok('52.9 cancel чужому адресу ничего не отправляет',
+      foreign.length === 0 && channelUp === 1 && cancelClient.count() === 1,
+      { foreign, channelUp, channels: cancelClient.count() });
+
+    /* --- 52.10: ГЛАВНОЕ. Отмена во время задачи, а не после --- */
+    const busy = makeStream52();
+    let releaseTask = null;
+    const taskGate = new Promise((r) => { releaseTask = r; });
+    let taskEntered = null;
+    const taskStarted = new Promise((r) => { taskEntered = r; });
+    const controls = [];
+
+    const served = taskProto.serveTaskStream(busy, async (msg) => {
+      taskEntered();
+      await taskGate;
+      /* `taskId` лежит ВНУТРИ `task`, а не на верхнем уровне кадра:
+       * `onTask` получает весь кадр `{action:'task', task:{…}}`. Это не
+       * догадка — то же поле читает `handleTask` в `p2p-worker.js`. */
+      return { ok: true, taskId: msg.task && msg.task.taskId, echo: 'done' };
+    }, {
+      log: () => {},
+      onControl: (m) => { controls.push(m); },
+    });
+
+    busy.push(JSON.stringify({ action: 'task', task: { taskId: 'busy-1' } }) + '\n');
+    await taskStarted;
+    busy.push(JSON.stringify({ action: 'cancel', taskId: 'busy-1', reason: 'swarm_loser' }) + '\n');
+
+    /* 300 мс — заведомо меньше, чем задача живёт: она ждёт `releaseTask`,
+     * который вызывается ниже. Если бы чтение ждало задачу, отмена не
+     * пришла бы никогда. */
+    await tick(300);
+    const cancelDuring = controls.length === 1 && controls[0].taskId === 'busy-1'
+      && busy.sent.length === 0;
+    ok('52.10 cancel обрабатывается во время задачи, а не после',
+      cancelDuring,
+      { controls: controls.length, sentWhileBusy: busy.sent.length });
+
+    releaseTask();
+    await tick(150);
+    ok('52.11 ответ задачи ушёл после отмены, а не потерялся',
+      busy.sent.length === 1 && JSON.parse(String(busy.sent[0]).trim()).taskId === 'busy-1',
+      { sent: busy.sent.length });
+
+    /* --- 52.12: порядок ответов сохранён (цепочка задач осталась) ---
+     * Две задачи, первая медленная. Без цепочки вторая ответила бы первой,
+     * и мост сопоставил бы ответ не с той задачей: очередь ожиданий
+     * сопоставляет по ГОЛОВЕ, а не по id. */
+    const ordered = makeStream52();
+    const served2 = taskProto.serveTaskStream(ordered, async (msg) => {
+      const id = msg.task && msg.task.taskId;
+      if (id === 'slow') await tick(150);
+      return { ok: true, taskId: id };
+    }, { log: () => {} });
+
+    ordered.push(JSON.stringify({ action: 'task', task: { taskId: 'slow' } }) + '\n');
+    ordered.push(JSON.stringify({ action: 'task', task: { taskId: 'fast' } }) + '\n');
+    await tick(500);
+    const order = ordered.sent.map((l) => JSON.parse(String(l).trim()).taskId);
+    ok('52.12 ответы идут в порядке задач',
+      order.length === 2 && order[0] === 'slow' && order[1] === 'fast',
+      { order });
+
+    /* Закрываем потоки, чтобы `serveTaskStream` вернулся и не держал таймеры. */
+    try { await busy.close(); } catch (_e) { /* уже закрыт */ }
+    try { await ordered.close(); } catch (_e) { /* уже закрыт */ }
+    try { await s62.close(); } catch (_e) { /* уже закрыт */ }
+    await served.catch(() => {});
+    await served2.catch(() => {});
+
+    fs.rmSync(keyHome, { recursive: true, force: true });
+    fs.rmSync(lateHome, { recursive: true, force: true });
+    fs.rmSync(emptyHome, { recursive: true, force: true });
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

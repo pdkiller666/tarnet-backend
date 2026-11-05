@@ -31,7 +31,7 @@ import { identify } from '@libp2p/identify'
 import { ping } from '@libp2p/ping'
 import { multiaddr } from '@multiformats/multiaddr'
 import { serveTaskStream, encodeLine, TASK_PROTOCOL } from './task-protocol.js'
-import { loadWorkerIdentity, buildHello } from './peer-hello.js'
+import { buildHello, waitForWorkerIdentity } from './peer-hello.js'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -51,6 +51,16 @@ const BOOTSTRAP_TIMEOUT_MS = Number(process.env.P2P_BOOTSTRAP_TIMEOUT_MS || 8000
 const RETRY_MS = Number(process.env.P2P_RETRY_MS || 15000)
 
 const ONCE = process.argv.includes('--once')
+
+/* Сколько ждать появления ключа воркера на диске.
+ *
+ * Ключ создаёт ДРУГОЙ процесс (`worker-demo.js`) при WS-рукопожатии. Если
+ * p2p-процесс стартует первым (отдельный юнит, автозапуск Windows), файла
+ * ещё нет, и без ожидания первый же `openTaskStream` возвращал
+ * `NO_WORKER_KEY`, поток не открывался, а мост показывал «каналов нет».
+ * Это и есть «курица и яйцо»: ключ — после рукопожатия, рукопожатие — после
+ * ключа. Ждём ограниченно; не дождались — повторим на следующем цикле. */
+const KEY_WAIT_MS = Number(process.env.P2P_KEY_WAIT_MS || 5000)
 
 function log(msg) {
   console.log(`[p2p-worker] ${msg}`)
@@ -219,6 +229,53 @@ async function proxyToLocalExecutor(task) {
   }
 }
 
+/**
+ * Передать отмену локальному исполнителю (CANCEL по P2P, 2.22.5).
+ *
+ * ПОЧЕМУ ЧЕРЕЗ ПРОКСИ, А НЕ ЛОКАЛЬНЫМ ФЛАГОМ.
+ * Отменить можно только то, что реально считается, а считается это в
+ * `worker-demo.js`: там `AbortController` задачи и запрос к Ollama. Флаг
+ * здесь остановил бы передачу следующей задачи, но не текущую генерацию —
+ * то есть «отмена», после которой вентилятор крутится ещё минуту.
+ *
+ * ПОЧЕМУ БЕЗ ОЖИДАНИЯ ОТВЕТА НА ВЫЗЫВАЮЩЕМ. Кадр `cancel` по протоколу не
+ * предполагает ответа (см. `CONTROL_FRAME`). Ответ исполнителя читаем
+ * только для лога: он говорит, был ли найден дескриптор, — но его ошибка
+ * не должна ломать поток задач.
+ */
+async function proxyCancelToLocalExecutor({ taskId, reason }) {
+  const d = loadExecDescriptor()
+  if (!d) {
+    log(`отмена ${taskId || '(без id)'}: локальный исполнитель не найден`)
+    return { ok: false, error: 'NO_LOCAL_EXECUTOR' }
+  }
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 5000)
+  try {
+    const res = await fetch(`http://127.0.0.1:${d.port}/p2p/cancel`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${d.token}`
+      },
+      body: JSON.stringify({ taskId, reason }),
+      signal: ctrl.signal
+    })
+    const body = await res.json().catch(() => null)
+    if (res.status === 401) {
+      execCache = { mtimeMs: -1, port: null, token: null }
+      return { ok: false, error: 'BAD_TOKEN' }
+    }
+    log(`отмена ${taskId || '(без id)'} → исполнитель: ${body && body.ok ? 'принята' : 'отказ'}`)
+    return body || { ok: false, error: 'BAD_EXECUTOR_REPLY' }
+  } catch (e) {
+    if (ctrl.signal.aborted) return { ok: false, error: 'CANCEL_TIMEOUT' }
+    return { ok: false, error: 'EXEC_UNREACHABLE', detail: e.message }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 async function handleTask(msg) {
   if (msg && msg.action === 'ping') {
     return { ok: true, action: 'ping', pong: true, via: 'p2p', ts: Date.now() }
@@ -253,15 +310,20 @@ async function openTaskStream(node, ma) {
      * Без ключа поток не открываем вовсе: соединение, которое заведомо
      * закроют, только засоряет лог моста отказами и мешает отличить
      * неавторизованного пира от сломанного воркера. */
-    const ident = loadWorkerIdentity()
+    /* Ждём ключ, а не читаем один раз. Порядок старта процессов не
+     * гарантирован: `worker-demo.js` может подняться позже этого файла,
+     * и тогда «файла ещё нет» — это не «ключа не будет». */
+    const ident = await waitForWorkerIdentity({ timeoutMs: KEY_WAIT_MS })
     if (ident.error) {
       log(
         `поток задач не открываю: ${ident.error} ` +
-        `(адрес: ${ident.sources.address || 'нет'}, ключ: ${ident.sources.seed || 'нет'})`
+        `(адрес: ${ident.sources.address || 'нет'}, ключ: ${ident.sources.seed || 'нет'}, ` +
+        `ждал ${ident.waited_ms} мс)`
       )
       try { await stream.close() } catch (_e) { /* уже закрыт */ }
       return false
     }
+    if (ident.waited_ms > 0) log(`ключ появился через ${ident.waited_ms} мс ожидания`)
     const hello = buildHello({ address: ident.address, seed: ident.seed })
     if (!stream.send(encodeLine(hello))) {
       await new Promise((resolve, reject) => {
@@ -276,7 +338,15 @@ async function openTaskStream(node, ma) {
 
     /* Обслуживаем в фоне: основной цикл продолжает следить за соединением.
      * Ждать здесь значило бы не логировать живость, пока поток открыт. */
-    serveTaskStream(stream, handleTask, { log: (m) => log(m) })
+    serveTaskStream(stream, handleTask, {
+      log: (m) => log(m),
+      /* Отмена приходит тем же потоком, но обрабатывается ВНЕ очереди
+       * задач: ждать конца работы, которую отменяют, бессмысленно. */
+      onControl: (msg) => proxyCancelToLocalExecutor({
+        taskId: msg && msg.taskId ? String(msg.taskId) : null,
+        reason: (msg && msg.reason) || 'swarm_loser'
+      })
+    })
       .then(() => {
         taskStreamPeer = null
         log('поток задач закрыт')
