@@ -29,6 +29,11 @@ const readline = require('readline');
  * p2p-процесс живёт отдельно, потому что libp2p — 105 МБ, а сборка
  * воркера запрещает внешние пакеты. */
 const http = require('http');
+/* Дочерний процесс для libp2p (2.22.6). `spawn`, а не `fork`: p2p-воркер —
+ * ESM-модуль (`"type": "module"`), и `fork` с его IPC-каналом потребовал бы
+ * общего протокола сообщений, которого нет. Нам нужно только запустить его
+ * рядом и унаследовать вывод, чтобы человек видел оба лога в одном окне. */
+const { spawn } = require('node:child_process');
 /* Печать/распечатка ключа сессии. Функции продублированы в воркере, а не
  * импортированы из server.js: воркер ставится отдельно от сервера и не должен
  * тянуть за собой весь серверный код ради двух функций. */
@@ -1204,6 +1209,15 @@ async function main() {
    * работать из-за этого было бы хуже, чем попробовать другой транспорт. */
   await bindKey();
 
+  /* libp2p-транспорт — ТОЛЬКО СЕЙЧАС, после `bindKey`.
+   * Ключ в `~/.tarnet/worker-key.json` пишет этот процесс при рукопожатии,
+   * а p2p-процесс читает только файл. Запуск раньше давал бы
+   * `NO_WORKER_KEY` на каждом первом старте — та же «курица и яйцо»,
+   * из-за которой в 2.22.5 появилось ожидание ключа. Отказ транспорта не
+   * роняет воркер: WS-путь остаётся рабочим.
+   */
+  if (P2P_WANTED) startP2pChild();
+
   /* Привязка кодом — сразу после handshake и до цикла опроса. Место именно
    * такое: `bindKey` только что зафиксировал ключ ПК в `ws_worker_auth`, а
    * без этой записи сервер не может проверить подпись ПК при погашении.
@@ -1226,6 +1240,9 @@ async function main() {
 
   process.on('SIGINT', () => {
     running = false;
+    /* Ребёнка гасим явно: иначе осиротевший libp2p-процесс держит порт и
+     * показывает мосту живое соединение от уже закрытого воркера. */
+    stopP2pChild();
     wsClose();
     log('остановлен');
     process.exit(0);
@@ -1578,9 +1595,105 @@ function startP2pExecutor() {
   return server;
 }
 
+/* ---------- Флаг `--p2p`: libp2p-транспорт из того же окна (2.22.6) ----------
+ *
+ * ЗАЧЕМ. До этого человек запускал `worker-demo.js` и `p2p-worker.js` двумя
+ * командами в двух окнах. Забыть вторую — обычное дело, и симптом получался
+ * обманчивым: воркер жив, `ws активен`, а мост показывает `connections: 0`.
+ * Один флаг убирает целую категорию «я всё запустил, а не работает».
+ *
+ * ПОЧЕМУ ДОЧЕРНИЙ ПРОЦЕСС, А НЕ LIBP2P ЗДЕСЬ. Сборка воркера запрещает
+ * внешние `require` (см. build-worker.js), а libp2p — 105 МБ зависимостей.
+ * Вшить его в один файл нельзя: он перестанет ставиться без зависимостей.
+ * Поэтому транспорт остаётся отдельным процессом, но запускается сам.
+ *
+ * ПОЧЕМУ ПОСЛЕ `bindKey`. Ключ в `~/.tarnet/worker-key.json` пишет ЭТОТ
+ * процесс при handshake. p2p-процесс читает только файл. Старт раньше
+ * давал бы `NO_WORKER_KEY` на каждом первом запуске: ровно та «курица и
+ * яйцо», из-за которой в 2.22.5 появилось ожидание ключа.
+ *
+ * АДРЕС НЕ ХАРДКОДИМ. `p2p-worker.js` спрашивает `GET /p2p/bootstrap` и
+ * получает адрес того, кто реально слушает порт. Захардкоженный multiaddr
+ * молча протухает при переезде узла, а через bootstrap расхождение видно
+ * сразу. Переопределить сервер можно `TARNET_PUBLIC_URL`, а не правкой кода.
+ */
+const P2P_WANTED = process.argv.includes('--p2p') || process.env.TARNET_P2P === '1';
+let p2pChild = null;
+
+/* Путь к p2p-воркеру ищем рядом с собой и на уровень выше: собранный файл
+ * лежит в `dist/`, исходник — в корне репозитория. Если не нашли — это не
+ * повод падать с загадочной ошибкой: говорим прямо, что нужно клонировать
+ * репозиторий, и продолжаем работу на WS. */
+function findP2pWorker() {
+  const candidates = [
+    path.join(__dirname, 'p2p-node', 'p2p-worker.js'),
+    path.join(__dirname, '..', 'p2p-node', 'p2p-worker.js'),
+    path.join(process.cwd(), 'p2p-node', 'p2p-worker.js'),
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
+function startP2pChild() {
+  if (p2pChild) return p2pChild;
+  const workerPath = findP2pWorker();
+  if (!workerPath) {
+    log('--p2p: рядом нет p2p-node/p2p-worker.js — транспорт не поднят, работаю на WS');
+    log('  (libp2p — 105 МБ, его нельзя вшить в один файл: нужен клон репозитория)');
+    return null;
+  }
+
+  /* `TARNET_PUBLIC_URL` пробрасываем, только если API задан явно и это не
+   * localhost по умолчанию: иначе локальная разработка стучалась бы на прод. */
+  const env = { ...process.env };
+  if (process.env.TARNET_PUBLIC_URL) env.TARNET_PUBLIC_URL = process.env.TARNET_PUBLIC_URL;
+  else if (!/^https?:\/\/(localhost|127\.0\.0\.1)/.test(API)) env.TARNET_PUBLIC_URL = API;
+  // Ключ уже на диске — ждать его появления ребёнку не нужно.
+  if (!env.P2P_KEY_WAIT_MS) env.P2P_KEY_WAIT_MS = '5000';
+
+  try {
+    p2pChild = spawn(process.execPath, [workerPath], {
+      cwd: path.dirname(workerPath),
+      env,
+      stdio: 'inherit', // оба лога в одном окне: иначе человек смотрит в пустоту
+    });
+  } catch (e) {
+    log(`--p2p: не смог запустить транспорт (${e.message}) — работаю на WS`);
+    return null;
+  }
+
+  log(`--p2p: транспорт запущен отдельным процессом (pid ${p2pChild.pid})`);
+
+  p2pChild.on('exit', (code, signal) => {
+    /* Не перезапускаем автоматически: если libp2p не установлен или
+     * bootstrap отдаёт 503, цикл рестартов дал бы шум в лог вместо
+     * причины. Воркер на WS при этом продолжает работать. */
+    if (running) {
+      log(`--p2p: транспорт завершился (код ${code ?? signal}) — WS-путь продолжает работать`);
+    }
+    p2pChild = null;
+  });
+  p2pChild.on('error', (e) => {
+    log(`--p2p: ошибка транспорта: ${e.message}`);
+    p2pChild = null;
+  });
+
+  return p2pChild;
+}
+
+function stopP2pChild() {
+  if (!p2pChild) return;
+  try { p2pChild.kill('SIGTERM'); } catch (_e) { /* уже мёртв */ }
+  p2pChild = null;
+}
+
 module.exports = {
   normalizeModelName, resolveOllamaModel, ollamaTags, workerModelReport, generate, main,
   startP2pExecutor, P2P_EXEC_FILE,
+  /* Запуск libp2p отдельным процессом по флагу `--p2p` (2.22.6). */
+  startP2pChild, stopP2pChild, findP2pWorker, P2P_WANTED,
   /* Экспорт транспорта — для тестов handshake без запуска цикла опроса. */
   connectWs, signAuth, ed25519FromSeed, loadOrCreateSeed, wsState, wsUrl, wsSupported,
   runTask, AUTH_PREFIX, claimLinkCode, linkFromCli,

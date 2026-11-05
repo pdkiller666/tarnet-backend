@@ -9436,6 +9436,94 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     fs.rmSync(emptyHome, { recursive: true, force: true });
   }
 
+  /* ===== 53. Флаг `--p2p`: транспорт из того же окна (2.22.6) =====
+   *
+   * Проверяется ПОВЕДЕНИЕ, а не наличие строки в файле:
+   *   1) без флага дочерний libp2p НЕ поднимается — обычный запуск не должен
+   *      тянуть второй процесс и 105 МБ зависимостей;
+   *   2) `--p2p` и `TARNET_P2P=1` его включают (второе — для службы Windows);
+   *   3) путь к p2p-воркеру находится там, где он есть;
+   *   4) без `p2p-node` рядом — `null` и честное сообщение, а не падение.
+   *
+   * Пункты 3–4 — не формальность. Установщик качает ОДИН файл
+   * `tarnet-worker.js`, и `p2p-node/` рядом с ним не будет никогда.
+   * Падение с `Cannot find module` человек прочитал бы как «воркер
+   * сломан», хотя WS-путь в этот момент полностью работоспособен. */
+  console.log('\n53. Флаг --p2p: libp2p отдельным процессом');
+  {
+    const { spawnSync } = require('child_process');
+    const ROOT_DIR = __dirname;
+    const WORKER_SRC = path.join(ROOT_DIR, 'worker-demo.js');
+
+    /* Подпроцесс, а не require: `P2P_WANTED` вычисляется при загрузке
+     * модуля из `process.argv`, поэтому обе ветки в одном процессе не
+     * проверить — второе требование просто перезаписало бы первое. */
+    const flagOf = (args, env = {}) => spawnSync(process.execPath, ['-e', [
+      'const w = require(process.argv[1]);',
+      'process.stdout.write(String(w.P2P_WANTED));',
+    ].join('\n'), WORKER_SRC, ...args], {
+      cwd: ROOT_DIR,
+      /* HOME подменён: загрузка воркера трогает `~/.tarnet`. */
+      env: {
+        ...process.env,
+        HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-p2pflag-')),
+        ...env,
+      },
+      encoding: 'utf8',
+      timeout: 30000,
+    });
+
+    const plain = flagOf([]);
+    ok('53.1 без флага транспорт не включается',
+      plain.stdout === 'false',
+      { out: plain.stdout, err: String(plain.stderr || '').slice(0, 120) });
+
+    const withFlag = flagOf(['--p2p']);
+    ok('53.2 --p2p включает транспорт', withFlag.stdout === 'true',
+      { out: withFlag.stdout });
+
+    const withEnv = flagOf([], { TARNET_P2P: '1' });
+    ok('53.3 TARNET_P2P=1 включает транспорт (для службы Windows)',
+      withEnv.stdout === 'true', { out: withEnv.stdout });
+
+    /* --- 53.4: путь находится в клоне репозитория --- */
+    const found = spawnSync(process.execPath, ['-e', [
+      'const w = require(process.argv[1]);',
+      'process.stdout.write(String(w.findP2pWorker()));',
+    ].join('\n'), WORKER_SRC], { cwd: ROOT_DIR, encoding: 'utf8', timeout: 30000 });
+    ok('53.4 findP2pWorker находит p2p-node/p2p-worker.js в репозитории',
+      typeof found.stdout === 'string' && found.stdout.endsWith('p2p-worker.js'),
+      { out: found.stdout });
+
+    /* --- 53.5–53.6: собранный файл БЕЗ p2p-node рядом (как у установщика) --- */
+    const soloDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-solo-'));
+    const soloFile = path.join(soloDir, 'tarnet-worker.js');
+    fs.copyFileSync(path.join(ROOT_DIR, 'dist', 'tarnet-worker.js'), soloFile);
+
+    const solo = spawnSync(process.execPath, ['-e', [
+      'const w = require(process.argv[1]);',
+      'process.stdout.write(JSON.stringify({',
+      '  found: w.findP2pWorker(),',
+      '  childNull: w.startP2pChild() === null,',
+      '}));',
+    ].join('\n'), soloFile], { cwd: soloDir, encoding: 'utf8', timeout: 30000 });
+
+    let soloOut = null;
+    /* Вывод содержит лог `--p2p: рядом нет p2p-node…` ПЕРЕД JSON: струм
+     * общий, а `console.log` пишет в stdout. Парсить надо последнюю строку,
+     * а не весь вывод — первый прогон дал null и два ложных «провала»
+     * именно из-за этого. */
+    const lastLine = String(solo.stdout || '').trim().split('\n').pop();
+    try { soloOut = JSON.parse(lastLine); } catch (_e) { soloOut = null; }
+
+    ok('53.5 без p2p-node путь не найден',
+      !!soloOut && soloOut.found === null, { out: soloOut });
+    ok('53.6 без p2p-node startP2pChild вернул null, а не упал',
+      !!soloOut && soloOut.childNull === true, { out: soloOut });
+
+    fs.rmSync(soloDir, { recursive: true, force: true });
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {
