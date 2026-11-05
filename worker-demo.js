@@ -748,7 +748,7 @@ const wsState = {
  * кадром, poll — через POST /worker/submit. Дублировать генерацию и
  * расшифровку в двух ветках значило бы получить два slightly разных
  * поведения, которые расходятся ровно в самом редком случае. */
-async function runTask(task) {
+async function runTask(task, via = 'http') {
   let prompt;
   let taskMaxTokens = null;
   /* Отмена, пришедшая до старта: задачу не начинаем. Ответа не будет —
@@ -799,7 +799,16 @@ async function runTask(task) {
     log(`задача ${task.taskId} не расшифрована (${e.message}) — пропускаю`);
     return { ok: false, reason: 'decrypt_failed', taskId: task.taskId };
   }
-  log(`задача ${task.taskId}: «${prompt.slice(0, 60)}»`);
+  /* Транспорт в строке приёма, а не только в строке ответа.
+   * Раньше по логу нельзя было понять, КАК пришла задача: «отдал по ws»
+   * печатается после генерации и говорит о доставке ответа, а не о том,
+   * каким путём получен промпт. Для приёмки «задача идёт через push»
+   * нужен именно момент приёма.
+   *
+   * Метка честная: `ws` — кадр TASK по сокету, `http` — /worker/poll.
+   * Не `p2p`: канал libp2p в этом воркере не участвует, и надпись `p2p`
+   * означала бы транспорт, которого здесь нет. */
+  log(`[${String(via).toUpperCase()}] задача ${task.taskId}: «${prompt.slice(0, 60)}»`);
 
   const started = Date.now();
   const pulse = setInterval(heartbeat, 7000);
@@ -848,7 +857,7 @@ function wsSend(obj) {
 
 function onWsTask(task) {
   wsTaskChain = wsTaskChain.then(async () => {
-    const out = await runTask(task);
+    const out = await runTask(task, 'ws');
     if (!out.ok) {
       /* Отменённую задачу не отчитываем как ошибку: сервер её снял, и
        * ERROR-кадр по ней был бы шумом в его логе. */
@@ -1096,7 +1105,7 @@ async function pollOnce() {
   /* Расшифровка и генерация — в общей runTask: тот же код исполняет задачу,
    * пришедшую кадром по WS. Разные ветки здесь означали бы два поведения,
    * которые расходятся ровно в самом редком случае. */
-  const out = await runTask(task);
+  const out = await runTask(task, 'http');
   if (!out.ok) return;
   const { gen, took } = out;
 

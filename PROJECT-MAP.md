@@ -41,7 +41,7 @@
 | Модуль | Строк | Роль | Статус |
 | :--- | --: | :--- | :--- |
 | `ws-inbound.js` | 601 | Входящий WS для воркеров: Ed25519-хендшейк, nonce, TOFU, кадры `TASK`/`CANCEL` | ✅ работает |
-| `worker-demo.js` | 1417 | Воркер на ПК владельца: опрос/WS, `fetchAbortable`, `askOllama`/`askCloud`, `MAX_EARLY_CANCELS = 200`, `startLinkListener` — ввод кода привязки в окне воркера, `--self-check` | ✅ работает |
+| `worker-demo.js` | 1425 | Воркер на ПК владельца: опрос/WS, `fetchAbortable`, `askOllama`/`askCloud`, `MAX_EARLY_CANCELS = 200`, `startLinkListener` — ввод кода привязки в окне воркера, `--self-check`. С 2.22.1: `runTask(task, via)` печатает `[WS]`/`[HTTP]` в строке приёма — видно транспорт получения, а не только отправки ответа | ✅ работает |
 | `worker-box.js` | 132 | `openFromWorker` / `sealToWorker`: `sessionKey` шифруется на ключ воркера. **Локальная зависимость воркера** — вшивается сборкой, отдельно не качается | ✅ работает |
 | `build-worker.js` | 188 | Сборщик одного файла: `maskComments`, `localRequireNames`, `stripShebang`; `require('./x')` → `__localRequire('x')` | ✅ работает |
 | `dist/tarnet-worker.js` | — | Готовая сборка, её отдаёт `/download/worker.js`. В `.gitignore`; **пересобирается автоматически, если старше `worker-demo.js` / `worker-box.js` / `build-worker.js`**. С 2.21.5: проверка «файл есть» не считалась свежестью — старая сборка жила вечно | 🏗 артефакт |

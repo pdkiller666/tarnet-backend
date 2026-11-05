@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.22.0-p2p-peer-auth",
+  "version": "2.22.1-worker-transport-tag",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {
