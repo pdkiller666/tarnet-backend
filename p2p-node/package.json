@@ -1,0 +1,23 @@
+{
+  "name": "tarnet-p2p-node",
+  "version": "0.1.0-poc",
+  "private": true,
+  "description": "Proof-of-concept libp2p node for TarNet Phase 3. Isolated from backend-api: nothing here is imported by server.js.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@libp2p/identify": "^3.0.0",
+    "@libp2p/kad-dht": "^16.4.9",
+    "@libp2p/noise": "^17.0.7",
+    "@libp2p/ping": "^3.1.17",
+    "@libp2p/tcp": "^11.0.32",
+    "@libp2p/yamux": "^8.0.7",
+    "libp2p": "^3.5.1"
+  }
+}

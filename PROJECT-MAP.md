@@ -44,6 +44,9 @@
 | `p2p-transport.js` | 611 | WS между узлами, `wildcardBind`, `P2P_PUBLIC_URL → P2P_ADVERTISE_IP` | ⚠️ настроен только на `127.0.0.1` |
 | `onion.js` | 289 | Onion Routing: RSA-2048-OAEP-SHA256 оборачивает 32-байтный AES, нагрузка AES-256-GCM | ✅ работает (`hops: 3`) |
 | `p2p-demo.js` | 129 | Демонстрация P2P | демо |
+| `p2p-bridge-client.js` | 140 | Клиент моста к libp2p-узлу: `announce` при старте, голый `net`, не бросает | ✅ работает |
+| `p2p-node/bridge.js` | 290 | Отдельный процесс. Unix-socket `/tmp/tarnet-p2p-bridge.sock` (0600), JSON Lines, `announce`/`status`/`peers`/`ping` | ✅ работает |
+| `p2p-node/index.js` | 96 | PoC libp2p: tcp+noise+yamux+identify, kad-dht `clientMode` | ✅ поднимается, DHT не опрашивает |
 
 **Важно:** воркер держит **исходящее** соединение и не открывает портов, поэтому
 `registry.total: 0` — это корректное состояние, а не поломка.
@@ -204,5 +207,5 @@ SQLite, `/var/lib/tarnet` на проде. 38 таблиц; группы по с
 | `archive/python-app/crypto.py` | `sign_message()` на SHA-256 — хеш-заглушка, **не Ed25519**. Не использовать |
 | `archive/lottery-tests/` | Отозванная механика лотерей |
 | `node_modules/` | Не читать, не грепать при аудите |
-| `../MANIFEST.md` (v3.1), `../MANIFEST.v3.3.md` | Помечены «устарело». Побеждает v3.4-UNIFIED. Лежат **на уровень выше**, в корне workspace, вне этого репозитория |
+| `../archive/MANIFEST.md` (v3.1), `../archive/MANIFEST.v3.3.md` | Помечены «устарело», перенесены в `archive/` 2026-11-05. Побеждает v3.4-UNIFIED. В корне workspace остался только канон |
 | `.model-cache/` | Модели ONNX; на проде отсутствует |

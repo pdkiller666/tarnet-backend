@@ -1,0 +1,242 @@
+/**
+ * TarNet Phase 3 — мост между backend-api/server.js и libp2p-узлом.
+ *
+ * Задача моста одна: дать server.js способ сказать «я здесь, мой адрес
+ * такой» и получить ответ, не втягивая libp2p внутрь backend-api.
+ *
+ * Почему отдельный процесс, а не модуль в server.js:
+ * libp2p тянет 105 МБ зависимостей и несколько event-loop-таймеров. Если
+ * импортировать его в server.js, любая ошибка libp2p при старте уронит
+ * HTTP-сервер, который сейчас обслуживает 1124 проверки и прод. Мост
+ * изолирует это: сервер живёт, даже когда p2p-узла нет вовсе.
+ *
+ * Почему Unix-socket, а не HTTP:
+ * TCP-порт на 127.0.0.1 всё равно виден любому локальному пользователю и
+ * попадает в `ss -ltn`. Unix-socket защищён правами файловой системы —
+ * доступ есть только у того, кто может открыть путь. Для служебного
+ * канала «процесс → процесс» это дешевле и точнее.
+ *
+ * Формат — JSON Lines: одна команда на строку. Не WebSocket: у нас нет
+ * браузера на другом конце, а разбор кадров WS — лишний код, который
+ * сломается первым.
+ *
+ * libp2p ПО УМОЛЧАНИЮ НЕ ПОДНИМАЕТСЯ.
+ * Мост умеет его запустить (`P2P_BRIDGE_LIBP2P=1`), но по умолчанию только
+ * принимает команды и логирует их. Причина: запуск узла открывает порт
+ * 4001 наружу. Это отдельное решение с правкой firewall, и принимать его
+ * молча, из-за деплоя, нельзя.
+ */
+import net from 'node:net'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
+const SOCKET_PATH =
+  process.env.P2P_BRIDGE_SOCKET ||
+  path.join(os.tmpdir(), 'tarnet-p2p-bridge.sock')
+
+/* Запускать ли настоящий libp2p-узел. Выключено по умолчанию — см. шапку. */
+const WANT_LIBP2P = process.env.P2P_BRIDGE_LIBP2P === '1'
+
+/* Кто мы для server.js. Пока у backend-api нет собственного peerId
+ * (в нём нет ни ключа узла, ни таблицы идентичностей), мост отдаёт
+ * свой. Когда появится `P2P_PEER_ID`, значение возьмётся из env и
+ * перекроет это — так server.js сможет объявлять реальный адрес. */
+let node = null
+let peerId = process.env.P2P_PEER_ID || null
+let libp2pState = 'off'
+
+const announced = new Map() // nodeId -> { peerId, at }
+const startedAt = Date.now()
+
+async function startLibp2p() {
+  if (!WANT_LIBP2P) return
+  /* Динамический импорт: без флага libp2p не загружается вообще, и мост
+   * работает на голом node без 105 МБ зависимостей. Это позволяет
+   * прогонять тесты моста на чистой машине. */
+  const { createLibp2p } = await import('libp2p')
+  const { tcp } = await import('@libp2p/tcp')
+  const { noise } = await import('@libp2p/noise')
+  const { yamux } = await import('@libp2p/yamux')
+  const { identify } = await import('@libp2p/identify')
+
+  const port = Number(process.env.P2P_PORT || 4001)
+  const host = process.env.P2P_HOST || '127.0.0.1'
+
+  node = await createLibp2p({
+    addresses: { listen: [`/ip4/${host}/tcp/${port}`] },
+    transports: [tcp()],
+    connectionEncrypters: [noise()],
+    streamMuxers: [yamux()],
+    services: { identify: identify() }
+  })
+  await node.start()
+  peerId = node.peerId.toString()
+  libp2pState = `listening ${host}:${port}`
+  console.log(`[bridge] libp2p поднят: ${peerId}`)
+}
+
+function reply(socket, obj) {
+  socket.write(JSON.stringify(obj) + '\n')
+}
+
+/* Обработчики команд. Каждый возвращает объект ответа.
+ *
+ * Явная карта, а не `switch` внутри обработчика: неизвестное действие
+ * должно получать внятный отказ со списком известных, иначе опечатка в
+ * имени команды выглядит как «мост не отвечает». */
+const handlers = {
+  announce(msg, socket) {
+    const nodeId = msg.nodeId || socket.remoteAddress || 'unknown'
+    const claimed = msg.peerId || peerId || 'unassigned'
+    announced.set(nodeId, { peerId: claimed, at: Date.now() })
+
+    /* Главная строка первого шага: владелец хотел видеть, что команда
+     * дошла. Логируем и узел, и заявленный peerId, и счётчик — по ним
+     * видно, переобъявился ли сервер или это первый старт. */
+    console.log(
+      `[bridge] announce: node=${nodeId} peerId=${claimed} ` +
+      `(всего объявлено: ${announced.size})`
+    )
+    return {
+      ok: true,
+      action: 'announce',
+      peerId: claimed,
+      /* Если server.js не знал своего peerId, он получит наш — и это
+       * единственный способ объявить хоть что-то осмысленное до того,
+       * как у backend-api появится ключ узла. */
+      assigned: !msg.peerId,
+      announced_total: announced.size
+    }
+  },
+
+  status() {
+    return {
+      ok: true,
+      action: 'status',
+      peerId,
+      libp2p: libp2pState,
+      listen: node ? node.getMultiaddrs().map((m) => m.toString()) : [],
+      announced_total: announced.size,
+      uptime_s: Math.round((Date.now() - startedAt) / 1000),
+      socket: SOCKET_PATH
+    }
+  },
+
+  peers() {
+    return {
+      ok: true,
+      action: 'peers',
+      peers: [...announced.entries()].map(([nodeId, v]) => ({
+        nodeId,
+        peerId: v.peerId,
+        age_s: Math.round((Date.now() - v.at) / 1000)
+      }))
+    }
+  },
+
+  ping() {
+    return { ok: true, action: 'ping', pong: true, ts: Date.now() }
+  }
+}
+
+/* Проверка «сокет занят живым процессом».
+ *
+ * Файл сокета переживает SIGKILL. Без этой проверки после падения моста
+ * новый экземпляр упал бы с EADDRINUSE на файле, который некому слушать,
+ * и выглядело бы это как «мост не поднимается» без причины. */
+function socketIsLive(p) {
+  return new Promise((resolve) => {
+    const probe = net.connect(p)
+    const done = (live) => {
+      probe.destroy()
+      resolve(live)
+    }
+    probe.once('connect', () => done(true))
+    probe.once('error', () => done(false))
+    setTimeout(() => done(false), 300)
+  })
+}
+
+async function main() {
+  await startLibp2p()
+
+  if (fs.existsSync(SOCKET_PATH)) {
+    if (await socketIsLive(SOCKET_PATH)) {
+      console.error(`[bridge] на ${SOCKET_PATH} уже слушает живой мост — выходим`)
+      process.exit(2)
+    }
+    fs.unlinkSync(SOCKET_PATH)
+  }
+
+  const server = net.createServer((socket) => {
+    let buf = ''
+    socket.setEncoding('utf8')
+
+    socket.on('data', (chunk) => {
+      buf += chunk
+      /* Режем по \n, а не по таймауту: команда — это строка, и склеивать
+       * половину JSON с началом следующей нельзя. Остаток живёт в buf до
+       * следующего chunk'а. */
+      let idx
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim()
+        buf = buf.slice(idx + 1)
+        if (!line) continue
+
+        let msg
+        try {
+          msg = JSON.parse(line)
+        } catch (e) {
+          reply(socket, { ok: false, error: 'BAD_JSON', detail: e.message })
+          continue
+        }
+
+        const fn = handlers[msg.action]
+        if (!fn) {
+          reply(socket, {
+            ok: false,
+            error: 'UNKNOWN_ACTION',
+            received: msg.action,
+            known: Object.keys(handlers)
+          })
+          continue
+        }
+        try {
+          reply(socket, fn(msg, socket))
+        } catch (e) {
+          reply(socket, { ok: false, error: 'HANDLER_FAILED', detail: e.message })
+        }
+      }
+    })
+
+    /* Ошибку сокета гасим: клиент мог умереть на полуслове, и это не
+     * повод ронять мост, который обслуживает остальных. */
+    socket.on('error', (e) => console.error('[bridge] socket:', e.message))
+  })
+
+  server.listen(SOCKET_PATH, () => {
+    /* Права 0600: канал служебный, читать его посторонним незачем. */
+    try { fs.chmodSync(SOCKET_PATH, 0o600) } catch {}
+    console.log('=== TarNet p2p bridge ===')
+    console.log('Сокет   :', SOCKET_PATH)
+    console.log('Peer ID :', peerId || '(не назначен, выдаётся при announce)')
+    console.log('libp2p  :', libp2pState, WANT_LIBP2P ? '' : '(P2P_BRIDGE_LIBP2P≠1)')
+    console.log('Команды :', Object.keys(handlers).join(', '))
+  })
+
+  const shutdown = async (sig) => {
+    console.log(`\n[bridge] ${sig}, останавливаюсь`)
+    server.close()
+    if (node) await node.stop().catch(() => {})
+    try { fs.unlinkSync(SOCKET_PATH) } catch {}
+    process.exit(0)
+  }
+  process.on('SIGINT', () => shutdown('SIGINT'))
+  process.on('SIGTERM', () => shutdown('SIGTERM'))
+}
+
+main().catch((e) => {
+  console.error('[bridge] старт не удался:', e)
+  process.exit(1)
+})

@@ -32,6 +32,10 @@ const { PIIClassifier } = require('./pii-classifier');
 const benchmarkGate = require('./benchmark-gate');
 const onion = require('./onion');
 const { startDemoMesh, describeMesh } = require('./p2p-demo');
+/* Фаза 3, шаг 1: мост к libp2p-узлу (p2p-node/bridge.js).
+ * Модуль на голом `net` и не бросает: отсутствие моста — штатное состояние,
+ * backend-api не должен зависеть от p2p ни при старте, ни в работе. */
+const p2pBridge = require('./p2p-bridge-client');
 /* Фаза 2: TarNet ID, оффлайн-синхронизация чатов, Knowledge Loop.
  * Спека-источник — v2.2.2 (v2.2.1 отозвана: недетерминированные ключи + wrtc). */
 const tarIdentity = require('./identity');
@@ -9261,6 +9265,20 @@ if (require.main === module) {
     wsInbound.attach(server);
     console.log(`🔌 Worker WS inbound: ws://<host>:${PORT}/p2p/worker (maxPayload ${wsInbound.snapshot().max_payload_bytes} B, ping ${wsInbound.snapshot().ping_interval_ms} ms)`);
     console.log(`🖥️  Web UI: http://localhost:${PORT}/index.html`);
+
+    /* Фаза 3, шаг 1 — объявление p2p-мосту.
+     *
+     * ПОЧЕМУ без await: старт HTTP не должен зависеть от p2p. Если бы
+     * здесь стоял await, при медленном или зависшем мосте сервис
+     * формально запускался бы, но не обслуживал запросы — а systemd
+     * поставил бы `active` и деплой счёл бы раскатку успешной.
+     *
+     * Ошибку гасим в .catch: announceOnStartup не бросает, но
+     * непредвиденная ошибка не должна превращаться в unhandledRejection
+     * на старте. */
+    p2pBridge.announceOnStartup().catch((e) => {
+      console.log(`🌐 p2p bridge: непредвиденная ошибка объявления — ${e.message}`);
+    });
   });
 }
 
