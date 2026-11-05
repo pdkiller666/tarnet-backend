@@ -273,7 +273,9 @@ function summarizeSession(db, sessionId) {
         /^Conversation info:/.test(flat) ||
         flat.length < 25
       if (!noise && s.userAsks.length < 60) {
-        uniqPush(s.userAsks, flat.slice(0, 200), 60)
+        // Не режем здесь: жёсткий slice(0,200) оставлял обрубки вида
+        // «и т.п. п» ещё до форматирования. Границу слова ставит cut().
+        uniqPush(s.userAsks, flat.slice(0, 600), 60)
       }
     } else if (msg.role === 'assistant') {
       s.assistantMessages += 1
@@ -340,6 +342,18 @@ function shortDate(iso) {
   return iso.slice(0, 16).replace('T', ' ')
 }
 
+/**
+ * Обрезка по границе слова. Без неё в канонический документ попадают
+ * обрубки вида «фактическое состояние, пот» — читается как дефект текста.
+ */
+function cut(text, limit) {
+  const s = String(text).replace(/\s+/g, ' ').trim()
+  if (s.length <= limit) return s
+  const head = s.slice(0, limit)
+  const sp = head.lastIndexOf(' ')
+  return (sp > limit * 0.6 ? head.slice(0, sp) : head).replace(/[,;:\-–—]$/, '') + '…'
+}
+
 function linesFor(s) {
   const out = []
   const fork = s.forkOf
@@ -354,10 +368,10 @@ function linesFor(s) {
       fork
   )
   if (s.userAsks.length) {
-    out.push(`- Запросы: ${s.userAsks.slice(0, 2).map((a) => a.slice(0, 110)).join(' ⏐ ')}`)
+    out.push(`- Запросы: ${s.userAsks.slice(0, 2).map((a) => cut(a, 110)).join(' ⏐ ')}`)
   }
   if (s.decisions.length) {
-    out.push(`- Решения: ${s.decisions.slice(0, 3).map((d) => d.slice(0, 110)).join(' ⏐ ')}`)
+    out.push(`- Решения: ${s.decisions.slice(0, 3).map((d) => cut(d, 110)).join(' ⏐ ')}`)
   }
   const art = []
   if (s.commits.length) art.push('коммиты ' + s.commits.slice(0, 4).join(', '))
@@ -365,7 +379,7 @@ function linesFor(s) {
   if (s.testCounts.length) art.push('тесты ' + s.testCounts.join(' '))
   if (art.length) out.push(`- Артефакты: ${art.join('; ')}`)
   if (s.failures.length) {
-    out.push(`- Провалы: ${s.failures.slice(0, 2).map((f) => f.slice(0, 100)).join(' ⏐ ')}`)
+    out.push(`- Провалы: ${s.failures.slice(0, 2).map((f) => cut(f, 100)).join(' ⏐ ')}`)
   }
   return out
 }
