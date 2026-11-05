@@ -123,6 +123,7 @@
 | `tarnet-guard.sh` | Сторож сервиса | — |
 | `tarnet-supervisor.sh` | Супервизор | — |
 | `tarnet-tunnel*.sh` | Cloudflare-туннель | Эфемерный URL |
+| `extract-session-summary.js` | **Выжимка сессии перед удалением** (только чтение): запросы, решения, коммиты, версии, тесты, провалы; определяет форк | `--top N`, `--session <id>`, `--status failed`, `--json`, `--markdown`. Ничего не удаляет |
 
 ---
 
