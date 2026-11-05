@@ -160,6 +160,7 @@ GitHub:    pdkiller666/... (креды в ~/.openclaw/credentials/github/...)
 | 24.10 | 312 МБ, 97% | Удалён ONNX-стек 811 МБ (не используется), `journalctl --vacuum-time=3d` |
 | 05.11 | 208 МБ, 98% | Деплой 2.19.2 + проверка |
 | 05.11 (после чистки) | **733 МБ, 93%** | `incremental_vacuum` + `wal_checkpoint(TRUNCATE)`: база 884 → 622 МБ, `freelist` 0, WAL 4.3 МБ |
+| 05.11 (вечер) | **695 МБ, 93%** | `/tmp` (29 МБ), старые логи; база 624 МБ. Удаление сессий не помогает — нужен `incremental_vacuum` |
 
 **Что реально занимает (замер 05.11 11:24):** `openclaw-agent.sqlite` **622 МБ** + WAL 4.3 МБ; внутри неё необработанного текста `transcript_events` **332 МБ** — `done` 217.3 МБ / 469 сессий, `running` 104.8 МБ / 6 сессий, `failed` **6.8 МБ** / 15 сессий, `null` 2.6 МБ, `timeout` 0.5 МБ. Workspace 156 МБ.
 
@@ -236,7 +237,7 @@ GitHub:    pdkiller666/... (креды в ~/.openclaw/credentials/github/...)
 1. **Тест привязки ПК ↔ Браузер** — владелец запускает `worker-demo.js`, проходит Device Linking, проверяет Earn→Spend. Ждём.
 2. **`totalUtilizedTar` = 0.000012** — механизм жив, объём мизерный. Нужен живой пользовательский поток, не код.
 3. **Воркер постоянно** — сейчас `active_workers: 0`. Нужен ПК, который держат включённым, либо отдельный воркер-VPS.
-4. **P2P Discovery** — `p2p-bridge.service` на проде **работает**: `active`, `enabled`, `NRestarts=0`, порт 4001 слушает, `peerId 12D3KooWRjbDE4rzafznjsd4aDu3S4Z1exHcPKSw2MeH4WcVEZpy` постоянный (`/var/lib/tarnet/p2p/peer-id.bin`). **Не закрыто другое — discovery:** `clientMode`, запросов в Kademlia DHT 0, `peers: 1` = сам `server.js`. Один узел сети не создаёт. Следующий шаг: `GET /p2p/bootstrap` на `server.js` + клиентский libp2p-узел в `worker-demo.js`, чтобы ПК владельца нашёл VPS через DHT, а не через центральный `/worker/poll`.
+4. ~~**P2P Discovery**~~ — **СДЕЛАНО 2026-11-05 (`2.21.0-p2p-bootstrap`).** `GET /p2p/bootstrap` отдаёт `multiaddrs` из живого `status.listen` моста; `p2p-node/p2p-worker.js` читает адрес, поднимает узел на `/ip4/127.0.0.1/tcp/0`, делает `dial` и держит соединение с ретраем 15с. Приёмка пройдена: `connections: 1` и peerId воркера в `connected_peers` с обеих сторон, после остановки воркера снова `0`. Не сделано: в `worker-demo.js` клиентского libp2p пока нет — демо ходит через `/worker/poll`.
 5. **NER (ФИО, адреса)** — Фаза 3, отдельный сервис.
 6. **On-chain** — ждёт выбора сети.
 7. **Комитет валидаторов** — упирается в деньги (50 TAR стейк).
