@@ -5448,9 +5448,23 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     ok('31.11 в тексте ошибки нет rem вместо echo',
       strayRem.length === 0, { rems: strayRem.length });
 
-    /* Без адреса установщик отдавать нельзя: воркер создаст свой кошелёк. */
+    /* 2.21.4: установщик БЕЗ адреса — это теперь норма, а не ошибка.
+     *
+     * Старый тест ждал 400 и был правдой для схемы «один адрес на все
+     * устройства». Но именно эта схема и ломала привязку: ПК получал адрес
+     * браузера, и погашение кода отвечало SAME_ADDRESS. Поэтому проверка
+     * перевёрнута не для того, чтобы тест стал зелёным, а потому что
+     * изменилось требование. */
     const noAddr = await apiAt(BASE, '/install/install.bat');
-    ok('31.12 без адреса → 400, файл не отдаётся', noAddr.status === 400, noAddr.status);
+    const noAddrText = typeof noAddr.body === 'string' ? noAddr.body : '';
+    ok('31.12 без адреса → 200, адрес создаст сам воркер',
+      noAddr.status === 200 && noAddrText.length > 1000 && !noAddrText.includes('__TARNET_ADDR__'),
+      { status: noAddr.status, bytes: noAddrText.length });
+
+    /* Мусор вместо адреса по-прежнему отвергается: опечатка молча увела бы
+     * работу в чужой баланс — это остаётся настоящей ошибкой. */
+    const badAddr = await apiAt(BASE, '/install/install.bat?addr=0xZZZ');
+    ok('31.12b битый адрес → 400', badAddr.status === 400, badAddr.status);
 
     /* macOS: .command остаётся LF — там CRLF сломал бы shebang. */
     const sh = await apiAt(BASE, `/install/install.command?addr=${ADDR31}`);
@@ -5535,11 +5549,15 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     /* Проверки на пустоту и формат обязаны ОСТАТЬСЯ: без них файл, отредакти-
      * рованный руками, молча создаст новый кошелёк и работа уйдёт в чужой
      * баланс. Убрать блок целиком было бы лечением хуже болезни. */
-    ok('31.20 проверки на пустоту и формат 0x/длина сохранены',
-      batText.includes('if "%ADDR%"=="" goto fail_addr')
+    /* Смысл проверки сохранён, изменился только её первый шаг (2.21.4):
+     * пустой адрес теперь ЗАКОНЕН и ведёт на :addr_ok, а не в ошибку.
+     * Проверки формата на месте и по-прежнему ведут в fail_addr: именно
+     * они ловят опечатку, которая молча увела бы работу в чужой баланс. */
+    ok('31.20 пусто → addr_ok, а формат 0x/длина → fail_addr',
+      batText.includes('if "%ADDR%"=="" goto addr_ok')
       && batText.includes('if not "%ADDR:~0,2%"=="0x" goto fail_addr')
       && batText.includes('if not "%ADDR:~42,1%"=="" goto fail_addr'),
-      { empty: batText.includes('if "%ADDR%"=="" goto fail_addr'),
+      { emptyGoesOk: batText.includes('if "%ADDR%"=="" goto addr_ok'),
         prefix: batText.includes(':~0,2%'),
         len: batText.includes('if not "%ADDR:~42,1%"=="" goto fail_addr') });
 

@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.21.3-fix-installer-p0",
+  "version": "2.21.4-ux-same-address",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

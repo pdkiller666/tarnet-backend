@@ -25,29 +25,33 @@ set "NODEV=v22.11.0"
 set "TARNET_DIR=%LOCALAPPDATA%\TarNet"
 set "SKIP_MODEL=0"
 
-rem ---------- validate worker address ----------
-rem The server injects the address at download time and answers HTTP 400
-rem when it is missing or malformed, so a downloaded file always carries a
-rem real address. An empty value here means the file was edited or truncated.
-rem Such a worker would generate its OWN wallet and the work would go to a
-rem different balance, so refuse to run.
+rem ---------- worker address (optional since 2.21.4) ----------
+rem The installer MUST NOT carry the browser wallet any more. A PC with the
+rem owner's address answers SAME_ADDRESS when the 6-digit code is claimed,
+rem because the server refuses owner == device. So the normal case is an
+rem EMPTY address here: the worker creates its own wallet on first run and
+rem the owner links that wallet with a 6-digit code from the PWA.
+rem
+rem An address is still accepted when present (old links, manual use), and
+rem then it must be valid: a typo would silently send work to a different
+rem balance. That is why the format checks below stay.
 rem
 rem NEVER compare ADDR against the server placeholder token. The server
 rem replaces EVERY occurrence of that token, including the copy inside the
 rem guard, so the guard ends up comparing the address with itself: it is
-rem always true and the installer dies on start for every user. The empty
-rem and length checks below are enough, because the server already rejects
-rem a bad address before anyone can download the file.
-if "%ADDR%"=="" goto fail_addr
+rem always true and the installer dies on start for every user.
+if "%ADDR%"=="" goto addr_ok
 if not "%ADDR:~0,2%"=="0x" goto fail_addr
 rem 0x + 40 hex chars = 42 characters total.
 if not "%ADDR:~42,1%"=="" goto fail_addr
 if "%ADDR:~41,1%"=="" goto fail_addr
+:addr_ok
 
 echo ============================================
 echo   TarNet Worker - installation
 echo ============================================
 echo   wallet: %ADDR%
+if "%ADDR%"=="" echo   wallet: will be created on first run, then link it by code
 echo   server: %API%
 echo   folder: %TARNET_DIR%
 echo ============================================

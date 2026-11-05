@@ -30,6 +30,7 @@ import { yamux } from '@libp2p/yamux'
 import { identify } from '@libp2p/identify'
 import { ping } from '@libp2p/ping'
 import { multiaddr } from '@multiformats/multiaddr'
+import { serveTaskStream, TASK_PROTOCOL } from './task-protocol.js'
 
 const BOOTSTRAP_BASE = (
   process.env.TARNET_PUBLIC_URL || 'https://v1107336.hosted-by-vdsina.com'
@@ -116,6 +117,49 @@ async function startNode() {
   return node
 }
 
+/* Поток задач к мосту.
+ *
+ * Инициирует его ВОРКЕР, а не мост. Причина не в удобстве: наш узел слушает
+ * /ip4/127.0.0.1/tcp/0 — случайный порт на loopback, которого мост не знает.
+ * Проверено запуском: попытка моста открыть поток даёт «no valid addresses
+ * for peer». Поэтому воркер звонит первым и держит поток.
+ *
+ * Ссылка на открытый поток — не для красоты: без неё цикл счёл бы «соединение
+ * есть» за «задачи доходят» и не переоткрыл бы поток после обрыва. */
+let taskStreamPeer = null
+let lastBridgeMa = null
+
+async function handleTask(msg) {
+  if (msg && msg.action === 'ping') {
+    return { ok: true, action: 'ping', pong: true, via: 'p2p', ts: Date.now() }
+  }
+  /* Неизвестная задача — внятный отказ, а не тишина: молчание мост
+   * истолкует как таймаут и будет искать проблему в сети, а не в имени. */
+  return { ok: false, error: 'UNKNOWN_TASK', received: msg && msg.action }
+}
+
+async function openTaskStream(node, ma) {
+  if (taskStreamPeer) return true
+  try {
+    const stream = await node.dialProtocol(ma, TASK_PROTOCOL)
+    taskStreamPeer = ma.toString()
+    log(`поток задач открыт: ${TASK_PROTOCOL}`)
+
+    /* Обслуживаем в фоне: основной цикл продолжает следить за соединением.
+     * Ждать здесь значило бы не логировать живость, пока поток открыт. */
+    serveTaskStream(stream, handleTask, { log: (m) => log(m) })
+      .then(() => {
+        taskStreamPeer = null
+        log('поток задач закрыт')
+      })
+      .catch(() => { taskStreamPeer = null })
+    return true
+  } catch (e) {
+    log(`поток задач не открылся: ${e.message}`)
+    return false
+  }
+}
+
 async function main() {
   log(`bootstrap: ${BOOTSTRAP_BASE}/p2p/bootstrap`)
 
@@ -162,6 +206,11 @@ async function main() {
         for (const c of conns) {
           log(`  → ${c.remotePeer.toString()} (${c.remoteAddr.toString()})`)
         }
+
+        /* Соединение есть — открываем поток задач. Это и делает транспорт
+         * пригодным для маршрутизации: без потока задача ушла бы по HTTP. */
+        lastBridgeMa = ma
+        await openTaskStream(node, ma)
         return true
       } catch (e) {
         lastErr = e
@@ -194,6 +243,13 @@ async function main() {
     const conns = node.getConnections()
     if (conns.length > 0) {
       log(`жив: соединений ${conns.length}`)
+      /* Соединение живо, но поток мог закрыться (мост перезапустился).
+       * Без этой ветки задачи пропали бы навсегда при живом соединении:
+       * снаружи это «воркер на связи», а задач он не получает. */
+      if (!taskStreamPeer && lastBridgeMa) {
+        log('поток задач отсутствует — открываю заново')
+        await openTaskStream(node, lastBridgeMa)
+      }
       return
     }
     log('соединений нет — переподключаюсь')

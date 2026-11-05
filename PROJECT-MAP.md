@@ -49,10 +49,12 @@
 | `onion.js` | 289 | Onion Routing: RSA-2048-OAEP-SHA256 оборачивает 32-байтный AES, нагрузка AES-256-GCM | ✅ работает (`hops: 3`) |
 | `p2p-demo.js` | 129 | Демонстрация P2P | демо |
 | `p2p-bridge-client.js` | 140 | Клиент моста к libp2p-узлу: `announce` при старте, голый `net`, не бросает; `startAnnounceLoop` — повтор каждые 60 с | ✅ работает на проде |
-| `p2p-node/bridge.js` | 329 | Отдельный процесс. Unix-socket `/tmp/tarnet-p2p-bridge.sock` (0600), JSON Lines, `announce`/`status`/`peers`/`ping` | ✅ работает на проде (`p2p-bridge.service`) |
+| `p2p-node/bridge.js` | 399 | Отдельный процесс. Unix-socket `/tmp/tarnet-p2p-bridge.sock` (0600), JSON Lines, `announce`/`status`/`peers`/`ping`/`task`. С 2.21.4 принимает поток `/tarnet/task/1.0.0` от воркеров | ✅ работает на проде (`p2p-bridge.service`) |
+| `p2p-node/task-protocol.js` | 170 | Кадры задачи поверх libp2p-потока: один JSON на строку, `createTaskClient` (мост) / `serveTaskStream` (воркер). Без `stream.source`/`sink` — в libp2p 3.5.1 поток итерируется сам, запись через `stream.send` + ожидание `drain` своим `waitEvent` (без пакета `p-event`: тот приходил транзитивно и исчез бы при обновлении libp2p) | ✅ ping→pong за 1–2 мс |
 | `p2p-node/peer-id-store.js` | 81 | Генерация/чтение ключа узла: `/var/lib/tarnet/p2p/peer-id.bin`, права `0600` | ✅ `peerId` стабилен между рестартами |
-| `p2p-node/p2p-worker.js` | 207 | Воркер-клиент: bootstrap → `dial` → удержание соединения | ESM |
+| `p2p-node/p2p-worker.js` | 263 | Воркер-клиент: bootstrap → `dial` → удержание соединения → **открывает поток задач сам**. Направление обязательно: узел слушает loopback на случайном порту, и `dial` моста даёт «no valid addresses for peer» | ESM |
 | `p2p-node/index.js` | 96 | PoC libp2p: tcp+noise+yamux+identify, kad-dht `clientMode` | ✅ поднимается, DHT не опрашивает |
+| `scripts/archive-transcripts.js` | 225 | Архивация транскриптов агента: gzip → проверка обратным чтением → `DELETE` партиями → `incremental_vacuum`. По умолчанию сухой прогон | ✅ 13431 строка → 9 МБ архива, база 628→605 МБ |
 
 **Важно:** воркер держит **исходящее** соединение и не открывает портов, поэтому
 `registry.total: 0` — это корректное состояние, а не поломка.

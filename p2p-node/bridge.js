@@ -33,6 +33,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadOrCreatePeerId, keyFilePath } from './peer-id-store.js'
 import { resolvePublicAddrs, listenMismatch } from './public-addr.js'
+import { createTaskClient, TASK_PROTOCOL } from './task-protocol.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
@@ -70,6 +71,16 @@ let announceNote = null
 
 const announced = new Map() // nodeId -> { peerId, at }
 const startedAt = Date.now()
+
+/* Каналы задач от воркеров.
+ *
+ * Инициирует их ВОРКЕР, а не мост: воркер слушает loopback на случайном
+ * порту, поэтому у моста нет адреса, по которому до него дозвониться
+ * (проверено запуском: dial даёт «no valid addresses for peer»). Один поток
+ * на воркер, обмен в обе стороны — так задача доходит без второго канала. */
+const taskClient = createTaskClient({
+  log: (m) => console.log(`[bridge] ${m}`)
+})
 
 async function startLibp2p() {
   if (!WANT_LIBP2P) return
@@ -119,6 +130,14 @@ async function startLibp2p() {
   await node.start()
   peerId = node.peerId.toString()
   libp2pState = `listening ${host}:${port}`
+
+  /* Приём потока задач. Регистрируется сразу после старта узла и до
+   * печати адреса: воркер, подключившийся по bootstrap, иначе открыл бы
+   * поток в протокол, который ещё никем не обслуживается. */
+  await node.handle(TASK_PROTOCOL, (stream, connection) => {
+    taskClient.attach(stream, connection?.remotePeer?.toString() ?? 'unknown')
+  })
+  console.log(`[bridge] приём задач: ${TASK_PROTOCOL}`)
   publicAddrs = publicIn.addrs
   announceNote = publicIn.note || listenMismatch(host, publicIn.addrs)
   console.log(
@@ -221,6 +240,52 @@ const handlers = {
 
   ping() {
     return { ok: true, action: 'ping', pong: true, ts: Date.now() }
+  },
+
+  /* Задача ВОРКЕРУ по libp2p — не путать с `ping` выше.
+   *
+   * `ping` отвечает сам мост: он доказывает, что сокет жив. Эта команда
+   * уходит по сети в воркер и доказывает, что работает транспорт. Два
+   * разных факта с похожими именами, поэтому `via` в ответе обязателен:
+   * по нему видно, что pong пришёл из сети, а не от моста. */
+  async task(msg) {
+    const payload = msg.payload && typeof msg.payload === 'object'
+      ? msg.payload
+      : { action: 'ping' }
+    const channels = taskClient.count()
+    if (channels === 0) {
+      /* Отказ, а не пустой ok: «воркеров нет» и «воркер ответил» — разные
+       * факты, и склеивать их в один ответ значит врать в отчёте. */
+      return {
+        ok: false,
+        action: 'task',
+        error: 'NO_TASK_CHANNEL',
+        detail: 'ни один воркер не открыл поток задач',
+        channels
+      }
+    }
+    const started = Date.now()
+    try {
+      const replyFromWorker = await taskClient.send(payload, {
+        timeoutMs: Math.min(Number(msg.timeoutMs) || 3000, 15000)
+      })
+      return {
+        ok: true,
+        action: 'task',
+        via: 'p2p',
+        channels,
+        rtt_ms: Date.now() - started,
+        result: replyFromWorker
+      }
+    } catch (e) {
+      return {
+        ok: false,
+        action: 'task',
+        error: e.message,
+        channels,
+        elapsed_ms: Date.now() - started
+      }
+    }
   }
 }
 
@@ -257,7 +322,7 @@ async function main() {
     let buf = ''
     socket.setEncoding('utf8')
 
-    socket.on('data', (chunk) => {
+    socket.on('data', async (chunk) => {
       buf += chunk
       /* Режем по \n, а не по таймауту: команда — это строка, и склеивать
        * половину JSON с началом следующей нельзя. Остаток живёт в buf до
@@ -286,8 +351,13 @@ async function main() {
           })
           continue
         }
+        /* Обработчик может быть async — и тогда его результат Promise.
+         * `reply(socket, fn(...))` на Promise даёт {} (JSON.stringify
+         * не видит полей), и вызывающий получает пустой объект вместо
+         * ответа. Ошибка была тихой: exit 0, пустой payload. Поэтому
+         * результат сначала ожидаем, потом пишем. */
         try {
-          reply(socket, fn(msg, socket))
+          reply(socket, await fn(msg, socket))
         } catch (e) {
           reply(socket, { ok: false, error: 'HANDLER_FAILED', detail: e.message })
         }

@@ -2125,11 +2125,46 @@ async function refreshLinks() {
   try {
     const r = await call(`/devices/${ADDR}`);
     box.textContent = '';
+
+    /* SAME_ADDRESS как УСПЕХ, а не ошибка (2.21.4).
+     *
+     * Сценарий: установщик старой версии вшивал адрес браузера, ПК работал
+     * на том же кошельке, что и аккаунт. При погашении кода сервер отвечает
+     * 400 SAME_ADDRESS (`owner === device` отклоняется намеренно), и человек
+     * видел красную ошибку там, где на самом деле всё в порядке: работа
+     * этого ПК уже идёт в его аккаунт.
+     *
+     * Прямого ответа SAME_ADDRESS здесь не будет: код гасит ВОРКЕР, а не
+     * PWA. Поэтому смотрим на тот же факт с другой стороны — есть ли в сети
+     * воркер с адресом этого аккаунта. Это и есть состояние «привязка не
+     * нужна», видимое без единого запроса на привязку. */
+    let sameAddress = false;
+    try {
+      const ws = await call('/worker/status');
+      const workers = Array.isArray(ws.workers) ? ws.workers : [];
+      sameAddress = workers.some(
+        (w) => String(w.workerAddress || '').toLowerCase() === ADDR.toLowerCase()
+      );
+    } catch (_e) {
+      /* Список воркеров не критичен: не смогли проверить — молчим о
+       * состоянии, а не выдумываем его. */
+    }
+
     if (!r.count) {
-      if (st) st.textContent = 'привязанных ПК нет';
+      if (st) {
+        /* Зелёный цвет — не украшение: по нему отличают успех от отказа
+         * без чтения текста. Класс из тех же переменных, что у баннера. */
+        st.className = sameAddress ? 'mono dim tiny addr-line text-ok' : 'mono dim tiny addr-line';
+        st.textContent = sameAddress
+          ? '✅ Этот ПК уже использует ваш аккаунт. Привязка не требуется, баланс будет поступать сюда.'
+          : 'привязанных ПК нет';
+      }
       return;
     }
-    if (st) st.textContent = `привязано ПК: ${r.count}`;
+    if (st) {
+      st.className = 'mono dim tiny addr-line';
+      st.textContent = `привязано ПК: ${r.count}`;
+    }
     r.devices.forEach((d) => box.appendChild(linkRow(d)));
   } catch (e) {
     if (st) st.textContent = e.code === 'RATE_LIMIT' ? e.message : `не смог прочитать список: ${e.message}`;
@@ -2475,19 +2510,27 @@ function renderWorkerHelp() {
    * продовом домене, и на туннеле, и на localhost — без правки руками. */
   const api = location.origin;
 
-  /* Установщики в один клик. Адрес подставляется на сервере, поэтому
-   * строим ссылки здесь: до появления ADDR подставлять было бы нечего.
-   * encodeURIComponent обязателен — адрес уходит в query-параметр. */
-  const q = `?addr=${encodeURIComponent(ADDR)}`;
+  /* Установщики в один клик. АДРЕС БОЛЬШЕ НЕ ПЕРЕДАЁТСЯ (2.21.4).
+   *
+   * Раньше здесь стоял `?addr=${ADDR}`, и сервер вшивал адрес браузера в
+   * WORKER_ADDRESS. Итог: ПК работал на том же кошельке, что и аккаунт, а
+   * погашение кода отвечало SAME_ADDRESS — то есть основной сценарий
+   * привязки ломался собственным установщиком.
+   *
+   * Теперь воркер при первом запуске создаёт СВОЙ кошелёк, а владелец
+   * привязывает его шестизначным кодом из блока выше. Установщику адрес не
+   * нужен вовсе. */
   const dlWin = $('dlWin');
-  if (dlWin) dlWin.href = `/install/install.bat${q}`;
+  if (dlWin) dlWin.href = '/install/install.bat';
   const dlMac = $('dlMac');
-  if (dlMac) dlMac.href = `/install/install.command${q}`;
+  if (dlMac) dlMac.href = '/install/install.command';
 
+  /* Ручной запуск без WORKER_ADDRESS — это теперь норма, а не бедный
+   * запасной путь: адрес создаст сам воркер. Оставлять в команде
+   * `WORKER_ADDRESS=${ADDR}` значило бы вернуть ту же ошибку руками. */
   const posix = $('runCmdPosix');
   if (posix) {
     posix.textContent =
-      `WORKER_ADDRESS=${ADDR} \\\n` +
       `TARNET_API_URL=${api} \\\n` +
       `node tarnet-worker.js`;
   }
@@ -2495,7 +2538,6 @@ function renderWorkerHelp() {
   const win = $('runCmdWin');
   if (win) {
     win.textContent =
-      `set WORKER_ADDRESS=${ADDR}\n` +
       `set TARNET_API_URL=${api}\n` +
       `node tarnet-worker.js`;
   }
