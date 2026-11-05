@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.22.2-ux-copy-and-p2p-route",
+  "version": "2.22.3-p2p-e2e-proof",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

@@ -42,7 +42,7 @@
 | :--- | --: | :--- | :--- |
 | `ws-inbound.js` | 601 | Входящий WS для воркеров: Ed25519-хендшейк, nonce, TOFU, кадры `TASK`/`CANCEL` | ✅ работает |
 | `worker-demo.js` | 1569 | Воркер на ПК владельца: опрос/WS, `fetchAbortable`, `askOllama`/`askCloud`, `MAX_EARLY_CANCELS = 200`, `startLinkListener` — ввод кода привязки в окне воркера, `--self-check`. С 2.22.1: `runTask(task, via)` печатает `[WS]`/`[HTTP]` в строке приёма — видно транспорт получения, а не только отправки ответа. С 2.22.2: `startP2pExecutor()` — локальный вход `127.0.0.1` с токеном для p2p-процесса (libp2p в сборку не влезает) | ✅ работает |
-| `p2p-node/p2p-worker.js` | 392 | Воркер-клиент: bootstrap → `dial` → удержание соединения, поток `TASK_PROTOCOL`. С 2.22.2: `handleTask` принимает кадр `task` и проксирует его локальному исполнителю через `~/.tarnet/p2p-exec.json`, печатает `[p2p-worker] задача … → локальный исполнитель` | ⚠️ транспорт есть, сквозной проход не проверен |
+| `p2p-node/p2p-worker.js` | 392 | Воркер-клиент: bootstrap → `dial` → удержание соединения, поток `TASK_PROTOCOL`. С 2.22.2: `handleTask` принимает кадр `task` и проксирует его локальному исполнителю через `~/.tarnet/p2p-exec.json`, печатает `[p2p-worker] задача … → локальный исполнитель` | ✅ сквозной проход доказан `scripts/test-p2p-e2e.js` (`via:p2p`) |
 | `p2p-bridge-client.js` | 193 | Клиент моста для server.js без зависимостей. `send`, `announceOnStartup`, `startAnnounceLoop`, `nodeIdentity`. С 2.22.2: `task(payload)` — задача воркеру через мост | ✅ работает |
 | `worker-box.js` | 132 | `openFromWorker` / `sealToWorker`: `sessionKey` шифруется на ключ воркера. **Локальная зависимость воркера** — вшивается сборкой, отдельно не качается | ✅ работает |
 | `build-worker.js` | 188 | Сборщик одного файла: `maskComments`, `localRequireNames`, `stripShebang`; `require('./x')` → `__localRequire('x')` | ✅ работает |
@@ -125,6 +125,7 @@
 | :--- | :--- | :--- |
 | `deploy.sh` | **Коммит + пуш + раскатка.** `--dry-run` НЕТ | Аргумент с `-` отклоняется (`EXIT=2`); повторный `/health` перед откатом |
 | `verify.sh` | Гоняет три набора + сверяет `/config` с `config.js` | Основной вход приёмки |
+| `test-p2p-e2e.js` | **Сквозной P2P** (`2.22.3`): поднимает мост + `p2p-worker.js` + исполнитель во временном `HOME`, ждёт `via:'p2p'` | Свой сокет/порт/bootstrap-заглушка — боевой мост не трогает; проверен loopback, не боевая топология |
 | `backup-tarnet-s3.sh` | Бэкап в S3 | — |
 | `make-icons.js` | Иконки PWA | — |
 | `push-tag.js` | Тег | — |
