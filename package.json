@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.19.1-swarm-synthesis",
+  "version": "2.19.2-p0-p1-security",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

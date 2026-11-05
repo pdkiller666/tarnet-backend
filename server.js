@@ -504,6 +504,14 @@ ensureColumn('worker_tasks', 'requeues', 'requeues INTEGER DEFAULT 0');
  * Одно поле кода на живом ПК оказалось достаточно, чтобы человек пошёл
  * искать причину руками, хотя она была в теле ответа Ollama. */
 ensureColumn('worker_tasks', 'errorDetail', 'errorDetail TEXT');
+/* Потолок генерации, который сервер назвал воркеру ВМЕСТЕ с задачей.
+ *
+ * Хранится отдельной колонкой, потому что до 2.19.2 его знал только воркер:
+ * maxTokens ехал внутри зашифрованного тела задачи, а строка `worker_tasks`
+ * его не помнила. На приёме результата сверить было не с чем, и воркер мог
+ * объявить любое число `usage.completion_tokens` — от него напрямую
+ * считается награда. Потолок, который некому проверить, — не потолок. */
+ensureColumn('worker_tasks', 'maxTokens', 'maxTokens INTEGER');
 
 /* ===== Миграция: burn-строки без fromAddress =====
  *
@@ -1885,21 +1893,30 @@ function reserveTier6Fee(receiptId, clientAddress, amountTar, ttlMs) {
 
 /* ===== Tier 6: цепочка плательщиков =====
  *
- * Комиссию платит тот, у кого есть свободный остаток: сначала само
- * устройство, затем владелец аккаунта из `device_links`. Почему так, а не
- * «всегда владелец»: устройство — это ПК со своим кошельком, и пока на нём
- * есть заработок, тратить его логичнее, чем деньги аккаунта.
+ * 2.19.2 (аудит Manus, P0): владелец из `device_links` БОЛЬШЕ НЕ ПЛАТИТ.
  *
- * ПОЧЕМУ НЕ ЛЮБОЙ АДРЕС: владелец берётся ТОЛЬКО из существующей привязки.
- * Иначе поле clientAddress стало бы способом списать с чужого кошелька —
- * достаточно было бы вписать чужой адрес в запрос.
+ * Что было. Комиссию списывал первый, у кого есть свободный остаток:
+ * устройство, затем владелец аккаунта из `device_links`. Это означало, что
+ * подпись владельца нужна один раз — при привязке ПК, — а дальше устройство
+ * тратит баланс владельца на КАЖДЫЙ запрос Tier 6 без его участия. Привязка
+ * превращалась в постоянный мандат на чужие деньги, хотя в интерфейсе она
+ * выглядела как «мой ПК в списке».
  *
- * Порядок владельцев — по дате привязки: при нескольких привязках одного
- * устройства выбор не должен зависеть от порядка строк в индексе, иначе
- * один и тот же запрос уходил бы то с одного кошелька, то с другого. */
+ * Что стало. Платит только сам вызвавший адрес. Нет средств — 402
+ * INSUFFICIENT_FUNDS с адресом faucet'а. Fallback на владельца вернётся
+ * только вместе с подписанными mandate: владелец заранее подписывает
+ * лимит/срок/получателя, и сервер проверяет эту подпись на каждом списании,
+ * а не на одном шаге привязки. До тех пор флага нет — включение обратно
+ * одним `true` было бы той же дырой.
+ *
+ * ПОЧЕМУ НЕ ЛЮБОЙ АДРЕС: даже с отключённым fallback список владельцев
+ * составляется только из существующей привязки, а не из тела запроса. */
+const TIER6_OWNER_FALLBACK_ENABLED = false;
+
 function tier6PayerChain(deviceAddress) {
   const raw = String(deviceAddress || '').trim();
   if (!raw) return [];
+  if (!TIER6_OWNER_FALLBACK_ENABLED) return [raw];
   const deviceKey = raw.toLowerCase();
   const owners = all(
     `SELECT ownerAddress FROM device_links
@@ -6598,11 +6615,18 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
     prompt,
     maxTokens: Number(maxTokens) > 0 ? Math.trunc(Number(maxTokens)) : CONFIG.MAX_TOKENS_PER_TASK,
   });
+  /* Тот же потолок кладём в строку: на приёме результата его надо СВЕРИТЬ с
+   * заявленными токенами. Одно число на задачу — один источник истины;
+   * пересчёт по зашифрованному телу на приёме потребовал бы ключа сессии,
+   * которого к тому моменту может уже не быть (он удаляется при чтении). */
+  const taskMaxTokens = Number(maxTokens) > 0
+    ? Math.trunc(Number(maxTokens))
+    : CONFIG.MAX_TOKENS_PER_TASK;
   run(
-    `INSERT INTO worker_tasks (taskId, encryptedPayload, model, tier, status, createdAt, expiresAt, intendedWorker)
-     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
+    `INSERT INTO worker_tasks (taskId, encryptedPayload, model, tier, status, createdAt, expiresAt, intendedWorker, maxTokens)
+     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
     [taskId, encryptWithKey(taskBody, sessionKey), model || null, tier || null, now, now + WORKER_TASK_TTL_MS,
-      workerAddress ? String(workerAddress).toLowerCase() : null],
+      workerAddress ? String(workerAddress).toLowerCase() : null, taskMaxTokens],
   );
 
   /* Коллбек отдаёт taskId СРАЗУ после INSERT, а не в resolve. Private Swarm
@@ -7228,7 +7252,34 @@ function ingestWorkerResult(body) {
     storedResponse = encryptedResponse;
   }
 
-  const tokens = Math.max(1, Math.floor(Number(body.usage?.completion_tokens || body.tokensGenerated) || 0));
+  /* ===== Потолок токенов (2.19.2, аудит Manus P1) =====
+   *
+   * ДО этой правки число токенов сервер брал с потолка воркера: `usage`
+   * приходил в теле ответа, и `Math.max(1, ...)` принимал любое значение.
+   * От этого числа напрямую считается награда (`recordWork`), поэтому воркер
+   * мог заявить 10^9 токенов на задачу, которую сервер ограничил 512. Подпись
+   * результата это не ловит: подпись подтверждает, что число объявил именно
+   * этот воркер, а не что число правдоподобно.
+   *
+   * Теперь сверху лежит потолок, который сервер САМ назвал в задаче
+   * (`worker_tasks.maxTokens`, едет и в зашифрованном теле, и в строке).
+   * Превышение НЕ отклоняется целиком: текст ответа уже посчитан, ссылаться
+   * на него клиент вправе, а 400 заставил бы воркер пересчитывать работу,
+   * которая физически сделана. Награда обрезается до потолка — платим за
+   * то, что заказали, а не за то, что воркер решил себе выписать.
+   *
+   * NULL в колонке — задача из очереди, созданная до деплоя. Для неё
+   * потолком становится глобальный `MAX_TOKENS_PER_TASK`: он и так выше
+   * любого значения, которое /inference пропускает, так что старые задачи
+   * не получают ни послабления, ни отказа. */
+  const tokenCap = Math.max(1, Math.trunc(Number(row.maxTokens) > 0
+    ? Number(row.maxTokens) : CONFIG.MAX_TOKENS_PER_TASK));
+  const declaredTokens = Math.max(1,
+    Math.floor(Number(body.usage?.completion_tokens || body.tokensGenerated) || 0));
+  const tokens = Math.min(declaredTokens, tokenCap);
+  /* Флаг уходит и в ответ, и в лог: без него расхождение «заявлено / оплачено»
+   * видно только тем, кто вручную сравнил usage с maxTokens задачи. */
+  const tokensClamped = declaredTokens > tokenCap;
   /* Источник объявляет воркер. Необязателен: старая версия worker.js его не
    * присылает, и такой ответ считается настоящим — иначе уже работающие
    * воркеры разом попали бы в model_unavailable. */
@@ -7255,7 +7306,20 @@ function ingestWorkerResult(body) {
   /* Ключ НЕ удаляем здесь: его ещё нужен читателю, чтобы расшифровать ответ
    * при выдаче клиенту. Удаление — в enqueueWorkerTask после расшифровки. */
 
-  return { status: 200, body: { taskId, accepted: true, tokensGenerated: tokens, workerAddress } };
+  return {
+    status: 200,
+    body: {
+      taskId, accepted: true, tokensGenerated: tokens, workerAddress,
+      /* Потолок и факт заявки — рядом с оплаченным числом. Клиент видит,
+       * что воркер превысил лимит, и что платёж считался не по его цифре. */
+      ...(tokensClamped ? {
+        tokens_clamped: true,
+        tokens_declared: declaredTokens,
+        maxTokens: tokenCap,
+        note: 'Воркер заявил больше токенов, чем разрешено задачей: награда урезана до maxTokens.',
+      } : {}),
+    },
+  };
 }
 
 /* Воркер присылает результат. Токены считаются по его usage, а не по вере
@@ -7617,16 +7681,35 @@ async function runInference(req, res) {
         reserve = attempt;
       }
       if (!reserve.ok) {
+        /* Причина, по которой владелец НЕ был проверен, названа явно. Без
+         * этого человек с деньгами на аккаунте и пустым кошельком ПК видел
+         * бы 402 и не понимал, почему fallback не сработал: в интерфейсе ПК
+         * привязан, а платит он сам. */
+        const ownerLinked = TIER6_OWNER_FALLBACK_ENABLED
+          ? false
+          : Boolean(get(`SELECT 1 AS ok FROM device_links WHERE lower(deviceAddress) = ?`,
+            [String(tier6Client).toLowerCase()]));
         return res.status(402).json({
           error: reserve.reason === 'insufficient_balance' ? 'INSUFFICIENT_FUNDS' : 'RESERVE_FAILED',
           note: payerAttempts.length > 1
             ? 'Недостаточно свободного баланса ни у устройства, ни у владельца аккаунта для комиссии Tier 6.'
-            : 'Недостаточно свободного баланса для комиссии Tier 6.',
+            : (ownerLinked
+              ? 'На кошельке этого ПК нет свободного баланса. Оплата с баланса владельца аккаунта отключена (2.19.2): пополните кошелёк ПК faucet\'ом или переводами.'
+              : 'Недостаточно свободного баланса для комиссии Tier 6.'),
           needed_tar: reserve.neededTar ?? TIER6.ORCHESTRATION_FEE_TAR,
           available_tar: reserve.availableTar,
           /* Полная картина, а не первый отказ: иначе видно только устройство
            * и остаётся неясным, смотрел ли сервер на владельца вообще. */
           checked_payers: payerAttempts,
+          /* Владелец привязан, но его деньги не тронуты. Поле нужно, чтобы
+           * PWA мог объяснить это одной строкой, а не заставлять выяснять
+           * причину из /config. */
+          owner_payment_available: TIER6_OWNER_FALLBACK_ENABLED,
+          ...(ownerLinked ? { owner_linked: true } : {}),
+          /* Кнопка Faucet: 402 у нового кошелька — это нехватка тестовых
+           * денег, и лечится она одним действием. */
+          faucet: { endpoint: '/faucet/claim', amount_tar: FAUCET.AMOUNT_TAR },
+          clientAddress: tier6Client,
           modelId, tier: 6,
         });
       }
@@ -8006,6 +8089,35 @@ async function runInference(req, res) {
   let reservation = null;
   let reserveTarHeld = 0;
 
+  /* ===== Потолок токенов на задачу =====
+   *
+   * ОБЪЯВЛЕН ЗДЕСЬ, а не в ветке агента: это число нужно ОБЕИМ ветками —
+   * и агентской (резерв бюджета считается по худшему случаю), и обычной
+   * (оно едет в задачу воркера и служит потолком оплаты). Объявление внутри
+   * `if (agentIdRaw)` делало его невидимым ниже, и /inference падал
+   * ReferenceError уже после выдачи задачи — то есть задачи перестали
+   * публиковаться вовсе. Поймано тестом 8.7b, а не на глаз.
+   *
+   * Потолок нужен и без агента: из числа токенов напрямую считается награда
+   * (`recordWork`), а воркер сообщает его сам в теле ответа. Без верхней
+   * границы он мог заявить 10^9 токенов на задачу, ограниченную 32-мя. */
+  const maxTokens = Math.trunc(Number(body.maxTokens ?? 512));
+  if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
+    return res.status(400).json({ error: 'maxTokens must be a positive integer', got: body.maxTokens ?? null });
+  }
+  /* Жёсткий потолок на одну задачу. Резерв берётся по maxTokens, поэтому
+   * запрос вида maxTokens = 10_000_000 блокировал бы дневной бюджет целиком
+   * и всё равно вернул бы обрезку по контексту модели. Отказ явный и с
+   * числом, чтобы клиент не гадал, какой предел у сервера. */
+  if (maxTokens > CONFIG.MAX_TOKENS_PER_TASK) {
+    return res.status(400).json({
+      error: 'max_tokens_exceeds_limit',
+      requestedTokens: maxTokens,
+      maxAllowedTokens: CONFIG.MAX_TOKENS_PER_TASK,
+      hint: `один запрос не может превышать ${CONFIG.MAX_TOKENS_PER_TASK} токенов`,
+    });
+  }
+
   if (agentIdRaw) {
     if (!/^[0-9a-f]{64}$/.test(agentIdRaw)) {
       return res.status(400).json({
@@ -8038,23 +8150,6 @@ async function runInference(req, res) {
         agentId: agentIdRaw,
         agentUserId: agentRow.userId,
         clientAddress: clientAddress || null,
-      });
-    }
-
-    const maxTokens = Math.trunc(Number(body.maxTokens ?? 512));
-    if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
-      return res.status(400).json({ error: 'maxTokens must be a positive integer', got: body.maxTokens ?? null });
-    }
-    /* Жёсткий потолок на одну задачу. Резерв берётся по maxTokens, поэтому
-     * запрос вида maxTokens = 10_000_000 блокировал бы дневной бюджет целиком
-     * и всё равно вернул бы обрезку по контексту модели. Отказ явный и с
-     * числом, чтобы клиент не гадал, какой предел у сервера. */
-    if (maxTokens > CONFIG.MAX_TOKENS_PER_TASK) {
-      return res.status(400).json({
-        error: 'max_tokens_exceeds_limit',
-        requestedTokens: maxTokens,
-        maxAllowedTokens: CONFIG.MAX_TOKENS_PER_TASK,
-        hint: `один запрос не может превышать ${CONFIG.MAX_TOKENS_PER_TASK} токенов`,
       });
     }
 
@@ -8325,6 +8420,10 @@ async function runInference(req, res) {
             tier,
             workerAddress: addr,
             forceWsAddr: addr,
+            /* Потолок обеих рук — из запроса клиента. Без него каждая рука
+             * получала глобальный 8192, и оплата шла по нему, а не по
+             * заказу: тот же дефект, что и в одиночной ветке. */
+            maxTokens,
             onEnqueued: (tid) => taskIds.push(tid),
           }).then(res => ({ ok: true, res, addr, taskId: res.taskId }))
             .catch(err => ({ ok: false, err, addr }));
@@ -8421,11 +8520,25 @@ async function runInference(req, res) {
             const loserIds = swarmMode === 'synthesis'
               ? []
               : taskIds.filter(tid => tid !== winner.taskId);
+            /* Кому именно уйдёт CANCEL: адрес проигравшего известен заранее
+             * (в ветках он `second`/`first`), но надёжнее взять его из
+             * строки задачи: после requeue адрес мог смениться, и кадр,
+             * отправленный «тому, кого мы выбирали», ушёл бы не туда. */
+            const cancelledAddrs = [];
             for (const tid of loserIds) {
               try {
+                const row = get('SELECT workerAddress, status FROM worker_tasks WHERE taskId = ?', [tid]);
                 run(`UPDATE worker_tasks SET status = 'cancelled', finishedAt = ?
                      WHERE taskId = ? AND status IN ('pending', 'claimed')`, [Date.now(), tid]);
                 workerTaskKeys.delete(tid);
+                /* Кадр — ПОСЛЕ снятия строки. Порядок обратный дал бы окно,
+                 * в котором воркер успевает прислать результат по уже
+                 * отменённой задаче и получить 409; это не ошибка, но
+                 * лишний отказ в его логе. */
+                if (row && row.status === 'claimed' && row.workerAddress) {
+                  wsInbound.cancelTask(row.workerAddress, tid, 'swarm_loser');
+                  cancelledAddrs.push(String(row.workerAddress).toLowerCase());
+                }
               } catch (_e) { /* снятие не должно ломать уже полученный ответ */ }
             }
             const w = winner.res;
@@ -8462,6 +8575,10 @@ async function runInference(req, res) {
               winnerTaskId: winner.taskId,
               loserTaskIds: loserIds,
               cancelled: loserIds.length,
+              /* Кому реально ушёл CANCEL. Меньше `cancelled` значит «воркер
+               * уже закрыл сокет или задачу забирали по poll» — факт,
+               * который иначе выглядел бы как «отмена не работает». */
+              cancelledWorkers: cancelledAddrs,
               /* Обоснование выбора — только в синтезе. В гонке обоснования
                * нет: там победило время, а не качество. */
               synthesis,
@@ -8508,9 +8625,15 @@ async function runInference(req, res) {
        * modelId дают два разных model в ответе». */
       /* Адрес передаётся обязательно: именно он становится intendedWorker, и
        * по нему /worker/poll решает, кому строку отдавать. Без него задача
-       * снова окажется «ничьей» и достанется первому спросившему. */
+       * снова окажется «ничьей» и достанется первому спросившему.
+       *
+       * maxTokens обязателен так же: без него строка получала глобальный
+       * потолок (8192), и воркер мог заявить награду за 8192 токена на
+       * задачу, которую клиент ограничил 32-мя. Проверка ниже берёт это
+       * число из строки как потолок оплаты — значит, не передав его здесь,
+       * мы теряем весь смысл потолка. */
       const w = await enqueueWorkerTask({
-        prompt, model: modelId || body.model || null, tier, workerAddress,
+        prompt, model: modelId || body.model || null, tier, workerAddress, maxTokens,
       });
       result = {
         source: 'live_llm',

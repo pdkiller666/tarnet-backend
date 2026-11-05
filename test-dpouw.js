@@ -5753,23 +5753,22 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       Number(cacheV33) >= 12, cacheV33);
   }
 
-  /* ===== 34. Tier 6: плательщик — устройство или владелец аккаунта =====
+  /* ===== 34. Tier 6: платит ТОЛЬКО сам клиент (2.19.2) =====
    *
-   * История дефекта. PWA шлёт `clientAddress: ADDR`, где ADDR — случайный
-   * кошелёк устройства из localStorage. Деньги же лежат на аккаунте TarNet ID,
-   * к которому устройство привязано через `device_links`. Сервер смотрел
-   * только на устройство и отдавал 402 INSUFFICIENT_FUNDS при 0.009995 TAR
-   * у владельца и 0.000163 TAR у устройства — то есть платный контур
-   * выглядел сломанным при живых деньгах на аккаунте.
+   * История. До 2.19.1 комиссию списывал первый, у кого есть свободный
+   * остаток: устройство, затем владелец из `device_links`. Аудит Manus (P0)
+   * назвал это обходом: подпись владельца требовалась один раз — при привязке
+   * ПК — а дальше устройство тратило его баланс на каждый запрос без его
+   * участия. В 2.19.2 fallback отключён до внедрения подписанных mandate.
    *
-   * Проверяются два случая из задачи и два инварианта:
-   *   1. устройство пусто + владелец с деньгами → вызов проходит ворота;
-   *   2. устройство пусто + владелец пуст       → 402;
-   *   3. списание и кэшбэк идут по ФАКТИЧЕСКОМУ плательщику;
-   *   4. чужой кошелёк не становится плательщиком: владелец берётся только
-   *      из существующей привязки `device_links`.
+   * Проверяется новое поведение И то, что оно не сломало законное:
+   *   1. устройство пусто + владелец с деньгами → 402, владелец не тронут;
+   *   2. устройство с деньгами → 200, плательщик — устройство;
+   *   3. в 402 назван вариант с faucet и сказано, что оплата владельцем
+   *      отключена (иначе человек ищет причину в привязке);
+   *   4. чужой кошелёк не становится плательщиком.
    */
-  console.log('\n34. Tier 6: комиссия — устройство или владелец из device_links');
+  console.log('\n34. Tier 6: платит только вызвавший адрес (owner fallback off)');
   {
     const http = require('http');
     const { DatabaseSync } = require('node:sqlite');
@@ -5831,84 +5830,95 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
         ...extra,
       }, { 'X-Provider-Key': '***' });
 
-      /* --- 34.1 устройство пусто, владелец с деньгами → ворота пройдены --- */
+      /* --- 34.1 устройство пусто, владелец с деньгами → 402 --- */
       link(OWN, DEV);
       seed(OWN, 0.009995);
       const byOwner = await callT6(DEV);
-      ok('34.1 пустое устройство + владелец с балансом → 200, не 402',
-        byOwner.status === 200,
-        { status: byOwner.status, error: byOwner.body?.error,
-          checked: byOwner.body?.checked_payers });
-      ok('34.1 в ответе видно, что заплатил владелец',
-        byOwner.body?.paid_by === 'owner' && byOwner.body?.payer_address === OWN,
-        { paid_by: byOwner.body?.paid_by, payer: byOwner.body?.payer_address });
-      ok('34.1 инвариант вызова сохранён (cashback + burn + treasury === fee)',
-        Number(byOwner.body?.economics?.delta) === 0, byOwner.body?.economics?.delta);
+      ok('34.1 пустое устройство + владелец с балансом → 402 INSUFFICIENT_FUNDS',
+        byOwner.status === 402 && byOwner.body?.error === 'INSUFFICIENT_FUNDS',
+        { status: byOwner.status, error: byOwner.body?.error });
+      /* Привязка не трогает деньги владельца — это и есть закрытый обход. */
+      const ownerAfterDenied = money(OWN);
+      ok('34.1 баланс владельца не тронут отказом',
+        Math.abs(ownerAfterDenied.balanceTar - 0.009995) < 1e-12 && ownerAfterDenied.reservedTar === 0,
+        ownerAfterDenied);
+      ok('34.1 в 402 сказано, что оплата владельцем отключена',
+        byOwner.body?.owner_payment_available === false
+        && byOwner.body?.owner_linked === true
+        && /владельца аккаунта отключена/.test(String(byOwner.body?.note || '')),
+        { available: byOwner.body?.owner_payment_available, linked: byOwner.body?.owner_linked });
+      ok('34.1 в 402 есть адрес faucet\'а и сумма',
+        byOwner.body?.faucet?.endpoint === '/faucet/claim'
+        && Number(byOwner.body?.faucet?.amount_tar) > 0,
+        byOwner.body?.faucet);
 
-      /* Деньги: нетто −0.0001 у владельца, у устройства — ноль. Второе не
-       * менее важно первого: иначе списание ушло бы не с того кошелька. */
-      const ownerAfter = money(OWN);
+      /* --- 34.1b устройство с деньгами → 200, платит оно --- */
+      seed(DEV, 0.009995);
+      const byDevice = await callT6(DEV);
+      ok('34.1b устройство с балансом → 200',
+        byDevice.status === 200,
+        { status: byDevice.status, error: byDevice.body?.error });
+      ok('34.1b в ответе плательщик — устройство',
+        byDevice.body?.paid_by === 'device' && byDevice.body?.payer_address === DEV,
+        { paid_by: byDevice.body?.paid_by, payer: byDevice.body?.payer_address });
+      ok('34.1b инвариант вызова сохранён (cashback + burn + treasury === fee)',
+        Number(byDevice.body?.economics?.delta) === 0, byDevice.body?.economics?.delta);
+
+      /* Деньги: нетто −0.0001 у устройства, у владельца — ни копейки. */
       const devAfter = money(DEV);
-      ok('34.1 списано с владельца ровно 0.0001 TAR нетто',
-        Math.abs((0.009995 - ownerAfter.balanceTar) - 0.0001) < 1e-9, ownerAfter.balanceTar);
-      ok('34.1 у устройства баланс не изменился',
-        devAfter.balanceTar === 0 && devAfter.reservedTar === 0, devAfter);
-      ok('34.1 резерв владельца освобождён',
-        ownerAfter.reservedTar === 0, ownerAfter.reservedTar);
+      const ownerAfterOk = money(OWN);
+      ok('34.1b списано с устройства ровно 0.0001 TAR нетто',
+        Math.abs((0.009995 - devAfter.balanceTar) - 0.0001) < 1e-9, devAfter.balanceTar);
+      ok('34.1b резерв устройства освобождён', devAfter.reservedTar === 0, devAfter.reservedTar);
+      ok('34.1b баланс владельца после успешного вызова не изменился',
+        Math.abs(ownerAfterOk.balanceTar - ownerAfterDenied.balanceTar) < 1e-12,
+        { before: ownerAfterDenied.balanceTar, after: ownerAfterOk.balanceTar });
 
-      /* --- 34.2 фактический плательщик записан в журнал --- */
+      /* --- 34.2 плательщик и вызвавший — один адрес --- */
       const receipts34 = dbWrite((sdb) => sdb
         .prepare(`SELECT clientAddress, callerAddress FROM tier6_receipts
                   WHERE callerAddress = ? ORDER BY usedAt DESC LIMIT 1`).get(DEV));
-      ok('34.2 чек помнит и плательщика, и вызвавшего',
-        receipts34?.clientAddress === OWN && receipts34?.callerAddress === DEV,
+      ok('34.2 чек пишет устройство и как плательщика, и как вызвавшего',
+        receipts34?.clientAddress === DEV && receipts34?.callerAddress === DEV,
         receipts34 || 'чек не найден');
 
       const lastCall = dbWrite((sdb) => sdb
         .prepare(`SELECT clientAddress, fundedBy FROM tier6_calls
                   ORDER BY createdAt DESC, rowid DESC LIMIT 1`).get());
-      ok('34.2 tier6_calls.clientAddress = адрес владельца',
-        lastCall?.clientAddress === OWN, lastCall);
+      ok('34.2 tier6_calls.clientAddress = адрес устройства',
+        lastCall?.clientAddress === DEV && lastCall?.fundedBy === 'client', lastCall);
 
-      /* --- 34.3 повтор того же чека с устройства не даёт 403 -----------
-       * Пока чек хранил только плательщика, повтор с устройства сравнивался
-       * с адресом владельца и отдавал RECEIPT_FOREIGN вместо «чек уже
-       * погашен». Для клиента это выглядит как «ваш чек чужой». */
-      const idem = 'owner-pay-' + RUN;
+      /* --- 34.3 повтор того же чека → 400 RECEIPT_ALREADY_USED --- */
+      const idem = 'device-pay-' + RUN;
       const firstIdem = await callT6(DEV, { clientRequestId: idem });
       const dupIdem = await callT6(DEV, { clientRequestId: idem });
-      ok('34.3 повтор с устройства → 400 RECEIPT_ALREADY_USED, не 403',
+      ok('34.3 повтор с устройства → 400 RECEIPT_ALREADY_USED',
         firstIdem.status === 200 && dupIdem.status === 400
           && dupIdem.body?.error === 'RECEIPT_ALREADY_USED',
         { first: firstIdem.status, dup: dupIdem.status, error: dupIdem.body?.error });
 
-      /* --- 34.4 оба пусты → 402 --------------------------------------- */
+      /* --- 34.4 оба пусты → 402, владелец даже не проверяется ---------- */
       link(BOTH_EMPTY_OWN, BOTH_EMPTY_DEV);
       const bothEmpty = await callT6(BOTH_EMPTY_DEV);
       ok('34.4 пустое устройство + пустой владелец → 402 INSUFFICIENT_FUNDS',
         bothEmpty.status === 402 && bothEmpty.body?.error === 'INSUFFICIENT_FUNDS',
         { status: bothEmpty.status, error: bothEmpty.body?.error });
-      /* В ответе должны быть ОБА кандидата: иначе непонятно, смотрел ли
-       * сервер на владельца вообще. */
+      /* Ровно ОДИН кандидат — устройство. Если бы владелец проверялся, в
+       * списке было бы два адреса, и отключённый fallback выглядел бы как
+       * «просто не хватило денег у обоих». */
       const checked = bothEmpty.body?.checked_payers || [];
-      ok('34.4 402 перечисляет проверенных плательщиков (устройство и владелец)',
-        checked.length === 2
-          && checked.some((c) => c.address === BOTH_EMPTY_DEV)
-          && checked.some((c) => c.address === BOTH_EMPTY_OWN),
+      ok('34.4 402 перечисляет только устройство: владелец не плательщик',
+        checked.length === 1 && checked[0].address === BOTH_EMPTY_DEV,
         checked);
 
-      /* --- 34.5 чужой кошелёк плательщиком не становится ----------------
-       * Ключевой инвариант: списать можно только с того, кто привязан.
-       * STRANGER в device_links не состоит и денег у него нет — если бы
-       * сервер брал владельца не из привязки, а из запроса, он бы нашёл
-       * баланс у OWN и списал с него по чужому clientAddress. */
+      /* --- 34.5 чужой кошелёк плательщиком не становится ---------------- */
       seed(STRANGER, 0);
-      /* Замер берём ПЕРЕД вызовом: между `ownerAfter` и здесь уже прошёл
+      /* Замер берём ПЕРЕД вызовом: между `ownerAfterOk` и здесь уже прошёл
        * легитимный платёж 34.3, и сравнение с устаревшим значением засчитало
        * бы его как «чужой запрос списал с владельца». */
       const ownerBeforeStranger = money(OWN);
       const stranger = await callT6(STRANGER);
-      ok('34.5 непривязанное устройство с нулём → 402, чужой кошелёк не тронут',
+      ok('34.5 непривязанное устройство с нулём → 402',
         stranger.status === 402 && stranger.body?.error === 'INSUFFICIENT_FUNDS',
         { status: stranger.status, error: stranger.body?.error });
       const ownerUntouched = money(OWN);
@@ -5918,7 +5928,7 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
 
       /* --- 34.6 экономика контура целиком ------------------------------ */
       const cons34 = (await apiAt(s34.base, '/health')).body?.conservationTier6;
-      ok('34.6 инвариант Tier 6 держится после платежей владельцем',
+      ok('34.6 инвариант Tier 6 держится после платежей устройством',
         cons34?.holds === true && Number(cons34?.delta) === 0,
         { delta: cons34?.delta, holds: cons34?.holds, bad: cons34?.inconsistentRows });
     } finally {
@@ -6479,8 +6489,8 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       'contour', 'contourHint', 'workerBanner', 'workerBannerText', 'workerHowto',
       'workerCard', 'balanceVal', 'walletAddr', 'faucetBtn', 'faucetState',
       'refreshBal', 'consentBox', 'consentState', 'byokKey', 'byokSave',
-      'byokClear', 'byokState', 'byokWarn', 'cashbackVal', 'linkCard', 'linkAddr',
-      'linkBtn', 'linkRefresh', 'linkState', 'linkedList', 'migrateCard',
+      'byokClear', 'byokState', 'byokWarn', 'cashbackVal', 'linkCard',
+      'linkRefresh', 'linkState', 'linkedList', 'migrateCard',
       'migrateTo', 'migrateOld', 'migrateCheck', 'migrateBtn', 'migrateState',
       'nanoBtn', 'nanoAddr', 'nanoLog', 'agentSetup', 'entropyInput',
       'genEntropy', 'createIdBtn', 'agentMain', 'agentBalance', 'agentIdLine',
@@ -8235,10 +8245,16 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       const okay = await waitFrame('AUTH_OK');
       if (!okay) { try { w.sock.close(); } catch (_e) { /* уже закрыт */ } return null; }
 
+      /* Кадры CANCEL собираются отдельно: без них «сервер снял задачу»
+       * проверялось бы только по строке в БД, а воркер мог так и не узнать,
+       * что считать больше не нужно. */
+      w.cancels = [];
+
       /* Постоянный сборщик TASK — ставится ДО запроса к /inference. */
       w.sock.addEventListener('message', (ev) => {
         let f = null;
         try { f = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); } catch (_e) { return; }
+        if (f && f.type === 'CANCEL') { w.cancels.push(f); return; }
         if (!f || f.type !== 'TASK' || !f.task) return;
         if (autoReply) {
           w.sock.send(JSON.stringify({
@@ -8378,6 +8394,30 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
           }
           ok('47.5 проигравшая задача снята со статусом cancelled',
             loserStatus === 'cancelled', { taskId: tB?.taskId, status: loserStatus });
+
+          /* 47.5b — CANCEL дошёл до проигравшего воркера, а не остался
+           * строкой в БД. Именно этого не хватало до 2.19.2: задача числилась
+           * снятой, а CPU ноутбука продолжал считать уже ненужный ответ.
+           * Ждём кадр после ответа победителя — он приходит сразу за
+           * обновлением строки, но по сокету асинхронно. */
+          const cancelFrame = await new Promise((resolve) => {
+            if (wb.cancels.length) return resolve(wb.cancels[0]);
+            const timer = setTimeout(() => resolve(null), 3000);
+            const tick = setInterval(() => {
+              if (wb.cancels.length) { clearInterval(tick); clearTimeout(timer); resolve(wb.cancels[0]); }
+            }, 25);
+          });
+          ok('47.5b проигравший воркер получил кадр CANCEL со своим taskId',
+            Boolean(cancelFrame) && cancelFrame.taskId === tB.taskId
+              && cancelFrame.reason === 'swarm_loser',
+            { got: cancelFrame?.taskId, want: tB?.taskId, reason: cancelFrame?.reason });
+          ok('47.5c победитель CANCEL не получил',
+            wa.cancels.length === 0, { cancels: wa.cancels.length });
+          ok('47.5d в ответе перечислены адреса, кому ушёл CANCEL',
+            Array.isArray(sw47?.cancelledWorkers)
+              && sw47.cancelledWorkers.length === 1
+              && sw47.cancelledWorkers[0] === wb.addr.toLowerCase(),
+            { cancelledWorkers: sw47?.cancelledWorkers, loser: wb.addr });
 
           /* 47.6 — без флага swarm поведение прежнее: одна задача, поле null.
            * Регрессия, которую легко не заметить: параллель включилась бы
@@ -8721,6 +8761,114 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       } finally {
         s49.stop();
       }
+    }
+  }
+
+  /* ===== 50. Потолок токенов: воркер не выписывает себе награду (2.19.2) =====
+   *
+   * ДО правки число токенов бралось из `usage` тела ответа, а из него
+   * напрямую считается награда (`recordWork`). Воркер мог заявить 10^9
+   * токенов на задачу, которую сервер ограничил 32. Подпись результата от
+   * этого не спасает: она подтверждает, что число объявил именно этот
+   * воркер, а не что число правдоподобно.
+   *
+   * Проверяется весь путь до денег, а не только флаг в ответе: если бы
+   * обрезка жила в ответе, но не в БД, награда считалась бы по заявке, и
+   * потолок был бы декоративным. */
+  {
+    console.log('\n50. Потолок токенов: заявка воркера не становится наградой');
+    const s50 = await spawnServer();
+    try {
+      const w50 = runAddress('cap');
+      await apiAt(s50.base, '/node', 'POST', { address: w50, stake: 30000, reputation: 0.8 });
+      await apiAt(s50.base, await signedPollPath(w50, '&model=mcap&heartbeat=1', s50.base));
+
+      /* Заказ на 32 токена — потолок, который сервер САМ назвал в задаче. */
+      const inflight50 = apiAt(s50.base, '/inference', 'POST', {
+        prompt: 'потолок токенов', workerAddress: w50, model: 'mcap', maxTokens: 32,
+      });
+      let task50 = null;
+      for (let i = 0; i < 60 && !task50; i++) {
+        const p = await apiAt(s50.base, await signedPollPath(w50, '&model=mcap', s50.base));
+        if (p.body?.task) task50 = p.body.task;
+        else await new Promise((r) => setTimeout(r, 100));
+      }
+      ok('50.1 задача выдана с потолком сервера', Boolean(task50), task50?.taskId);
+
+      /* Воркер заявляет на три порядка больше заказанного. */
+      const sub50 = await apiAt(s50.base, '/worker/submit', 'POST', {
+        taskId: task50.taskId, workerAddress: w50, response: 'ответ в пределах потолка',
+        source: 'ollama', model: 'mcap', usage: { completion_tokens: 999999 },
+      });
+      ok('50.2 результат принят, а не отклонён целиком',
+        sub50.status === 200, { status: sub50.status, body: sub50.body?.error });
+      ok('50.3 награда урезана до maxTokens задачи',
+        sub50.body?.tokensGenerated === 32, sub50.body?.tokensGenerated);
+      ok('50.4 расхождение заявлено явно (tokens_clamped + заявленное число)',
+        sub50.body?.tokens_clamped === true && sub50.body?.tokens_declared === 999999
+        && sub50.body?.maxTokens === 32,
+        { clamped: sub50.body?.tokens_clamped, declared: sub50.body?.tokens_declared });
+
+      const ans50 = await inflight50;
+      ok('50.5 текст ответа доходит до клиента',
+        ans50.status === 200 && typeof ans50.body?.response === 'string', ans50.status);
+
+      /* Главное: в БД и в счёте — потолок, а не заявка. */
+      let row50 = null;
+      try {
+        const { DatabaseSync } = require('node:sqlite');
+        const db50 = new DatabaseSync(path.join(s50.dir, 'test.db'));
+        row50 = db50.prepare('SELECT tokensGenerated FROM worker_tasks WHERE taskId = ?').get(task50.taskId);
+        db50.close();
+      } catch (_e) { row50 = null; }
+      ok('50.6 в worker_tasks записано обрезанное число',
+        row50?.tokensGenerated === 32, row50?.tokensGenerated);
+      ok('50.7 клиенту оплачено по потолку, а не по заявке',
+        Number(ans50.body?.tokensUsed ?? ans50.body?.tokensGenerated) > 0
+        && Number(ans50.body?.tokensUsed ?? ans50.body?.tokensGenerated) <= 32,
+        ans50.body?.tokensUsed ?? ans50.body?.tokensGenerated);
+
+      /* Обратная сторона: законный ответ НЕ обрезается. Без этой проверки
+       * обрезка всего подряд прошла бы как «потолок работает». */
+      const inflight50b = apiAt(s50.base, '/inference', 'POST', {
+        prompt: 'в пределах потолка', workerAddress: w50, model: 'mcap', maxTokens: 64,
+      });
+      let task50b = null;
+      for (let i = 0; i < 60 && !task50b; i++) {
+        const p = await apiAt(s50.base, await signedPollPath(w50, '&model=mcap', s50.base));
+        if (p.body?.task) task50b = p.body.task;
+        else await new Promise((r) => setTimeout(r, 100));
+      }
+      const sub50b = await apiAt(s50.base, '/worker/submit', 'POST', {
+        taskId: task50b.taskId, workerAddress: w50, response: 'честный ответ',
+        source: 'ollama', model: 'mcap', usage: { completion_tokens: 40 },
+      });
+      ok('50.8 заявка в пределах потолка не обрезается',
+        sub50b.body?.tokensGenerated === 40 && sub50b.body?.tokens_clamped === undefined,
+        { tokens: sub50b.body?.tokensGenerated, clamped: sub50b.body?.tokens_clamped });
+      await inflight50b;
+
+      /* Нулевая и отрицательная заявка не должны давать нулевую награду:
+       * `Math.max(1, ...)` — нижняя граница, без неё воркер «работал бы»
+       * бесплатно и выпадал из отчётов. */
+      const inflight50c = apiAt(s50.base, '/inference', 'POST', {
+        prompt: 'нулевая заявка', workerAddress: w50, model: 'mcap', maxTokens: 64,
+      });
+      let task50c = null;
+      for (let i = 0; i < 60 && !task50c; i++) {
+        const p = await apiAt(s50.base, await signedPollPath(w50, '&model=mcap', s50.base));
+        if (p.body?.task) task50c = p.body.task;
+        else await new Promise((r) => setTimeout(r, 100));
+      }
+      const sub50c = await apiAt(s50.base, '/worker/submit', 'POST', {
+        taskId: task50c.taskId, workerAddress: w50, response: 'пустая заявка',
+        source: 'ollama', model: 'mcap', usage: { completion_tokens: 0 },
+      });
+      ok('50.9 нулевая заявка не даёт нулевую награду',
+        sub50c.body?.tokensGenerated === 1, sub50c.body?.tokensGenerated);
+      await inflight50c;
+    } finally {
+      s50.stop();
     }
   }
 

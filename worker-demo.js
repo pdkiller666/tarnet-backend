@@ -317,12 +317,37 @@ async function register() {
   return true;
 }
 
-/* ---------- 1. Ollama на этом ПК ---------- */
-async function askOllama(prompt, requestedModel, maxTokens = null) {
+/* ---------- 1. Ollama на этом ПК ----------
+
+/* Общий HTTP-вызов с двумя источниками отмены: собственный таймаут и
+ * сигнал задачи (CANCEL от сервера). `AbortSignal.timeout` принимает
+ * только один сигнал, а нам нужно уметь прервать раньше таймаута.
+ *
+ * ПОЧЕМУ НЕ `AbortSignal.any`. Он появился в Node 20, а файл обещает
+ * работу на Node 18 (встроенный fetch). Ветка «нет AbortSignal.any» здесь
+ * была бы вторым путём, который никто не проверяет; ручная связка из
+ * двух строк работает на всех версиях одинаково. */
+async function fetchAbortable(url, opts, signal, timeoutMs = 120000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error('timeout')), timeoutMs);
+  const onAbort = () => ctrl.abort(signal.reason || new Error('cancelled'));
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+  }
+}
+
+async function askOllama(prompt, requestedModel, maxTokens = null, signal = null) {
   /* Модель из задачи имеет приоритет над OLLAMA_MODEL: клиент выбрал её в
    * каталоге, и подменять её своей значило бы врать в ответе. */
   const model = await resolveOllamaModel(requestedModel);
-  const res = await fetch(`${OLLAMA}/api/chat`, {
+  const res = await fetchAbortable(`${OLLAMA}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -338,8 +363,7 @@ async function askOllama(prompt, requestedModel, maxTokens = null) {
        * зашифрованного тела задачи — его задал сервер. */
       ...(maxTokens ? { options: { num_predict: maxTokens } } : {}),
     }),
-    signal: AbortSignal.timeout(120000),
-  });
+  }, signal);
   /* Тело ошибки ОБЯЗАТЕЛЬНО, а не только код.
    *
    * Столкновение с этим было живым: на ПК владельца Ollama отвечала
@@ -378,7 +402,7 @@ async function askOllama(prompt, requestedModel, maxTokens = null) {
  * (`qwen2.5-coder-7b`) провайдеру не принадлежит, и отправка его в облако
  * дала бы 404 «model not found» вместо ответа. В таком случае честно
  * считаем дефолтом и объявляем в ответе именно то, что запустили. */
-async function askCloud(prompt, requestedModel, maxTokens = null) {
+async function askCloud(prompt, requestedModel, maxTokens = null, signal = null) {
   const conf = GROQ_KEY
     ? { url: 'https://api.groq.com/openai/v1/chat/completions', key: GROQ_KEY,
         model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', name: 'groq', prefix: 'groq/' }
@@ -399,7 +423,7 @@ async function askCloud(prompt, requestedModel, maxTokens = null) {
     : null;
   const model = asked || conf.model;
 
-  const res = await fetch(conf.url, {
+  const res = await fetchAbortable(conf.url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${conf.key}` },
     body: JSON.stringify({
@@ -410,8 +434,7 @@ async function askCloud(prompt, requestedModel, maxTokens = null) {
       ],
       ...(maxTokens ? { max_tokens: maxTokens } : {}),
     }),
-    signal: AbortSignal.timeout(120000),
-  });
+  }, signal);
   if (!res.ok) throw new Error(`${conf.name} HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`);
   const j = await res.json();
   const response = j.choices?.[0]?.message?.content || '';
@@ -500,12 +523,16 @@ function ollamaErrorCode(e) {
   return 'OLLAMA_ERROR';
 }
 
-async function generate(prompt, requestedModel, maxTokens = null) {
+async function generate(prompt, requestedModel, maxTokens = null, signal = null) {
   let ollamaErr = null;
   if (Date.now() >= ollamaDeadUntil) {
     try {
-      return await askOllama(prompt, requestedModel, maxTokens);
+      return await askOllama(prompt, requestedModel, maxTokens, signal);
     } catch (e) {
+      /* Отмена — не поломка бэкенда: не записывать её в паузу Ollama и не
+       * переходить на облако по «ошибке». Иначе CANCEL ухудшал бы следующий
+       * запрос этого ПК, чего он точно не должен делать. */
+      if (signal && signal.aborted) throw e;
       ollamaErr = ollamaErrorCode(e);
       /* Отключаем бэкенд НА ВРЕМЯ только при недоступности процесса.
        *
@@ -527,10 +554,17 @@ async function generate(prompt, requestedModel, maxTokens = null) {
   }
   if (GROQ_KEY || OPENROUTER_KEY) {
     try {
-      return await askCloud(prompt, requestedModel, maxTokens);
+      return await askCloud(prompt, requestedModel, maxTokens, signal);
     } catch (e) {
       log(`облачный API не ответил (${e.message})`);
     }
+  }
+  /* Отменённая задача не должна доехать до шаблона: шаблон — это ответ,
+   * который сервер посчитал бы работой. Отдаём отмену вызывающему. */
+  if (signal && signal.aborted) {
+    const err = new Error('cancelled');
+    err.code = 'CANCELLED';
+    throw err;
   }
   return askFallback(prompt, ollamaErr || 'MODEL_NOT_CONFIGURED',
     ollamaErr ? (lastOllamaFailure && lastOllamaFailure.code === ollamaErr
@@ -666,6 +700,39 @@ function signAuth(nonce, timestamp, keys) {
  * на 1 CPU они бы мешали друг другу, растягивая обе. */
 let wsTaskChain = Promise.resolve();
 
+/* Отмена задач по кадру CANCEL (2.19.2).
+ *
+ * Два состояния, потому что кадр может прийти раньше, чем задача начнёт
+ * считаться: задачи идут через `wsTaskChain` последовательно, и пока
+ * воркер занят предыдущей, следующая уже «в работе» только для сервера.
+ *   - `taskAborts`  — задача уже выполняется: прерываем HTTP-запрос к Ollama.
+ *   - `taskCancelledBefore` — отмена пришла до старта: не начинаем вовсе.
+ *
+ * Почему не только Set: уже начатый fetch нельзя остановить флагом, ему
+ * нужен AbortSignal. Почему не только AbortController: контроллера ещё нет,
+ * пока задача ждёт в цепочке.
+ *
+ * Множество «заранее» ограничено по размеру: мусорные CANCEL не должны
+ * растить память воркера, живущего месяцами. */
+const taskAborts = new Map();
+const taskCancelledBefore = new Set();
+const MAX_EARLY_CANCELS = 200;
+
+function noteCancel(taskId) {
+  if (!taskId) return;
+  const ctrl = taskAborts.get(taskId);
+  if (ctrl) {
+    try { ctrl.abort(new Error('cancelled_by_server')); } catch (_e) { /* уже отменён */ }
+    return;
+  }
+  taskCancelledBefore.add(taskId);
+  if (taskCancelledBefore.size > MAX_EARLY_CANCELS) {
+    /* Удаляем самый старый: Set хранит порядок вставки. */
+    const first = taskCancelledBefore.values().next().value;
+    taskCancelledBefore.delete(first);
+  }
+}
+
 /* Один экземпляр на процесс. Хранит сокет и состояние реконнекта. */
 const wsState = {
   ws: null,
@@ -684,6 +751,17 @@ const wsState = {
 async function runTask(task) {
   let prompt;
   let taskMaxTokens = null;
+  /* Отмена, пришедшая до старта: задачу не начинаем. Ответа не будет —
+   * сервер её уже снял в `cancelled`, и присылать туда 409 бессмысленно. */
+  if (task && task.taskId && taskCancelledBefore.has(task.taskId)) {
+    taskCancelledBefore.delete(task.taskId);
+    log(`задача ${task.taskId} отменена до старта — не считаю`);
+    return { ok: false, reason: 'cancelled', taskId: task.taskId };
+  }
+  /* Один контроллер на задачу: им прерывается запрос к бэкенду. Удаляем
+   * в finally, чтобы Map не рос вместе с числом задач. */
+  const abortCtrl = new AbortController();
+  if (task && task.taskId) taskAborts.set(task.taskId, abortCtrl);
   /* Ключ сессии после распечатки.
    *
    * Сервер шлёт его запечатанным на наш публичный ключ (`box:v1:...`), чтобы
@@ -727,9 +805,19 @@ async function runTask(task) {
   const pulse = setInterval(heartbeat, 7000);
   let gen;
   try {
-    gen = await generate(prompt, task.model || null, taskMaxTokens);
+    gen = await generate(prompt, task.model || null, taskMaxTokens, abortCtrl.signal);
+  } catch (e) {
+    /* Отмена: это не ошибка воркера и не повод для ERROR-кадра — сервер
+     * отменил задачу сам. Возвращаем причину, чтобы onWsTask просто
+     * ничего не отправлял. */
+    if (abortCtrl.signal.aborted) {
+      log(`задача ${task.taskId} отменена сервером — генерация прервана`);
+      return { ok: false, reason: 'cancelled', taskId: task.taskId };
+    }
+    throw e;
   } finally {
     clearInterval(pulse);
+    if (task && task.taskId) taskAborts.delete(task.taskId);
   }
   const took = Date.now() - started;
 
@@ -762,6 +850,9 @@ function onWsTask(task) {
   wsTaskChain = wsTaskChain.then(async () => {
     const out = await runTask(task);
     if (!out.ok) {
+      /* Отменённую задачу не отчитываем как ошибку: сервер её снял, и
+       * ERROR-кадр по ней был бы шумом в его логе. */
+      if (out.reason === 'cancelled') return;
       wsSend({ type: 'ERROR', taskId: task.taskId, error: out.reason, workerAddress: WORKER });
       return;
     }
@@ -891,6 +982,15 @@ function connectWs(budgetMs = WS_CONNECT_BUDGET_MS) {
         return finish(false);
       }
       if (frame.type === 'TASK') return onWsTask(frame.task || {});
+      /* CANCEL от сервера: проигравшая ветка роя больше не нужна.
+       * Обрабатываем вне очереди wsTaskChain — отмена по определению про
+       * ту задачу, которая СЕЙЧАС считается, и ждать её окончания значило
+       * бы отменять уже посчитанное. */
+      if (frame.type === 'CANCEL') {
+        log(`ws: CANCEL ${frame.taskId} (${frame.reason || 'без причины'})`);
+        noteCancel(String(frame.taskId || ''));
+        return undefined;
+      }
       return undefined;
     });
 

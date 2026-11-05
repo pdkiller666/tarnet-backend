@@ -2074,15 +2074,20 @@ $('model')?.addEventListener('change', syncContourToModel);
 
 renderByokState();
 
-/* ---------- Привязка существующего ПК (Device Pairing) ----------
- * Зачем: воркер, запущенный без адреса, создаёт СВОЙ кошелёк. Работа
- * считается, но PWA честно писала «ваш ПК не среди них». Раньше помогал
- * только перезапуск с правильным адресом; теперь адрес работающего ПК
- * привязывается к аккаунту как есть.
+/* ---------- Привязка ПК ----------
+ * 2.19.2: ручной ввод адреса УБРАН. Кнопка «Привязать ПК» больше не зовёт
+ * `POST /devices/link` — этот эндпоинт остался для совместимости со старыми
+ * воркерами, но PWA шёл через него мимо JCS-челленджа (`/devices/link/
+ * challenge` → `/devices/link/confirm`), то есть мимо той проверки, которая
+ * требует ОБЕ подписи — владельца и ПК. Пока путь существовал в интерфейсе,
+ * обход был доступен человеку, который просто нажал не ту кнопку.
+ *
+ * Единственный путь привязки из PWA теперь — код из шести цифр:
+ * `/devices/link-code` (подпись владельца) + `--link <код>` в окне воркера
+ * (подпись ПК). Здесь остаётся только список и отвязка.
  *
  * Список читаем с сервера, а не из localStorage: привязка должна
- * переживать смену браузера и чистку памяти. Здесь хранится только
- * ничего не значащий кеш, и он не используется как источник истины.
+ * переживать смену браузера и чистку памяти.
  */
 function linkRow(d) {
   const dot = d.online ? '🟢' : '⚪';
@@ -2150,42 +2155,6 @@ async function unlinkDevice(addr) {
     if (st) st.textContent = `не смог отвязать: ${e.message}`;
   }
 }
-
-$('linkBtn')?.addEventListener('click', async () => {
-  const st = $('linkState');
-  const raw = String($('linkAddr')?.value || '').trim();
-  if (!/^0x[0-9a-fA-F]{40}$/.test(raw)) {
-    if (st) st.textContent = 'нужен адрес вида 0x + 40 hex-символов';
-    return;
-  }
-  if (raw.toLowerCase() === ADDR.toLowerCase()) {
-    if (st) st.textContent = 'это адрес вашего телефона — вставьте адрес ПК';
-    return;
-  }
-  try {
-    const device = raw.toLowerCase();
-    const nonce = makeNonce();
-    const signature = await signLink('link', ADDR, device, nonce);
-    if (!signature) {
-      /* Ключа нет — честно говорим об этом, а не шлём запрос без подписи:
-       * сервер ответил бы 400, и причина выглядела бы как ошибка ввода. */
-      if (st) st.textContent = 'нет ключа подписи в этом браузере: привязка недоступна';
-      return;
-    }
-    const r = await call('/devices/link', {
-      method: 'POST',
-      body: { ownerAddress: ADDR, deviceAddress: device, signature, nonce },
-    });
-    if (st) st.textContent = `привязан ${r.deviceAddress.slice(0, 10)}…`;
-    if ($('linkAddr')) $('linkAddr').value = '';
-    await refreshLinks();
-    refreshWorkerBanner();
-  } catch (e) {
-    /* Тексты сервера уже человеческие: показываем их, подменяя только
-     * лимит запросов — он не про привязку, и человеку нужен таймаут. */
-    if (st) st.textContent = e.code === 'RATE_LIMIT' ? e.message : (e.message || 'не получилось привязать');
-  }
-});
 
 $('linkRefresh')?.addEventListener('click', refreshLinks);
 

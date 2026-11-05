@@ -505,18 +505,16 @@
 
         <div class="card" id="linkCard">
           <div class="card-head">
-            <h2>Привязать существующий ПК</h2>
+            <h2>Мои ПК</h2>
             <span class="chip">Device Pairing</span>
           </div>
           <p class="dim tiny">
-            Если воркер уже запущен, но PWA его не видит — вставьте адрес из окна
-            воркера (строка «адрес: 0x…») или из <code>%LOCALAPPDATA%\TarNet\start.cmd</code>.
+            Привязка — только кодом выше. Ручной ввод адреса убран в 2.19.2:
+            он шёл по старому эндпоинту без JCS-челленджа, то есть мимо
+            проверки, которая не даёт привязать чужой ПК. Здесь остаётся
+            список уже привязанных устройств.
           </p>
-          <label class="consent" for="linkAddr"><span>Адрес ПК</span></label>
-          <input type="text" id="linkAddr" autocomplete="off" spellcheck="false"
-                 placeholder="0x..." aria-label="Адрес кошелька ПК">
           <div class="row">
-            <button id="linkBtn" class="btn">Привязать</button>
             <button id="linkRefresh" class="btn ghost">Обновить список</button>
           </div>
           <p class="mono dim tiny addr-line" id="linkState">—</p>

@@ -81,6 +81,7 @@ class WsInbound {
       authenticated: 0,
       rejected: 0,
       tasksSent: 0,
+      tasksCancelled: 0,
       resultsIn: 0,
       terminatedStale: 0,
       terminatedNoAuth: 0,
@@ -172,6 +173,33 @@ class WsInbound {
     } catch (_e) {
       return false;
     }
+  }
+
+  /* Отмена задачи, которую сервер уже выдал по сокету (2.19.2).
+   *
+   * ЗАЧЕМ. В режиме гонки роя второй воркер продолжает считать, когда первый
+   * уже ответил. Сервер снимал строку в `cancelled`, но воркер об этом не
+   * узнавал: на CPU (и особенно на ноутбуке) это минуты вентилятора впустую
+   * и занятый слот, из-за которого следующие задачи ждут.
+   *
+   * ЧЕГО CANCEL НЕ ДЕЛАЕТ. Он не отменяет деньги и не гарантирует остановку:
+   * воркер может быть в середине HTTP-запроса к Ollama, и тогда кадр ляжет
+   * в очередь на обработку. Это сигнал «результат больше не нужен», а не
+   * приказ с подтверждением. Поэтому строка задачи снимается на сервере
+   * ДО отправки кадра: даже если воркер его не увидит, результат не будет
+   * оплачен второй раз.
+   *
+   * inflight чистим сразу: задача больше не ждёт ответа, и держать её там
+   * значило бы считать воркера занятым до конца TTL. */
+  cancelTask(workerAddress, taskId, reason = 'swarm_loser') {
+    const addr = String(workerAddress || '').toLowerCase();
+    const w = this.workers.get(addr);
+    if (!w) return false;
+    if (w.inflight && taskId) w.inflight.delete(String(taskId));
+    if (w.ws.readyState !== WebSocket.OPEN) return false;
+    const sent = this._send(w.ws, { type: 'CANCEL', taskId, reason, at: Date.now() });
+    if (sent) this.stats.tasksCancelled = (this.stats.tasksCancelled || 0) + 1;
+    return sent;
   }
 
   /* Выбор воркера под задачу. Приоритет — наименее загруженный по inflight,
