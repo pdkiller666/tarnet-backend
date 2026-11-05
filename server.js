@@ -2523,7 +2523,33 @@ function workerBundlePath() {
 
 function ensureWorkerBundle() {
   const file = workerBundlePath();
-  if (fs.existsSync(file)) return file;
+
+  /* ПЕРЕСБОРКА ПО ВРЕМЕНИ ИСХОДНИКОВ, А НЕ ПО ФАКТУ ОТСУТСТВИЯ.
+   *
+   * Проверка «файла нет — собираем» оставляла в раздаче СТАРУЮ сборку
+   * навсегда. Реальный случай: `dist/tarnet-worker.js` собран в 14:26,
+   * `worker-demo.js` правился в 15:12, а `/download/worker.js` отдавал
+   * 88766 байт из 14:26 — без SAME_ADDRESS и без правки пробелов.
+   *
+   * Самое опасное в этом дефекте — он невидим: версия в `/health`
+   * поднялась, тесты зелёные, а пользователи качали старый воркер.
+   * `dist/` в `.gitignore`, поэтому rsync привозит исходники, но не сборку,
+   * и расхождение не видно ни в git, ни в выводе деплоя.
+   *
+   * Сравниваем с mtime исходников. Отсутствующая сборка — тоже повод собрать. */
+  const sources = ['worker-demo.js', 'worker-box.js', 'build-worker.js']
+    .map((name) => path.join(__dirname, name));
+  const stale = (() => {
+    if (!fs.existsSync(file)) return true;
+    try {
+      const builtAt = fs.statSync(file).mtimeMs;
+      return sources.some((src) => {
+        try { return fs.statSync(src).mtimeMs > builtAt; } catch { return false; }
+      });
+    } catch { return true; }
+  })();
+  if (!stale) return file;
+
   try {
     const { build } = require('./build-worker');
     const out = build();
@@ -2531,6 +2557,13 @@ function ensureWorkerBundle() {
     fs.writeFileSync(file, out.code);
     return file;
   } catch (e) {
+    /* Сборка не удалась, но старая на диске есть. Отдаём её и говорим об этом
+     * в лог: 503 на весь маршрут был бы хуже — скачивание вообще перестало бы
+     * работать из-за опечатки в одной строке. */
+    if (fs.existsSync(file)) {
+      console.error(`  ВНИМАНИЕ: пересборка воркера не удалась (${e.message}); отдаю прошлую сборку`);
+      return file;
+    }
     return { error: e.message };
   }
 }

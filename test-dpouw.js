@@ -5618,6 +5618,35 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
         isolated.code === 0 && /self-check: ok/.test(isolated.out) && isolated.files === 1,
         isolated);
     }
+
+    /* 31.25 Раздаётся СВЕЖАЯ сборка, а не прошлогодняя.
+     *
+     * Зачем отдельный тест. 31.21–31.24 проверяют, что скачанный файл
+     * существует, самодостаточен и запускается — но НЕ что он собран из
+     * текущего `worker-demo.js`. Реальный дефект 05.11 прошёл все зелёные
+     * проверки: сборка была от 14:26, исходник правился в 15:12, и на прод
+     * отдавались 88766 байт без SAME_ADDRESS. Тесты молчали, потому что
+     * старый бандл сам по себе исправен.
+     *
+     * Сравниваем не mtime (он врёт при rsync), а СОДЕРЖИМОЕ: каждый маркер
+     * из доставшегося текста обязан присутствовать и в исходнике. Маркеры
+     * взяты из двух последних правок воркера: ветка SAME_ADDRESS и чистка
+     * пробелов до валидации кода привязки. */
+    {
+      const srcText = fs.readFileSync(path.join(__dirname, 'worker-demo.js'), 'utf8');
+      const markers = [
+        "res.error === 'SAME_ADDRESS'",
+        'replace(/\\s+/g, \'\')',
+      ];
+      /* Маркер обязан быть в исходнике: иначе тест стерёг бы пустоту
+       * и «проходил» на любой сборке. */
+      const inSrc = markers.filter((m) => srcText.includes(m));
+      const inBundle = markers.filter((m) => dlText.includes(m));
+      ok('31.25 раздаётся сборка из текущего исходника, а не протухшая',
+        inSrc.length === markers.length && inBundle.length === markers.length,
+        { markers: markers.length, inSrc: inSrc.length, inBundle: inBundle.length,
+          missingInBundle: markers.filter((m) => !inBundle.includes(m)).map((m) => m.slice(0, 28)) });
+    }
   }
 
   /* ===== 32. Tier 6 в списке моделей PWA =====
