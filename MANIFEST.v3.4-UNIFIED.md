@@ -405,7 +405,7 @@ string» на `messages[]` теперь `400 {error:"expected_field_prompt", exp
 | `Planner` / `Map-Reduce` | есть в системе | **Нет кода.** `grep` → 0. `model-router.js` — 124 строки, только `classifyDomain` + `selectModel`; `Promise.all` → 0 | `model-router.js` |
 | Ключ BYOK | идёт из браузера напрямую | **Идёт через наш VPS**: `X-Provider-Key` → `server.js:6805` → `Authorization: Bearer` провайдеру | `app/app.js:1226`, `llm-adapter.js:108` |
 | Теги на VPS | отстают | **44 = 44, наборы идентичны** (`diff` — только порядок строки `v2.1.0-stable`) | `git tag` локально и на VPS |
-| Диск | `/dev/vda2`, риск | Устройство — **`overlay`**; `9.8G / 9.6G used / **26M avail** / 100%`. Inodes 41% — упор в байты | `df -h /`, `df -i /` |
+| Диск | `/dev/vda2`, риск | Устройство — **`overlay`**, Inodes 41% — упор в байты. На момент среза `26M avail / 100%`; **актуальное состояние — в блоке «Диск» ниже**, не здесь | `df -h /`, `df -i /` |
 
 **P2P подтверждён как локальный стенд:** `listenHost: "127.0.0.1"`, `publicUrl: "ws://127.0.0.1:4001"`,
 `announced_public: false`, `registry: {total: 0, has_public_nodes: false}`; у всех трёх узлов
@@ -516,19 +516,38 @@ CWU `754 300 692` · выплачено `109.56319 TAR` · Block `102.410739` п
 `onchain.simulated: true` — 17 settlement'ов синтетические, файлов `.sol` в репозитории 0.
 P2P — 3 узла на `127.0.0.1`. Комитет валидаторов — 0 членов. GPU-обучения нет.
 
-**Мост к libp2p (05.11.2026) — шаг, а не discovery.** `p2p-node/` перенесён
-внутрь репозитория (был вне git, то есть до VPS не доезжал никогда) и получил
-`bridge.js`: отдельный процесс на Unix-socket `/tmp/tarnet-p2p-bridge.sock`
-(права `0600`, JSON Lines). `server.js` при старте объявляет себя через
-`p2p-bridge-client.js`. Проверено сквозным прогоном.
-**Чего мост НЕ делает:** не ищет пиров в Kademlia DHT, не передаёт координацию,
-не снимает зависимость от единого `server.js`. libp2p по умолчанию **не
-поднимается** (`P2P_BRIDGE_LIBP2P=1` включает) — запуск узла открывает порт
-4001 наружу, это отдельное решение с правкой firewall. `peerId` остаётся
-`unassigned`: у backend-api нет ключа узла. Считать это «P2P работает» нельзя.
+**Мост к libp2p (05.11.2026) — узел объявлен, discovery нет.** `p2p-node/`
+перенесён внутрь репозитория (был вне git, то есть до VPS не доезжал никогда)
+и получил `bridge.js`: отдельный процесс на Unix-socket
+`/tmp/tarnet-p2p-bridge.sock` (права `0600`, JSON Lines). `server.js`
+объявляет себя через `p2p-bridge-client.js` при старте и переобъявляется
+циклом 60 с, если мост перезапустился.
+
+**На проде работает.** `p2p-bridge.service` — `active`, `enabled`,
+`NRestarts=0`; libp2p слушает `0.0.0.0:4001`, порт открыт в ufw (IPv4 + IPv6).
+Живой ответ сокета: `peerId 12D3KooWRjbDE4rzafznjsd4aDu3S4Z1exHcPKSw2MeH4WcVEZpy`,
+`listen /dns4/v1107336.hosted-by-vdsina.com/tcp/4001/p2p/<peerId>`,
+`peer_id_persistent: true`, `announced_total: 1`.
+
+**`peerId` постоянный, а не `unassigned`.** Ключ узла генерируется один раз
+(`p2p-node/peer-id-store.js`) и лежит в `/var/lib/tarnet/p2p/peer-id.bin`
+с правами `0600`; проверено двумя рестартами сервиса — идентификатор не
+меняется, `peer_id_created_on_start: false` со второго старта. Ключ
+закрыт `.gitignore` (`data/`) и в репозиторий не попадает.
+
+**Чего мост НЕ делает:** не ищет пиров в Kademlia DHT (kad-dht в
+`clientMode`, запросов 0), не передаёт координацию, не снимает зависимость
+от единого `server.js`. Условие готовности P1.1 (`has_public_nodes: true`
+и `framesIn > 0`) им **не закрыто**: один объявленный узел сети не создаёт.
+Считать это «P2P работает» нельзя.
 Казна `0.19815 TAR` против OPEX `517 $/мес` — `reserveStatus: critical`.
 Эмиссия доминирует: Block `116.75` против Fee `7.15` = **94.2% награды из эмиссии**,
 условие «спрос > эмиссия» не выполнено.
 
-**Диск — блокер.** `overlay 9.8G / 9.2G used / ~447M avail / 96%`. Следующий
-`npm install` требует ≥208 МБ; транскрипты растут ~100–190 МБ/сутки.
+**Диск — разгружен 05.11.2026, но остаётся тесным.** Было `~447M avail / 96%`.
+Удалены `failed`-сессии из `openclaw-agent.sqlite` и свободные страницы
+возвращены ОС (`auto_vacuum=2` → `PRAGMA incremental_vacuum`, плюс
+`wal_checkpoint(TRUNCATE)`): база `884 → 619 МБ`, `freelist 0`,
+`integrity_check: ok`, диск **`739M avail / 93%`**. Следующий `npm install`
+требует ≥208 МБ — запас есть. Транскрипты растут ~100–190 МБ/сутки,
+так что это отсрочка, а не решение: нужна ротация сессий.
