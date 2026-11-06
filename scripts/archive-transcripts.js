@@ -64,6 +64,19 @@ const EXCLUDE = arg('exclude-session', null);
 const WHERE_OLD = EXCLUDE ? 'created_at < ? AND session_id <> ?' : 'created_at < ?';
 const oldArgs = () => (EXCLUDE ? [cut, EXCLUDE] : [cut]);
 
+/* Строка seq=0 — не «старое событие», а ЗАГОЛОВОК транскрипта: `type:"session"`,
+ * version, cwd, sessionId. Она всегда самая старая по created_at, поэтому
+ * попадала под общий предикат и удалялась вместе с историей.
+ *
+ * 06.11.2026 это убило Telegram DM-сессию: транскрипт остался без заголовка, и
+ * рантайм отказался его читать — «Persisted legacy session transcripts require
+ * doctor/import migration before runtime use». Пользователь видел «⚠️ Something
+ * went wrong» на каждое сообщение, а агент молчал.
+ *
+ * Заголовок — одна строка на сессию, экономить на нём нечего. Поэтому он
+ * исключён из архивации и удаления. */
+const WHERE_OLD_ROWS = `${WHERE_OLD} AND seq <> 0`;
+
 if (!Number.isFinite(DAYS) || DAYS < 1) {
   console.error('  ОШИБКА: --days должно быть числом >= 1');
   process.exit(2);
@@ -89,8 +102,8 @@ const db = new DatabaseSync(DB, { readOnly: !APPLY });
 if (APPLY) db.exec('PRAGMA busy_timeout = 5000');
 
 function stats() {
-  const rows = db.prepare(`SELECT COUNT(*) c FROM transcript_events WHERE ${WHERE_OLD}`).get(...oldArgs());
-  const bytes = db.prepare(`SELECT SUM(length(event_json)) s FROM transcript_events WHERE ${WHERE_OLD}`).get(...oldArgs());
+  const rows = db.prepare(`SELECT COUNT(*) c FROM transcript_events WHERE ${WHERE_OLD_ROWS}`).get(...oldArgs());
+  const bytes = db.prepare(`SELECT SUM(length(event_json)) s FROM transcript_events WHERE ${WHERE_OLD_ROWS}`).get(...oldArgs());
   const total = db.prepare('SELECT COUNT(*) c, SUM(length(event_json)) s FROM transcript_events').get();
   const free = db.prepare('PRAGMA freelist_count').get();
   const ps = db.prepare('PRAGMA page_size').get();
@@ -161,7 +174,7 @@ async function main() {
   let rowCount = 0;
   async function* archivedLines() {
     const it = db.prepare(
-      `SELECT session_id, seq, event_json, created_at FROM transcript_events WHERE ${WHERE_OLD} ORDER BY created_at ASC`
+      `SELECT session_id, seq, event_json, created_at FROM transcript_events WHERE ${WHERE_OLD_ROWS} ORDER BY created_at ASC`
     ).iterate(...oldArgs());
     for (const r of it) {
       rowCount += 1;
@@ -213,7 +226,7 @@ async function main() {
   const del = db.prepare('DELETE FROM transcript_events WHERE session_id = ? AND seq = ?');
   while (true) {
     const slice = db.prepare(
-      `SELECT session_id, seq FROM transcript_events WHERE ${WHERE_OLD} LIMIT ${BATCH}`
+      `SELECT session_id, seq FROM transcript_events WHERE ${WHERE_OLD_ROWS} LIMIT ${BATCH}`
     ).all(...oldArgs());
     if (!slice.length) break;
     /* Транзакция с повтором: `database is locked` — не повод терять партию
@@ -239,6 +252,22 @@ async function main() {
     process.stdout.write(`\r  удалено: ${deleted} / ${rowCount}`);
   }
   console.log('');
+
+  /* Проверка, что ни одна сессия не потеряла заголовок. Один GROUP BY по
+   * индексу, но именно она поймала бы дефект 06.11.2026 здесь, а не в рантайме
+   * у пользователя. Заголовков быть не может только у сессий, которых нет. */
+  const headerless = db.prepare(`
+    SELECT COUNT(*) c FROM (
+      SELECT session_id FROM transcript_events GROUP BY session_id
+      HAVING SUM(CASE WHEN seq = 0 THEN 1 ELSE 0 END) = 0
+    )
+  `).get().c;
+  if (headerless > 0) {
+    console.error(`\n  ОШИБКА: ${headerless} сессий остались без заголовка seq=0.`);
+    console.error('  Восстановление: openclaw doctor --fix (или точечно, см. memory/2026-11-06).');
+    return 1;
+  }
+  console.log('  проверка заголовков: у всех сессий seq=0 на месте ✅');
 
   /* --- 4. Усадка файла ---
    * incremental_vacuum освобождает страницы из freelist и укорачивает файл.

@@ -660,7 +660,8 @@ libp2p-узла, а не принадлежность к сети TarNet.
 | Установщик без адреса браузера | `GET /install/:file` (`addr` необязателен), `install/*.tpl` | `200` без `addr`, `400` на `addr=0xZZZ` |
 | SAME_ADDRESS как успех | `worker-demo.js` (`applyLinkCode`), `app/app.js` (`refreshLinks`) | воркер снимает приглашение; PWA даёт зелёную `text-ok` строку |
 | Ввод кода с пробелами | `worker-demo.js` (`startLinkListener`) | `4 6 6 0 6 7` проходит валидацию |
-| Архивация транскриптов | `scripts/archive-transcripts.js` | 13431 строка → 9 МБ архив, база **628 → 605 МБ**, `integrity_check: ok` |
+| Архивация транскриптов | `scripts/archive-transcripts.js` | 13431 строка → 9 МБ архив, база **628 → 605 МБ**, `integrity_check: ok`; с 06.11 заголовок `seq=0` исключён (`WHERE_OLD_ROWS ... AND seq <> 0`) и проверяется финально — иначе сессия теряет право читаться |
+| Заголовки транскриптов | `repair-session-header.mjs` (workspace) → `noteSessionTranscriptHeaderHealth` из `/app/dist/doctor-session-transcript-headers-*.mjs` | 06.11: DM `921098636` восстановлена, `repaired: 1`, `383 → 384` события, заголовки **43/43**. Повторный dry-run: `found: 0` |
 
 **Направление потоков в P2P задано ограничением, а не вкусом.** Узел воркера
 слушает `/ip4/127.0.0.1/tcp/0` (loopback, случайный порт), поэтому мост не может
