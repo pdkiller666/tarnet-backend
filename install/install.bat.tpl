@@ -80,6 +80,14 @@ if not exist "%NODE_EXE%" goto fail_node
 del "%NODE_ZIP%" >nul 2>nul
 
 :have_node
+rem npm lives next to node.exe in both cases: portable archive ships it, and
+rem a system Node has its own. Resolving the FOLDER (not a hardcoded path)
+rem keeps the p2p dependency install working for both.
+for %%p in ("%NODE_EXE%") do set "NODE_DIR=%%~dp"
+set "NPM_EXE="
+if exist "%NODE_DIR%npm.cmd" set "NPM_EXE=%NODE_DIR%npm.cmd"
+rem npm.cmd spawns node by name, so the folder has to be on PATH.
+set "PATH=%NODE_DIR%;%PATH%"
 echo [1/4] Node.js: ok
 echo       %NODE_EXE%
 
@@ -146,6 +154,70 @@ set "WORKER_JS=%TARNET_DIR%\tarnet-worker.js"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%API%/download/worker.js' -OutFile '%WORKER_JS%'"
 if not exist "%WORKER_JS%" goto fail_worker
 
+rem ---------- 4b. p2p-node, the libp2p transport (2.22.7) ----------
+rem Until this step the installer shipped ONE file. `--p2p` then searched
+rem for p2p-node/p2p-worker.js next to the worker, found nothing, and the
+rem worker silently stayed on WS: same symptom as "forgot the second
+rem window", so nobody could tell a missing transport from an idle one.
+rem The archive carries SOURCES only; dependencies come from package-lock
+rem via npm, because 105 MB of node_modules has no business in a download.
+set "P2P_DIR=%TARNET_DIR%\p2p-node"
+set "P2P_ZIP=%TARNET_DIR%\p2p-node.zip"
+set "P2P_OK=0"
+echo       p2p transport...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%API%/download/p2p-node.zip' -OutFile '%P2P_ZIP%'"
+if not exist "%P2P_ZIP%" goto p2p_skip
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '%P2P_ZIP%' -DestinationPath '%TARNET_DIR%' -Force"
+if not exist "%P2P_DIR%\p2p-worker.js" goto p2p_skip
+del "%P2P_ZIP%" >nul 2>nul
+
+if not defined NPM_EXE goto p2p_no_npm
+rem `ci` and not `install`: the lockfile is in the archive, and `ci` refuses
+rem to invent versions. `--omit=dev` keeps test-only packages out.
+rem Installed INTO the p2p folder: that is where node resolves `libp2p`
+rem from, so no NODE_PATH tricks are needed.
+pushd "%P2P_DIR%"
+call "%NPM_EXE%" ci --omit=dev --no-audit --no-fund >"%TARNET_DIR%\p2p-install.log" 2>&1
+set "NPM_RC=%errorlevel%"
+popd
+if not "%NPM_RC%"=="0" goto p2p_npm_failed
+
+rem Prove the transport actually loads HERE, not on the user's first run.
+rem An import failure would otherwise surface as a silent WS fallback, which
+rem is exactly the failure this step exists to remove.
+pushd "%P2P_DIR%"
+"%NODE_EXE%" -e "import('libp2p').then(()=>process.exit(0)).catch(()=>process.exit(1))" >nul 2>nul
+set "IMPORT_RC=%errorlevel%"
+popd
+if not "%IMPORT_RC%"=="0" goto p2p_import_failed
+
+set "P2P_OK=1"
+echo       p2p transport: ok
+goto p2p_done
+
+:p2p_no_npm
+echo       WARNING: npm not found next to node.exe - p2p transport skipped.
+goto p2p_done
+
+:p2p_npm_failed
+echo       WARNING: npm ci failed - p2p transport skipped.
+echo       Log: %TARNET_DIR%\p2p-install.log
+goto p2p_done
+
+:p2p_import_failed
+echo       WARNING: libp2p does not load after npm ci - p2p transport skipped.
+goto p2p_done
+
+:p2p_skip
+echo       WARNING: p2p archive not downloaded - p2p transport skipped.
+goto p2p_done
+
+:p2p_done
+rem Step numbering is kept as 4/4: the p2p transport is part of "4/4", not
+rem a fifth manual step. A skipped transport is REPORTED below, never
+rem hidden: the worker will still start, but on WS only.
+
 rem Verify the downloaded worker ACTUALLY launches here, in the folder it
 rem will run from. Until 2.21.3 the installer shipped a worker that died
 rem with `Cannot find module './worker-box'`: the file was present, the
@@ -171,6 +243,10 @@ rem
 rem So no `start` here at all: node IS the interactive program.
 rem `pause` keeps the window open after a crash so the error text stays
 rem readable instead of the window vanishing instantly.
+rem
+rem `--p2p` is added only when the transport really installed. Passing it
+rem with no p2p-node leaves a working WS worker plus a warning line, which
+rem is honest but makes every user's log start with an avoidable error.
 (
   echo @echo off
   echo title TarNet Worker
@@ -178,7 +254,8 @@ rem readable instead of the window vanishing instantly.
   echo set "WORKER_ADDRESS=%ADDR%"
   echo set "TARNET_API_URL=%API%"
   echo set "TARNET_MODEL=%MODEL%"
-  echo "%NODE_EXE%" "%WORKER_JS%"
+  if "%P2P_OK%"=="1" echo "%NODE_EXE%" "%WORKER_JS%" --p2p
+  if not "%P2P_OK%"=="1" echo "%NODE_EXE%" "%WORKER_JS%"
   echo pause
 ) > "%TARNET_DIR%\start.cmd"
 

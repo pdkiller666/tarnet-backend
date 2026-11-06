@@ -177,6 +177,57 @@ if ! curl -fL --retry 2 --connect-timeout 20 -o "$WORKER_JS" "$API/download/work
   pause_exit 1
 fi
 
+# ---------- 4b. p2p-node (2.22.7) ----------
+# До этого шага установщик качал ОДИН файл. `--p2p` искал
+# p2p-node/p2p-worker.js рядом с воркером, не находил и молча оставался на
+# WS: симптом тот же, что «забыли второе окно», поэтому отсутствующий
+# транспорт было не отличить от простаивающего.
+#
+# В архиве ТОЛЬКО исходники: `node_modules` (105 МБ) ставится здесь по
+# package-lock — те же байты, но не через наш канал раздачи. `data/`
+# (ключ узла peer-id.bin) не уезжает никогда.
+P2P_DIR="$TARNET_DIR/p2p-node"
+P2P_OK=0
+say "      p2p-транспорт..."
+if curl -fL --retry 2 --connect-timeout 20 -o "$TARNET_DIR/p2p-node.zip" "$API/download/p2p-node.zip"; then
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -oq "$TARNET_DIR/p2p-node.zip" -d "$TARNET_DIR" && rm -f "$TARNET_DIR/p2p-node.zip"
+  else
+    # macOS без Xcode CLT не имеет unzip; tar там есть всегда, но zip он не
+    # читает. ditto — системная утилита macOS, читает zip нативно.
+    if command -v ditto >/dev/null 2>&1; then
+      ditto -x -k "$TARNET_DIR/p2p-node.zip" "$TARNET_DIR" && rm -f "$TARNET_DIR/p2p-node.zip"
+    fi
+  fi
+fi
+
+if [ -f "$P2P_DIR/p2p-worker.js" ]; then
+  NPM_BIN="$(dirname "$NODE_BIN")/npm"
+  if [ -x "$NPM_BIN" ]; then
+    # `ci`, а не `install`: lock-файл лежит в архиве, а ci отказывается
+    # выдумывать версии. Ставим В папку p2p — оттуда node разрешает `libp2p`,
+    # никаких NODE_PATH не нужно.
+    if (cd "$P2P_DIR" && "$NPM_BIN" ci --omit=dev --no-audit --no-fund >"$TARNET_DIR/p2p-install.log" 2>&1); then
+      # Проверяем, что транспорт реально загружается ЗДЕСЬ, а не при первом
+      # запуске у человека. Иначе отказ импорта вылезет молчаливым откатом
+      # на WS — ровно тот дефект, ради которого этот шаг и появился.
+      if (cd "$P2P_DIR" && "$NODE_BIN" -e "import('libp2p').then(()=>process.exit(0)).catch(()=>process.exit(1))" >/dev/null 2>&1); then
+        P2P_OK=1
+        say "      p2p-транспорт: ok"
+      else
+        say "      ПРЕДУПРЕЖДЕНИЕ: libp2p не загрузился после npm ci — p2p пропущен"
+      fi
+    else
+      say "      ПРЕДУПРЕЖДЕНИЕ: npm ci не удался — p2p пропущен"
+      say "      Лог: $TARNET_DIR/p2p-install.log"
+    fi
+  else
+    say "      ПРЕДУПРЕЖДЕНИЕ: npm не найден рядом с node — p2p пропущен"
+  fi
+else
+  say "      ПРЕДУПРЕЖДЕНИЕ: архив p2p не скачался — p2p пропущен"
+fi
+
 # Лаунчер на будущее: после перезагрузки не надо проходить установку заново.
 cat > "$TARNET_DIR/start.sh" <<LAUNCHER
 #!/bin/bash
@@ -188,7 +239,12 @@ if [ -n "$ADDR" ]; then
 fi
 export TARNET_API_URL="$API"
 export TARNET_MODEL="$MODEL"
-exec "$NODE_BIN" "$WORKER_JS" "\$@"
+# --p2p только когда транспорт действительно установлен: флаг без p2p-node
+# оставляет рабочий WS-воркер плюс строку предупреждения в каждом логе
+# запуска, то есть шум вместо пользы.
+P2P_FLAG=""
+if [ "$P2P_OK" = "1" ]; then P2P_FLAG="--p2p"; fi
+exec "$NODE_BIN" "$WORKER_JS" $P2P_FLAG "\$@"
 LAUNCHER
 chmod +x "$TARNET_DIR/start.sh"
 

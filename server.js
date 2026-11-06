@@ -36,6 +36,10 @@ const { startDemoMesh, describeMesh } = require('./p2p-demo');
  * Модуль на голом `net` и не бросает: отсутствие моста — штатное состояние,
  * backend-api не должен зависеть от p2p ни при старте, ни в работе. */
 const p2pBridge = require('./p2p-bridge-client');
+/* 2.22.7: архив p2p-node для установщика. Модуль чистый (fs + zlib, без сети
+ * и без БД), поэтому проверяется обычными юнит-тестами — архив можно собрать
+ * и распаковать, не поднимая сервер. */
+const p2pBundle = require('./p2p-bundle');
 /* Фаза 2: TarNet ID, оффлайн-синхронизация чатов, Knowledge Loop.
  * Спека-источник — v2.2.2 (v2.2.1 отозвана: недетерминированные ключи + wrtc). */
 const tarIdentity = require('./identity');
@@ -2627,6 +2631,53 @@ app.get('/download/worker.js', (_req, res) => {
   res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="tarnet-worker.js"');
   res.sendFile(file);
+});
+
+/* ===== p2p-node для установщика (2.22.7) =====
+ *
+ * ЗАЧЕМ. Флаг `--p2p` (2.22.6) поднимает libp2p отдельным процессом, но
+ * `findP2pWorker()` ищет `p2p-node/p2p-worker.js` РЯДОМ С ВОРКЕРОМ. В
+ * `%LOCALAPPDATA%\TarNet` его никогда не было: установщик качал один
+ * `tarnet-worker.js`. Значит у обычного человека флаг молча уходил в WS, а
+ * симптом совпадал с «второе окно забыли»: воркер жив, `ws активен`, мост
+ * показывает `connections: 0`. Сеть из двух узлов оставалась ручной сборкой
+ * на клоне репозитория, то есть не продуктом.
+ *
+ * ПОЧЕМУ АРХИВ, А НЕ ФАЙЛ. p2p-node — это 10 модулей (ESM, `type: module`),
+ * которые импортируют друг друга по именам; раздача их по одному дала бы
+ * второй список файлов рядом с настоящим графом импортов — тот самый дефект,
+ * от которого в 2.21.3 спасала сборка воркера. Архив собирается из явного
+ * списка (`p2p-bundle.js`), и отсутствие файла в списке — ошибка, а не тихий
+ * пропуск.
+ *
+ * ЧЕГО В АРХИВЕ НЕТ. `node_modules` (105 МБ): его ставит установщик по
+ * `package-lock.json` штатным npm из portable Node — это те же байты, но не
+ * через наш канал. `data/` (ключ узла `peer-id.bin`) не уезжает никогда:
+ * личность узла обязана создаваться на машине, а не приходить по HTTP.
+ *
+ * ОТДАЁМ БЕЗ КЕША, но с ETag по mtime исходников: установщик может
+ * перезапускаться, и повторное скачивание того же архива — это 52 КБ на
+ * ровном месте. */
+app.get('/download/p2p-node.zip', (_req, res) => {
+  let built;
+  try {
+    built = p2pBundle.getP2pArchive();
+  } catch (e) {
+    /* Нет файлов в p2p-node — это ошибка сборки, а не пользователя. 503 с
+     * причиной честнее, чем архив без `p2p-worker.js`: второй распакуется и
+     * упадёт на `ERR_MODULE_NOT_FOUND` уже на чужой машине. */
+    return res.status(503).json({ error: 'p2p_bundle_failed', detail: e.message, missing: e.missing || null });
+  }
+
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', 'attachment; filename="p2p-node.zip"');
+  /* `no-cache` без `no-store`: архив не персонален (в отличие от установщика
+   * с адресом), поэтому прокси может хранить его, но обязан переспросить.
+   * `no-store` заставлял бы качать 52 КБ при каждом запуске установщика. */
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('ETag', `"p2p-${built.stamp.toString(16)}"`);
+  res.setHeader('Content-Length', String(built.buffer.length));
+  res.send(built.buffer);
 });
 
 /* ===== Установщики воркера в один клик =====

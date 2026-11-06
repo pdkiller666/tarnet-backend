@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.22.6-p2p-flag",
+  "version": "2.22.7-installer-p2p-and-cleanup",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

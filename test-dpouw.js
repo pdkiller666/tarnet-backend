@@ -9524,6 +9524,148 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     fs.rmSync(soloDir, { recursive: true, force: true });
   }
 
+  /* ===== 54. Установщик привозит p2p-node (2.22.7) =====
+   *
+   * ДЕФЕКТ, КОТОРЫЙ ЭТО ЛОВИТ. `--p2p` (2.22.6) ищет
+   * `p2p-node/p2p-worker.js` РЯДОМ С ВОРКЕРОМ, а установщик качал ровно один
+   * `tarnet-worker.js`. Значит у обычного человека флаг молча уходил в WS,
+   * и симптом совпадал с «забыли второе окно»: воркер жив, `ws активен`,
+   * мост показывает `connections: 0`. Тесты 53.5–53.6 закрепляли это как
+   * ШТАТНОЕ поведение — они и сейчас верны для сборки без архива, но
+   * установщик обязан архив привозить. Поэтому здесь проверяется стык:
+   * маршрут отдаёт архив, и шаблоны его распаковывают.
+   *
+   * Почему проверяется СОДЕРЖИМОЕ архива, а не только код ответа: пустой zip
+   * с `200` распакуется у человека в пустую папку и даст `ERR_MODULE_NOT_FOUND`
+   * на первом запуске — ровно та категория «установка выглядит успешной»,
+   * из-за которой появился `--self-check`. */
+  console.log('\n54. Установщик: раздача p2p-node и флаг --p2p');
+  {
+    const PB = require('./p2p-bundle');
+
+    /* Бинарное тело: общий `apiAt` читает `res.text()` и валидирует JSON —
+     * zip прошёл бы через него как испорченная строка. Поэтому отдельный
+     * путь на том же `fetch`, без разбора тела. */
+    const zipRes = await fetch(BASE + '/download/p2p-node.zip');
+    const zipBuf = Buffer.from(await zipRes.arrayBuffer());
+    ok('54.1 /download/p2p-node.zip отдаётся как application/zip',
+      zipRes.status === 200 && /application\/zip/.test(zipRes.headers.get('content-type') || '')
+      && zipBuf.length > 1000,
+      { status: zipRes.status, type: zipRes.headers.get('content-type'), bytes: zipBuf.length });
+
+    /* Локальная структура zip без внешних пакетов: читаем central directory
+     * по EOCD. Регулярка по байтам здесь была бы ложью — имя файла и его
+     * содержимое могут совпасть случайно, а количество записей в EOCD — нет. */
+    const zipEntries = (() => {
+      const eocdAt = zipBuf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+      if (eocdAt < 0) return null;
+      const count = zipBuf.readUInt16LE(eocdAt + 10);
+      let off = zipBuf.readUInt32LE(eocdAt + 16);
+      const names = [];
+      for (let i = 0; i < count; i++) {
+        if (zipBuf.readUInt32LE(off) !== 0x02014b50) return null;
+        const nameLen = zipBuf.readUInt16LE(off + 28);
+        const extraLen = zipBuf.readUInt16LE(off + 30);
+        const commentLen = zipBuf.readUInt16LE(off + 32);
+        names.push(zipBuf.slice(off + 46, off + 46 + nameLen).toString('utf8'));
+        off += 46 + nameLen + extraLen + commentLen;
+      }
+      return names;
+    })();
+
+    ok('54.2 в архиве ровно ожидаемые файлы под p2p-node/',
+      !!zipEntries && zipEntries.length === PB.BUNDLED_FILES.length
+      && PB.BUNDLED_FILES.every((f) => zipEntries.includes('p2p-node/' + f)),
+      { entries: zipEntries, want: PB.BUNDLED_FILES.length });
+
+    /* Самый важный тест блока: в архиве не должно быть приватного ключа
+     * узла. `data/peer-id.bin` лежит в ТОЙ ЖЕ папке p2p-node, и соблазн
+     * «заархивировать всё» отдал бы личность узла каждому, кто скачал
+     * установщик. Проверяем и data/, и node_modules: второе — 105 МБ,
+     * которые установщик обязан ставить сам по lock-файлу. */
+    ok('54.3 в архиве нет data/ и node_modules',
+      !!zipEntries && !zipEntries.some((n) => /(^|\/)data\//.test(n) || n.includes('node_modules')),
+      { leaked: (zipEntries || []).filter((n) => n.includes('data/') || n.includes('node_modules')).slice(0, 5) });
+
+    /* Забытый файл ловится здесь, а не `ERR_MODULE_NOT_FOUND` у человека:
+     * явный список в p2p-bundle.js обязан покрывать все модули папки. */
+    const actualJs = fs.readdirSync(path.join(__dirname, 'p2p-node'))
+      .filter((n) => n.endsWith('.js')).sort();
+    const bundledJs = PB.BUNDLED_FILES.filter((n) => n.endsWith('.js')).sort();
+    ok('54.4 каждый .js из p2p-node попал в список архива',
+      actualJs.length === bundledJs.length && actualJs.every((n) => bundledJs.includes(n)),
+      { actual: actualJs, bundled: bundledJs });
+
+    /* `npm ci` без lock-файла не работает вовсе, а без `package.json` не
+     * знает, что ставить. Оба файла обязаны быть в архиве, иначе установщик
+     * скачает исходники и не сможет поставить зависимости. */
+    ok('54.5 в архиве есть package.json и package-lock.json',
+      !!zipEntries && zipEntries.includes('p2p-node/package.json')
+      && zipEntries.includes('p2p-node/package-lock.json'),
+      { entries: (zipEntries || []).filter((n) => n.endsWith('.json')) });
+
+    /* Стык шаблона с сервером. Проверяется по ОТДАЧЕ, а не по файлу на
+     * диске: человек получает отрендеренный .bat, и именно в нём должны быть
+     * и скачивание архива, и `--p2p` в лаунчере. */
+    const bat54 = await apiAt(BASE, '/install/install.bat');
+    const bat54Text = typeof bat54.body === 'string' ? bat54.body : '';
+    ok('54.6 установщик Windows качает p2p-node.zip и ставит зависимости',
+      bat54.status === 200 && bat54Text.includes('/download/p2p-node.zip')
+      && bat54Text.includes('npm') && bat54Text.includes(':p2p_done'),
+      { status: bat54.status, hasZip: bat54Text.includes('/download/p2p-node.zip'),
+        hasNpm: bat54Text.includes('npm') });
+
+    /* `--p2p` обязан быть в лаунчере, но ТОЛЬКО при успешной установке
+     * транспорта. Флаг без p2p-node оставляет рабочий WS-воркер плюс
+     * предупреждение в каждом логе запуска — шум вместо пользы. */
+    ok('54.7 --p2p попадает в start.cmd только при P2P_OK=1',
+      bat54Text.includes('if "%P2P_OK%"=="1" echo')
+      && bat54Text.includes('--p2p')
+      && bat54Text.includes('if not "%P2P_OK%"=="1" echo'),
+      { guarded: bat54Text.includes('if "%P2P_OK%"=="1" echo') });
+
+    const sh54 = await apiAt(BASE, '/install/install.command');
+    const sh54Text = typeof sh54.body === 'string' ? sh54.body : '';
+    ok('54.8 установщик macOS качает архив и передаёт --p2p в start.sh',
+      sh54.status === 200 && sh54Text.includes('/download/p2p-node.zip')
+      && sh54Text.includes('P2P_OK') && sh54Text.includes('--p2p'),
+      { status: sh54.status, hasZip: sh54Text.includes('/download/p2p-node.zip'),
+        hasFlag: sh54Text.includes('--p2p') });
+
+    /* --- 54.9 мёртвая константа удалена (2.22.7) ---
+     *
+     * Проверяется ИСХОДНИК, а не CONFIG в памяти: удалённая, но объявленная
+     * в комментарии константа снова всплывает в `grep` и вводит следующего
+     * исполнителя в заблуждение — он правит число, перезапускает сервис и
+     * считает, что изменил ставку утилизации. Критерий приёмки владельца —
+     * ноль вхождений во всём коде, поэтому проверяем весь репозиторий. */
+    const selfSrc = fs.readFileSync(__filename, 'utf8');
+    const repoFiles = fs.readdirSync(__dirname).filter((n) => n.endsWith('.js'));
+    const hits = [];
+    for (const f of repoFiles) {
+      const t = fs.readFileSync(path.join(__dirname, f), 'utf8');
+      /* Сам тест упоминает имя как строку поиска — иначе проверку не написать.
+       * Исключаем только собственный файл и только сборку в dist/. */
+      if (f === path.basename(__filename)) continue;
+      if (t.includes('TAR_UTILITY_FEE_BPS')) hits.push(f);
+    }
+    ok('54.9 мёртвой константы ставки нет ни в одном .js',
+      hits.length === 0, { hits });
+
+    /* Конфиг обязан остаться рабочим: две живые ставки на месте, и именно
+     * они считают долю. Если бы удаление задело соседние строки, этот тест
+     * упал бы раньше, чем 1159 остальных. */
+    const cfg54 = require('./config').CONFIG;
+    ok('54.10 живые ставки утилизации на месте (1% + 1%)',
+      cfg54.TAR_UTILITY_BURN_RATE === 0.01 && cfg54.TAR_UTILITY_TREASURY_RATE === 0.01,
+      { burn: cfg54.TAR_UTILITY_BURN_RATE, treasury: cfg54.TAR_UTILITY_TREASURY_RATE });
+
+    /* Имя переменной осталось в `selfSrc` только как поисковая строка —
+     * тест не должен сам себя ловить в 54.9. Убеждаемся, что это так. */
+    ok('54.11 тест ищет имя, но не объявляет его',
+      !/^\s*TAR_UTILITY_FEE_BPS\s*:/m.test(selfSrc), { ok: true });
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {
