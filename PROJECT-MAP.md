@@ -4,7 +4,7 @@
 а не «что работает» (это `MANIFEST.v3.4-UNIFIED.md`) и не «как мы сюда пришли»
 (это `PROJECT-HISTORY.md`).
 
-**Сверено с кодом:** 2026-11-05, сборка `2.19.2-p0-p1-security`. Карта описывает **файлы**,
+**Сверено с кодом:** 2026-11-06, сборка `2.22.6-p2p-flag`. Карта описывает **файлы**,
 поэтому устаревает медленнее манифеста — но при добавлении/удалении модуля правится в тот же день.
 
 ---
@@ -18,6 +18,8 @@
 | Приёмка | `node test-dpouw.js --test` — поднимает изолированный сервер на `mktemp`-БД |
 | Прод | systemd `tarnet.service`, каталог `/opt/tarnet/backend-api`, БД `/var/lib/tarnet` |
 | Мост к libp2p | systemd `p2p-bridge.service` (юнит в `deploy/systemd/p2p-bridge.service`), ключ узла `/var/lib/tarnet/p2p/peer-id.bin`, порт `4001` |
+| Проверка снаружи | `https://v1107336.hosted-by-vdsina.com/health` и `/p2p/bootstrap` (за **Caddy** на `443`; порт `3001` наружу **закрыт** — не судить о доступности по нему) |
+| Соседи P2P | `GET /p2p/status` → `registry.total`, `client`, `nodes`; `connections` — в `/p2p/bootstrap` |
 | Деплой | `scripts/deploy.sh` — **коммит + пуш + раскатка без `--dry-run`** (см. §8) |
 
 ---
