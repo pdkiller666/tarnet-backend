@@ -574,6 +574,26 @@ ensureColumn('worker_tasks', 'errorDetail', 'errorDetail TEXT');
  * считается награда. Потолок, который некому проверить, — не потолок. */
 ensureColumn('worker_tasks', 'maxTokens', 'maxTokens INTEGER');
 
+/* ===== Целостность промпта (2.23.3) =====
+ *
+ * ЗАЧЕМ ЗДЕСЬ ХЕШ, ЕСЛИ ТЕЛО ЗАДАЧИ УЖЕ ЗАШИФРОВАНО. Шифрование защищает
+ * перехват по дороге, но не отвечает на вопрос «на каком тексте воркер
+ * реально считал». Сохраняем sha256 промпта, который сервер отправил, и
+ * сверяем с тем, что воркер вернул вместе с результатом. Это ловит подмену
+ * или порчу промпта между записью задачи и исполнением.
+ *
+ * ЧЕГО ЭТО НЕ ЛОВИТ (и не должно выдаваться за это): воркер может посчитать
+ * правильный промпт и прислать выдуманный ответ, либо просто соврать про
+ * хеш. Подпись результата покрывает задачу, токены и хеш ОТВЕТА; хеш
+ * промпта в неё не входит, поэтому это проверка целостности, а не
+ * аттестация вычисления. Полноценная верификация — Фаза 3.
+ *
+ * NULL в promptHash — задача из очереди, созданная до 2.23.3: сверять
+ * нечего, и такая работа получает promptHashVerified = NULL (не «прошла»
+ * и не «провалила»). */
+ensureColumn('worker_tasks', 'promptHash', 'promptHash TEXT');
+ensureColumn('worker_tasks', 'promptHashVerified', 'promptHashVerified INTEGER');
+
 /* ===== Миграция: burn-строки без fromAddress =====
  *
  * recordBurn до этой правки писал адрес плательщика (или воркера) в
@@ -1050,6 +1070,7 @@ CREATE TABLE IF NOT EXISTS distillation_buffer (
  * Порядок колонок совпадает с порядком в WHERE — (domain, usedInTraining). */
 CREATE INDEX IF NOT EXISTS idx_distill_domain_unused
   ON distillation_buffer(domain, usedInTraining);
+
 
 /* Версии LoRA-адаптеров.
  *
@@ -1585,6 +1606,58 @@ function migratePlaintextKeys() {
 }
 const reencrypted = migratePlaintextKeys();
 
+/* ===== Шифрование промптов в буфере дистилляции (2.23.3) =====
+ *
+ * ПОЧЕМУ ЭТО НЕ КОСМЕТИКА. Манифест §3.1 обещал «зашифрованы AES-256-GCM»,
+ * а код писал promptText открытым текстом. Обещание приватности без
+ * механизма — худший вид расхождения: его нельзя заметить, пока база не
+ * утечёт. Обещание было записано в документ раньше, чем в код.
+ *
+ * Теперь promptText И response в `distillation_buffer` лежат в формате
+ * `enc:v1:...` (AES-256-GCM, ключ `master.key` из SECRETS_DIR).
+ *
+ * ЧЕГО ЭТО НЕ ДАЁТ. Ключ у сервера есть — иначе обучение невозможно.
+ * Поэтому «мы не можем прочитать ваш промпт» остаётся ЛОЖЬЮ, и формулировка
+ * запрещена наравне с прежним «промпты зашифрованы, а на деле нет». Верная:
+ * «в базе он зашифрован, открытый текст существует только в памяти процесса
+ * обучения».
+ *
+ * Строки, записанные до 2.23.3, перешифровываются при старте: иначе новая
+ * запись была бы защищена, а старая лежала бы открытой, и «мы шифруем» было
+ * бы верно только для половины таблицы. Идемпотентно по условию выборки:
+ * повторный старт находит 0 строк. */
+function migratePlaintextDistillation() {
+  const rows = db.prepare(
+    `SELECT id, promptText, response FROM distillation_buffer
+      WHERE (promptText IS NOT NULL AND promptText NOT LIKE 'enc:v1:%')
+         OR (response IS NOT NULL AND response NOT LIKE 'enc:v1:%')`,
+  ).all();
+  let n = 0;
+  for (const r of rows) {
+    const encPrompt = r.promptText === null || r.promptText === undefined
+      ? null
+      : (String(r.promptText).startsWith('enc:v1:') ? r.promptText : encryptSecret(r.promptText));
+    const encResponse = String(r.response || '').startsWith('enc:v1:')
+      ? r.response : encryptSecret(r.response);
+    /* Ключ недоступен — оставляем строку как есть, но НЕ считаем её
+     * перешифрованной: иначе лог соврал бы о количестве. */
+    if ((r.promptText !== null && r.promptText !== undefined && encPrompt === null) || encResponse === null) {
+      continue;
+    }
+    db.prepare('UPDATE distillation_buffer SET promptText = ?, response = ? WHERE id = ?')
+      .run(encPrompt, encResponse, r.id);
+    n++;
+  }
+  return n;
+}
+
+/* Буфер дистилляции: открытые строки → enc:v1. Идемпотентно по условию
+ * выборки, повторный старт находит 0 строк. */
+const reencryptedDistill = migratePlaintextDistillation();
+if (reencryptedDistill > 0) {
+  console.log(`🔐 distillation_buffer: ${reencryptedDistill} строк перешифрованы (promptText/response)`);
+}
+
 // ===== Helper Wrappers =====
 function run(sql, params = []) {
   const stmt = db.prepare(sql);
@@ -1612,6 +1685,10 @@ function get(sql, params = []) {
  * которой не было. */
 const knowledgeCoordinator = new knowledgeLoop.KnowledgeLoopCoordinator({
   db: { run, all, get },
+  /* Расшифровка живёт на сервере, а не в координаторе: ключ — `master.key`
+   * из SECRETS_DIR, и второй копии этого знания быть не должно. Координатор
+   * получает функцию и не знает, чем именно зашифровано. */
+  decryptText: decryptSecret,
 });
 
 /* Сумма всех резервов по счетам.
@@ -2146,7 +2223,7 @@ function lookupActionId(id) {
 /* ===== Ядро начисления =====
  * Единственный путь, которым в системе появляются токены. Никаких условий
  * «если повезло»: при γ=1 начисление всегда, при γ=0 — никогда. */
-function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, response, actionId, flush = false, demo = false, paymentMode = null }) {
+function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, response, actionId, flush = false, demo = false, paymentMode = null, promptHashVerified = null }) {
   const t = normalizeTier(tier);
   if (!t) {
     const err = new Error(`tier must be one of ${TIERS.join('|')}`);
@@ -2239,7 +2316,8 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
      * качества, когда копилась. enqueue() вызывается лишь при gamma > 0,
      * поэтому проваленной работы в pending_work нет и перепроверять нечего. */
     ? { gamma: 1, sampled: false, bucket: null, checks: {}, passed: true, reason: 'demo_flush' }
-    : verifyQuality({ actionId: auditSeed, tokens, response: response || 'ok', adapterId: adapterId || BASE_MODEL });
+    : verifyQuality({ actionId: auditSeed, tokens, response: response || 'ok',
+      adapterId: adapterId || BASE_MODEL, promptHashVerified });
 
   /* 1.5) Батчинг коротких работ. Работа дешевле порога не пропадает и не
    * превращается в чек на ноль: она копится в pending_work и суммируется со
@@ -5417,13 +5495,30 @@ app.post('/distill/record', async (req, res) => {
 
   const id = crypto.randomUUID();
   const promptHash = crypto.createHash('sha256').update(promptText).digest('hex');
+  /* Шифруем ОБА поля до записи (2.23.3). Хеш считается по ОТКРЫТОМУ тексту:
+   * он и нужен для сверки с тем, что было отправлено, поэтому после
+   * шифрования его не пересчитать.
+   *
+   * Что кладём в ответ клиенту: promptHash и pii-статус, но НЕ текст —
+   * клиент его только что прислал сам, а эхо в ответе не нужно.
+   * В БД не остаётся открытого текста. Если `encryptSecret` вернёт null
+   * (ключа нет или текст пустой), запись отменяем — silently сохранять
+   * открытым текстом было бы ровно тем дефектом, который здесь закрывается. */
+  const encPrompt = encryptSecret(promptText);
+  const encResponse = encryptSecret(response);
+  if (!encPrompt || !encResponse) {
+    return res.status(503).json({
+      error: 'ENCRYPTION_UNAVAILABLE',
+      note: 'Ключ шифрования недоступен — пара не сохранена, открытым текстом не пишем',
+    });
+  }
   run(`INSERT INTO distillation_buffer
          (id, promptHash, promptText, response, rating, modelId, domain, userId, timestamp)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, promptHash, promptText, response, rating, modelId.trim(),
+    [id, promptHash, encPrompt, encResponse, rating, modelId.trim(),
       (domain || 'general').trim(), userId.trim(), Date.now()]);
 
-  res.json({ status: 'recorded', id, promptHash,
+  res.json({ status: 'recorded', id, promptHash, encrypted: true,
     pii: { checked: true, nerUsed: Boolean(pii.nerUsed) } });
 });
 
@@ -6866,6 +6961,9 @@ const wsInbound = createWsInbound({
       tokensGenerated: frame.tokensGenerated,
       source: frame.source,
       error: frame.error,
+      /* Хеш промпта от воркера (2.23.3). Без этой строки WS-путь терял бы
+       * его молча, и одна ветка проверяла бы целостность, а другая — нет. */
+      promptHash: typeof frame.promptHash === 'string' ? frame.promptHash : null,
     };
     const out = ingestWorkerResult(body);
     if (out.status !== 200) {
@@ -7074,6 +7172,14 @@ async function dispatchTaskOverP2p({
     workerAddress: addr,
     response: typeof r.payload?.response === 'string' ? r.payload.response : null,
     encryptedResponse: typeof r.payload?.encryptedResponse === 'string' ? r.payload.encryptedResponse : null,
+    /* Хеш промпта (2.23.3): третий транспорт обязан подчиняться тем же
+     * правилам, что HTTP и WS — иначе P2P стал бы способом обойти сверку.
+     * Читаем ДВА места: p2p-исполнитель в воркере кладёт payload вложенным
+     * (`r.payload.promptHash`), а WS-кадр — разворачивает его в корень.
+     * Если читать только одно, один из транспортов молча терял бы хеш и
+     * выглядел бы как «воркер не прислал». */
+    promptHash: typeof r.promptHash === 'string' ? r.promptHash
+      : (typeof r.payload?.promptHash === 'string' ? r.payload.promptHash : null),
     model: r.model,
     usage: r.usage || null,
     source: r.source,
@@ -7093,6 +7199,11 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
   const now = Date.now();
   const sessionKey = crypto.randomBytes(32);
   workerTaskKeys.set(taskId, sessionKey);
+  /* Хеш промпта, который сервер ОТПРАВЛЯЕТ (2.23.3). Считается здесь, пока
+   * открытый текст ещё в руках, и воркеру НЕ сообщается: иначе сверка была
+   * бы проверкой эха, а не целостности. Воркер обязан хешировать то, что
+   * расшифровал, и вернуть хеш вместе с результатом. */
+  const promptHash = crypto.createHash('sha256').update(String(prompt), 'utf8').digest('hex');
   /* Предел генерации едет ВНУТРИ зашифрованной части задачи, а не отдельным
    * полем в кадре. Иначе потолок, названный сервером, лежал бы открытым
    * текстом и мог быть подменён на любом посреднике — а смысл потолка в том,
@@ -7109,10 +7220,10 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
     ? Math.trunc(Number(maxTokens))
     : CONFIG.MAX_TOKENS_PER_TASK;
   run(
-    `INSERT INTO worker_tasks (taskId, encryptedPayload, model, tier, status, createdAt, expiresAt, intendedWorker, maxTokens)
-     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
+    `INSERT INTO worker_tasks (taskId, encryptedPayload, model, tier, status, createdAt, expiresAt, intendedWorker, maxTokens, promptHash)
+     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
     [taskId, encryptWithKey(taskBody, sessionKey), model || null, tier || null, now, now + WORKER_TASK_TTL_MS,
-      workerAddress ? String(workerAddress).toLowerCase() : null, taskMaxTokens],
+      workerAddress ? String(workerAddress).toLowerCase() : null, taskMaxTokens, promptHash],
   );
 
   /* Коллбек отдаёт taskId СРАЗУ после INSERT, а не в resolve. Private Swarm
@@ -7279,6 +7390,13 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
            * что именно случилось на этом ПК. */
           errorDetail: row.errorDetail || null,
           workerAddress: row.workerAddress,
+          /* Три состояния, как и в БД (2.23.3): true — хеш сошёлся,
+           * false — не прислан или не сошёлся, null — задача старше
+           * механизма, сверять было нечего. Схлопывать null в false здесь
+           * нельзя: /inference передаёт это значение в recordWork, и старые
+           * задачи начали бы валить spot-check на пустом месте. */
+          promptHashVerified: row.promptHashVerified === null || row.promptHashVerified === undefined
+            ? null : Number(row.promptHashVerified) === 1,
         });
       }
       if (row.status === 'failed') return reject(new Error('worker reported failure'));
@@ -7801,6 +7919,30 @@ function ingestWorkerResult(body) {
     return { status: 400, body: { error: 'model is required — worker must declare the model it ran' } };
   }
 
+  /* ===== Целостность промпта (2.23.3) =====
+   *
+   * Воркер обязан вернуть `promptHash` — sha256 текста, на котором он
+   * реально считал. Сервер сверит с тем, что записал при выдаче задачи.
+   *
+   * ПОЧЕМУ ЭТО НЕ ЛОМАЕТ СТАРЫЕ ВОРКЕРЫ. Отсутствие поля НЕ отклоняет
+   * результат: текст ответа уже посчитан и оплачен трудом, а 400 заставило
+   * бы пересчитывать работу, которая физически сделана. Вместо отказа —
+   * флаг `promptHashVerified = 0` и запись в ответе: клиент видит, что по
+   * этой задаче целостность не подтверждена.
+   *
+   * ПОЧЕМУ `null`, А НЕ `0`, КОГДА ЗАДАЧА СТАРАЯ. У строки, созданной до
+   * 2.23.3, нет `promptHash` вовсе — сверять нечего, и называть это
+   * провалом значило бы наказывать за то, чего сервер не спрашивал.
+   *
+   * ЧЕГО ЭТА ПРОВЕРКА НЕ ДЕЛАЕТ: не доказывает, что модель работала, и не
+   * мешает воркеру соврать про хеш (подпись результата его не покрывает).
+   * Полноценная верификация — Фаза 3. */
+  const declaredPromptHash = typeof body.promptHash === 'string' ? body.promptHash.trim().toLowerCase() : null;
+  let promptHashVerified = null;
+  if (typeof row.promptHash === 'string' && row.promptHash.length) {
+    promptHashVerified = declaredPromptHash !== null && declaredPromptHash === String(row.promptHash).toLowerCase();
+  }
+
   /* Расшифровка ответа. Если воркер прислал шифротекст — он обязан сойтись:
    * битый authTag означает, что ответ подменён или собран не той сессией,
    * и такой результат нельзя засчитывать как работу. */
@@ -7866,10 +8008,12 @@ function ingestWorkerResult(body) {
    * завершена, хранить шифротекст больше не для чего. */
   run(
     `UPDATE worker_tasks SET status = 'done', response = ?, tokensGenerated = ?,
-       usageJson = ?, model = ?, source = ?, error = ?, errorDetail = ?, finishedAt = ?, encryptedPayload = NULL
+       usageJson = ?, model = ?, source = ?, error = ?, errorDetail = ?, finishedAt = ?, encryptedPayload = NULL,
+       promptHashVerified = ?
      WHERE taskId = ?`,
     [storedResponse, tokens, JSON.stringify(body.usage || null), body.model, declaredSource,
-      declaredError, declaredErrorDetail, Date.now(), taskId],
+      declaredError, declaredErrorDetail, Date.now(),
+      promptHashVerified === null ? null : (promptHashVerified ? 1 : 0), taskId],
   );
   /* Ключ НЕ удаляем здесь: его ещё нужен читателю, чтобы расшифровать ответ
    * при выдаче клиенту. Удаление — в enqueueWorkerTask после расшифровки. */
@@ -7878,6 +8022,10 @@ function ingestWorkerResult(body) {
     status: 200,
     body: {
       taskId, accepted: true, tokensGenerated: tokens, workerAddress,
+      /* Отдельное поле, а не только внутри `quality` у чека: воркер и
+       * клиент должны видеть результат сверки сразу, не дожидаясь
+       * расчёта вознаграждения. */
+      promptHashVerified,
       /* Потолок и факт заявки — рядом с оплаченным числом. Клиент видит,
        * что воркер превысил лимит, и что платёж считался не по его цифре. */
       ...(tokensClamped ? {
@@ -8423,13 +8571,20 @@ async function runInference(req, res) {
 
         if (trainingAllowed) {
           try {
-            run(`INSERT INTO distillation_buffer
-                   (id, promptHash, promptText, response, rating, modelId, domain, userId, timestamp)
-                 VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)`,
-              [crypto.randomUUID(),
-                crypto.createHash('sha256').update(prompt).digest('hex'),
-                prompt, apiResult.text, modelId,
-                (classifyDomain(prompt) || 'general'), String(body.userId), Date.now()]);
+            /* Шифруем до записи (2.23.3). null означает «ключа нет» — тогда
+             * НЕ пишем вовсе: молчаливая запись открытым текстом была бы
+             * возвратом того же дефекта через второй путь. */
+            const encPrompt = encryptSecret(prompt);
+            const encResponse = encryptSecret(apiResult.text);
+            if (encPrompt && encResponse) {
+              run(`INSERT INTO distillation_buffer
+                     (id, promptHash, promptText, response, rating, modelId, domain, userId, timestamp)
+                   VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+                [crypto.randomUUID(),
+                  crypto.createHash('sha256').update(prompt).digest('hex'),
+                  encPrompt, encResponse, modelId,
+                  (classifyDomain(prompt) || 'general'), String(body.userId), Date.now()]);
+            }
           } catch (_e) { /* буфер — не повод терять уже полученный ответ */ }
         }
 
@@ -9165,6 +9320,10 @@ async function runInference(req, res) {
               model: w.model || null,
               response: w.response,
               usage: w.usage || null,
+              /* Целостность промпта (2.23.3). Переносится из ответа задачи
+               * в объект ответа: без этой строки флаг умирал здесь, и
+               * /inference отдавал null при уже состоявшейся сверке. */
+              promptHashVerified: w.promptHashVerified === undefined ? null : w.promptHashVerified,
               tokensGenerated: Math.max(1, Math.floor(Number(w.tokensGenerated) || 1)),
               emulated: false,
               workerTaskId: w.taskId,
@@ -9258,6 +9417,9 @@ async function runInference(req, res) {
         model: w.model || null,
         response: w.response,
         usage: w.usage || null,
+        /* То же, что и в ветке роя: флаг сверки хеша обязан доехать до
+         * recordWork и до ответа клиенту. */
+        promptHashVerified: w.promptHashVerified === undefined ? null : w.promptHashVerified,
         tokensGenerated: Math.max(1, Math.floor(Number(w.tokensGenerated) || 1)),
         emulated: false,
         workerTaskId: w.taskId,
@@ -9388,6 +9550,12 @@ async function runInference(req, res) {
   const outcome = recordWork({
     workerAddress, clientAddress, tokens: tokensGenerated,
     tier, adapterId, response: result.response || `[emulated:${tokensGenerated} tokens]`,
+    /* Целостность промпта (2.23.3). Приходит из строки задачи воркера:
+     * true/false — сверка была, null — задача старше механизма или ответ
+     * получен без воркера (Tier 6 / шаблон). Прямой POST /work этого поля
+     * не передаёт вообще, и там проверка неприменима: сервер не отправлял
+     * никакого промпта, сверять не с чем. */
+    promptHashVerified: result.promptHashVerified === undefined ? null : result.promptHashVerified,
     /* Оплата из внутреннего баланса TAR идёт по ставке 2% вместо 5%.
      *
      * Условие строгое: клиент назван, платёж проходит через его баланс, и
@@ -9605,6 +9773,14 @@ async function runInference(req, res) {
     batchedFrom: outcome.batchedFrom || [],
     conservation: outcome.conservation ?? null,
     agent: agentBlock,
+    /* Целостность промпта (2.23.3) — на уровне ответа, а не только чека.
+     * Три состояния, и схлопывать их нельзя:
+     *   true  — воркер вернул хеш, и он сошёлся с отправленным;
+     *   false — воркер хеш НЕ вернул или вернул чужой;
+     *   null  — сверки не было (ответ дал не воркер: внешний API, шаблон).
+     * Без этого поля клиент видел бы только `fallback_reason` и не мог бы
+     * отличить «модель не считала» от «считала, но не на том промпте». */
+    prompt_hash_verified: result.promptHashVerified === undefined ? null : result.promptHashVerified,
   });
 }
 

@@ -4,7 +4,7 @@
 а не «что работает» (это `MANIFEST.v3.4-UNIFIED.md`) и не «как мы сюда пришли»
 (это `PROJECT-HISTORY.md`).
 
-**Сверено с кодом:** 2026-11-07 18:25, сборка `2.23.0-reality-check` (`82ee033`). Карта описывает **файлы**,
+**Сверено с кодом:** 2026-11-08 00:45, сборка `2.23.3-prompt-integrity`. Карта описывает **файлы**,
 поэтому устаревает медленнее манифеста — но при добавлении/удалении модуля правится в тот же день.
 
 ---
@@ -31,7 +31,7 @@
 | :--- | --: | :--- |
 | `config.js` | 257 | **Единственный источник констант.** `PRICE_USD_PER_1M_TOKENS`, `USD_PER_TAR`, `TIER_WEIGHTS`, `PROTOCOL_FEE_RATE`, `TIER6.*`, `FAUCET.*` |
 | `ledger.js` | 336 | `CumulativeLedger` — накопительные чеки, `debit()`/`credit()`, двойная запись, ключи at rest AES-256-GCM |
-| `economics.js` | 232 | CWU, `√stake × reputation`, эмиссия с непрерывным затуханием, ставка `TAR_UTILITY` (единственное место — строки 115-116) |
+| `economics.js` | 255 | CWU, `√stake × reputation`, эмиссия с непрерывным затуханием, ставка `TAR_UTILITY` (единственное место — строки 115-116). С `2.23.3`: `verifyQuality` принимает `promptHashVerified` и различает три состояния; `spotCheckDecision` — 5% выборочная проверка (seed из содержимого работы, не из идентификаторов клиента) |
 | `dag-chain.js` | 185 | SHA-256-сцепка чеков: `prevReceiptHash` / `receiptHash`, `payloadVersion: 2` |
 
 **Цепочка расчёта чека:** `POST /work` → `economics.js` (CWU, fee, block reward) →
@@ -102,7 +102,7 @@
 | Модуль | Строк | Роль |
 | :--- | --: | :--- |
 | `agent-runtime.js` | 285 | Бюджеты агента в токенах, вызовы инструментов |
-| `knowledge-loop.js` | 573 | Сжатие Micro-LoRA (Trim 80% → INT8 → CSR), шлюз валидации |
+| `knowledge-loop.js` | 626 | Сжатие Micro-LoRA (Trim 80% → INT8 → CSR), шлюз валидации. С `2.23.3`: `selectPairs` расшифровывает `promptText`/`response` через `decryptText` — без этого сборка датасета после шифрования вернула бы `DECRYPT_UNAVAILABLE`. Обратная сторона шифрования: в JSONL должен попасть **открытый** текст, а не `enc:v1` |
 | `benchmark-gate.js` | 206 | Benchmark Gate / Proof-of-Learning (Фаза 3) |
 | `chat-sync.js` | 310 | Оффлайн-история: LWW-Element-Set + векторные часы |
 | `seed.js` | 112 | Начальные данные (3 фикстуры адаптеров) |
@@ -171,11 +171,16 @@ SQLite, `/var/lib/tarnet` на проде. **45 таблиц** (проверен
 | Агенты | `agent_registry`, `agent_wallets`, `agent_spend`, `agent_reservations`, `approvals` |
 | Прочее | `inference`, `model_registry`, `tool_registry`, `benchmark_runs`, `distillation_buffer` |
 
-**`distillation_buffer` — не пустая и не шифрованная (исправлено 07.11.2026).** Прежняя
-запись «промпты туда не пишутся» **неверна**: на проде 9 строк, их пишет
-`POST /distill/record` после opt-in-гейта и PII-проверки. `promptText` лежит
-**открытым текстом** — `encryptSecret()` на этом пути не вызывается. `usedInTraining`
-у всех строк `0`: до обучения ни один не дошёл. Подробности — `MANIFEST` §3.1.
+**`distillation_buffer` — зашифрована с 07.11.2026 (`2.23.3`).** Прежняя
+запись «промпты туда не пишутся» **неверна**: таблицу пишет
+`POST /distill/record` после opt-in-гейта и PII-проверки. До `2.23.3`
+`promptText` лежал **открытым текстом**; теперь `encryptSecret()` применяется
+к `promptText` **и** `response` до `INSERT` (`server.js:5498-5518`), а
+`migratePlaintextDistillation()` (`server.js:1629`, вызов на старте `1656`)
+перешифровывает строки, записанные раньше. `promptHash` — SHA-256 **открытого**
+текста, считается ДО шифрования (`server.js:5497`): после него хеш не пересчитать.
+`usedInTraining` у всех строк `0`: до обучения ни один не дошёл. Подробности —
+`MANIFEST` §3.1, доказательство — тест 62.5 (поиск байт промпта в файлах БД и WAL).
 
 **8 из 45 таблиц пусты на 07.11.2026** (0 строк): `balance_migrations`,
 `benchmark_runs`, `chat_sync_log`, `device_link_challenges`, `device_link_nonces`,

@@ -51,8 +51,26 @@ function spotCheckDecision(actionId) {
 
 /* Верификация: γ=1 если проверка пройдена или работа не попала в выборку.
  * При провале проверки начисления не происходит вовсе — это единственный
- * детерминированный «отказ», и он всегда объясним в логе. */
-function verifyQuality({ actionId, tokens, response, adapterId }) {
+ * детерминированный «отказ», и он всегда объясним в логе.
+ *
+ * ===== Чего эта проверка НЕ ДОКАЗЫВАЕТ (2.23.3) =====
+ * Она отвечает на вопрос «присланный результат имеет правильную ФОРМУ», а не
+ * «модель действительно считала». Пересчёта ответа, сверки с эталоном и TEE
+ * здесь нет и не появляется от этих правок. Полноценная верификация —
+ * Фаза 3 (`[SPEC / ROADMAP]`, см. REALITY-CHECK-v3.md §«Верификация работ»).
+ *
+ * ===== Что добавлено: целостность ПРОМПТА =====
+ * `promptHashVerified` приходит от пути задачи воркера (`worker_tasks`):
+ * сервер записал sha256 промпта, который отправлял, и сверил его с тем,
+ * что вернул воркер. Это отсекает подмену промпта (воркер посчитал на
+ * другом входе), но НЕ подмену ответа и не холостой прогон.
+ *
+ * Значение `null`/`undefined` означает «контекста задачи нет» (прямой
+ * POST /work, синтетический flush) — такая работа не получает ни плюса, ни
+ * минуса. `false` означает «хеш был, но не сошёлся или не прислан» и валит
+ * проверку. Разница обязательна: иначе отсутствие механизма выглядело бы
+ * как его успешное прохождение. */
+function verifyQuality({ actionId, tokens, response, adapterId, promptHashVerified } = {}) {
   const { sampled, bucket } = spotCheckDecision(actionId);
   const tokensNum = Number(tokens);
   const checks = {
@@ -61,6 +79,11 @@ function verifyQuality({ actionId, tokens, response, adapterId }) {
     knownAdapter: typeof adapterId === 'string' && adapterId.length > 0,
     plausibleVolume: !Number.isFinite(tokensNum) || tokensNum <= 100_000_000,
   };
+  /* Поле попадает в checks ТОЛЬКО когда применимо. Иначе объект проверок
+   * у прямого /work отличался бы от задачи воркера выдуманным `true`. */
+  if (promptHashVerified !== undefined && promptHashVerified !== null) {
+    checks.promptHashMatches = promptHashVerified === true;
+  }
   const passed = Object.values(checks).every(Boolean);
   if (!sampled) {
     return { gamma: 1, sampled, bucket, checks, passed: true, reason: 'not sampled' };

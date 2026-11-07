@@ -879,6 +879,17 @@ async function runTask(task, via = 'http') {
   }
   const took = Date.now() - started;
 
+  /* Хеш промпта, на котором РЕАЛЬНО считали (2.23.3). Считается по тексту
+   * после расшифровки задачи, а не берётся из кадра: иначе это было бы эхо
+   * серверного поля, и проверка не значила бы ничего.
+   *
+   * Уходит во всех трёх путях сразу — WS-кадр, HTTP-добивка после закрытия
+   * сокета и обычный poll — потому что все они берут `out.payload`. Правка
+   * в одном из них оставила бы два пути без хеша и превратила бы исправление
+   * в лотерею по транспорту. */
+  const promptHash = nodeCrypto.createHash('sha256')
+    .update(String(prompt ?? ''), 'utf8').digest('hex');
+
   return {
     ok: true,
     taskId: task.taskId,
@@ -886,10 +897,11 @@ async function runTask(task, via = 'http') {
     gen,
     took,
     /* Ответ шифруется ключом сессии, когда он есть. Ключ пришёл по TLS и
-     * живёт только в памяти — на диск не попадает. */
+     * живёт только в памяти — на диск не попадает. Хеш промпта — рядом,
+     * открытым: он не раскрывает текст, но доказывает, что считали именно его. */
     payload: sessionKeyB64
-      ? { encryptedResponse: encryptResult(gen.response, sessionKeyB64) }
-      : { response: gen.response },
+      ? { encryptedResponse: encryptResult(gen.response, sessionKeyB64), promptHash }
+      : { response: gen.response, promptHash },
   };
 }
 

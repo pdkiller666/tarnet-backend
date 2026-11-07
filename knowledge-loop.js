@@ -275,14 +275,22 @@ class KnowledgeLoopCoordinator {
    * @param {object} [deps.p2p] опциональный канал с sendRPC(nodeId, method, payload)
    * @param {number} [deps.minPairs] порог датасета
    * @param {number} [deps.stakeLockTar] сколько блокировать с валидатора
+   * @param {(blob:string)=>string|null} [deps.decryptText] расшифровка полей
+   *   буфера (`enc:v1:...`). С 2.23.3 promptText и response в БД зашифрованы,
+   *   и координатор без этой функции НЕ имеет права писать датасет: молчаливая
+   *   выгрузка шифротекста дала бы JSONL, который выглядит как датасет, а
+   *   обучать на нём нечего. Ключ знает только сервер — поэтому это
+   *   зависимость, а не встроенная криптография.
    */
   constructor({ db, outputDir, pythonScript, p2p = null,
-    minPairs = MIN_PAIRS_FOR_TRAINING, stakeLockTar = VALIDATOR_STAKE_LOCK_TAR } = {}) {
+    minPairs = MIN_PAIRS_FOR_TRAINING, stakeLockTar = VALIDATOR_STAKE_LOCK_TAR,
+    decryptText = null } = {}) {
     if (!db || typeof db.run !== 'function' || typeof db.all !== 'function') {
       throw new Error('KNOWLEDGE_LOOP_DB_REQUIRED');
     }
     this.db = db;
     this.p2p = p2p;
+    this.decryptText = typeof decryptText === 'function' ? decryptText : null;
     this.minPairs = minPairs;
     this.stakeLockTar = stakeLockTar;
     this.outputDir = outputDir || path.join(__dirname, 'storage', 'experience');
@@ -322,12 +330,57 @@ class KnowledgeLoopCoordinator {
       return { status: 'insufficient_data', count, required: minPairs, domain };
     }
 
+    /* ===== Расшифровка (2.23.3) =====
+     *
+     * Открытый текст живёт ТОЛЬКО здесь, в памяти, и только на время записи
+     * JSONL. В БД он не возвращается: ни один UPDATE вниз не пишет
+     * `decrypted` обратно.
+     *
+     * Ошибка расшифровки — ОТКАЗ на весь прогон, а не пропуск строки.
+     * Пропустить битую строку значило бы обучить адаптер на неполном
+     * датасете и не сказать об этом; записать шифротекст — получить JSONL,
+     * который выглядит датасетом, но содержит «enc:v1:...» вместо текста.
+     * Оба варианта хуже явного отказа.
+     *
+     * Без `decryptText` контракт тот же: отказ, а не «вдруг там открытый
+     * текст». Так тестовый экземпляр без ключа не может случайно пройти
+     * проверку, которую в проде закрывает шифрование. */
+    const decryptedPairs = [];
+    for (const r of pairs) {
+      if (!this.decryptText) {
+        return {
+          status: 'error',
+          error: 'DECRYPT_UNAVAILABLE',
+          count,
+          domain,
+          note: 'буфер зашифрован, а координатору не передан decryptText — датасет не собран',
+        };
+      }
+      const prompt = r.promptText === null || r.promptText === undefined
+        ? null : this.decryptText(r.promptText);
+      const response = this.decryptText(r.response);
+      /* null здесь означает «не расшифровалось»: `enc:v1:` с чужим ключом,
+       * битым authTag или повреждённой строкой. Пустая строка — валидное
+       * (хотя и бесполезное) значение и отказом не считается. */
+      if (response === null || (r.promptText !== null && r.promptText !== undefined && prompt === null)) {
+        return {
+          status: 'error',
+          error: 'DECRYPT_FAILED',
+          id: r.id,
+          count,
+          domain,
+          note: 'часть буфера не расшифровалась (ключ не тот или строка повреждена) — датасет не собран',
+        };
+      }
+      decryptedPairs.push({ ...r, promptText: prompt, response });
+    }
+
     /* Имя файла с временной меткой: повторный прогон не должен затирать
      * датасет предыдущего. Домен санируется — иначе '../' в домене увёл бы
      * запись за пределы outputDir. */
     const safeDomain = String(domain).replace(/[^a-zA-Z0-9_-]/g, '_');
     const jsonlPath = path.join(this.outputDir, `distill-${safeDomain}-${Date.now()}.jsonl`);
-    const jsonl = pairs.map((r) => JSON.stringify({
+    const jsonl = decryptedPairs.map((r) => JSON.stringify({
       promptHash: r.promptHash,
       prompt: r.promptText,
       response: r.response,
@@ -335,7 +388,7 @@ class KnowledgeLoopCoordinator {
       modelId: r.modelId,
       domain: r.domain,
     })).join('\n') + '\n';
-    fs.writeFileSync(jsonlPath, jsonl, 'utf8');
+    fs.writeFileSync(jsonlPath, jsonl, { encoding: 'utf8', mode: 0o600 });
 
     let trainResult;
     try {

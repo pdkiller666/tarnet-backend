@@ -60,9 +60,15 @@ function freePort() {
  * начислений требуется сервер с другим окружением (INITIAL_BLOCK_REWARD=0),
  * а не тот, на котором идёт остальная приёмка: менять окружение у живого
  * сервера нельзя, его можно только перезапустить. */
-async function spawnServer(envOverrides = {}) {
+async function spawnServer(envOverrides = {}, opts = {}) {
   const port = await freePort();
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-test-'));
+  /* `opts.dir` — поднять сервер на СУЩЕСТВУЮЩЕМ каталоге. Нужен там, где
+   * проверяется поведение при старте (миграция открытых строк): без
+   * переиспользования БД можно проверить только новый пустой файл, а вся
+   * суть миграции — в уже лежащих данных.
+   * `opts.keepDir` — не удалять каталог при остановке, чтобы следующий
+   * запуск увидел те же файлы. */
+  const dir = opts.dir || fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-test-'));
   const proc = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
     cwd: __dirname,
     env: {
@@ -88,7 +94,9 @@ async function spawnServer(envOverrides = {}) {
     if (proc.exitCode === null) {
       try { proc.kill('SIGTERM'); } catch (_e) { /* уже мёртв */ }
     }
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_e) { /* занято */ }
+    if (!opts.keepDir) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_e) { /* занято */ }
+    }
   };
 
   const deadline = Date.now() + 20000;
@@ -10510,6 +10518,211 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     const pairNone = pickModule.pickSwarmPair([], []);
     ok('61.9 пустые источники — пустая пара (рой честно не состоится)',
       pairNone.length === 0, pairNone);
+  }
+
+  /* ===== 62. Приватность промптов: шифрование в БД и сверка хеша (2.23.3) =====
+   *
+   * Проверяется ОБЕЩАНИЕ, а не намерение: в базе не должно лежать открытого
+   * promptText, а сервер обязан отличить «воркер считал именно отправленный
+   * промпт» от «вернул что-то другое».
+   *
+   * Почему проверка идёт через файл БД, а не через ответ API: ответ можно
+   * сделать красивым, не меняя запись. Обещание приватности нарушается именно
+   * на диске, поэтому смотрим туда же. */
+  {
+    console.log('\n62. Шифрование distillation_buffer и целостность промпта');
+    const s62dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-p62-'));
+    const plainPrompt = 'отсорбируй массив 62-тест';
+    const plainResponse = 'arr.sort((a,b)=>a-b)';
+    const s62 = await spawnServer({}, { dir: s62dir, keepDir: true });
+    try {
+      const u62 = runAddress('p62u');
+      await apiAt(s62.base, '/consent', 'POST', { userId: u62, isOptIn: true });
+      const rec62 = await apiAt(s62.base, '/distill/record', 'POST', {
+        userId: u62, modelId: 'qwen2.5-coder-7b', domain: 'p62',
+        promptText: plainPrompt, response: plainResponse, rating: 1,
+      });
+      ok('62.1 пара записана', rec62.body?.status === 'recorded', rec62.body);
+
+      const { DatabaseSync } = require('node:sqlite');
+      const db62 = new DatabaseSync(path.join(s62dir, 'test.db'));
+      const row62 = db62.prepare(
+        'SELECT promptHash, promptText, response FROM distillation_buffer WHERE id = ?')
+        .get(rec62.body?.id);
+      db62.close();
+
+      ok('62.2 promptText в БД — шифротекст enc:v1:',
+        typeof row62?.promptText === 'string' && row62.promptText.startsWith('enc:v1:'),
+        row62?.promptText?.slice(0, 24));
+      ok('62.3 response в БД — тоже шифротекст (а не только промпт)',
+        typeof row62?.response === 'string' && row62.response.startsWith('enc:v1:'),
+        row62?.response?.slice(0, 24));
+      /* Хеш считается по ОТКРЫТОМУ тексту: после шифрования его не пересчитать,
+       * а нужен он именно для сверки с отправленным. */
+      ok('62.4 promptHash считается по открытому тексту',
+        row62?.promptHash === crypto.createHash('sha256').update(plainPrompt, 'utf8').digest('hex'),
+        row62?.promptHash);
+
+      /* Самый важный тест секции: открытого текста нет НИГДЕ в файлах БД.
+       * Один только `startsWith('enc:v1:')` его бы не поймал — SQLite может
+       * держать старую версию строки в свободных страницах или в WAL. */
+      let leaked = [];
+      for (const f of fs.readdirSync(s62dir)) {
+        if (!f.startsWith('test.db')) continue;
+        const buf = fs.readFileSync(path.join(s62dir, f));
+        if (buf.includes(Buffer.from(plainPrompt, 'utf8'))
+          || buf.includes(Buffer.from(plainResponse, 'utf8'))) leaked.push(f);
+      }
+      ok('62.5 открытого текста нет ни в test.db, ни в WAL',
+        leaked.length === 0, leaked);
+
+      /* --- Миграция строк, записанных ДО 2.23.3 ---
+       * Кладём открытый текст прямо в БД (так выглядели старые строки) и
+       * перезапускаем сервер на том же каталоге. */
+      const db62b = new DatabaseSync(path.join(s62dir, 'test.db'));
+      db62b.prepare('UPDATE distillation_buffer SET promptText = ?, response = ? WHERE id = ?')
+        .run(plainPrompt, plainResponse, rec62.body.id);
+      db62b.close();
+      s62.stop();
+
+      const s62b = await spawnServer({}, { dir: s62dir, keepDir: true });
+      try {
+        const db62c = new DatabaseSync(path.join(s62dir, 'test.db'));
+        const migrated = db62c.prepare(
+          'SELECT promptText, response FROM distillation_buffer WHERE id = ?').get(rec62.body.id);
+        const leftPlain = db62c.prepare(
+          `SELECT COUNT(*) AS c FROM distillation_buffer
+            WHERE promptText NOT LIKE 'enc:v1:%' OR response NOT LIKE 'enc:v1:%'`).get();
+        db62c.close();
+        ok('62.6 старая открытая строка перешифрована при старте',
+          String(migrated?.promptText || '').startsWith('enc:v1:')
+          && String(migrated?.response || '').startsWith('enc:v1:'),
+          { p: String(migrated?.promptText || '').slice(0, 20) });
+        ok('62.7 в таблице не осталось ни одной открытой строки',
+          Number(leftPlain?.c) === 0, leftPlain?.c);
+
+        /* Обратная сторона: перешифровка не должна испортить данные.
+         * Заодно проверяется, что координатор получил ключ: без `decryptText`
+         * обучение вернуло бы DECRYPT_UNAVAILABLE. */
+        await apiAt(s62b.base, '/consent', 'POST', { userId: u62, isOptIn: true });
+        const train62 = await apiAt(s62b.base, '/knowledge/trigger-train', 'POST', {
+          domain: 'p62', minPairs: 1,
+        });
+        ok('62.8 датасет собран после перешифровки (нет DECRYPT_*)',
+          train62.body?.status === 'pending_gpu', train62.body);
+        const jsonlPath62 = train62.body?.jsonlPath;
+        const line62 = jsonlPath62 && fs.existsSync(jsonlPath62)
+          ? JSON.parse(fs.readFileSync(jsonlPath62, 'utf8').trim().split('\n')[0]) : null;
+        ok('62.9 в JSONL открытый текст, а не enc:v1',
+          line62?.prompt === plainPrompt && line62?.response === plainResponse, line62);
+      } finally {
+        s62b.stop();
+      }
+    } finally {
+      try { fs.rmSync(s62dir, { recursive: true, force: true }); } catch (_e) { /* занято */ }
+    }
+  }
+
+  /* --- Сверка хеша промпта в /worker/submit ---
+   * Три состояния обязаны различаться: true — совпало, false — не прислан или
+   * чужой, null — задача старше механизма. Схлопывание null в false наказывало
+   * бы старые задачи за то, чего сервер не спрашивал. */
+  {
+    console.log('\n62.10 Сверка хеша промпта: три состояния, а не два');
+    const s62h = await spawnServer();
+    try {
+      const w62 = runAddress('ph62');
+      await apiAt(s62h.base, '/node', 'POST', { address: w62, stake: 30000, reputation: 0.8 });
+      await apiAt(s62h.base, await signedPollPath(w62, '&model=mph62&heartbeat=1', s62h.base));
+
+      const runTask62 = async (prompt, submitExtra) => {
+        const inflight = apiAt(s62h.base, '/inference', 'POST', {
+          prompt, workerAddress: w62, model: 'mph62', maxTokens: 32,
+        });
+        let task = null;
+        for (let i = 0; i < 80 && !task; i++) {
+          const p = await apiAt(s62h.base, await signedPollPath(w62, '&model=mph62', s62h.base));
+          if (p.body?.task) task = p.body.task;
+          else await new Promise((r) => setTimeout(r, 100));
+        }
+        if (!task) throw new Error('62: задача не выдана');
+        const sub = await apiAt(s62h.base, '/worker/submit', 'POST', {
+          taskId: task.taskId, workerAddress: w62, response: 'ответ 62',
+          model: 'mph62', usage: { completion_tokens: 5 }, ...submitExtra,
+        });
+        const ans = await inflight;
+        return { task, sub, ans };
+      };
+
+      /* 1) Честный воркер: хеш того, что реально пришло. */
+      const p62ok = 'целостность промпта 62';
+      const r62ok = await runTask62(p62ok, {
+        promptHash: crypto.createHash('sha256').update(p62ok, 'utf8').digest('hex'),
+      });
+      ok('62.10 хеш сошёлся → promptHashVerified = true',
+        r62ok.sub.body?.promptHashVerified === true, r62ok.sub.body?.promptHashVerified);
+      ok('62.11 воркер видит результат сверки в ответе на сдачу',
+        r62ok.sub.status === 200 && r62ok.sub.body?.promptHashVerified !== undefined,
+        r62ok.sub.body?.promptHashVerified);
+      ok('62.12 клиенту в /inference тоже видно сверку',
+        r62ok.ans.body?.prompt_hash_verified === true, r62ok.ans.body?.prompt_hash_verified);
+
+      /* 2) Воркер не прислал хеш. Результат НЕ отклоняется: работа сделана,
+       * но целостность не подтверждена — это разные вещи. */
+      const r62no = await runTask62('без хеша 62', {});
+      ok('62.13 без хеша результат принят (не 400)',
+        r62no.sub.status === 200, { status: r62no.sub.status, error: r62no.sub.body?.error });
+      ok('62.14 без хеша promptHashVerified = false (а не null)',
+        r62no.sub.body?.promptHashVerified === false, r62no.sub.body?.promptHashVerified);
+
+      /* 3) Чужой хеш: воркер считал на другом входе. */
+      const r62bad = await runTask62('другой промпт 62', {
+        promptHash: crypto.createHash('sha256').update('совсем другой текст', 'utf8').digest('hex'),
+      });
+      ok('62.15 несовпавший хеш → promptHashVerified = false',
+        r62bad.sub.body?.promptHashVerified === false, r62bad.sub.body?.promptHashVerified);
+
+      /* 4) Задача старше механизма: колонка пуста. Сверять нечего — null. */
+      const r62old = await (async () => {
+        const inflight = apiAt(s62h.base, '/inference', 'POST', {
+          prompt: 'старая задача 62', workerAddress: w62, model: 'mph62', maxTokens: 32,
+        });
+        let task = null;
+        for (let i = 0; i < 80 && !task; i++) {
+          const p = await apiAt(s62h.base, await signedPollPath(w62, '&model=mph62', s62h.base));
+          if (p.body?.task) task = p.body.task;
+          else await new Promise((r) => setTimeout(r, 100));
+        }
+        const { DatabaseSync } = require('node:sqlite');
+        const dbh = new DatabaseSync(path.join(s62h.dir, 'test.db'));
+        dbh.prepare('UPDATE worker_tasks SET promptHash = NULL WHERE taskId = ?').run(task.taskId);
+        dbh.close();
+        const sub = await apiAt(s62h.base, '/worker/submit', 'POST', {
+          taskId: task.taskId, workerAddress: w62, response: 'ответ 62',
+          model: 'mph62', usage: { completion_tokens: 5 },
+        });
+        await inflight;
+        return { sub };
+      })();
+      ok('62.16 задача без promptHash → null, а не «провал»',
+        r62old.sub.body?.promptHashVerified === null, r62old.sub.body?.promptHashVerified);
+
+      /* Флаг обязан лечь в БД числом: в ответе его можно нарисовать, не
+       * сохранив, и тогда отчёт разошёлся бы с хранилищем. */
+      const { DatabaseSync } = require('node:sqlite');
+      const db62h = new DatabaseSync(path.join(s62h.dir, 'test.db'));
+      const dbbad = db62h.prepare('SELECT promptHashVerified FROM worker_tasks WHERE taskId = ?')
+        .get(r62bad.task.taskId);
+      const dbold = db62h.prepare('SELECT promptHashVerified FROM worker_tasks WHERE taskId = ?')
+        .get(r62old.sub.body?.taskId);
+      db62h.close();
+      ok('62.17 «не сошлось» записано в БД нулём',
+        Number(dbbad?.promptHashVerified) === 0, dbbad?.promptHashVerified);
+      ok('62.18 «нечего сверять» записано в БД как NULL',
+        dbold?.promptHashVerified === null, dbold?.promptHashVerified);
+    } finally {
+      s62h.stop();
+    }
   }
 
   console.log('\n' + '─'.repeat(50));
