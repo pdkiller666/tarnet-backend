@@ -97,6 +97,15 @@ async function writeLine(stream, obj) {
 export function createTaskClient({ log = () => {}, authorize = null } = {}) {
   const channels = new Set()
   let rejected = 0
+  /* Счётчики кадров — для критерия готовности сети.
+   *
+   * Зачем отдельно от `channels`: `channels` отвечает «кто открыл поток», а
+   * не «шёл ли трафик». Воркер может подключиться и молчать — тогда канал
+   * есть, а транспорта нет. `framesIn > 0` доказывает, что кадр реально
+   * пришёл по сети, и это единственный признак, который нельзя получить
+   * из реестра публичных адресов (у клиента за NAT его нет вовсе). */
+  let framesIn = 0
+  let framesOut = 0
 
   /**
    * Принять поток задач от воркера.
@@ -138,6 +147,9 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
             if (!line.trim()) continue
             let msg
             try { msg = JSON.parse(line) } catch { continue }
+            /* Считаем ЛЮБОЙ разобранный кадр, включая hello: он тоже пришёл
+             * по сети, и именно он первым доказывает, что поток живой. */
+            framesIn += 1
 
             if (!ch.authorized) {
               const verdict = authorize(msg)
@@ -204,6 +216,7 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
     })
 
     await writeLine(ch.stream, msg)
+    framesOut += 1
     return answer
   }
 
@@ -236,6 +249,7 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
     for (const ch of targets) {
       try {
         await writeLine(ch.stream, frame)
+        framesOut += 1
         sentTo.push(String(ch.address).toLowerCase())
         log(`отмена ${frame.taskId || '(без id)'} → ${ch.address}`)
       } catch (e) {
@@ -254,6 +268,10 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
     channels,
     count: () => channels.size,
     rejected: () => rejected,
+    /* Снимок трафика. Отдаётся копией, а не ссылкой на счётчики: вызывающий
+     * не должен уметь их обнулить, а поле, которое можно испортить снаружи,
+     * рано или поздно будет испорчено. */
+    stats: () => ({ framesIn, framesOut, rejected, channels: channels.size }),
     list: () => [...channels]
   }
 }

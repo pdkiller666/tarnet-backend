@@ -6058,6 +6058,27 @@ app.get('/p2p/status', async (_req, res) => {
     return res.status(503).json({ ok: false, error: 'P2P_MESH_UNAVAILABLE', detail: e.message });
   }
   const d = describeMesh(mesh);
+
+  /* --- Мост libp2p: настоящий транспорт против демо-стенда ---
+   *
+   * Выше в этом ответе `nodes[]` — демо-меш на `127.0.0.1`. Он доказывает,
+   * что луковица собирается, но не доказывает существования сети: три
+   * процесса в одной машине сетью не являются.
+   *
+   * Настоящий признак сети — этот блок. `connections` берётся у libp2p
+   * (`node.getConnections()`), а не из реестра объявлений: один сервер
+   * может объявиться сто раз при нуле соединений.
+   *
+   * ПОЧЕМУ ЗДЕСЬ НЕТ `has_public_nodes`-критерия. Домашний воркер за NAT
+   * дозванивается до моста сам и публичного адреса не имеет и не может
+   * иметь. Требовать публичный адрес в реестре значило бы объявлять
+   * работающую сеть «неготовой» и наоборот: filled реестр при нуле
+   * трафика выглядел бы готовым. Поэтому мерим `connections` и `tasks.framesIn`.
+   *
+   * Моста может не быть — тогда `bridge.ok: false` и честная причина,
+   * а не пустой объект, который читается как «сеть есть, но тихо». */
+  const bridge = await p2pBridge.send({ action: 'status' }, { timeoutMs: 800 });
+
   res.json({
     ok: true,
     transport: 'websocket',
@@ -6117,6 +6138,32 @@ app.get('/p2p/status', async (_req, res) => {
       };
     })(),
     client: d.client,
+    /* Готовность P2P считается по этому блоку, а не по `registry`.
+     * `connections >= 1` и `tasks.framesIn > 0` — два разных факта:
+     * первое «кто-то подключён», второе «кадр дошёл по сети». */
+    bridge: bridge && bridge.ok === true
+      ? {
+          ok: true,
+          peerId: bridge.peerId ?? null,
+          libp2p: bridge.libp2p ?? null,
+          connections: typeof bridge.connections === 'number' ? bridge.connections : null,
+          connected_peers: Array.isArray(bridge.connected_peers) ? bridge.connected_peers : [],
+          tasks: bridge.tasks || { framesIn: 0, framesOut: 0, rejected: 0, channels: 0 },
+          uptime_s: typeof bridge.uptime_s === 'number' ? bridge.uptime_s : null,
+        }
+      : {
+          ok: false,
+          error: 'P2P_BRIDGE_UNAVAILABLE',
+          detail: 'мост p2p-node не отвечает по сокету',
+          socket: p2pBridge.DEFAULT_SOCKET,
+          /* `null`, а не `0`. Моста нет — значит про соединения и трафик
+           * мы НЕ ЗНАЕМ ничего, и ноль здесь соврал бы в сторону «сеть
+           * есть, но тихо». Критерий P1.1 требует `>= 1` и `> 0`, поэтому
+           * null его не выполнит — ровно то, что нужно. */
+          connections: null,
+          connected_peers: [],
+          tasks: null,
+        },
   });
 });
 

@@ -19,7 +19,8 @@
 | Прод | systemd `tarnet.service`, каталог `/opt/tarnet/backend-api`, БД `/var/lib/tarnet` |
 | Мост к libp2p | systemd `p2p-bridge.service` (юнит в `deploy/systemd/p2p-bridge.service`), ключ узла `/var/lib/tarnet/p2p/peer-id.bin`, порт `4001` |
 | Проверка снаружи | `https://v1107336.hosted-by-vdsina.com/health` и `/p2p/bootstrap` (за **Caddy** на `443`; порт `3001` наружу **закрыт** — не судить о доступности по нему) |
-| Соседи P2P | `GET /p2p/status` → `registry.total`, `client`, `nodes`; `connections` — в `/p2p/bootstrap` |
+| Соседи P2P | `GET /p2p/status` → блок `bridge` (`connections`, `connected_peers`, `tasks.framesIn`) — **по нему считается готовность P1.1**; плюс `nodes`/`client` демо-меша и `registry` (реестр публичных адресов, критерием **не является**) |
+| Счётчики трафика | `p2p-node/task-protocol.js` → `createTaskClient().stats()` → `{framesIn, framesOut, rejected, channels}`; наружу — через `GET /p2p/status → bridge.tasks` |
 | Деплой | `scripts/deploy.sh` — **коммит + пуш + раскатка без `--dry-run`** (см. §8) |
 
 ---

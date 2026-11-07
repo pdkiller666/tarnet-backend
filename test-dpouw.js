@@ -9666,6 +9666,215 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       !/^\s*TAR_UTILITY_FEE_BPS\s*:/m.test(selfSrc), { ok: true });
   }
 
+  /* ===== 55. Критерий P1.1 — соединения и трафик, а не реестр =====
+   *
+   * ЧТО ЗАЩИЩАЕТСЯ. До 2.22.8 условием готовности P1.1 был
+   * `registry.has_public_nodes: true`. Условие невыполнимо для домашнего
+   * воркера: он за NAT, дозванивается до моста САМ и публичного адреса не
+   * имеет и не может иметь. Плюс `publicUrl` в реестр пишется только ручным
+   * `POST /node`, куда ни один клиентский путь не ходит — то есть флаг
+   * оставался бы `false` навсегда даже при работающей сети.
+   *
+   * Тест держит три вещи, каждая из которых ломает откат по-своему:
+   *   1) счётчики кадров существуют и РАСТУТ на реальных кадрах;
+   *   2) `/p2p/status` отдаёт блок `bridge` с этими цифрами;
+   *   3) документы больше не называют реестр условием готовности.
+   * Если кто-то вернёт старое условие в ROADMAP — упадёт 55.8.
+   */
+  section('55. Критерий P1.1: connections + framesIn, а не реестр публичных адресов');
+  {
+    const taskProto = await import('./p2p-node/task-protocol.js');
+    const tick55 = (ms = 30) => new Promise((r) => setTimeout(r, ms));
+
+    /* --- Поддельный поток вместо libp2p ---
+     * `createTaskClient` работает с любым async-iterable, у которого есть
+     * `send`/`close`. Ставить 105 МБ libp2p ради проверки счётчика нельзя:
+     * приёмка обязана идти на чистой машине. Заглушка честная в главном —
+     * кадры проходят через тот же `for await`, что и настоящие.
+     *
+     * ПОТОК ЖДЁТ ЯВНОГО ЗАКРЫТИЯ. Пока итератор не закончился, мост считает
+     * канал живым и может в него писать — ровно как с настоящим libp2p.
+     * Если отдать кадры и выйти сразу, канал удаляется через
+     * `channels.delete(ch)` в том же микротике, и любые проверки «канал
+     * открыт, в него ушёл кадр» падают по вине заглушки, а не кода. */
+    function fakeStream(frames) {
+      const enc = new TextEncoder();
+      const sent = [];
+      let closed = false;
+      let release;
+      const held = new Promise((r) => { release = r; });
+      return {
+        sent,
+        get closed() { return closed; },
+        send(buf) { sent.push(Buffer.from(buf).toString('utf8')); return true; },
+        async close() { closed = true; release(); },
+        once() { /* drain не нужен: send всегда true */ },
+        removeListener() {},
+        async *[Symbol.asyncIterator]() {
+          for (const f of frames) yield enc.encode(JSON.stringify(f) + '\n');
+          await held;
+        },
+      };
+    }
+
+    const client55 = taskProto.createTaskClient({
+      authorize: () => ({ ok: true, address: '0x' + '55'.repeat(20) }),
+    });
+
+    const empty = client55.stats();
+    ok('55.1 статистика существует до любых кадров',
+      empty && empty.framesIn === 0 && empty.framesOut === 0
+        && empty.channels === 0 && typeof empty.rejected === 'number',
+      empty);
+
+    const s55 = fakeStream([
+      { action: 'hello', address: '0x' + '55'.repeat(20) },
+      { ok: true, result: 'второй кадр' },
+    ]);
+    client55.attach(s55, '12D3KooW-test-peer');
+    await tick55(120);
+
+    const afterIn = client55.stats();
+    ok('55.2 connection + кадры: канал открыт и hello авторизован',
+      afterIn.channels === 1, afterIn);
+    ok('55.3 framesIn растёт с приходом кадров (главное свойство)',
+      afterIn.framesIn === 2, afterIn);
+
+    await client55.cancel({ taskId: 't55', address: '0x' + '55'.repeat(20) });
+    const afterOut = client55.stats();
+    ok('55.4 framesOut растёт при отправке кадра',
+      afterOut.framesOut === 1 && s55.sent.length === 1, afterOut);
+
+    /* Снимок — копия, а не ссылка на внутренние счётчики: иначе вызывающий
+     * мог бы обнулить признак трафика и «закрыть» критерий руками. */
+    const snap = client55.stats();
+    snap.framesIn = 999;
+    snap.channels = 999;
+    const snapAfter = client55.stats();
+    ok('55.5 stats отдаёт копию: правка снимка не меняет счётчики',
+      snapAfter.framesIn === 2 && snapAfter.channels === 1, snapAfter);
+
+    /* Закрытие потока — тоже факт: канал обязан уйти из набора, иначе
+     * критерий залип бы на «1» после смерти воркера. */
+    await s55.close();
+    await tick55(120);
+    ok('55.5a канал снят после закрытия потока',
+      client55.stats().channels === 0, client55.stats());
+
+    /* --- /p2p/status: блок bridge в живом ответе --- */
+    const st55 = await api('/p2p/status');
+    const br = st55.body?.bridge;
+    ok('55.6 /p2p/status отдаёт блок bridge',
+      st55.status === 200 && br && typeof br.ok === 'boolean', br);
+    /* Две ветки одного контракта. Мост есть — цифры обязаны быть числами;
+     * моста нет — обязаны быть null, а НЕ нулями: ноль читается как
+     * «мост жив, но тихо», и критерий не отличил бы одно от другого. */
+    if (br && br.ok === true) {
+      ok('55.7 мост ответил: connections — число, tasks.framesIn — число',
+        typeof br.connections === 'number' && typeof br.tasks?.framesIn === 'number',
+        { connections: br.connections, tasks: br.tasks });
+    } else {
+      ok('55.7 моста нет: connections = null, а не выдуманный ноль',
+        br?.connections === null && br?.tasks === null,
+        { connections: br?.connections, tasks: br?.tasks });
+    }
+
+    /* --- Документы: критерий не должен откатиться --- */
+    const road55 = fs.readFileSync(path.join(__dirname, 'ROADMAP.md'), 'utf8');
+    ok('55.8 ROADMAP: условие P1.1 — bridge.connections, а не реестр',
+      road55.includes('bridge.connections >= 1'),
+      { found: road55.includes('bridge.connections >= 1') });
+    ok('55.9 ROADMAP: реестр больше НЕ назван условием готовности',
+      !/Условие готовности[^\n]*registry\.has_public_nodes/.test(road55),
+      { stale: /Условие готовности[^\n]*registry\.has_public_nodes/.test(road55) });
+    ok('55.10 ROADMAP объясняет причину: NAT и отсутствие публичного адреса',
+      /за NAT/.test(road55.slice(road55.indexOf('P1.1'), road55.indexOf('P1.2'))),
+      { hasNat: /за NAT/.test(road55.slice(road55.indexOf('P1.1'), road55.indexOf('P1.2'))) });
+
+    /* --- ГЛАВНОЕ: критерий МОЖЕТ загореться ---
+     * Без этой проверки секция доказывала бы только форму ответа, а
+     * критерий, который невыполним ни при каких условиях, остался бы
+     * «зелёным» — ровно так и жил `registry.has_public_nodes`.
+     *
+     * Поднимаем заглушку моста на unix-сокете и отдельный изолированный
+     * сервер, направленный на неё. Заглушка отвечает как живой мост с
+     * одним подключённым воркером. Проверяем не форму, а то, что условие
+     * P1.1 становится ИСТИННЫМ: connections >= 1 && framesIn > 0. */
+    const fakeSock = path.join(os.tmpdir(), `tarnet-fakebridge-${RUN}.sock`);
+    const fakeBridge = net.createServer((sock) => {
+      sock.setEncoding('utf8');
+      let buf = '';
+      sock.on('data', (d) => {
+        buf += d;
+        const i = buf.indexOf('\n');
+        if (i < 0) return;
+        const line = buf.slice(0, i);
+        buf = buf.slice(i + 1);
+        let cmd;
+        try { cmd = JSON.parse(line); } catch (_e) { return; }
+        if (cmd.action === 'status') {
+          sock.write(JSON.stringify({
+            ok: true,
+            action: 'status',
+            peerId: '12D3KooWfakeBridge',
+            libp2p: 'listening 127.0.0.1:4001',
+            connections: 1,
+            connected_peers: ['12D3KooWworkerBehindNat'],
+            tasks: { framesIn: 7, framesOut: 2, rejected: 0, channels: 1 },
+            uptime_s: 42,
+          }) + '\n');
+        } else {
+          sock.write(JSON.stringify({ ok: true, action: cmd.action }) + '\n');
+        }
+      });
+      sock.on('error', () => { /* клиент ушёл — штатно */ });
+    });
+    try { fs.unlinkSync(fakeSock); } catch (_e) { /* сокета ещё нет */ }
+    await new Promise((resolve, reject) => {
+      fakeBridge.once('error', reject);
+      fakeBridge.listen(fakeSock, resolve);
+    });
+
+    const h56 = await spawnServer({ P2P_BRIDGE_SOCKET: fakeSock });
+    try {
+      const r56 = await apiAt(h56.base, '/p2p/status');
+      const b56 = r56.body?.bridge;
+      ok('55.11 критерий выполним: connections >= 1 виден в /p2p/status',
+        b56?.ok === true && b56?.connections === 1, b56);
+      ok('55.12 framesIn > 0 виден в /p2p/status',
+        b56?.tasks?.framesIn === 7, b56?.tasks);
+      ok('55.13 условие P1.1 выполняется обоими фактами сразу',
+        (b56?.connections ?? 0) >= 1 && (b56?.tasks?.framesIn ?? 0) > 0,
+        { connections: b56?.connections, framesIn: b56?.tasks?.framesIn });
+      ok('55.14 воркер за NAT виден по peerId, без публичного адреса',
+        b56?.connected_peers?.[0] === '12D3KooWworkerBehindNat'
+          && !JSON.stringify(b56).includes('ws://'),
+        b56?.connected_peers);
+    } finally {
+      h56.stop();
+      await new Promise((r) => fakeBridge.close(r));
+      try { fs.unlinkSync(fakeSock); } catch (_e) { /* уже удалён */ }
+    }
+
+    /* --- Моста нет → честный отказ, а не выдуманные нули --- */
+    const noSock = path.join(os.tmpdir(), `tarnet-nobridge-${RUN}.sock`);
+    try { fs.unlinkSync(noSock); } catch (_e) { /* сокета ещё нет */ }
+    const h55 = await spawnServer({ P2P_BRIDGE_SOCKET: noSock });
+    try {
+      const r55 = await apiAt(h55.base, '/p2p/status');
+      ok('55.15 без моста bridge.ok = false',
+        r55.body?.bridge?.ok === false, r55.body?.bridge);
+      ok('55.16 причина названа кодом, а не пустотой',
+        r55.body?.bridge?.error === 'P2P_BRIDGE_UNAVAILABLE',
+        r55.body?.bridge?.error);
+      ok('55.17 без моста критерий НЕ выполняется (null не проходит >= 1)',
+        !((r55.body?.bridge?.connections ?? 0) >= 1),
+        r55.body?.bridge?.connections);
+    } finally {
+      h55.stop();
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

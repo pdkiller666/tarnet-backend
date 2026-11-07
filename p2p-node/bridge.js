@@ -251,6 +251,11 @@ const handlers = {
       connected_peers: node
         ? [...new Set(node.getConnections().map((c) => c.remotePeer.toString()))]
         : [],
+      /* Трафик задач по p2p-потоку. Отдельно от `connections`: соединение
+       * можно установить и молчать, тогда `connections: 1` при
+       * `framesIn: 0` — это «пир подключён», а не «сеть работает».
+       * Критерий готовности P1.1 требует оба факта, поэтому оба здесь. */
+      tasks: taskClient.stats(),
       announced_total: announced.size,
       uptime_s: Math.round((Date.now() - startedAt) / 1000),
       socket: SOCKET_PATH
