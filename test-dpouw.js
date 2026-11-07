@@ -5647,6 +5647,83 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
         { markers: markers.length, inSrc: inSrc.length, inBundle: inBundle.length,
           missingInBundle: markers.filter((m) => !inBundle.includes(m)).map((m) => m.slice(0, 28)) });
     }
+
+    /* --- Автозапуск при входе в систему (2.22.10, P1.2) ---
+     *
+     * Узел, который надо поднимать руками, не является узлом сети: после
+     * перезагрузки ПК молча выпадал из грида, а единственным симптомом был
+     * простаивающий мост — на экране ничего не говорило «эта машина больше
+     * не работает».
+     *
+     * Проверяем ровно те свойства, из-за которых автозапуск может
+     * существовать в файле и при этом не работать у человека:
+     *
+     * 1) Путь Startup берётся через GetFolderPath, а не склеивается из
+     *    %APPDATA%: папка локализована, и английский литерал молча
+     *    промахивается на русской Windows — ярлык создаётся, но не там.
+     * 2) Цель — start.cmd, а не node.exe: --p2p живёт в start.cmd
+     *    (добавляется только при P2P_OK=1), поэтому копия флагов здесь
+     *    разошлась бы с ярлыком на рабочем столе и p2p пропал бы ТОЛЬКО
+     *    из автозапуска.
+     * 3) Отказ виден: сбой COM-объекта ведёт на метку с предупреждением.
+     *    Проглоченная ошибка выглядела бы как работающий автозапуск до
+     *    первой перезагрузки. */
+    {
+      const tplBat = fs.readFileSync(path.join(__dirname, 'install/install.bat.tpl'), 'utf8');
+      const batLines = tplBat.split('\n');
+      /* Только ИСПОЛНЯЕМЫЕ строки: комментарий выше тоже содержит текст
+       * GetFolderPath('Startup') — в первой редакции теста он и попал под
+       * фильтр, из-за чего проверялась проза, а не код. Ошибка нашлась
+       * первым же прогоном (31.26 отдал getFolderPath: 2). */
+      const psAutostart = batLines.filter((l) => !/^\s*(rem|::)/i.test(l)
+        && /GetFolderPath\('Startup'\)/.test(l));
+      const hardcoded = batLines.filter((l) => !/^\s*(rem|::)/i.test(l)
+        && /Start Menu|Microsoft\\\\Windows\\\\Start/i.test(l));
+
+      ok('31.26 автозапуск кладётся в Startup через GetFolderPath',
+        psAutostart.length === 1 && hardcoded.length === 0,
+        { getFolderPath: psAutostart.length, hardcodedPath: hardcoded.length,
+          sample: (hardcoded[0] || '').trim().slice(0, 60) });
+
+      /* Цель ярлыка автозапуска — start.cmd в той же команде, что и
+       * GetFolderPath. Ищем по строке PowerShell, а не по всему файлу:
+       * start.cmd упоминается ещё и в ярлыке рабочего стола, и совпадение
+       * оттуда доказательством не является. */
+      const autostartCmd = psAutostart[0] || '';
+
+      ok('31.26b автозапуск стартует start.cmd, а не node напрямую',
+        /TargetPath='%TARNET_DIR%\\start\.cmd'/.test(autostartCmd)
+        && !/node\.exe/i.test(autostartCmd),
+        { targetsStartCmd: /TargetPath='%TARNET_DIR%\\start\.cmd'/.test(autostartCmd),
+          mentionsNode: /node\.exe/i.test(autostartCmd) });
+
+      /* --p2p обязан доходить до автозапуска. Прямая проверка — через
+       * генератор start.cmd: он пишет --p2p только при P2P_OK=1, и
+       * автозапуск наследует это, потому что запускает тот же файл.
+       * Условие проверяем в шаблоне, а не в отдаче: баг живёт здесь. */
+      const p2pInStartCmd = tplBat.includes('if "%P2P_OK%"=="1" echo "%NODE_EXE%" "%WORKER_JS%" --p2p');
+
+      ok('31.26c --p2p попадает в start.cmd, откуда его берёт автозапуск',
+        p2pInStartCmd,
+        { p2pBranch: p2pInStartCmd });
+
+      ok('31.26d сбой автозапуска сообщается, а не проглатывается',
+        tplBat.includes('goto autostart_failed')
+        && tplBat.includes(':autostart_failed')
+        && /will NOT start by itself/i.test(tplBat),
+        { gotoFailed: tplBat.includes('goto autostart_failed'),
+          hasLabel: tplBat.includes(':autostart_failed'),
+          honestText: /will NOT start by itself/i.test(tplBat) });
+
+      /* Инварианты файла: Windows CMD разбирает батник по CRLF, а кириллица
+       * в UTF-8 читается консолью как OEM/CP866 и превращается в мусор.
+       * Обе поломки валили установщик целиком, поэтому это не стиль. */
+      const nonAscii = tplBat.split('\n').filter((l) => /[^\x00-\x7F]/.test(l));
+
+      ok('31.26e шаблон остаётся чистым ASCII без CR',
+        nonAscii.length === 0 && tplBat.indexOf('\r') === -1,
+        { nonAsciiLines: nonAscii.length, hasCR: tplBat.indexOf('\r') !== -1 });
+    }
   }
 
   /* ===== 32. Tier 6 в списке моделей PWA =====

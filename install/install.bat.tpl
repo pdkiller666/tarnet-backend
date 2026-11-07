@@ -291,6 +291,40 @@ echo   Could not create a Desktop shortcut.
 echo   Run manually: "%TARNET_DIR%\start.cmd"
 
 :shortcut_done
+rem ---------- autostart shortcut (P1.2) ----------
+rem A node that must be started by hand is not a node in the network. After
+rem a reboot the worker stayed down, the PC silently left the grid, and the
+rem only symptom was an idle bridge: nothing on screen said "this machine is
+rem no longer working". The Startup folder fixes exactly that.
+rem
+rem Startup and not schtasks: it needs no administrator rights, it is per
+rem user, and opting out is a visible act - delete the shortcut from the
+rem folder. A scheduled task would hide the same switch behind Task
+rem Scheduler, where a normal user will not find it.
+rem
+rem The target is start.cmd, NOT node: start.cmd already carries --p2p when
+rem the transport installed, so autostart and the desktop shortcut share one
+rem definition of "how the worker runs". Copying the flags here would let
+rem the two drift apart, and the p2p path would quietly disappear from
+rem autostart only.
+rem
+rem GetFolderPath('Startup') and not %APPDATA%\Microsoft\Windows\Start Menu:
+rem the path is localized, and a hardcoded English one silently misses on a
+rem Russian Windows.
+rem
+rem Failure is REPORTED, never swallowed: a missing shortcut would look like
+rem working autostart until the first reboot.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$f=[Environment]::GetFolderPath('Startup'); if (-not $f) { exit 1 }; $p=Join-Path $f 'TarNet Worker.lnk'; try { $ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut($p); $s.TargetPath='%TARNET_DIR%\start.cmd'; $s.WorkingDirectory='%TARNET_DIR%'; $s.Description='Start TarNet worker'; $s.Save(); exit 0 } catch { exit 1 }"
+if errorlevel 1 goto autostart_failed
+echo   Autostart: worker starts automatically when you sign in
+goto autostart_done
+
+:autostart_failed
+echo   WARNING: could not create the autostart shortcut.
+echo   The worker will NOT start by itself after a reboot.
+echo   Start it manually: "%TARNET_DIR%\start.cmd"
+
+:autostart_done
 echo [4/4] Starting worker...
 rem Visible window, not minimized: the worker prints the link-code prompt
 rem and reads the code from this very console (2.21.2). A minimized window
