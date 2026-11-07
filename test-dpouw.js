@@ -10453,6 +10453,65 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     await chB.close();
   }
 
+  /* ===== 61. Выбор адресата для роя: WS и P2P — одно правило =====
+   *
+   * ЧТО ЗДЕСЬ ЛОВИТСЯ. Через час после починки `taskClient.send` нашлось
+   * то же самое на слой выше: `dispatchTaskOverP2p` брал `channels[0]`,
+   * игнорируя адрес руки. Две руки роя уходили ОДНОМУ воркеру, он считал
+   * два раза, а `workerAddress` второй строки перезаписывался на того же
+   * адресата. «Параллельно двум» оказывалось «дважды одному» — и
+   * оплачивалось как две работы.
+   *
+   * Второй дефект рядом: пара для роя бралась только из WS-реестра, а
+   * воркер с `--no-experimental-websocket` в нём отсутствует. С двумя
+   * живыми узлами рой ответил бы `need_two_workers` — «сеть не умеет рой»
+   * при живой сети.
+   *
+   * Тесты без моста и без libp2p: логика чистая, поэтому проверяется
+   * обычным `node` — это и есть причина, по которой она вынесена в модуль. */
+  {
+    const pickModule = require('./p2p-channel-pick');
+    const chA = { address: '0x' + 'a1'.repeat(20) };
+    const chB = { address: '0x' + 'b2'.repeat(20) };
+    const chC = { address: '0x' + 'c3'.repeat(20) };
+
+    const byAddr = pickModule.pickChannel([chA, chB], { preferAddress: chB.address.toUpperCase().replace('0X', '0x') });
+    ok('61.1 задача идёт каналу ПО АДРЕСУ, а не первому живому',
+      byAddr.channel && byAddr.channel.address === chB.address, byAddr.channel);
+
+    const missing = pickModule.pickChannel([chA, chB], { preferAddress: chC.address });
+    ok('61.2 нет канала у адресата — отказ, а не подмена другим',
+      missing.channel === null && missing.reason === 'NO_CHANNEL_FOR_WORKER', missing);
+
+    const firstOk = pickModule.pickChannel([chA, chB]);
+    ok('61.3 без адреса — первый канал (поведение одиночной ветки сохранено)',
+      firstOk.channel && firstOk.channel.address === chA.address, firstOk.channel);
+
+    const excluded = pickModule.pickChannel([chA, chB], { excludeSet: new Set([chA.address]) });
+    ok('61.4 excludeSet отводит занятого воркера',
+      excluded.channel && excluded.channel.address === chB.address, excluded.channel);
+
+    const none = pickModule.pickChannel([]);
+    ok('61.5 пустой список — NO_CHANNEL (а не тихий undefined)',
+      none.channel === null && none.reason === 'NO_CHANNEL', none);
+
+    const pairBoth = pickModule.pickSwarmPair([chA.address], [chA.address, chB.address]);
+    ok('61.6 пара собирается из WS + P2P, повтор адреса отсеян',
+      pairBoth.length === 2 && pairBoth[0] === chA.address && pairBoth[1] === chB.address, pairBoth);
+
+    const pairP2pOnly = pickModule.pickSwarmPair([], [chA.address, chB.address]);
+    ok('61.7 два P2P-узла БЕЗ WS — пара есть (иначе рой «не умеет» при живой сети)',
+      pairP2pOnly.length === 2, pairP2pOnly);
+
+    const pairOne = pickModule.pickSwarmPair([chA.address], [chA.address]);
+    ok('61.8 один адрес во всех источниках — пара из одного, а не дубль',
+      pairOne.length === 1, pairOne);
+
+    const pairNone = pickModule.pickSwarmPair([], []);
+    ok('61.9 пустые источники — пустая пара (рой честно не состоится)',
+      pairNone.length === 0, pairNone);
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

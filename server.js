@@ -47,6 +47,11 @@ const jcs = require('./jcs');
 /* Выбор лучшего из двух ответов роя (2.19.1). Модуль чистый: ни БД, ни сети —
  * поэтому проверяется обычными юнит-тестами, без поднятия сервера. */
 const swarmSynth = require('./swarm-synthesis');
+/* Выбор адресата и пары для роя — одно правило на WS и на P2P.
+ * Здесь дважды ломался рой: сначала `taskClient.send` брал первый живой
+ * канал, потом `dispatchTaskOverP2p` брал `channels[0]`, игнорируя адрес
+ * руки. Вынесено в модуль, чтобы проверялось обычным `node`, без моста. */
+const channelPick = require('./p2p-channel-pick');
 const chatSync = require('./chat-sync');
 const knowledgeLoop = require('./knowledge-loop');
 /* Волна 4: лимиты агента, резерв и цикл Think→Act→Observe.
@@ -6951,7 +6956,7 @@ async function p2pTaskChannels() {
  * ждёт poll.
  */
 async function dispatchTaskOverP2p({
-  taskId, taskBody, sessionKey, model, tier, excludeSet = null,
+  taskId, taskBody, sessionKey, model, tier, excludeSet = null, preferAddress = null,
 }) {
   let channels;
   try {
@@ -6961,13 +6966,22 @@ async function dispatchTaskOverP2p({
   }
   if (!channels.length) return { attempted: false, reason: 'no_channel' };
 
-  /* Берём первый подходящий канал. Исключение — Private Swarm: две руки
-   * обязаны уйти разным воркерам, иначе «параллельно» окажется дважды
-   * на одном ПК. */
-  const pick = excludeSet
-    ? channels.find((c) => !excludeSet.has(String(c.address).toLowerCase()))
-    : channels[0];
-  if (!pick) return { attempted: false, reason: 'all_excluded' };
+  /* Кому именно.
+   *
+   * `preferAddress` — адрес, для которого строка уже нацелена (рука роя
+   * через `forceWsAddr`, или `intendedWorker`). Раньше здесь стоял
+   * `channels[0]`: с одним P2P-воркером это работало, с двумя — обе руки
+   * роя уходили ОДНОМУ воркеру, он считал два раза, а `workerAddress`
+   * второй строки перезаписывался на того же адресата. «Параллельно двум»
+   * оказывалось «дважды одному», и оплачивалось как две работы.
+   *
+   * Отказ при отсутствии канала именно у этого адреса — не ошибка: строка
+   * остаётся `pending`, и её заберёт `/worker/poll`. */
+  const chosen = channelPick.pickChannel(channels, { preferAddress, excludeSet });
+  if (!chosen.channel) {
+    return { attempted: false, reason: chosen.reason === 'ALL_EXCLUDED' ? 'all_excluded' : 'no_channel' };
+  }
+  const pick = chosen.channel;
 
   const addr = String(pick.address).toLowerCase();
 
@@ -7218,7 +7232,13 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
   if (P2P_TASK_ROUTING) {
     const rowNow = get('SELECT status FROM worker_tasks WHERE taskId = ?', [taskId]);
     if (rowNow && rowNow.status === 'pending') {
-      dispatchTaskOverP2p({ taskId, taskBody, sessionKey, model, tier, excludeSet })
+      /* `preferAddress` — тот же адрес, что уже записан в `intendedWorker`
+       * (или выбран рукой роя). Без него P2P-ветка брала первый канал и
+       * молча подменяла адресата. */
+      dispatchTaskOverP2p({
+        taskId, taskBody, sessionKey, model, tier, excludeSet,
+        preferAddress: forceWsAddr || workerAddress,
+      })
         .catch((e) => console.log(`p2p: маршрут упал для ${taskId}: ${e.message}`));
     }
   }
@@ -8930,8 +8950,35 @@ async function runInference(req, res) {
        * Здесь заявлена ровно та гарантия, которую код выполняет: отказ
        * одного узла не роняет запрос, пока жив второй. */
       if (body.swarm === true) {
-        const first = wsInbound.pickLeastBusy(tier, null);
-        const second = first ? wsInbound.pickLeastBusy(tier, new Set([first])) : null;
+        /* Пара берётся из ДВУХ источников, а не только из WS-реестра.
+         *
+         * Почему. `pickLeastBusy` перебирает `this.workers`, а туда попадает
+         * воркер, открывший сокет `/p2p/worker`. Узел, запущенный с
+         * `--no-experimental-websocket` (именно так работает демо-воркер
+         * владельца), в этом реестре отсутствует, хотя задачи ему доставляются
+         * по libp2p. Рой, смотрящий только в `this.workers`, с двумя живыми
+         * узлами ответил бы `need_two_workers` — то есть «сеть не умеет рой»
+         * при живой сети.
+         *
+         * Порядок: сначала WS по загрузке, потом P2P-каналы. Повтор адреса
+         * отсекает `pickSwarmPair`: две руки на один ПК — не параллель. */
+        const wsOrdered = [];
+        const taken = new Set();
+        for (let i = 0; i < 16; i++) {
+          const a = wsInbound.pickLeastBusy(tier, taken);
+          if (!a || taken.has(a)) break;
+          taken.add(a);
+          wsOrdered.push(a);
+        }
+        let p2pAddrs = [];
+        if (P2P_TASK_ROUTING) {
+          try {
+            p2pAddrs = (await p2pTaskChannels()).map((c) => c.address);
+          } catch (_e) { p2pAddrs = []; }
+        }
+        const pair = channelPick.pickSwarmPair(wsOrdered, p2pAddrs);
+        const first = pair[0] || null;
+        const second = pair[1] || null;
         /* Режим роя объявлен ЗДЕСЬ, а не внутри проверки пары, и это не
          * стилистика. Блок «swarm не состоялся» ниже читает `swarmMode`,
          * чтобы назвать причину (`need_two_workers` против
