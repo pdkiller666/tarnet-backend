@@ -1031,6 +1031,13 @@ function connectWs(budgetMs = WS_CONNECT_BUDGET_MS) {
         wsState.everConnected = true;
         wsState.attempts = 0;
         log(`ws авторизован: ${frame.workerAddress}`);
+        /* Здесь ключ ПК уже записан в `ws_worker_auth` (`ws-inbound.js:386`),
+         * поэтому отложенный из-за гонки код привязки можно повторить.
+         * Без `await`: рукопожатие не должно ждать погашения кода, иначе
+         * один медленный `claim` задержал бы старт работы воркера.
+         * Этот же путь срабатывает при реконнекте — код мог быть введён
+         * человеком уже после первого подключения. */
+        retryPendingLink().catch((e) => log(`повтор привязки не удался: ${e.message}`));
         return finish(true);
       }
       if (frame.type === 'AUTH_FAIL') {
@@ -1378,7 +1385,7 @@ async function linkFromCli(argv = process.argv.slice(2)) {
  * пуст: там ввод не ждём, иначе воркер висел бы на чтении, выглядя живым,
  * но ничего не опрашивая. Для автоматизации остаётся `--link`.
  */
-const linkState = { listening: false, linked: false, rl: null };
+const linkState = { listening: false, linked: false, rl: null, pendingCode: null };
 
 const LINK_PROMPT = '[Чтобы привязать ПК к аккаунту, введите 6-значный код из PWA и нажмите Enter]';
 
@@ -1433,8 +1440,55 @@ async function applyLinkCode(code) {
     return { ...res, ok: true, alreadyAttached: true };
   }
 
+  /* DEVICE_KEY_UNKNOWN — не приговор, а гонка двух транспортов.
+   *
+   * `applyLinkCode` вызывал `claim` по HTTP ДО того, как WS-рукопожатие
+   * запишет ключ в `ws_worker_auth` (`ws-inbound.js:386`). Если HTTP
+   * `bindKey` не прошёл (сервер на секунду недоступен, старый прокси,
+   * таймаут), а WS поднялся — ключа в базе ещё нет, и сервер честно
+   * отвечает «у адреса нет привязанного ключа» (`server.js:3927`).
+   * Раньше код терялся безвозвратно: человек видел отказ при живом сокете
+   * и верном коде.
+   *
+   * Теперь код запоминается и повторяется ПОСЛЕ успешной авторизации WS —
+   * к тому моменту ключ гарантированно записан. Повтор делает
+   * `retryPendingLink`, его зовёт основной цикл сразу после `connectWs`.
+   * Код в памяти процесса и не пишется на диск: он одноразовый. */
+  if (res.error === 'DEVICE_KEY_UNKNOWN') {
+    linkState.pendingCode = digits;
+    log('ключ ещё не привязан — повторю код после ws-рукопожатия');
+    return res;
+  }
+
   log(`привязка не удалась: ${res.error} — ${res.message}`);
   return res;
+}
+
+/* Повтор погашения, отложенного из-за гонки с WS-рукопожатием.
+ *
+ * Вызывается ТОЛЬКО после `AUTH_OK` (или после успешного опроса, если WS
+ * так и не поднялся, — см. вызов в основном цикле). Условие "не linked"
+ * обязательно: пока ждали сокет, человек мог ввести код руками, и второй
+ * `claim` тем же кодом получил бы `CODE_USED`.
+ *
+ * Возвращает true, если повтор реально состоялся и удался. */
+async function retryPendingLink() {
+  if (linkState.linked || !linkState.pendingCode) return false;
+  const code = linkState.pendingCode;
+  linkState.pendingCode = null;
+  log('ws авторизован — повторяю отложенный код привязки');
+  const res = await applyLinkCode(code);
+  if (res && res.ok) return true;
+  /* Не удалось и со второго раза. Возвращаем код в ожидание только при
+   * той же причине (WS ещё не записал ключ — например, рукопожатие
+   * прошло, но `publishPeerAllowlist` задержался); при любом другом
+   * отказе код бесполезен — он мог истечь или быть уже погашенным. */
+  if (res && res.error === 'DEVICE_KEY_UNKNOWN') {
+    linkState.pendingCode = code;
+    log('ключ всё ещё неизвестен — попробую ещё раз после следующего опроса');
+    return false;
+  }
+  return false;
 }
 
 function startLinkListener() {
@@ -1699,7 +1753,7 @@ module.exports = {
   runTask, AUTH_PREFIX, claimLinkCode, linkFromCli,
   /* Интерактив привязки — наружу для тестов: подсказка, разбор ввода и
    * состояние слушателя проверяются без запуска цикла опроса. */
-  applyLinkCode, startLinkListener, printLinkPrompt, linkState, LINK_PROMPT,
+  applyLinkCode, retryPendingLink, startLinkListener, printLinkPrompt, linkState, LINK_PROMPT,
 };
 
 if (require.main === module) {

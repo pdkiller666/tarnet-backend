@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.22.8-fix-p1.1-criterion",
+  "version": "2.22.9-manus-audit-fixes",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

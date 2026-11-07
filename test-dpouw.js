@@ -9875,6 +9875,290 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     }
   }
 
+  /* ===== 56. /p2p/bootstrap — discovery-контракт (аудит Manus) =====
+   *
+   * ЧТО НЕ БЫЛО ЗАКРЫТО. До 2.22.9 `/p2p/bootstrap` не имел ни одной
+   * автотеста: секция 55 проверяла `/p2p/status`, а ручка, по которой
+   * воркер на чужой машине ИЩЕТ сеть, оставалась непроверенной. Это самый
+   * дорогой вид дыры: сломанный bootstrap выглядит как «сеть не
+   * запустилась», и искать причину начнут в libp2p, а не в ответе сервера.
+   *
+   * ТРИ ВЕТКИ, и все три обязаны быть различимы:
+   *   • мост жив, узел слушает → 200 с `multiaddr`;
+   *   • моста нет вовсе       → 503 P2P_BRIDGE_UNAVAILABLE;
+   *   • мост есть, узел молчит → 503 P2P_NODE_NOT_LISTENING.
+   * Вторая и третья — разные поломки с разным лечением, поэтому и коды
+   * разные. Слить их в один код значило бы отправить человека чинить не то.
+   */
+  section('56. /p2p/bootstrap: адрес сети, а не «сеть как-нибудь найдётся»');
+  {
+    /* Заглушка моста на unix-сокете. Отдаёт то же, что настоящий `status`,
+     * включая `listen` — именно его `/p2p/bootstrap` превращает в multiaddr. */
+    function makeBridgeStub(responder) {
+      const sock = path.join(os.tmpdir(), `tarnet-boot-${RUN}-${Math.random().toString(36).slice(2, 8)}.sock`);
+      try { fs.unlinkSync(sock); } catch (_e) { /* сокета ещё нет */ }
+      const srv = net.createServer((conn) => {
+        conn.setEncoding('utf8');
+        let buf = '';
+        conn.on('data', (d) => {
+          buf += d;
+          const i = buf.indexOf('\n');
+          if (i < 0) return;
+          const line = buf.slice(0, i);
+          buf = buf.slice(i + 1);
+          let cmd = null;
+          try { cmd = JSON.parse(line); } catch (_e) { return; }
+          conn.write(JSON.stringify(responder(cmd)) + '\n');
+        });
+        conn.on('error', () => { /* клиент ушёл — штатно */ });
+      });
+      return { sock, srv };
+    }
+
+    const openStub = async (stub) => {
+      await new Promise((resolve, reject) => {
+        stub.srv.once('error', reject);
+        stub.srv.listen(stub.sock, resolve);
+      });
+    };
+    const closeStub = async (stub) => {
+      await new Promise((r) => stub.srv.close(r));
+      try { fs.unlinkSync(stub.sock); } catch (_e) { /* уже удалён */ }
+    };
+    const peerId56 = '12D3KooWboot56TestPeerId';
+
+    /* --- 56.1–56.4: узел слушает → адрес есть --- */
+    const live = makeBridgeStub((cmd) => ({
+      ok: true,
+      action: cmd.action,
+      peerId: peerId56,
+      libp2p: 'listening 0.0.0.0:4001',
+      /* Адреса — ровно в том виде, в каком их отдаёт `node.getMultiaddrs()`:
+       * с суффиксом `/p2p/<peerId>`. Без суффикса такой multiaddr не годится
+       * для `dial()` — воркеру пришлось бы склеивать его на клиенте, а
+       * контракт обещает готовый адрес. Два адреса намеренно: воркер
+       * пробует по очереди, и поле `multiaddrs` — массив. */
+      listen: [
+        `/ip4/1.2.3.4/tcp/4001/p2p/${peerId56}`,
+        `/dns4/node.example/tcp/4001/p2p/${peerId56}`,
+      ],
+      connections: 0,
+      connected_peers: [],
+      uptime_s: 7,
+    }));
+    await openStub(live);
+    const h56a = await spawnServer({ P2P_BRIDGE_SOCKET: live.sock });
+    try {
+      const r = await apiAt(h56a.base, '/p2p/bootstrap');
+      ok('56.1 живой узел: 200 и ok=true',
+        r.status === 200 && r.body?.ok === true, { status: r.status, ok: r.body?.ok });
+      ok('56.2 multiaddr = первый адрес из listen, с /p2p/<peerId>',
+        r.body?.multiaddr === `/ip4/1.2.3.4/tcp/4001/p2p/${peerId56}`
+          && String(r.body?.multiaddr || '').includes('/p2p/'),
+        { multiaddr: r.body?.multiaddr });
+      ok('56.3 multiaddrs — массив из двух адресов (воркер пробует по очереди)',
+        Array.isArray(r.body?.multiaddrs) && r.body.multiaddrs.length === 2,
+        r.body?.multiaddrs);
+      ok('56.4 connections — число в ответе, а не строка',
+        typeof r.body?.connections === 'number', { connections: r.body?.connections, type: typeof r.body?.connections });
+      ok('56.5 peerId и protocol отдаются явно',
+        r.body?.peerId === peerId56 && r.body?.protocol === 'libp2p',
+        { peerId: r.body?.peerId, protocol: r.body?.protocol });
+    } finally {
+      h56a.stop();
+      await closeStub(live);
+    }
+
+    /* --- 56.6–56.7: мост есть, но узел не слушает ---
+     * Самый вероятный вид поломки: сервис запущен и отвечает, порт пуст.
+     * 200 здесь соврал бы про готовность сети. */
+    const deaf = makeBridgeStub((cmd) => ({
+      ok: true,
+      action: cmd.action,
+      peerId: peerId56,
+      libp2p: 'off',
+      listen: [],
+      connections: null,
+      connected_peers: [],
+    }));
+    await openStub(deaf);
+    const h56b = await spawnServer({ P2P_BRIDGE_SOCKET: deaf.sock });
+    try {
+      const r = await apiAt(h56b.base, '/p2p/bootstrap');
+      ok('56.6 мост жив, узел молчит → 503 P2P_NODE_NOT_LISTENING',
+        r.status === 503 && r.body?.error === 'P2P_NODE_NOT_LISTENING',
+        { status: r.status, error: r.body?.error });
+      ok('56.7 в отказе есть peerId — видно, ЧЕЙ узел не слушает',
+        r.body?.peerId === peerId56, { peerId: r.body?.peerId });
+    } finally {
+      h56b.stop();
+      await closeStub(deaf);
+    }
+
+    /* --- 56.8–56.9: моста нет --- */
+    const noSock56 = path.join(os.tmpdir(), `tarnet-boot-none-${RUN}.sock`);
+    try { fs.unlinkSync(noSock56); } catch (_e) { /* сокета ещё нет */ }
+    const h56c = await spawnServer({ P2P_BRIDGE_SOCKET: noSock56 });
+    try {
+      const r = await apiAt(h56c.base, '/p2p/bootstrap');
+      ok('56.8 без моста → 503 P2P_BRIDGE_UNAVAILABLE (не «пиров нет»)',
+        r.status === 503 && r.body?.error === 'P2P_BRIDGE_UNAVAILABLE',
+        { status: r.status, error: r.body?.error });
+      /* Пустой список клиент понял бы как «сеть есть, пиров нет» и ждал бы
+       * вечно. Поэтому при отказе адреса не должно быть вовсе. */
+      ok('56.9 в отказе НЕТ multiaddr — иначе воркер пойдёт в пустоту',
+        !r.body?.multiaddr && !r.body?.multiaddrs,
+        { multiaddr: r.body?.multiaddr, multiaddrs: r.body?.multiaddrs });
+    } finally {
+      h56c.stop();
+    }
+  }
+
+  /* ===== 57. linkFromCli: гонка с WS-рукопожатием (аудит Manus) =====
+   *
+   * ДЕФЕКТ, КОТОРЫЙ ЭТО ЗАКРЫВАЕТ. `applyLinkCode` вызывался ДО `connectWs`.
+   * Ключ в `ws_worker_auth` пишут два места: HTTP `/worker/handshake`
+   * (`server.js:7460`) и WS-рукопожатие (`ws-inbound.js:386`). Если HTTP
+   * `bindKey` упал, а WS поднялся, то `claim` уходил по HTTP раньше, чем
+   * появился ключ, и сервер отвечал `403 DEVICE_KEY_UNKNOWN` при верном
+   * коде и живом сокете. Код терялся безвозвратно.
+   *
+   * ЧТО ПРОВЕРЯЕТСЯ: код запоминается, а `retryPendingLink` гасит его
+   * после `AUTH_OK`. Заглушка сервера воспроизводит именно ту
+   * последовательность: первый `claim` — отказ, второй — успех.
+   */
+  section('57. Привязка кодом: отказ DEVICE_KEY_UNKNOWN не теряет код');
+  {
+    /* `spawn` асинхронный и берётся из общего импорта сверху файла.
+     * `spawnSync` здесь был бы ловушкой: он замораживает event loop
+     * родителя и не даёт заглушке принять ни одного соединения. */
+    const linkHome = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-link57-'));
+    const claims = [];
+
+    /* Заглушка API: считает вызовы `claim` и меняет ответ после первого.
+     * Счётчик, а не таймер: тест обязан быть детерминированным. */
+    const stub = net.createServer((conn) => {
+      conn.setEncoding('utf8');
+      let buf = '';
+      conn.on('data', (d) => {
+        buf += d;
+        const idx = buf.indexOf('\r\n\r\n');
+        if (idx < 0) return;
+        const head = buf.slice(0, idx);
+        const rest = buf.slice(idx + 4);
+        const lenMatch = /content-length:\s*(\d+)/i.exec(head);
+        const len = lenMatch ? Number(lenMatch[1]) : 0;
+        if (rest.length < len) return;
+        buf = '';
+        const first = head.split('\r\n')[0] || '';
+        const isClaim = first.includes('/devices/link/claim');
+        let status = 200;
+        let payload = { ok: true };
+        if (isClaim) {
+          claims.push(first);
+          if (claims.length === 1) {
+            status = 403;
+            payload = {
+              error: 'DEVICE_KEY_UNKNOWN',
+              detail: 'у этого адреса нет привязанного ключа',
+            };
+          } else {
+            payload = { ok: true, ownerAddress: '0x' + '77'.repeat(20) };
+          }
+        }
+        const bodyText = JSON.stringify(payload);
+        conn.write(
+          `HTTP/1.1 ${status} ${status === 200 ? 'OK' : 'Forbidden'}\r\n` +
+          'content-type: application/json\r\n' +
+          `content-length: ${Buffer.byteLength(bodyText)}\r\n` +
+          'connection: close\r\n\r\n' + bodyText
+        );
+        conn.end();
+      });
+      conn.on('error', () => { /* клиент ушёл */ });
+    });
+    const stubPort = await new Promise((resolve, reject) => {
+      stub.once('error', reject);
+      stub.listen(0, '127.0.0.1', () => resolve(stub.address().port));
+    });
+
+    /* Подпроцесс: `worker-demo.js` на загрузке создаёт адрес и трогает
+     * файлы, поэтому в общем процессе это был бы побочный эффект.
+     * `HOME` подменён — настоящий `~/.tarnet` не тронут.
+     *
+     * ЗАПУСК АСИНХРОННЫЙ, И ЭТО НЕ СТИЛЬ. Заглушка API живёт в ЭТОМ же
+     * процессе. `spawnSync` замораживает event loop родителя на всё время
+     * жизни ребёнка, поэтому заглушка не могла принять ни одного
+     * соединения: ребёнок стучался в открытый порт, который никто не
+     * обслуживал. Первый прогон дал `claims: 0` и пустой `got` — тест
+     * мерил сам себя, а не код. `spawn` без `Sync` оставляет loop живым. */
+    const script = [
+      'const w = require(process.argv[1]);',
+      '(async () => {',
+      "  const first = await w.applyLinkCode('123456');",
+      '  const pendingAfterFirst = w.linkState.pendingCode;',
+      '  const retried = await w.retryPendingLink();',
+      '  const linked = w.linkState.linked === true;',
+      '  const pendingAfterRetry = w.linkState.pendingCode;',
+      /* Маркер обязателен: `worker-demo.js` пишет в stdout свои строки
+       * («погашаю код…», «ключ ещё не привязан…»). Без маркера разбор
+       * всего stdout как JSON падал бы в `null`, и тест выглядел бы
+       * красным при полностью рабочей логике — так уже было. */
+      '  process.stdout.write("@@RESULT@@" + JSON.stringify({',
+      '    firstError: first && first.error ? first.error : null,',
+      '    pendingAfterFirst, retried, linked, pendingAfterRetry,',
+      '  }));',
+      '})().catch((e) => { process.stdout.write("@@RESULT@@" + JSON.stringify({ crash: e.message })); });',
+    ].join('\n');
+
+    const run = await new Promise((resolve) => {
+      const proc = spawn(process.execPath, ['-e', script, path.join(__dirname, 'worker-demo.js')], {
+        cwd: __dirname,
+        env: {
+          ...process.env,
+          HOME: linkHome,
+          TARNET_API_URL: `http://127.0.0.1:${stubPort}`,
+          /* Свой seed на прогон: адрес воркера не должен совпасть с адресом
+           * других секций, иначе заглушка увидит чужой запрос. */
+          TARNET_WORKER_SEED: crypto.randomBytes(32).toString('hex'),
+        },
+      });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', (d) => { stdout += d.toString(); });
+      proc.stderr.on('data', (d) => { stderr += d.toString(); });
+      /* Свой таймаут, а не опция `timeout` у spawnSync: без него зависший
+       * ребёнок удержал бы заглушку и весь прогон. */
+      const timer = setTimeout(() => {
+        try { proc.kill('SIGKILL'); } catch (_e) { /* уже мёртв */ }
+        resolve({ stdout, stderr, timedOut: true });
+      }, 30000);
+      proc.on('close', () => { clearTimeout(timer); resolve({ stdout, stderr, timedOut: false }); });
+      proc.on('error', (e) => { clearTimeout(timer); resolve({ stdout, stderr: stderr + e.message, timedOut: false }); });
+    });
+    await new Promise((r) => stub.close(r));
+
+    /* Разбор ТОЛЬКО по маркеру: до него в stdout идут лог-строки
+     * `worker-demo.js`, после — ничего. Голый `JSON.parse(stdout)`
+     * давал `null` при живой логике. */
+    let got = null;
+    const marker = /@@RESULT@@(\{[\s\S]*\})\s*$/.exec((run.stdout || '').trim());
+    try { got = marker ? JSON.parse(marker[1]) : null; } catch (_e) { got = null; }
+
+    ok('57.1 первый claim получил DEVICE_KEY_UNKNOWN',
+      got?.firstError === 'DEVICE_KEY_UNKNOWN',
+      { got, stdout: (run.stdout || '').slice(0, 200), stderr: (run.stderr || '').slice(0, 200) });
+    ok('57.2 код НЕ потерян: отложен в linkState.pendingCode',
+      got?.pendingAfterFirst === '123456', { pending: got?.pendingAfterFirst });
+    ok('57.3 повтор вернул успех (код погашен со второго раза)',
+      got?.retried === true && got?.linked === true,
+      { retried: got?.retried, linked: got?.linked });
+    ok('57.4 после успеха ожидание очищено — второй раз код не гасится',
+      got?.pendingAfterRetry === null, { pending: got?.pendingAfterRetry });
+    ok('57.5 заглушка видела РОВНО два claim (нет цикла повторов)',
+      claims.length === 2, { claims: claims.length });
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {
