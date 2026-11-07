@@ -206,6 +206,7 @@ SQLite, `/var/lib/tarnet` на проде. **44 таблицы** (провере
 | `PROJECT-HISTORY.md` | «как мы сюда пришли» | при каждой вехе |
 | `ROADMAP.md` | «что дальше и в каком порядке» | при смене приоритетов |
 | `docs/BACKLOG.md` | «что отложено и почему» | когда задачу откладывают |
+| `docs/REALITY-CHECK-v3.md` | «что обещали и что имеем» — Gap Analysis Манифест vs Код по 4 категориям | при смене вехи; устаревает → заменяется v4, а не правится |
 | `docs/NETWORK-CONTRACT-v1.md` | контракт воркера и API | при изменении API |
 | `docs/PROJECT-MEMORY.md` | сводка по всем сессиям | по запросу |
 
@@ -221,7 +222,7 @@ SQLite, `/var/lib/tarnet` на проде. **44 таблицы** (провере
 | Где | Что |
 | :--- | :--- |
 | корень `backend-api/` | `MANIFEST.v3.4-UNIFIED.md`, `PROJECT-HISTORY.md`, `PROJECT-MAP.md`, `ROADMAP.md`, `README.md` |
-| `docs/` — отчёты и планы | `docs/BACKLOG.md`, `docs/PLAN-WAVE2.md`, `docs/PLAN-AGENT-RUNTIME.md`, `docs/LEGAL-DISTILLATION-PIPELINE.md`, `docs/V2.17.*-REPORT.md`, `docs/V2.17.13-REPORT.md`, `docs/REALITY-CHECK-v2.17.7.md` |
+| `docs/` — отчёты и планы | `docs/BACKLOG.md`, `docs/PLAN-WAVE2.md`, `docs/PLAN-AGENT-RUNTIME.md`, `docs/LEGAL-DISTILLATION-PIPELINE.md`, `docs/V2.17.*-REPORT.md`, `docs/V2.17.13-REPORT.md`, `docs/REALITY-CHECK-v2.17.7.md`, `docs/REALITY-CHECK-v3.md` |
 | `docs/` — инвестору и демо | `docs/ONE-PAGER.md`, `docs/PITCH-DECK.md`, `docs/DEMO-SCRIPT.md`, `docs/DEMO-RUNBOOK.md`, `docs/EMAIL-TEMPLATE.md`, `docs/AUDIT-REALITY.md` |
 | `docs/` — контракты и решения | `docs/NETWORK-CONTRACT-v1.md`, `docs/BYOK-PRICING.md`, `docs/PII-DECISION.md`, `docs/VISION-8-COMPONENTS.md`, `docs/PROJECT-MEMORY.md` |
 
