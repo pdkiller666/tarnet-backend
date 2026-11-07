@@ -53,7 +53,7 @@
 | `p2p-transport.js` | 611 | WS между узлами, `wildcardBind`, `P2P_PUBLIC_URL → P2P_ADVERTISE_IP` | ⚠️ настроен только на `127.0.0.1` |
 | `onion.js` | 289 | Onion Routing: RSA-2048-OAEP-SHA256 оборачивает 32-байтный AES, нагрузка AES-256-GCM | ✅ работает (`hops: 3`) |
 | `p2p-demo.js` | 129 | Демонстрация P2P | демо |
-| `p2p-node/bridge.js` | 493 | Отдельный процесс. Unix-socket `/tmp/tarnet-p2p-bridge.sock` (0600), JSON Lines, `announce`/`status`/`peers`/`ping`/`task`/`cancel`. С 2.21.4 принимает поток `/tarnet/task/1.0.0` от воркеров. С 2.22.5: `cancel(msg)` → `taskClient.cancel()` | ✅ работает на проде (`p2p-bridge.service`) |
+| `p2p-node/bridge.js` | 493 | Отдельный процесс. Unix-socket `/tmp/tarnet-p2p-bridge.sock` (0600), JSON Lines, `announce`/`status`/`peers`/`ping`/`task`/`cancel`. С 2.21.4 принимает поток `/tarnet/task/1.0.0` от воркеров. С 2.22.5: `cancel(msg)` → `taskClient.cancel()`. Action **`channels`** добавляется с 2.22.x (список авторизованных живых каналов) — если его нет в ответе, мост на старом коде | ✅ работает на проде (`p2p-bridge.service`) |
 | `p2p-node/task-protocol.js` | 328 | Кадры задачи поверх libp2p-потока: один JSON на строку, `createTaskClient` (мост) / `serveTaskStream` (воркер). Без `stream.source`/`sink` — в libp2p 3.5.1 поток итерируется сам, запись через `stream.send` + ожидание `drain` своим `waitEvent` (без пакета `p-event`: тот приходил транзитивно и исчез бы при обновлении libp2p). С 2.22.5: `CONTROL_FRAME='cancel'`, `isControlFrame`, `cancel()`; управление читается **вне** цепочки задач, иначе отмена ждала бы ответа модели | ✅ 52.7–52.12 |
 | `p2p-node/peer-auth.js` | 168 | **Проверка права на поток задач:** `verifyHello` (Ed25519 тем же ключом, что в WS), `loadAllowlist` — формат `{updatedAt,peers}`, нет файла/битый JSON = запрет; префикс `TARNET_P2P_HELLO`, окно 120 с | ✅ 11 проверок в 51.1–51.11 |
 | `p2p-node/peer-hello.js` | 153 | Сторона воркера: `loadWorkerIdentity` (env → `~/.tarnet/*.json`), `buildHello` — подпись PKCS8-обёрткой seed, тот же префикс, что в `worker-demo.js`. С 2.22.5: `workerKeyFile({home,env})` (`P2P_WORKER_KEY_FILE`), `waitForWorkerIdentity({timeoutMs,pollMs})` — ключ может появиться позже. **`verifyHello` здесь НЕТ** — он в `peer-auth.js` | ✅ без сети, обычным `node` |
@@ -129,7 +129,7 @@
 
 | Скрипт | Что делает | Осторожно |
 | :--- | :--- | :--- |
-| `deploy.sh` | **Коммит + пуш + раскатка.** `--dry-run` НЕТ | Аргумент с `-` отклоняется (`EXIT=2`); повторный `/health` перед откатом |
+| `deploy.sh` | **Коммит + пуш + раскатка.** `--dry-run` НЕТ | Аргумент с `-` отклоняется (`EXIT=2`); повторный `/health` перед откатом. С 07.11 шаг **5b** перезапускает `p2p-bridge` (имя в `TARNET_BRIDGE_SERVICE`, по умолчанию `p2p-bridge`) — без этого шага мост остаётся на старом коде после подмены файла (случилось 07.11: двое суток без action `channels`) |
 | `verify.sh` | Гоняет три набора + сверяет `/config` с `config.js` | Основной вход приёмки |
 | `test-p2p-e2e.js` | **Сквозной P2P** (`2.22.3`): поднимает мост + `p2p-worker.js` + исполнитель во временном `HOME`, ждёт `via:'p2p'` | Свой сокет/порт/bootstrap-заглушка — боевой мост не трогает; проверен loopback, не боевая топология |
 | `prune-archives.js` | **Очистка `.zst`** (`2.22.4`): удаляет архивы старше 7 дн. только при совпадении SHA-256 с `session_transcript_archives` | Dry-run по умолчанию; возраст из метки `.deleted.<ISO>` в имени, не из mtime. Прогон: 32 файла, 75.3 КБ |

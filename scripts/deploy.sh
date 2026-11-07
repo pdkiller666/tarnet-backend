@@ -39,6 +39,13 @@ REMOTE_DIR="${TARNET_REMOTE_DIR:-/opt/tarnet/backend-api}"
 REMOTE_BUNDLE="/tmp/tarnet-deploy.bundle"
 LOCAL_BUNDLE="/tmp/tarnet-deploy.bundle"
 SERVICE="${TARNET_SERVICE:-tarnet}"
+# Мост — ОТДЕЛЬНЫЙ юнит (p2p-bridge.service), и его перезапуск обязателен.
+# ПОЧЕМУ: 2026-11-07 мост работал на коде от 05.11 двое суток после двух
+# деплоев. `bridge.js` на диске знал action `channels`, а процесс в памяти —
+# нет, и отвечал UNKNOWN_ACTION. Следствие тихое: P2P-маршрут задач всегда
+# получал `channels_failed`, задачи уходили по WS, `framesIn` оставался 0,
+# и приёмка P1.1 не могла закрыться при формально зелёном деплое.
+BRIDGE_SERVICE="${TARNET_BRIDGE_SERVICE:-p2p-bridge}"
 HEALTH_LOCAL="http://127.0.0.1:3001/health"
 PUBLIC_URL="${TARNET_PUBLIC_URL:-https://v1107336.hosted-by-vdsina.com}"
 MSG="${1:-}"
@@ -317,6 +324,28 @@ for _ in $(seq 1 30); do
 done
 echo "ERR: сервис не стал active за 30 с"
 journalctl -u "$SVC" -n 25 --no-pager >&2
+exit 7
+REMOTE
+
+# ---------- 5b. перезапуск моста ----------
+# Отдельно от основного сервиса и НЕ роняя деплой: мост — необязательный
+# компонент (libp2p 105 МБ, может отсутствовать на новом хосте), и его
+# падение означает только «discovery недоступен», а не поломку API.
+# Но молча пропускать его нельзя — это и был двухдневный разрыв выше.
+info "перезапускаю мост $BRIDGE_SERVICE"
+ssh "${SSH_OPTS[@]}" "$VPS" "bash -s" -- "$BRIDGE_SERVICE" <<'REMOTE' || printf 'ВНИМАНИЕ: мост не перезапущен — P2P-маршрут задач может работать на старом коде\n' >&2
+BSVC=$1
+if ! systemctl list-unit-files "$BSVC.service" >/dev/null 2>&1 || ! systemctl cat "$BSVC" >/dev/null 2>&1; then
+  echo "юнита $BSVC нет — пропускаю (P2P не настроен на этом хосте)"
+  exit 0
+fi
+systemctl restart "$BSVC" || { echo "ERR: restart $BSVC"; exit 6; }
+for _ in $(seq 1 30); do
+  if systemctl is-active --quiet "$BSVC"; then echo "active после рестарта"; exit 0; fi
+  sleep 1
+done
+echo "ERR: $BSVC не стал active за 30 с"
+journalctl -u "$BSVC" -n 25 --no-pager >&2
 exit 7
 REMOTE
 
