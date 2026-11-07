@@ -146,7 +146,7 @@
 
 ## 9. База данных
 
-SQLite, `/var/lib/tarnet` на проде. 38 таблиц; группы по смыслу:
+SQLite, `/var/lib/tarnet` на проде. **44 таблицы** (проверено 07.11.2026 прямым чтением БД); группы по смыслу:
 
 | Группа | Таблицы |
 | :--- | :--- |
@@ -161,6 +161,17 @@ SQLite, `/var/lib/tarnet` на проде. 38 таблиц; группы по с
 | Прочее | `inference`, `model_registry`, `tool_registry`, `benchmark_runs`, `distillation_buffer` |
 
 **`distillation_buffer` объявлена, но промпты туда не пишутся** — Фаза 2.5.
+
+**9 из 44 таблиц пусты на 07.11.2026** (0 строк): `balance_migrations`,
+`benchmark_runs`, `chat_sync_log`, `device_link_challenges`, `device_link_nonces`,
+`key_limits`, `key_usage`, `user_keys`. Пустота — не дефект: `key_*` и `user_keys`
+созданы как схема-первой для Фазы 2.5, `benchmark_runs` ждёт комитета (0 членов),
+`device_link_*` — короткоживущие челленджи. Но при чтении «что работает» опираться
+на наличие таблицы нельзя — только на число строк.
+
+**Где читать правду о содержимом:** `node --input-type=commonjs -e` с `node:sqlite`
+на VPS (`better-sqlite3` НЕ установлен — сервер на встроенном модуле).
+`sede`/`sqlite3` CLI на VPS отсутствует.
 
 ---
 
