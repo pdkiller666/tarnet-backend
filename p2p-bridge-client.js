@@ -94,9 +94,9 @@ function send(command, { socketPath = DEFAULT_SOCKET, timeoutMs = 700 } = {}) {
  * Никогда не бросает: возвращает `{ok:false, error}` — вызывающий решает,
  * откатиться на HTTP или показать ошибку.
  */
-async function task(payload, { timeoutMs = 15000, socketPath = DEFAULT_SOCKET } = {}) {
+async function task(payload, { timeoutMs = 15000, socketPath = DEFAULT_SOCKET, address = null } = {}) {
   const res = await send(
-    { action: 'task', payload, timeoutMs },
+    { action: 'task', payload, address, timeoutMs },
     { socketPath, timeoutMs: timeoutMs + 2000 },
   );
   if (!res) return { ok: false, error: 'BRIDGE_UNREACHABLE' };

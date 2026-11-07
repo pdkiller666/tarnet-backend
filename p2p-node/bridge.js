@@ -317,6 +317,10 @@ const handlers = {
     const payload = msg.payload && typeof msg.payload === 'object'
       ? msg.payload
       : { action: 'ping' }
+    /* Адресат едет отдельным полем, а не внутри payload: payload — кадр
+     * протокола задач, и добавление туда служебного поля сломало бы
+     * проверку формы у воркера. */
+    const address = msg.address ? String(msg.address).toLowerCase() : null
     const channels = taskClient.count()
     if (channels === 0) {
       /* Отказ, а не пустой ok: «воркеров нет» и «воркер ответил» — разные
@@ -332,7 +336,8 @@ const handlers = {
     const started = Date.now()
     try {
       const replyFromWorker = await taskClient.send(payload, {
-        timeoutMs: Math.min(Number(msg.timeoutMs) || 3000, 15000)
+        timeoutMs: Math.min(Number(msg.timeoutMs) || 3000, 15000),
+        address
       })
       return {
         ok: true,

@@ -6931,7 +6931,7 @@ const P2P_TASK_TIMEOUT_MS = Number(process.env.P2P_TASK_TIMEOUT_MS || 25000);
  * Такая строка остаётся 'claimed' до TTL: если воркер успеет, результат
  * ещё примут, а если нет — истечёт без повторов. */
 const P2P_SAFE_TO_REQUEUE = new Set([
-  'BRIDGE_UNREACHABLE', 'NO_TASK_CHANNEL', 'BAD_TOKEN',
+  'BRIDGE_UNREACHABLE', 'NO_TASK_CHANNEL', 'NO_CHANNEL_FOR_WORKER', 'BAD_TOKEN',
   'NO_LOCAL_EXECUTOR', 'UNKNOWN_TASK', 'CHANNEL_GONE',
 ]);
 
@@ -7012,7 +7012,10 @@ async function dispatchTaskOverP2p({
 
   let reply;
   try {
-    reply = await p2pBridge.task(frame, { timeoutMs: P2P_TASK_TIMEOUT_MS });
+    /* `address` — чтобы задача ушла ИМЕННО тому воркеру, для которого
+     * строка уже claim'нута выше. Без него мост брал первый живой канал,
+     * и при двух узлах ответ отклонялся как чужой (409). */
+    reply = await p2pBridge.task(frame, { timeoutMs: P2P_TASK_TIMEOUT_MS, address: addr });
   } catch (e) {
     reply = { ok: false, error: 'BRIDGE_UNREACHABLE', detail: e.message };
   }

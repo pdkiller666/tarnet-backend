@@ -10236,6 +10236,223 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       claims.length === 2, { claims: claims.length });
   }
 
+  /* ===== 58. scripts/authorize-peer.js: адрес без ключа не впускается =====
+   *
+   * ПОЧЕМУ ТАК. Белый список моста — это пары «адрес → 64-hex ключ», и
+   * подпись `hello` проверяется именно ключом. Скрипт, который «просто
+   * дописывает адрес», создал бы строку, которую `loadAllowlist` молча
+   * выбросит: снаружи «добавили», а воркер получает отказ. Поэтому
+   * проверяются все три исхода, а не только счастливый.
+   */
+  section('58. authorize-peer: привязка по ключу, а не по адресу');
+  {
+    const { spawnSync } = require('child_process');
+    const { DatabaseSync } = require('node:sqlite');
+    const dir58 = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-auth58-'));
+    const dbPath = path.join(dir58, 't.db');
+    const listPath = path.join(dir58, 'p2p', 'authorized-peers.json');
+    const addr58 = '0x209a5200ef368ebe32320c89c20e69543f35df15';
+    const keyA = 'ab'.repeat(32);
+    const keyB = 'cd'.repeat(32);
+    const script = path.join(__dirname, 'scripts', 'authorize-peer.js');
+
+    const db = new DatabaseSync(dbPath);
+    db.exec(`CREATE TABLE ws_worker_auth (
+      workerAddress TEXT PRIMARY KEY, pubkeyHex TEXT, firstSeenAt INTEGER, lastSeenAt INTEGER)`);
+    db.close();
+
+    const run58 = (extra) => spawnSync(process.execPath,
+      [script, addr58, '--db', dbPath, '--file', listPath, ...extra], { encoding: 'utf8' });
+
+    const noBind = run58([]);
+    ok('58.1 без привязки — отказ 3, файл не создан',
+      noBind.status === 3 && !fs.existsSync(listPath),
+      { status: noBind.status, stderr: (noBind.stderr || '').slice(0, 120) });
+
+    const badAddr = spawnSync(process.execPath,
+      [script, '0x123', '--db', dbPath, '--file', listPath], { encoding: 'utf8' });
+    ok('58.2 кривой адрес — отказ 2', badAddr.status === 2, badAddr.status);
+
+    const bound = run58(['--pubkey', keyA]);
+    let file58 = null;
+    try { file58 = JSON.parse(fs.readFileSync(listPath, 'utf8')); } catch (_e) { file58 = null; }
+    ok('58.3 --pubkey привязывает и публикует',
+      bound.status === 0 && file58 && file58.peers[addr58] === keyA,
+      { status: bound.status, peers: file58 && Object.keys(file58.peers || {}) });
+    ok('58.4 файл списка создан с правами 0600',
+      (fs.statSync(listPath).mode & 0o777) === 0o600,
+      (fs.statSync(listPath).mode & 0o777).toString(8));
+
+    const again = run58([]);
+    let json58 = null;
+    try { json58 = JSON.parse(run58(['--json']).stdout); } catch (_e) { json58 = null; }
+    ok('58.5 повтор без ключа — 0 и boundNow=false (ничего не пересоздаёт)',
+      again.status === 0 && json58 && json58.boundNow === false && json58.pubkeyHex === keyA,
+      { status: again.status, json: json58 });
+
+    /* Подмена ключа — это захват адреса, поэтому отказ, а не тихая замена. */
+    const hijack = run58(['--pubkey', keyB]);
+    ok('58.6 другой ключ на тот же адрес — отказ 4',
+      hijack.status === 4, { status: hijack.status });
+
+    const after = JSON.parse(fs.readFileSync(listPath, 'utf8'));
+    ok('58.7 после отказа ключ в файле не сменился',
+      after.peers[addr58] === keyA, after.peers[addr58]);
+
+    fs.rmSync(dir58, { recursive: true, force: true });
+  }
+
+  /* ===== 59. scripts/check-autostart.js: следствие, а не причина =====
+   *
+   * Скрипт не может узнать, перезагружали ли ПК: таких данных у сервера
+   * нет. Он проверяет, что узел В СЕТИ, и честно пишет, что «без ручного
+   * запуска» — условие сценария, а не измеренный факт. Тесты проверяют
+   * именно это поведение: готовность по двум условиям и честный таймаут.
+   */
+  section('59. check-autostart: готовность по workers И connections');
+  {
+    const script59 = path.join(__dirname, 'scripts', 'check-autostart.js');
+
+    /* Заглушка на net, а не на http: в тесте уже есть этот приём (57),
+     * и он не тянет новых зависимостей. */
+    const startStub = (readyAfterHits) => new Promise((resolve) => {
+      let healthHits = 0;
+      const srv = net.createServer((conn) => {
+        conn.setEncoding('utf8');
+        let buf = '';
+        conn.on('data', (d) => {
+          buf += d;
+          if (!buf.includes('\r\n\r\n')) return;
+          const reqPath = (buf.split('\r\n')[0] || '').split(' ')[1] || '/';
+          buf = '';
+          let body = '{}';
+          if (reqPath === '/health') {
+            healthHits += 1;
+            body = JSON.stringify({ active_workers: healthHits >= readyAfterHits ? 1 : 0, llm_mode: 'worker' });
+          } else if (reqPath === '/p2p/status') {
+            const ready = healthHits >= readyAfterHits;
+            body = JSON.stringify({ ok: true, bridge: {
+              connections: ready ? 1 : 0,
+              connected_peers: ready ? ['12D3KooWstub'] : [],
+              tasks: { channels: ready ? 1 : 0, framesIn: ready ? 2 : 0 },
+            } });
+          }
+          conn.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n` +
+            `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+          conn.end();
+        });
+      });
+      srv.listen(0, '127.0.0.1', () => resolve({ srv, port: srv.address().port }));
+    });
+
+    const runScript = (port, windowSec) => new Promise((resolve) => {
+      const p = spawn(process.execPath, [script59, '--url', `http://127.0.0.1:${port}`,
+        '--window', String(windowSec), '--interval', '1'], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      p.stdout.on('data', (d) => { out += d.toString(); });
+      p.stderr.on('data', (d) => { out += d.toString(); });
+      p.on('close', (code) => resolve({ code, out }));
+    });
+
+    const fast = await startStub(2);
+    try {
+      const r = await runScript(fast.port, 15);
+      ok('59.1 готовность после появления воркера — код 0',
+        r.code === 0, { code: r.code, tail: r.out.slice(-200) });
+    } finally { fast.srv.close(); }
+
+    const never = await startStub(9999);
+    try {
+      const r = await runScript(never.port, 3);
+      ok('59.2 нет воркера — код 1 и честный таймаут',
+        r.code === 1 && /За 3 с условие не выполнено/.test(r.out),
+        { code: r.code, tail: r.out.slice(-200) });
+      ok('59.3 в таймауте названа причина (воркер не появился)',
+        /ярлык в Startup не сработал|воркер упал/.test(r.out),
+        r.out.slice(-160));
+    } finally { never.srv.close(); }
+  }
+
+  /* ===== 60. Адресация задачи в мосте: не «первому живому» =====
+   *
+   * ДЕФЕКТ. `taskClient.send` брал первый живой канал. При двух узлах
+   * задача, заclaim'ленная на A, уходила B; B исполнял её, а
+   * `POST /worker/submit` отвечал 409 «issued to another worker». Работа
+   * сделана, ответ потерян, строка висела до TTL. С одним воркером
+   * невидимо, с двумя — постоянный отказ.
+   */
+  section('60. Мост: задача уходит адресату, а не первому каналу');
+  {
+    const taskProto60 = await import('./p2p-node/task-protocol.js');
+    const tick60 = (ms = 25) => new Promise((r) => setTimeout(r, ms));
+
+    function makeStream60() {
+      const sent = [];
+      const queue = [];
+      let waiter = null;
+      let isClosed = false;
+      const stream = {
+        sent,
+        send(buf) { const b = buf && buf.subarray ? buf.subarray() : buf; sent.push(Buffer.from(b).toString('utf8')); return true; },
+        async close() {
+          isClosed = true;
+          if (waiter) { const w = waiter; waiter = null; w({ done: true, value: undefined }); }
+        },
+        push(text) {
+          const chunk = new TextEncoder().encode(text);
+          if (waiter) { const w = waiter; waiter = null; w({ done: false, value: chunk }); } else queue.push(chunk);
+        },
+        [Symbol.asyncIterator]() {
+          return {
+            next() {
+              if (queue.length) return Promise.resolve({ done: false, value: queue.shift() });
+              if (isClosed) return Promise.resolve({ done: true, value: undefined });
+              return new Promise((resolve) => { waiter = resolve; });
+            },
+          };
+        },
+      };
+      Object.defineProperty(stream, 'closed', { get: () => isClosed });
+      return stream;
+    }
+
+    const addrA = '0x' + 'a1'.repeat(20);
+    const addrB = '0x' + 'b2'.repeat(20);
+    const tc = taskProto60.createTaskClient({
+      log: () => {},
+      /* Вердикт без криптографии: проверяется АДРЕСАЦИЯ, а не подпись —
+       * подпись уже покрыта секцией 51. */
+      authorize: (msg) => (msg && msg.address ? { ok: true, address: msg.address } : { ok: false, error: 'HELLO_REQUIRED' }),
+    });
+    const chA = makeStream60();
+    const chB = makeStream60();
+    tc.attach(chA, 'peerA');
+    tc.attach(chB, 'peerB');
+    chA.push(JSON.stringify({ action: 'hello', address: addrA }) + '\n');
+    chB.push(JSON.stringify({ action: 'hello', address: addrB }) + '\n');
+    await tick60(60);
+
+    const pending = tc.send({ action: 'task', task: { taskId: 'wt_addressing' } }, { address: addrA, timeoutMs: 2000 });
+    await tick60(30);
+    const wentToA = chA.sent.some((s) => s.includes('wt_addressing'));
+    const wentToB = chB.sent.some((s) => s.includes('wt_addressing'));
+    chA.push(JSON.stringify({ ok: true, from: 'A' }) + '\n');
+    const reply60 = await pending;
+
+    ok('60.1 задача ушла ТОЛЬКО каналу A', wentToA === true && wentToB === false, { wentToA, wentToB });
+    ok('60.2 ответ вернулся от A', reply60 && reply60.from === 'A', reply60);
+
+    let unknownErr = null;
+    try {
+      await tc.send({ action: 'task' }, { address: '0x' + 'c3'.repeat(20), timeoutMs: 300 });
+    } catch (e) { unknownErr = e.message; }
+    ok('60.3 нет канала у адресата — NO_CHANNEL_FOR_WORKER (а не NO_TASK_CHANNEL)',
+      unknownErr === 'NO_CHANNEL_FOR_WORKER', unknownErr);
+
+    await chA.close();
+    await chB.close();
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

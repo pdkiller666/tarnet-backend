@@ -200,10 +200,23 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
     return ch
   }
 
-  /** Отправить задачу первому живому каналу и дождаться ответа. */
-  async function send(msg, { timeoutMs = 3000 } = {}) {
-    const ch = [...channels].find((c) => !c.closed)
-    if (!ch) throw new Error('NO_TASK_CHANNEL')
+  /** Отправить задачу каналу воркера и дождаться ответа.
+   *
+   * `address` — кому именно. Раньше выбирался ПЕРВЫЙ живой канал, и при двух
+   * подключённых воркерах задача, нацеленная на A, уходила B. B её честно
+   * исполнял, `POST /worker/submit` отвечал 409 «Task was issued to another
+   * worker», и результат терялся: работа сделана, деньги не начислены,
+   * строка висела claimed до TTL. С одним воркером это невидимо, с двумя —
+   * постоянный отказ, который выглядит как «сеть не работает». */
+  async function send(msg, { timeoutMs = 3000, address = null } = {}) {
+    const want = address ? String(address).toLowerCase() : null
+    const ch = [...channels].find(
+      (c) => !c.closed && (!want || String(c.address).toLowerCase() === want)
+    )
+    /* Коды разные намеренно: «воркеров нет вовсе» лечится ожиданием, а
+     * «нет канала ИМЕННО у этого» — падением своего канала при живых чужих,
+     * и это разные диагнозы в логе. */
+    if (!ch) throw new Error(want ? 'NO_CHANNEL_FOR_WORKER' : 'NO_TASK_CHANNEL')
 
     const answer = new Promise((resolve, reject) => {
       const w = { resolve, reject, timer: null }
