@@ -4,8 +4,9 @@
 а не «что работает» (это `MANIFEST.v3.4-UNIFIED.md`) и не «как мы сюда пришли»
 (это `PROJECT-HISTORY.md`).
 
-**Сверено с кодом:** 2026-11-08 00:45, сборка `2.23.3-prompt-integrity`. Карта описывает **файлы**,
-поэтому устаревает медленнее манифеста — но при добавлении/удалении модуля правится в тот же день.
+**Сверено с кодом:** 2026-11-08 08:40 MSK, сборка `2.24.0-p0-hardening` — **эта же сборка на проде**
+(`HEAD 30b1cf36`, `/health` → `200`). Карта описывает **файлы**, поэтому устаревает медленнее
+манифеста — но при добавлении/удалении модуля правится в тот же день.
 
 ---
 
@@ -20,6 +21,7 @@
 | Мост к libp2p | systemd `p2p-bridge.service` (юнит в `deploy/systemd/p2p-bridge.service`), ключ узла `/var/lib/tarnet/p2p/peer-id.bin`, порт `4001` |
 | Проверка снаружи | `https://v1107336.hosted-by-vdsina.com/health` и `/p2p/bootstrap` (за **Caddy** на `443`; порт `3001` наружу **закрыт** — не судить о доступности по нему) |
 | Соседи P2P | `GET /p2p/status` → блок `bridge` (`connections`, `connected_peers`, `tasks.framesIn`) — **по нему считается готовность P1.1**; плюс `nodes`/`client` демо-меша и `registry` (реестр публичных адресов, критерием **не является**) |
+| Проверка автозапуска (P1.2) | `GET /p2p/status → bridge.worker_addresses` — TAR-адреса (`0x…`) воркеров с авторизованным каналом, с 2.24.0. **`connected_peers` для этой сверки не годятся:** там peerId libp2p, а в `~/.tarnet/worker.json` — `0x…`. Нет поля вовсе = сервер старше 2.24.0 (код `3`), есть пустой массив = никто не подключён (код `1`) |
 | Счётчики трафика | `p2p-node/task-protocol.js` → `createTaskClient().stats()` → `{framesIn, framesOut, rejected, channels}`; наружу — через `GET /p2p/status → bridge.tasks` |
 | Деплой | `scripts/deploy.sh` — **коммит + пуш + раскатка без `--dry-run`** (см. §8) |
 
