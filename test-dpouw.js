@@ -9303,6 +9303,52 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     good.push(JSON.stringify({ action: 'task', taskId: 't-zhdet', status: 'ok' }) + '\n');
     try { await waiting; } catch (_e) { /* уже проверено, что не протёк */ }
 
+    /* --- 51.15–51.17: анонимная полоса и дубликаты taskId (2.24.1) ---
+     *
+     * Две дыры, названные аудитом Manus:
+     *   1) `anon.shift()` закрывал ожидание ping ЛЮБЫМ кадром без taskId;
+     *   2) повторный ответ с тем же taskId нельзя ни отличить, ни посчитать.
+     *
+     * Проверки построены так, чтобы падать при возврате старого поведения:
+     * 51.15 красный, если посторонний кадр без id закрывает ping;
+     * 51.16 красный, если `duplicates` не растёт на втором кадре;
+     * 51.17 красный, если первое ожидание получило второй (дублирующий) кадр. */
+    const pingWait = client.send({ action: 'ping' }, { timeoutMs: 600 });
+    await tick();
+
+    /* Посторонний кадр без taskId: не pong. Ожидание ping обязан проигнорировать. */
+    good.push(JSON.stringify({ action: 'hello', address: addr, ts: Date.now() }) + '\n');
+    await tick();
+    let pingResolvedEarly = null;
+    pingWait.then((v) => { pingResolvedEarly = v; }).catch(() => {});
+    await tick();
+    ok('51.15 не-pong кадр без taskId не закрывает ожидание ping',
+      pingResolvedEarly === null,
+      { got: pingResolvedEarly });
+
+    /* Настоящий pong закрывает его и несёт признак pong. */
+    good.push(JSON.stringify({ action: 'ping', pong: true, ts: Date.now() }) + '\n');
+    let pongAnswer = null;
+    try { pongAnswer = await pingWait; } catch (_e) { pongAnswer = null; }
+    ok('51.16 настоящий pong доходит до ожидания ping',
+      pongAnswer !== null && pongAnswer.pong === true,
+      { got: pongAnswer });
+
+    /* Дубликат: первый ответ отдан, второй с тем же id обязан попасть
+     * в `duplicates`, а не перезаписать результат. */
+    const dupeWait = client.send({ action: 'task', task: { taskId: 't-dup' } }, { timeoutMs: 800 });
+    await tick();
+    good.push(JSON.stringify({ action: 'task', taskId: 't-dup', status: 'pervyy' }) + '\n');
+    let dupeAnswer = null;
+    try { dupeAnswer = await dupeWait; } catch (_e) { dupeAnswer = null; }
+    const dupBefore = client.stats().duplicates;
+    good.push(JSON.stringify({ action: 'task', taskId: 't-dup', status: 'vtoroy' }) + '\n');
+    await tick();
+    const dupAfter = client.stats().duplicates;
+    ok('51.17 повторный ответ считается дубликатом и не перезаписывает первый',
+      dupeAnswer !== null && dupeAnswer.status === 'pervyy' && dupAfter === dupBefore + 1,
+      { first: dupeAnswer && dupeAnswer.status, before: dupBefore, after: dupAfter });
+
     try { await good.close(); } catch (_e) { /* уже закрыт */ }
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -10403,7 +10449,13 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
           let body = '{}';
           if (reqPath === '/health') {
             healthHits += 1;
-            body = JSON.stringify({ active_workers: healthHits >= readyAfterHits ? 1 : 0, llm_mode: 'worker' });
+            /* `forceWorkers` изображает расхождение, которое ловит 59.6:
+             * адрес в `worker_addresses` есть, а живых воркеров по
+             * presence-окну ноль. Раньше это давало код 0. */
+            const workers = opts.forceWorkers !== undefined
+              ? opts.forceWorkers
+              : (healthHits >= readyAfterHits ? 1 : 0);
+            body = JSON.stringify({ active_workers: workers, llm_mode: workers ? 'worker' : 'fallback' });
           } else if (reqPath === '/p2p/status') {
             const ready = healthHits >= readyAfterHits;
             const bridge = {
@@ -10493,6 +10545,26 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       ok('59.5c отказ называет виновника — старую сборку сервера',
         /старше 2\.24\.0/.test(r.out), r.out.slice(-220));
     } finally { oldSrv.srv.close(); }
+
+    /* АДРЕС ЕСТЬ, ВОРКЕР МЁРТВ (2.24.1).
+     *
+     * Главная дыра контракта, найденная аудитом: `worker_addresses`
+     * собирается из АВТОРИЗОВАННЫХ P2P-КАНАЛОВ, а `active_workers` — из
+     * WS-presence. Канал переживает падение воркера (TCP не закрыт сразу,
+     * presence протух по окну), поэтому адрес в списке при нуле живых
+     * воркеров — штатное состояние. Старый код считал это готовностью и
+     * отдавал 0: «автозапуск сработал», хотя работать было некому.
+     *
+     * Заглушка даёт ровно это: connections=1, канал=1, адрес наш,
+     * active_workers=0. Правильный ответ — код 1. */
+    const zombie = await startStub(2, MINE, { forceWorkers: 0 });
+    try {
+      const r = await runScript(zombie.port, 4, MINE);
+      ok('59.6 адрес в списке, но active_workers=0 — НЕ готовность (код 1)',
+        r.code === 1, { code: r.code, tail: r.out.slice(-260) });
+      ok('59.6b вывод различает адрес и живость (addr=да mine=нет)',
+        /addr=да/.test(r.out) && /mine=нет/.test(r.out), r.out.slice(-240));
+    } finally { zombie.srv.close(); }
   }
 
   /* ===== 60. Адресация задачи в мосте: не «первому живому» =====

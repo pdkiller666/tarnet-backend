@@ -130,7 +130,8 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
     console.log('check-autostart.js [--url URL] [--window 600] [--interval 10] [--address 0x…] [--any] [--json]');
-    console.log('Ждёт active_workers>=1 и bridge.connections>=1 в пределах окна.');
+    console.log('Ждёт active_workers>=1 И bridge.connections>=1 в пределах окна.');
+    console.log('С адресом — дополнительно требует, чтобы ЭТОТ адрес был в worker_addresses:');
     console.log('С адресом (или если найден ~/.tarnet/worker.json) — ждёт ЭТОТ узел, а не любой.');
     console.log('--any отключает сверку по адресу (нужно, если сервер старше 2.24.0).');
     process.exit(0);
@@ -170,10 +171,10 @@ async function main() {
     console.log(`Окно ${args.window} с, опрос каждые ${args.interval} с`);
     if (expected) {
       console.log(`Свой адрес: ${expected} (${explicit ? '--address' : local.file})`);
-      console.log('Критерий: этот адрес в сети И bridge.connections >= 1');
+      console.log('Критерий: этот адрес в worker_addresses, active_workers >= 1 И bridge.connections >= 1');
     } else {
       console.log(`Свой адрес неизвестен (${local.error}) — проверяю любого воркера.`);
-      console.log('Критерий: active_workers >= 1 И bridge.connections >= 1');
+      console.log('Критерий: active_workers >= 1 И bridge.connections >= 1 (какой узел — не проверяется)');
     }
     console.log('');
   }
@@ -206,19 +207,29 @@ async function main() {
     last = s;
 
     if (!s.error) {
-      /* Сверка адреса, когда он известен.
+      /* ЕДИНЫЙ КОНТРАКТ ГОТОВНОСТИ (2.24.1).
        *
-       * Три состояния, а не два (2.24.0):
+       * Ловушка, которую нашёл аудит: при известном адресе критерий был
+       * ТОЛЬКО «адрес в worker_addresses». Но список адресов — это
+       * АВТОРИЗОВАННЫЕ P2P-каналы, а `active_workers` — живые записи в
+       * `worker_presence` по WS-опросу. Живой канал при мёртвом воркере —
+       * штатное состояние: воркер отвалился, канал ещё не закрыт
+       * (TCP-долгоживущий), или presence протух по окну. В этом случае
+       * старый код отдавал код 0 «автозапуск сработал», хотя воркер не
+       * работал: именно та подмена следствия причиной, ради которой
+       * проверка и переписывалась.
+       *
+       * ПРАВИЛО: адрес говорит «ЭТОТ узел», счётчик — «узел РАБОТАЕТ».
+       * Нужны оба факта, иначе проверка ничего не доказывает. Без адреса
+       * (`--any`) остаётся прежний счётчик — но и тогда `>= 1` честно
+       * означает «какой-то воркер живой», о чём скрипт говорит в выводе.
+       *
+       * Три состояния поля, а не два:
        *   `hasAddressField === false` — сервер старой сборки, спросить нечем;
        *   `[]` — поле есть, но никто не подключён;
-       *   адрес в списке — наш узел в сети.
-       *
-       * Склеивать первое со вторым нельзя: на проде `2.23.0` скрипт
-       * молчал бы всё окно и выдал «узел не появился», хотя причиной был
-       * старый сервер. Владелец пошёл бы чинить автозапуск на исправном ПК. */
-      const mine = expected
-        ? s.workerAddresses.includes(expected)
-        : s.activeWorkers >= 1;
+       *   адрес в списке — наш узел среди авторизованных каналов. */
+      const addressMatch = expected ? s.workerAddresses.includes(expected) : null;
+      const mine = expected ? (addressMatch === true && s.activeWorkers >= 1) : s.activeWorkers >= 1;
       const ready = mine && s.contacts >= 1;
       const elapsed = Math.round((Date.now() - started) / 1000);
       if (!args.json) {
@@ -226,7 +237,7 @@ async function main() {
           `[${String(elapsed).padStart(4)}с] workers=${s.activeWorkers} contacts=${s.contacts}` +
           ` channels=${s.channels} framesIn=${s.framesIn}` +
           `${s.llmMode ? ` mode=${s.llmMode}` : ''}` +
-          `${expected && s.hasAddressField ? ` mine=${mine ? 'да' : 'нет'}` : ''}` +
+          `${expected && s.hasAddressField ? ` addr=${addressMatch ? 'да' : 'нет'} mine=${mine ? 'да' : 'нет'}` : ''}` +
           `${expected && !s.hasAddressField ? ' mine=?' : ''}` +
           `${ready ? '  ← ГОТОВО' : ''}`
         );

@@ -60,7 +60,7 @@ async function bindWorker(addr) {
   const sig = crypto.sign(null, Buffer.from(`TARNET_WORKER_POLL:${k}:${ts}`, 'utf8'), kp.privateKey).toString('base64');
   return api('/worker/handshake', 'POST', { pubkey: rawPubHex(kp), timestamp: ts, signature: sig, claimedAddress: k });
 }
-async function signedWork(addr, { tokens, tier, actionId }) {
+async function signedWork(addr, { tokens, tier, actionId, clientAddress }) {
   const k = String(addr).toLowerCase();
   const kp = workerKeyFor(k);
   const ts = Date.now();
@@ -70,7 +70,12 @@ async function signedWork(addr, { tokens, tier, actionId }) {
     'TARNET_WORK_SUBMIT', k, String(Number(tokens)), String(tier ?? 'base'), String(actionId ?? ''), String(ts),
   ].join(':');
   const sig = crypto.sign(null, Buffer.from(payload, 'utf8'), kp.privateKey).toString('base64');
-  return api('/work', 'POST', { workerAddress: k, tokens, tier, actionId, worker_ts: ts, worker_signature: sig });
+  const body = { workerAddress: k, tokens, tier, actionId, worker_ts: ts, worker_signature: sig };
+  /* Плательщик обязателен с 2.24.0: `/work` без `clientAddress` отвечает
+   * 400 CLIENT_REQUIRED до аудита казны, и тест гейта не доходит до цели.
+   * Фикстуру чиним здесь, а не ослаблением шлюза. */
+  if (clientAddress) body.clientAddress = String(clientAddress).toLowerCase();
+  return api('/work', 'POST', body);
 }
 
 let pass = 0;
@@ -123,6 +128,11 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
     if (!up) throw new Error(`сервер не поднялся:\n${out.slice(-2000)}`);
 
     const worker = '0x' + 'a'.repeat(40);
+    /* Плательщик — отдельный кошелёк, пополненный Faucet'ом. Гейт 2.24.0
+     * требует реального списания, поэтому «просто тестовый вызов» больше
+     * не существует: у клиента должны быть деньги на комиссию. 0.01 TAR
+     * от Faucet покрывает несколько вызовов по ~0.001 TAR gross. */
+    const client = '0x' + 'c'.repeat(40);
 
     console.log('=== 0) узел и базовая работа ===');
     const reg = await api('/node', 'POST', { address: worker, stake: 1, reputation: 1 });
@@ -131,7 +141,13 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
     const hs = await bindWorker(worker);
     ok('ключ привязан к адресу (handshake)', hs.status === 200, { status: hs.status, error: hs.body?.error });
 
-    const w1 = await signedWork(worker, { tokens: 100000, tier: 'base', actionId: 'gate-proof-1' });
+    const fc = await api('/faucet/claim', 'POST', { address: client });
+    ok('плательщик пополнен через Faucet', fc.status === 200 || fc.status === 201,
+      { status: fc.status, error: fc.body?.error });
+    const clientBal = (await api('/balance/' + client)).body?.balanceTar;
+    ok('у плательщика есть баланс', Number(clientBal) > 0, { balanceTar: clientBal });
+
+    const w1 = await signedWork(worker, { tokens: 100000, tier: 'base', actionId: 'gate-proof-1', clientAddress: client });
     ok('первая работа начислена', w1.status === 200 || w1.status === 201, { status: w1.status, error: w1.body?.error });
     const receiptsBefore = (await api('/summary')).body.receipts;
     console.log(`  чеков до порчи: ${receiptsBefore}`);
@@ -146,7 +162,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
     ok('баланс казны испорчен на +1', Math.abs((after.balanceTar - before.balanceTar) - 1) < 1e-9);
 
     console.log('\n=== 2) начисление обязано отказать и откатиться ===');
-    const w2 = await signedWork(worker, { tokens: 100000, tier: 'base', actionId: 'gate-proof-2' });
+    const w2 = await signedWork(worker, { tokens: 100000, tier: 'base', actionId: 'gate-proof-2', clientAddress: client });
     ok('ответ 500', w2.status === 500, { status: w2.status, body: w2.body });
     ok('код TREASURY_AUDIT_FAILED', w2.body?.code === 'TREASURY_AUDIT_FAILED', w2.body);
     ok('в ответе есть audit с expected/actual/delta',
@@ -166,7 +182,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
     const db2 = new DatabaseSync(DB);
     db2.prepare('UPDATE balances SET balanceTar = ? WHERE address = ?').run(before.balanceTar, TREASURY);
     db2.close();
-    const w3 = await signedWork(worker, { tokens: 100000, tier: 'base', actionId: 'gate-proof-3' });
+    const w3 = await signedWork(worker, { tokens: 100000, tier: 'base', actionId: 'gate-proof-3', clientAddress: client });
     ok('начисление снова проходит (2xx)', w3.status === 200 || w3.status === 201, { status: w3.status, error: w3.body?.error });
     const s3 = (await api('/summary')).body;
     ok('holds: true после возврата', s3.treasuryAudit.holds === true, s3.treasuryAudit);

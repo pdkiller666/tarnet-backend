@@ -75,6 +75,29 @@ export function encodeLine(obj) {
   return new TextEncoder().encode(JSON.stringify(obj) + '\n')
 }
 
+/**
+ * Отличить pong от прочих кадров без `taskId`.
+ *
+ * ЗАЧЕМ ЯВНЫЙ ПРЕДИКАТ, А НЕ «любой кадр без id».
+ * Анонимная очередь ожиданий существует ровно для ping: у него нет
+ * taskId, и сопоставить его по ключу нельзя. Пока условием было просто
+ * отсутствие id, ЛЮБОЙ посторонний кадр без taskId (мусор от старой
+ * версии воркера, чужой `hello` посреди сессии, случайный ответ на уже
+ * снятую задачу) закрывал ожидание ping — и `ping` возвращал `ok: true`
+ * по кадру, который пингом не был. Это ровно тот класс дефекта, что и
+ * сопоставление по порядку, только по другой оси.
+ *
+ * Форма ответа зафиксирована производителями: `p2p-worker.js` и мост
+ * возвращают `{ action: 'ping', pong: true }`. Принимаем оба признака,
+ * потому что `action: 'pong'` — естественное написание для нового
+ * воркера, и отказ от него сломал бы совместимость на ровном месте.
+ */
+export function isPongFrame(msg) {
+  if (!msg || typeof msg !== 'object') return false
+  if (msg.action === 'pong') return true
+  return msg.action === 'ping' && msg.pong === true
+}
+
 /** Привести кусок от libp2p к строке: приходит Uint8ArrayList или Uint8Array. */
 function chunkToText(chunk) {
   return Buffer.from(chunk.subarray ? chunk.subarray() : chunk).toString('utf8')
@@ -122,6 +145,30 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
   let framesOut = 0
   /* Сироты по всем каналам: ответы, которым не нашлось ожидания. */
   let orphans = 0
+  /* Повторные ответы: тот же taskId пришёл второй раз. Отдельно от сирот,
+   * потому что лечатся по-разному: сирота — сетевой таймаут, дубликат —
+   * воркер, отвечающий дважды на одну задачу. */
+  let duplicates = 0
+
+  /* Сколько последних taskId помнить для распознавания дубликатов.
+   *
+   * Список ограничен намеренно: Set без потолка рос бы вместе с числом
+   * задач за всё время работы моста — на долгоживущем процессе это утечка,
+   * которая проявится через сутки, когда её уже никто не свяжет с этим
+   * кодом. 512 id — это минуты трафика; более старый повтор всё равно
+   * придёт после таймаута и будет корректно отброшен как сирота. */
+  const SEEN_TASK_IDS_MAX = 512
+  const seenTaskIds = new Set()
+  const seenOrder = []
+  function rememberTaskId(id) {
+    if (seenTaskIds.has(id)) return
+    seenTaskIds.add(id)
+    seenOrder.push(id)
+    while (seenOrder.length > SEEN_TASK_IDS_MAX) {
+      const drop = seenOrder.shift()
+      seenTaskIds.delete(drop)
+    }
+  }
 
   /**
    * Принять поток задач от воркера.
@@ -151,6 +198,7 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
       /* Ответы, которым не нашлось ожидания. Счётчик нужен, чтобы «ответ
        * потерялся» было видно в /p2p/status, а не выяснялось по деньгам. */
       orphans: 0,
+      duplicates: 0,
       closed: false,
       /* Без `authorize` (тесты транспорта, PoC) канал считается готовым
        * сразу: иначе проверка, которую не просили, ломала бы прежний
@@ -208,17 +256,48 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
             let w = null
             if (replyId !== null) {
               w = ch.pending.get(replyId) || null
-              if (w) ch.pending.delete(replyId)
-              else {
-                /* Ответ на задачу, которой уже никто не ждёт: таймаут,
-                 * отмена или чужой кадр. НЕ отдаём его следующему ожиданию
-                 * — именно это и приводило к зачёту чужой работы. */
-                ch.orphans += 1
-                orphans += 1
-                log(`ответ ${replyId} без ожидания (сирота, всего ${ch.orphans})`)
+              if (w) {
+                ch.pending.delete(replyId)
+              } else {
+                /* Два разных диагноза, и порядок проверки — часть контракта.
+                 *
+                 * ДУБЛИКАТ — этот id уже приходил раньше. Воркер ответил
+                 * дважды на одну задачу. Перезаписывать нечего и отдавать
+                 * некому: ожидание снято ещё на первом кадре. Именно это
+                 * дыра, которую нашёл аудит: без явной проверки второй
+                 * кадр с тем же id молча уходил в `orphans`, и отличить
+                 * «воркер дублирует ответ» от «ответ пришёл после
+                 * таймаута» было нельзя ни в логе, ни в /p2p/status.
+                 *
+                 * СИРОТА — id не приходил раньше, но и ожидания нет:
+                 * таймаут, отмена или чужой кадр. НЕ отдаём его следующему
+                 * ожиданию — это и приводило к зачёту чужой работы.
+                 *
+                 * Счётчики раздельные, потому что лечатся по-разному. */
+                if (seenTaskIds.has(replyId)) {
+                  ch.duplicates += 1
+                  duplicates += 1
+                  log(`ответ ${replyId} повторный (дубликат, всего ${ch.duplicates})`)
+                } else {
+                  ch.orphans += 1
+                  orphans += 1
+                  log(`ответ ${replyId} без ожидания (сирота, всего ${ch.orphans})`)
+                }
               }
-            } else {
+              /* Помним ЛЮБОЙ пришедший id, а не только отданный ожиданию:
+               * дубликатом считается и повтор кадра, который в первый раз
+               * был сиротой. Иначе воркер, дважды ответивший на отменённую
+               * задачу, дал бы две сироты и ноль дубликатов. */
+              rememberTaskId(replyId)
+            } else if (isPongFrame(msg)) {
               w = ch.anon.shift() || null
+            } else {
+              /* Кадр без taskId и не pong: ожидание ping он закрывать не
+               * вправе. Считаем брошенным, чтобы мусор был виден в
+               * /p2p/status, а не тонул в логе. */
+              ch.orphans += 1
+              orphans += 1
+              log(`кадр без taskId и не pong (${msg && msg.action ? msg.action : 'без action'}) — сирота`)
             }
             if (w) {
               clearTimeout(w.timer)
@@ -347,7 +426,7 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
     /* Снимок трафика. Отдаётся копией, а не ссылкой на счётчики: вызывающий
      * не должен уметь их обнулить, а поле, которое можно испортить снаружи,
      * рано или поздно будет испорчено. */
-    stats: () => ({ framesIn, framesOut, rejected, orphans, channels: channels.size }),
+    stats: () => ({ framesIn, framesOut, rejected, orphans, duplicates, channels: channels.size }),
     list: () => [...channels]
   }
 }
