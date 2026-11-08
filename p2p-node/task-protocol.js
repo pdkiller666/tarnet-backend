@@ -90,9 +90,23 @@ async function writeLine(stream, obj) {
 /**
  * Сторона моста: держать принятые потоки и уметь задать вопрос воркеру.
  *
- * Канал = один воркер. Задачи идут в порядке отправки, потому что ответ
- * сопоставляется с головой очереди ожидающих, а не по id: воркер отвечает
- * на каждый кадр ровно одним кадром (протокол «запрос-ответ»).
+ * Канал = один воркер. Ответ сопоставляется по `taskId`, а НЕ по порядку.
+ *
+ * ПОЧЕМУ НЕ ПОРЯДОК (дефект, найденный аудитом 08.11 и подтверждённый кодом).
+ * Раньше ожидания лежали в массиве и ответ забирался `waiters.shift()` — по
+ * голове очереди. Пока воркер один, порядок совпадает и всё выглядит живым.
+ * С двумя каналами всё ломается: канал — это ОТДЕЛЬНАЯ очередь, но если
+ * воркер A отвалился по таймауту, а его ответ пришёл позже, ответ вставал
+ * в голову очереди и доставался следующей задаче. Ставка — деньги: чужой
+ * результат засчитывался как работа другого адреса.
+ *
+ * ПРАВИЛО ТЕПЕРЬ: ответ без `taskId` не отдаётся НИКОМУ из ждущих задачу.
+ * Воркер проставляет `taskId` в каждом ответе (`worker-demo.js`, `/p2p/execute`),
+ * поэтому сирота — это либо ответ на отменённую задачу, либо посторонний кадр.
+ * Отдать его очередному ожиданию значило бы повторить исходный дефект мягче.
+ *
+ * Очередь без id сохранена ТОЛЬКО для `ping`: он не несёт задачи и ответа с
+ * `taskId` не имеет. Это не «остаток FIFO», а отдельная полоса трафика.
  */
 export function createTaskClient({ log = () => {}, authorize = null } = {}) {
   const channels = new Set()
@@ -106,6 +120,8 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
    * из реестра публичных адресов (у клиента за NAT его нет вовсе). */
   let framesIn = 0
   let framesOut = 0
+  /* Сироты по всем каналам: ответы, которым не нашлось ожидания. */
+  let orphans = 0
 
   /**
    * Принять поток задач от воркера.
@@ -127,7 +143,14 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
       stream,
       peerId,
       buf: '',
-      waiters: [],
+      /* Ожидания по taskId. Map, а не массив: поиск по ключу, а не по
+       * позиции — позиция и была дефектом. */
+      pending: new Map(),
+      /* Ожидания кадров без taskId (только ping). */
+      anon: [],
+      /* Ответы, которым не нашлось ожидания. Счётчик нужен, чтобы «ответ
+       * потерялся» было видно в /p2p/status, а не выяснялось по деньгам. */
+      orphans: 0,
       closed: false,
       /* Без `authorize` (тесты транспорта, PoC) канал считается готовым
        * сразу: иначе проверка, которую не просили, ломала бы прежний
@@ -176,7 +199,27 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
               continue
             }
 
-            const w = ch.waiters.shift()
+            /* Адресация по taskId. `replyId` берём из любого места, где
+             * воркер мог его положить: верхний уровень (так отвечает
+             * `/p2p/execute`) либо `msg.task.taskId`. Иначе — анонимная
+             * полоса (ping). */
+            const replyId = (msg && (msg.taskId || (msg.task && msg.task.taskId)))
+              ? String(msg.taskId || msg.task.taskId) : null
+            let w = null
+            if (replyId !== null) {
+              w = ch.pending.get(replyId) || null
+              if (w) ch.pending.delete(replyId)
+              else {
+                /* Ответ на задачу, которой уже никто не ждёт: таймаут,
+                 * отмена или чужой кадр. НЕ отдаём его следующему ожиданию
+                 * — именно это и приводило к зачёту чужой работы. */
+                ch.orphans += 1
+                orphans += 1
+                log(`ответ ${replyId} без ожидания (сирота, всего ${ch.orphans})`)
+              }
+            } else {
+              w = ch.anon.shift() || null
+            }
             if (w) {
               clearTimeout(w.timer)
               w.resolve(msg)
@@ -190,7 +233,12 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
       channels.delete(ch)
       /* Незавершённые ожидания обязаны получить отказ: иначе вызывающий
        * повиснет навсегда и будет выглядеть как «воркер думает». */
-      for (const w of ch.waiters.splice(0)) {
+      for (const w of ch.pending.values()) {
+        clearTimeout(w.timer)
+        w.reject(new Error('TASK_STREAM_CLOSED'))
+      }
+      ch.pending.clear()
+      for (const w of ch.anon.splice(0)) {
         clearTimeout(w.timer)
         w.reject(new Error('TASK_STREAM_CLOSED'))
       }
@@ -218,14 +266,29 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
      * и это разные диагнозы в логе. */
     if (!ch) throw new Error(want ? 'NO_CHANNEL_FOR_WORKER' : 'NO_TASK_CHANNEL')
 
+    /* Ключ ожидания — taskId отправляемой задачи. Без него (ping) — анонимная
+     * полоса. Два разных механизма намеренно: задача обязана найтись по id,
+     * а ping id не имеет и последовательностью не притворяется. */
+    const waitId = (msg && msg.task && msg.task.taskId)
+      ? String(msg.task.taskId)
+      : (msg && msg.taskId ? String(msg.taskId) : null)
+
     const answer = new Promise((resolve, reject) => {
       const w = { resolve, reject, timer: null }
+      const drop = () => {
+        if (waitId !== null) {
+          if (ch.pending.get(waitId) === w) ch.pending.delete(waitId)
+        } else {
+          const i = ch.anon.indexOf(w)
+          if (i >= 0) ch.anon.splice(i, 1)
+        }
+      }
       w.timer = setTimeout(() => {
-        const i = ch.waiters.indexOf(w)
-        if (i >= 0) ch.waiters.splice(i, 1)
+        drop()
         reject(new Error('TASK_TIMEOUT'))
       }, timeoutMs)
-      ch.waiters.push(w)
+      if (waitId !== null) ch.pending.set(waitId, w)
+      else ch.anon.push(w)
     })
 
     await writeLine(ch.stream, msg)
@@ -284,7 +347,7 @@ export function createTaskClient({ log = () => {}, authorize = null } = {}) {
     /* Снимок трафика. Отдаётся копией, а не ссылкой на счётчики: вызывающий
      * не должен уметь их обнулить, а поле, которое можно испортить снаружи,
      * рано или поздно будет испорчено. */
-    stats: () => ({ framesIn, framesOut, rejected, channels: channels.size }),
+    stats: () => ({ framesIn, framesOut, rejected, orphans, channels: channels.size }),
     list: () => [...channels]
   }
 }

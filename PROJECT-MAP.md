@@ -54,8 +54,8 @@
 | `p2p-transport.js` | 611 | WS между узлами, `wildcardBind`, `P2P_PUBLIC_URL → P2P_ADVERTISE_IP` | ⚠️ настроен только на `127.0.0.1` |
 | `onion.js` | 289 | Onion Routing: RSA-2048-OAEP-SHA256 оборачивает 32-байтный AES, нагрузка AES-256-GCM | ✅ работает (`hops: 3`) |
 | `p2p-demo.js` | 129 | Демонстрация P2P | демо |
-| `p2p-node/bridge.js` | 493 | Отдельный процесс. Unix-socket `/tmp/tarnet-p2p-bridge.sock` (0600), JSON Lines, `announce`/`status`/`peers`/`ping`/`task`/`cancel`. С 2.21.4 принимает поток `/tarnet/task/1.0.0` от воркеров. С 2.22.5: `cancel(msg)` → `taskClient.cancel()`. Action **`channels`** добавляется с 2.22.x (список авторизованных живых каналов) — если его нет в ответе, мост на старом коде | ✅ работает на проде (`p2p-bridge.service`) |
-| `p2p-node/task-protocol.js` | 328 | Кадры задачи поверх libp2p-потока: один JSON на строку, `createTaskClient` (мост) / `serveTaskStream` (воркер). Без `stream.source`/`sink` — в libp2p 3.5.1 поток итерируется сам, запись через `stream.send` + ожидание `drain` своим `waitEvent` (без пакета `p-event`: тот приходил транзитивно и исчез бы при обновлении libp2p). С 2.22.5: `CONTROL_FRAME='cancel'`, `isControlFrame`, `cancel()`; управление читается **вне** цепочки задач, иначе отмена ждала бы ответа модели | ✅ 52.7–52.12 |
+| `p2p-node/bridge.js` | 493 | Отдельный процесс. Unix-socket `/tmp/tarnet-p2p-bridge.sock` (0600), JSON Lines, `announce`/`status`/`peers`/`ping`/`task`/`cancel`. С 2.21.4 принимает поток `/tarnet/task/1.0.0` от воркеров. С 2.22.5: `cancel(msg)` → `taskClient.cancel()`. Action **`channels`** добавляется с 2.22.x (список авторизованных живых каналов) — если его нет в ответе, мост на старом коде. С 2.24.0: `status()` отдаёт `worker_addresses` — TAR-адреса авторизованных живых каналов, по ним `check-autostart` сверяет «в сети ЭТОТ ПК» | ✅ работает на проде (`p2p-bridge.service`) |
+| `p2p-node/task-protocol.js` | 328 | Кадры задачи поверх libp2p-потока: один JSON на строку, `createTaskClient` (мост) / `serveTaskStream` (воркер). Без `stream.source`/`sink` — в libp2p 3.5.1 поток итерируется сам, запись через `stream.send` + ожидание `drain` своим `waitEvent` (без пакета `p-event`: тот приходил транзитивно и исчез бы при обновлении libp2p). С 2.22.5: `CONTROL_FRAME='cancel'`, `isControlFrame`, `cancel()`; управление читается **вне** цепочки задач, иначе отмена ждала бы ответа модели. С 2.24.0: ожидания ответов в `Map<taskId, waiter>` вместо массива FIFO — ответ ищется по `taskId`, а не по порядку; ответ без id или с чужим id не отдаётся никому (`orphans` в `stats()`), `ping` идёт отдельной анонимной полосой | ✅ 51.12–51.14, `check-correlation.mjs` 8/8 |
 | `p2p-node/peer-auth.js` | 168 | **Проверка права на поток задач:** `verifyHello` (Ed25519 тем же ключом, что в WS), `loadAllowlist` — формат `{updatedAt,peers}`, нет файла/битый JSON = запрет; префикс `TARNET_P2P_HELLO`, окно 120 с | ✅ 11 проверок в 51.1–51.11 |
 | `p2p-node/peer-hello.js` | 153 | Сторона воркера: `loadWorkerIdentity` (env → `~/.tarnet/*.json`), `buildHello` — подпись PKCS8-обёрткой seed, тот же префикс, что в `worker-demo.js`. С 2.22.5: `workerKeyFile({home,env})` (`P2P_WORKER_KEY_FILE`), `waitForWorkerIdentity({timeoutMs,pollMs})` — ключ может появиться позже. **`verifyHello` здесь НЕТ** — он в `peer-auth.js` | ✅ без сети, обычным `node` |
 | `p2p-node/peer-id-store.js` | 81 | Генерация/чтение ключа узла: `/var/lib/tarnet/p2p/peer-id.bin`, права `0600` | ✅ `peerId` стабилен между рестартами |
@@ -113,15 +113,17 @@
 
 | Файл | Строк | Проверок | Что покрывает |
 | :--- | --: | --: | :--- |
-| `test-dpouw.js` | 10534 | **1191** | Основная приёмка: экономика, леджер, чеки, API, Private Swarm |
+| `test-dpouw.js` | 10870 | **1215** | Основная приёмка: экономика, леджер, чеки, API, Private Swarm, корреляция ответов (51.12–51.14), сверка адреса автозапуска (59.1–59.4b) |
 | `test-mesh.js` | 459 | **25** | Onion, mesh, многоузловой путь |
 | `proof-treasury-gate.js` | 188 | **13** | Казна и гейт |
 | `proof-agent-key.js` | 352 | 57 | Ключ агента: `exportKey` → `InvalidAccessError` |
 | `proof-onion-inference.js` | 125 | — | Onion-инференс |
 | `proof-onion-restart.js` | 161 | — | Переживание рестарта |
 | `test-mesh-worker.js` | 50 | — | Воркер для mesh-теста |
+| `check-payment-gate.js` | 130 | **7** | Гейт оплаты на живом сервере: `/work` без `clientAddress` → 400 и ноль начислений; пустой клиент → 402; `TARNET_REQUIRE_PAYMENT=0` возвращает стенд |
+| `p2p-node/check-correlation.mjs` | 95 | **8** | Корреляция ответов по `taskId`: поздний ответ не достаётся следующему ожиданию, чужой id — сирота, `ping` отдельной полосой |
 
-**Итого приёмки: 1229** (1191 + 25 + 13), прогон 07.11 18:22, `RC=0` по трём файлам.
+**Итого приёмки: 1215** (`test-dpouw.js`), прогон 08.11 06:14, `0 ❌`. Плюс отдельные стенды: `check-payment-gate.js` 7/7 и `check-correlation.mjs` 8/8.
 Гоняет `scripts/verify.sh`.
 
 Тесты роя и отмены живут в `test-dpouw.js`: `47.4` (оплата победителю, не обоим),

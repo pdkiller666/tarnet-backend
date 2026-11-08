@@ -2223,7 +2223,7 @@ function lookupActionId(id) {
 /* ===== Ядро начисления =====
  * Единственный путь, которым в системе появляются токены. Никаких условий
  * «если повезло»: при γ=1 начисление всегда, при γ=0 — никогда. */
-function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, response, actionId, flush = false, demo = false, paymentMode = null, promptHashVerified = null }) {
+function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, response, actionId, flush = false, demo = false, paymentMode = null, promptHashVerified = null, allowUnpaid = false }) {
   const t = normalizeTier(tier);
   if (!t) {
     const err = new Error(`tier must be one of ${TIERS.join('|')}`);
@@ -2441,6 +2441,80 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
 
   // 4) Атомарная запись: чек + балансы + реестр + состояние эпохи.
   return tx(() => {
+    /* 4.0) ОПЛАТА И ГЕЙТ — ДО ЧЕКА, А НЕ ПОСЛЕ.
+     *
+     * ПОЧЕМУ ЗДЕСЬ, А НЕ В 4.5. В первой версии 2.24.0 оплата стояла после
+     * `ledger.append()`. Для `throw` это было бы верно (RN откатил бы всё),
+     * но у бесплатного пути реакция — `return`, а не бросок. Возврат внутри
+     * `tx()` КОММИТИТ: чек о неоплаченной работе остался бы в цепочке
+     * подписей, `pending_work` был бы удалён, а эпоха сдвинута. Это ровно
+     * тот дефект, который гейт и должен закрывать, только в новой форме.
+     *
+     * Поэтому здесь две гарантии: (1) деньги списываются ДО любых записей,
+     * (2) ни один путь дальше не выполняется без `payment.charged`. */
+    /* Вид списания различает ДВА РАЗНЫХ события в жизни токена.
+     *
+     *   'spend'       — клиент оплатил работу по обычной ставке 5%.
+     *   'utilization' — оплата из внутреннего баланса TAR по ставке 2%.
+     *
+     * Разделять обязательно: утилизация — показатель того, что токен
+     * работает внутри контура, а не выводится. Смешав оба вида в 'spend',
+     * метрика totalUtilizedTar считала бы любой платёж утилизацией.
+     */
+    const spendKind = settled.fee.paymentMode === 'TAR_UTILITY' ? 'utilization' : 'spend';
+    const payment = clientAddress
+      ? debit(clientAddress, settled.fee.gross, spendKind, id, TREASURY_ADDRESS)
+      : { charged: false, reason: 'no_client' };
+
+    /* ГЕЙТ ОПЛАТЫ (2.24.0). Главный дефект, найденный аудитом 08.11.
+     *
+     * Было: `debit()` возвращал `charged: false` при отсутствии клиента или
+     * денег, а СЛЕДУЮЩАЯ строка начисляла воркеру, казне и роялти из ниоткуда.
+     * То есть `/work` без адреса платил эмиссией за неоплаченную работу —
+     * ровно «печать денег из воздуха».
+     *
+     * Чего гейт НЕ делает: он не трогает демо-пути (`demo: true` — батч и
+     * принудительный flush) и выключается явным `TARNET_REQUIRE_PAYMENT=0`
+     * для стенда. Выключение на стенде — не возврат дефекта: там денег нет
+     * вовсе, и печатать нечего. Прод запускается с дефолтным `true`. */
+    if (CONFIG.REQUIRE_PAYMENT && !demo && !payment.charged) {
+      /* Две разные реакции, и разница — не косметика.
+       *
+       * allowUnpaid — только путь `/inference`, когда сервер САМ создал
+       * клиенту пустой кошелёк (`clientProvisioned`): у такого кошелька
+       * денег нет по определению, и 402 на первый же запрос из PWA был бы
+       * поломкой UX. Ответ отдаётся, но чек НЕ выпускается и воркеру
+       * ничего не начисляется: бесплатный ответ — бизнес-решение, а
+       * начисление без оплаты — дефект учёта.
+       *
+       * STRICT (по умолчанию) — `POST /work`, эндпоинт выплаты. Именно сюда
+       * бьёт попытка получить TAR без денег, и здесь отказ обязателен. */
+      if (allowUnpaid) {
+        return {
+          unpaid: true,
+          reason: payment.reason || 'payment_required',
+          payment,
+          workerAddress,
+          tier: t,
+          actionId: id,
+          receipt: null,
+          settled: null,
+          quality,
+          queued: false,
+          rejected: false,
+          tokensUsed,
+        };
+      }
+      const err = new Error(
+        payment.reason === 'no_client'
+          ? 'Payment required: clientAddress is mandatory for real payouts'
+          : `Payment failed: ${payment.reason}`,
+      );
+      err.code = payment.reason === 'no_client' ? 'CLIENT_REQUIRED' : 'PAYMENT_FAILED';
+      err.payment = payment;
+      throw err;
+    }
+
     const receipt = ledger.append({
       workerAddress,
       cwu: settled.cwu.cwu,
@@ -2469,26 +2543,6 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
       run('DELETE FROM pending_work WHERE workerAddress = ? AND tier = ? AND adapterId = ?',
         [workerAddress, t, pendAdapter]);
     }
-
-    // 4.5) Оплата потребления: если запрос пришёл от известного клиента,
-    //      gross списывается с его баланса. Без этой строки весь поток был
-    //      фиктивным: начисления создавались из ничего.
-    /* Вид списания различает ДВА РАЗНЫХ события в жизни токена.
-     *
-     *   'spend'       — клиент оплатил работу по обычной ставке 5%.
-     *   'utilization' — оплата из внутреннего баланса TAR по ставке 2%.
-     *
-     * Разделять обязательно: утилизация — это показатель того, что токен
-     * работает внутри контура, а не выводится. Смешав оба вида в 'spend',
-     * метрика totalUtilizedTar считала бы любой платёж утилизацией.
-     *
-     * Плата за разделение: читатели 'spend' обязаны видеть оба вида, иначе
-     * траты в /cross-compute обнулятся у тех, кто платит TAR_UTILITY.
-     * Читатель обновлён в том же коммите. */
-    const spendKind = settled.fee.paymentMode === 'TAR_UTILITY' ? 'utilization' : 'spend';
-    const payment = clientAddress
-      ? debit(clientAddress, settled.fee.gross, spendKind, id, TREASURY_ADDRESS)
-      : { charged: false, reason: 'no_client' };
 
     if (settled.workerTotal > 0) credit(workerAddress, settled.workerTotal, 'payout', id, TREASURY_ADDRESS);
     if (settled.treasuryTotal > 0) credit(TREASURY_ADDRESS, settled.treasuryTotal, 'treasury', id, TREASURY_ADDRESS);
@@ -5988,6 +6042,36 @@ function handleWork(req, res) {
         charged: false,
       });
     }
+    /* Гейт оплаты (2.24.0). Два разных кода, потому что лечатся они
+     * по-разному и клиенту нельзя их путать:
+     *
+     *   CLIENT_REQUIRED — 400: запрос НЕ ПОЛНЫЙ. Платить не с кого, потому что
+     *                     клиент не назван. Чинится на клиенте.
+     *   PAYMENT_FAILED  — 402: запрос полный, но денег не хватило (или их ноль).
+     *                     Чинится пополнением баланса, а не правкой запроса.
+     *
+     * Начисление в обоих случаях не произошло: гейт бросает ДО `credit()`, а
+     * транзакция откатилась целиком. `charged: false` в теле — не украшение:
+     * по нему клиент отличает «не заплатили» от «заплатили, но упало дальше». */
+    if (e.code === 'CLIENT_REQUIRED') {
+      return res.status(400).json({
+        error: 'CLIENT_REQUIRED',
+        code: 'CLIENT_REQUIRED',
+        note: 'clientAddress обязателен: воркеру не начисляется без реальной оплаты',
+        charged: false,
+      });
+    }
+    if (e.code === 'PAYMENT_FAILED') {
+      return res.status(402).json({
+        error: 'PAYMENT_FAILED',
+        code: 'PAYMENT_FAILED',
+        reason: (e.payment && e.payment.reason) || 'unknown',
+        balanceTar: e.payment ? e.payment.balanceTar : null,
+        neededTar: e.payment ? e.payment.neededTar : null,
+        note: 'оплата не прошла — начисления не было',
+        charged: false,
+      });
+    }
     throw e;
   }
 }
@@ -6248,6 +6332,19 @@ app.get('/p2p/status', async (_req, res) => {
           libp2p: bridge.libp2p ?? null,
           connections: typeof bridge.connections === 'number' ? bridge.connections : null,
           connected_peers: Array.isArray(bridge.connected_peers) ? bridge.connected_peers : [],
+          /* Адреса воркеров с авторизованным каналом задач (2.24.0).
+           *
+           * Нужны проверке автозапуска: владелец должен убедиться, что
+           * в сети ИМЕННО его ПК, а не «какой-то воркер». Без этого
+           * списка снаружи виден только счётчик `channels`, и зелёная
+           * проверка ничего не говорит о нужном узле.
+           *
+           * Массив, а не число: `connected_peers` содержит peerId
+           * (`12D3Koo…`), а в `~/.tarnet/worker.json` лежит TAR-адрес
+           * `0x…` — сопоставить их напрямую нельзя. */
+          worker_addresses: Array.isArray(bridge.worker_addresses)
+            ? bridge.worker_addresses.map((a) => String(a).toLowerCase())
+            : [],
           tasks: bridge.tasks || { framesIn: 0, framesOut: 0, rejected: 0, channels: 0 },
           uptime_s: typeof bridge.uptime_s === 'number' ? bridge.uptime_s : null,
         }
@@ -6262,6 +6359,7 @@ app.get('/p2p/status', async (_req, res) => {
            * null его не выполнит — ровно то, что нужно. */
           connections: null,
           connected_peers: [],
+          worker_addresses: [],
           tasks: null,
         },
   });
@@ -9565,6 +9663,14 @@ async function runInference(req, res) {
     paymentMode: paymentMethod === 'TAR' && clientAddress
       ? (String(body.paymentMode || '').toUpperCase() === 'TAR_UTILITY' ? 'TAR_UTILITY' : null)
       : null,
+    /* Анонимный первый запрос: кошелёк создал СЕРВЕР (`clientProvisioned`),
+     * а не клиент. Денег в нём нет по определению, поэтому требование оплаты
+     * вернуло бы 402 на первый же запрос из PWA. Ответ при этом отдаётся,
+     * но воркеру ничего не начисляется: строка 9618 — ответ, не эмиссия.
+     *
+     * Явно названный клиент (PWA передаёт свой адрес) идёт по строгому пути:
+     * его кошелёк может быть пуст — и тогда он получит 402, что честно. */
+    allowUnpaid: clientProvisioned === true,
   });
 
   /* В лог НЕ пишется текст ответа. Он содержит эхо промпта (шаблон стенда
@@ -10093,6 +10199,29 @@ app.use((err, req, res, _next) => {
    * бросит ERR_HTTP_HEADERS_SENT и уронит соединение. Отдаём остаток
    * обработчику закрытия и не пытаемся писать тело. */
   if (res.headersSent) return _next(err);
+  /* Отказы оплаты — не поломка сервера (2.24.0).
+   *
+   * Без этой ветки `PAYMENT_FAILED`, брошенный из `recordWork`, доходил
+   * сюда и превращался в 500 «Internal server error». Клиент видел аварию
+   * вместо «нет денег», а дежурный шёл искать баг там, где всё работает.
+   * 402 Payment Required — ровно то, что произошло. */
+  if (err && err.code === 'PAYMENT_FAILED') {
+    return res.status(402).json({
+      error: 'PAYMENT_FAILED',
+      code: 'PAYMENT_FAILED',
+      reason: (err.payment && err.payment.reason) || 'unknown',
+      balanceTar: err.payment ? err.payment.balanceTar : null,
+      neededTar: err.payment ? err.payment.neededTar : null,
+      charged: false,
+    });
+  }
+  if (err && err.code === 'CLIENT_REQUIRED') {
+    return res.status(400).json({
+      error: 'CLIENT_REQUIRED',
+      code: 'CLIENT_REQUIRED',
+      charged: false,
+    });
+  }
   res.status(500).json({ error: 'Internal server error', details: err.message });
 });
 

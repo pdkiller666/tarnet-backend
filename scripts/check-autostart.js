@@ -28,15 +28,46 @@
  */
 'use strict';
 
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
 const DEFAULT_URL = process.env.TARNET_PUBLIC_URL || 'https://v1107336.hosted-by-vdsina.com';
+const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+/**
+ * Адрес ЭТОГО ПК из `~/.tarnet/worker.json`.
+ *
+ * ЗАЧЕМ СВЕРЯТЬ АДРЕС, А НЕ СЧИТАТЬ ВОРКЕРОВ.
+ * Критерий «active_workers >= 1 и connections >= 1» отвечает на вопрос
+ * «в сети есть хоть один воркер». После перезагрузки ЭТОГО ПК он ничего не
+ * доказывает: чужой узел, поднятый вчера, даёт те же единицы, и владелец
+ * видит зелёный свет, хотя его собственный воркер не стартовал. Ровно так
+ * автозапуск и остаётся «непроверенным» при формально пройденной проверке.
+ *
+ * Ошибка чтения здесь НЕ фатальна: без адреса скрипт откатывается на
+ * старый критерий, но обязан сказать об этом вслух, а не молча ослабнуть.
+ */
+function readLocalWorkerAddress() {
+  const file = path.join(os.homedir(), '.tarnet', 'worker.json');
+  try {
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const addr = String(saved && saved.address || '').trim().toLowerCase();
+    if (ADDRESS_RE.test(addr)) return { address: addr, file, error: null };
+    return { address: null, file, error: 'в файле нет корректного address' };
+  } catch (e) {
+    return { address: null, file, error: e.code === 'ENOENT' ? 'файла нет' : e.message };
+  }
+}
 
 function parseArgs(argv) {
-  const out = { url: DEFAULT_URL, window: 600, interval: 10, json: false, help: false };
+  const out = { url: DEFAULT_URL, window: 600, interval: 10, json: false, help: false, address: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--url') out.url = String(argv[++i] || '').trim();
     else if (a === '--window') out.window = Number(argv[++i]);
     else if (a === '--interval') out.interval = Number(argv[++i]);
+    else if (a === '--address') out.address = String(argv[++i] || '').trim();
     else if (a === '--json') out.json = true;
     else if (a === '--help' || a === '-h') out.help = true;
     else if (!out.unknown) out.unknown = a;
@@ -76,6 +107,11 @@ async function snapshot(base) {
     channels: Number((b.tasks && b.tasks.channels) || 0),
     framesIn: Number((b.tasks && b.tasks.framesIn) || 0),
     peers: Array.isArray(b.connected_peers) ? b.connected_peers : [],
+    /* TAR-адреса воркеров с авторизованным каналом. `peers` для сверки
+     * не годятся: там peerId libp2p, а не `0x…` из worker.json. */
+    workerAddresses: Array.isArray(b.worker_addresses)
+      ? b.worker_addresses.map((a) => String(a).toLowerCase())
+      : [],
     errors: [h.error, p.error].filter(Boolean),
   };
 }
@@ -83,8 +119,9 @@ async function snapshot(base) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
-    console.log('check-autostart.js [--url URL] [--window 600] [--interval 10] [--json]');
+    console.log('check-autostart.js [--url URL] [--window 600] [--interval 10] [--address 0x…] [--json]');
     console.log('Ждёт active_workers>=1 и bridge.connections>=1 в пределах окна.');
+    console.log('С адресом (или если найден ~/.tarnet/worker.json) — ждёт ЭТОТ узел, а не любой.');
     process.exit(0);
   }
   if (args.unknown) bad(2, `неизвестный аргумент ${args.unknown}`);
@@ -98,10 +135,31 @@ async function main() {
   let last = null;
   let ticks = 0;
 
+  /* Какой адрес считаем «своим».
+   *
+   * `--address` — явное указание (например, проверяют другой ПК).
+   * Иначе — `~/.tarnet/worker.json` этого ПК. Если ни того, ни другого
+   * нет, остаётся старый критерий «хоть один воркер», но об этом сказано
+   * в выводе: молча ослабленная проверка хуже отсутствующей. */
+  const explicit = args.address ? String(args.address).trim().toLowerCase() : null;
+  if (explicit && !ADDRESS_RE.test(explicit)) {
+    bad(2, `--address должен быть 0x + 40 hex, получено ${JSON.stringify(args.address)}`);
+  }
+  const local = explicit
+    ? { address: explicit, file: null, error: null }
+    : readLocalWorkerAddress();
+  const expected = local.address;
+
   if (!args.json) {
     console.log(`Проверяю автозапуск узла: ${base}`);
     console.log(`Окно ${args.window} с, опрос каждые ${args.interval} с`);
-    console.log('Критерий: active_workers >= 1 И bridge.connections >= 1');
+    if (expected) {
+      console.log(`Свой адрес: ${expected} (${explicit ? '--address' : local.file})`);
+      console.log('Критерий: этот адрес в сети И bridge.connections >= 1');
+    } else {
+      console.log(`Свой адрес неизвестен (${local.error}) — проверяю любого воркера.`);
+      console.log('Критерий: active_workers >= 1 И bridge.connections >= 1');
+    }
     console.log('');
   }
 
@@ -111,13 +169,24 @@ async function main() {
     last = s;
 
     if (!s.error) {
-      const ready = s.activeWorkers >= 1 && s.contacts >= 1;
+      /* Сверка адреса, когда он известен.
+       *
+       * `worker_addresses` пуст, если мост старой версии: тогда сервер
+       * не присылает это поле, и `undefined` неотличим от «списка нет».
+       * Такой ответ НЕ засчитываем как «наш узел найден»: пустой список
+       * означает «никто не подключён» либо «спросить нечем», и оба случая
+       * не доказывают, что нужный ПК поднялся. */
+      const mine = expected
+        ? s.workerAddresses.includes(expected)
+        : s.activeWorkers >= 1;
+      const ready = mine && s.contacts >= 1;
       const elapsed = Math.round((Date.now() - started) / 1000);
       if (!args.json) {
         console.log(
           `[${String(elapsed).padStart(4)}с] workers=${s.activeWorkers} contacts=${s.contacts}` +
           ` channels=${s.channels} framesIn=${s.framesIn}` +
-          `${s.llmMode ? ` mode=${s.llmMode}` : ''}${ready ? '  ← ГОТОВО' : ''}`
+          `${s.llmMode ? ` mode=${s.llmMode}` : ''}` +
+          `${expected ? ` mine=${mine ? 'да' : 'нет'}` : ''}${ready ? '  ← ГОТОВО' : ''}`
         );
       }
       if (ready) {
@@ -129,10 +198,15 @@ async function main() {
           channels: s.channels,
           framesIn: s.framesIn,
           connectedPeers: s.peers,
+          workerAddresses: s.workerAddresses,
+          expectedAddress: expected,
+          addressMatched: expected ? true : null,
           llmMode: s.llmMode,
           url: base,
           /* Явное ограничение: факт перезагрузки скрипт не проверял. */
-          proved: 'узел в сети; что это произошло БЕЗ ручного запуска — следует из того, что воркер не запускали после ребута',
+          proved: expected
+            ? 'ЭТОТ узел в сети; что это произошло БЕЗ ручного запуска — следует из того, что воркер не запускали после ребута'
+            : 'узел в сети (какой именно — не проверялось: адрес неизвестен); что это произошло БЕЗ ручного запуска — следует из того, что воркер не запускали после ребута',
         };
         if (args.json) console.log(JSON.stringify(result));
         else {

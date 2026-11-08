@@ -80,6 +80,22 @@ async function spawnServer(envOverrides = {}, opts = {}) {
        * лимите она упала бы на 429. Лимит проверяется отдельной секцией
        * 8.16 на собственном сервере с маленьким окном. */
       RATE_LIMIT_MAX: '0',
+      /* СТЕНД, А НЕ ПРОД (2.24.0).
+       *
+       * Гейт оплаты по умолчанию строгий: `/work` без реально списанных
+       * денег отвечает 400/402 и ничего не начисляет. Это правильно для
+       * боевого эндпоинта выплат.
+       *
+       * Но приёмка проверяет арифметику начисления, а не платёжеспособность:
+       * десятки вызовов `/work` создают воркера, просят токены и сверяют
+       * формулы κ/γ/CWU. Кошельков и денег там нет вовсе. Без этой строки
+       * все они получили бы 400, и красной стала бы вся арифметика —
+       * то есть тест мерил бы не то, что задумано.
+       *
+       * Явный `0` вместо неявного умолчания: отключается ОДНОЙ строкой и
+       * заметно. Строгий режим проверяется отдельно (`check-payment-gate.js`
+       * и секция 53) на сервере с дефолтным значением. */
+      TARNET_REQUIRE_PAYMENT: '0',
       ...envOverrides,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -9241,6 +9257,52 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       sneaky.closed === true && client.rejected() === 2 && client.count() === 1,
       { closed: sneaky.closed, rejected: client.rejected(), channels: client.count() });
 
+    /* --- 51.12–51.14: ответ не путается между ожиданиями ---
+     *
+     * Ловится именно тот дефект, который был в коде: ответ приходил по
+     * голове очереди, а не по taskId. Если вернуть `waiters.shift()`, эти
+     * проверки КРАСНЫЕ: поздний ответ `t-medlennyy` достанется `t-bystryy`.
+     * Ставка — деньги, поэтому проверка не косметическая. */
+    const slow = client.send({ action: 'task', task: { taskId: 't-medlennyy' } }, { timeoutMs: 40 });
+    let slowTimedOut = false;
+    try { await slow; } catch (e) { slowTimedOut = e.message === 'TASK_TIMEOUT'; }
+
+    const fast = client.send({ action: 'task', task: { taskId: 't-bystryy' } }, { timeoutMs: 800 });
+    await tick();
+
+    /* Поздний ответ на уже просроченную задачу. Он НЕ должен уйти в fast. */
+    good.push(JSON.stringify({ action: 'task', taskId: 't-medlennyy', status: 'pozdniy' }) + '\n');
+    await tick();
+
+    let fastResolvedEarly = null;
+    fast.then((v) => { fastResolvedEarly = v; }).catch(() => {});
+    await tick();
+    ok('51.12 поздний ответ не достался следующему ожиданию',
+      slowTimedOut && fastResolvedEarly === null,
+      { slowTimedOut, fastGot: fastResolvedEarly && fastResolvedEarly.taskId });
+
+    /* Свой ответ по своему id — доходит. */
+    good.push(JSON.stringify({ action: 'task', taskId: 't-bystryy', status: 'svoy' }) + '\n');
+    let fastAnswer = null;
+    try { fastAnswer = await fast; } catch (_e) { fastAnswer = null; }
+    ok('51.13 свой ответ доходит по taskId, а не по порядку',
+      fastAnswer && fastAnswer.taskId === 't-bystryy' && fastAnswer.status === 'svoy',
+      { got: fastAnswer && fastAnswer.taskId });
+
+    /* Кадр с неизвестным id не отдаётся никому из ждущих задачу. */
+    const waiting = client.send({ action: 'task', task: { taskId: 't-zhdet' } }, { timeoutMs: 800 });
+    await tick();
+    good.push(JSON.stringify({ action: 'task', taskId: 't-chuzhoy', status: 'chuzhoy' }) + '\n');
+    await tick();
+    let leaked = null;
+    waiting.then((v) => { leaked = v; }).catch(() => {});
+    await tick();
+    ok('51.14 ответ с чужим taskId не отдаётся никому',
+      leaked === null && client.stats().orphans >= 2,
+      { leaked: leaked && leaked.taskId, orphans: client.stats().orphans });
+    good.push(JSON.stringify({ action: 'task', taskId: 't-zhdet', status: 'ok' }) + '\n');
+    try { await waiting; } catch (_e) { /* уже проверено, что не протёк */ }
+
     try { await good.close(); } catch (_e) { /* уже закрыт */ }
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -10322,8 +10384,13 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     const script59 = path.join(__dirname, 'scripts', 'check-autostart.js');
 
     /* Заглушка на net, а не на http: в тесте уже есть этот приём (57),
-     * и он не тянет новых зависимостей. */
-    const startStub = (readyAfterHits) => new Promise((resolve) => {
+     * и он не тянет новых зависимостей.
+     *
+     * `workerAddr` — адрес, который заглушка объявляет подключённым.
+     * Он нужен потому, что скрипт с 2.24.0 сверяет КОНКРЕТНЫЙ узел, а не
+     * счётчик: `active_workers >= 1` выполнялось и тогда, когда поднялся
+     * совсем другой ПК. */
+    const startStub = (readyAfterHits, workerAddr) => new Promise((resolve) => {
       let healthHits = 0;
       const srv = net.createServer((conn) => {
         conn.setEncoding('utf8');
@@ -10342,6 +10409,7 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
             body = JSON.stringify({ ok: true, bridge: {
               connections: ready ? 1 : 0,
               connected_peers: ready ? ['12D3KooWstub'] : [],
+              worker_addresses: ready && workerAddr ? [workerAddr] : [],
               tasks: { channels: ready ? 1 : 0, framesIn: ready ? 2 : 0 },
             } });
           }
@@ -10353,25 +10421,48 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       srv.listen(0, '127.0.0.1', () => resolve({ srv, port: srv.address().port }));
     });
 
-    const runScript = (port, windowSec) => new Promise((resolve) => {
-      const p = spawn(process.execPath, [script59, '--url', `http://127.0.0.1:${port}`,
-        '--window', String(windowSec), '--interval', '1'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    /* `--address` передаётся явно, а не читается из `~/.tarnet/worker.json`:
+     * тест не должен зависеть от того, есть ли на машине сборки реальный
+     * адрес воркера. */
+    const runScript = (port, windowSec, address) => new Promise((resolve) => {
+      const argv = [script59, '--url', `http://127.0.0.1:${port}`,
+        '--window', String(windowSec), '--interval', '1'];
+      if (address) argv.push('--address', address);
+      const p = spawn(process.execPath, argv, { stdio: ['ignore', 'pipe', 'pipe'] });
       let out = '';
       p.stdout.on('data', (d) => { out += d.toString(); });
       p.stderr.on('data', (d) => { out += d.toString(); });
       p.on('close', (code) => resolve({ code, out }));
     });
 
-    const fast = await startStub(2);
+    const MINE = '0x' + 'a1'.repeat(20);
+    const OTHER = '0x' + 'b2'.repeat(20);
+
+    const fast = await startStub(2, MINE);
     try {
-      const r = await runScript(fast.port, 15);
-      ok('59.1 готовность после появления воркера — код 0',
+      const r = await runScript(fast.port, 15, MINE);
+      ok('59.1 готовность после появления СВОЕГО узла — код 0',
         r.code === 0, { code: r.code, tail: r.out.slice(-200) });
+      ok('59.1b в выводе назван сверенный адрес',
+        r.out.includes(MINE), r.out.slice(0, 200));
     } finally { fast.srv.close(); }
 
-    const never = await startStub(9999);
+    /* ГЛАВНЫЙ НОВЫЙ ТЕСТ. Узел в сети есть, соединение есть, счётчики
+     * единичные — но это ЧУЖОЙ воркер. Старый критерий сказал бы
+     * «готово» (код 0) и владелец решил бы, что автозапуск его ПК
+     * сработал. Правильный ответ — код 1. */
+    const alien = await startStub(2, OTHER);
     try {
-      const r = await runScript(never.port, 3);
+      const r = await runScript(alien.port, 5, MINE);
+      ok('59.4 чужой узел в сети НЕ засчитан как свой (код 1)',
+        r.code === 1, { code: r.code, tail: r.out.slice(-220) });
+      ok('59.4b скрипт прямо говорит mine=нет',
+        /mine=нет/.test(r.out), r.out.slice(-200));
+    } finally { alien.srv.close(); }
+
+    const never = await startStub(9999, MINE);
+    try {
+      const r = await runScript(never.port, 3, MINE);
       ok('59.2 нет воркера — код 1 и честный таймаут',
         r.code === 1 && /За 3 с условие не выполнено/.test(r.out),
         { code: r.code, tail: r.out.slice(-200) });
@@ -10444,7 +10535,16 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     await tick60(30);
     const wentToA = chA.sent.some((s) => s.includes('wt_addressing'));
     const wentToB = chB.sent.some((s) => s.includes('wt_addressing'));
-    chA.push(JSON.stringify({ ok: true, from: 'A' }) + '\n');
+    /* Ответ воркера обязан нести `taskId` — так отвечает и `worker-demo.js`
+     * (`/p2p/execute` → `taskId: task.taskId`), и собранный `dist/tarnet-worker.js`.
+     *
+     * Раньше фикстура отвечала без id, и это проходило: клиент брал ответ
+     * из очереди FIFO, не спрашивая, чей он. После перехода на Map такой
+     * ответ стал сиротой и ожидание истекло — тест упал на TASK_TIMEOUT,
+     * хотя нашёл РЕАЛЬНЫЙ дефект фикстуры: она изображала воркер, которого
+     * в природе нет. Ослаблять проверку (принимать ответ без id) нельзя:
+     * именно это и засчитывало чужую работу. */
+    chA.push(JSON.stringify({ ok: true, from: 'A', taskId: 'wt_addressing' }) + '\n');
     const reply60 = await pending;
 
     ok('60.1 задача ушла ТОЛЬКО каналу A', wentToA === true && wentToB === false, { wentToA, wentToB });

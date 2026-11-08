@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.23.3-prompt-integrity",
+  "version": "2.24.0-p0-hardening",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {
