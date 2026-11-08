@@ -251,6 +251,29 @@ SQLite, `/var/lib/tarnet` на проде. **45 таблиц** (проверен
 **Ссылки внутри документов указывают путь от `backend-api/`**, то есть на перемещённое —
 через `docs/`: `docs/BACKLOG.md`, `docs/DEMO-RUNBOOK.md`. Голое имя теперь означает файл в корне.
 
+### 11.2. Репозиторий на GitHub — **private** с 08.11.2026
+
+| Факт | Значение |
+| :--- | :--- |
+| Слаг | `pdkiller666/tarnet-backend` |
+| Видимость | **private** (было public 22.10–08.11, переключено по указанию владельца) |
+| Ветка | `main`, HEAD сверяется с локальным при каждом деплое |
+| Креденшелы | `$HOME/.openclaw/credentials/github/personal/*/hosts.yml`, override — `TARNET_GH_CREDS` |
+| Токен в env (`$GH_TOKEN`, `$GITHUB_TOKEN`) | **не использовать**: `$GH_TOKEN` мёртв (`401`), `$GITHUB_TOKEN` пуст. Деплой их не читает |
+
+**Как потребители ходят в GitHub теперь:**
+
+| Потребитель | Путь |
+| :--- | :--- |
+| `scripts/deploy.sh` | пуш и `ls-remote` по `https://x-access-token:<TOKEN>@…` |
+| Код на VPS | **bundle по SSH**, GitHub со стороны сервера не участвует |
+| `scripts/verify.sh:128` | `git ls-remote` с токеном |
+| `scripts/push-tag.js:60` | URL с токеном |
+
+⚠️ **Анонимный `curl` на `raw.githubusercontent.com` больше не работает** — отдаёт `404`.
+Если такой шаг появится в скрипте, диагностировать как «нет доступа», а не «нет файла».
+Pages/Actions/webhooks/releases — не используются (проверено 08.11: 0 и 404).
+
 ---
 
 ## 12. Куда НЕ идти
