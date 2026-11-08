@@ -10390,7 +10390,7 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
      * Он нужен потому, что скрипт с 2.24.0 сверяет КОНКРЕТНЫЙ узел, а не
      * счётчик: `active_workers >= 1` выполнялось и тогда, когда поднялся
      * совсем другой ПК. */
-    const startStub = (readyAfterHits, workerAddr) => new Promise((resolve) => {
+    const startStub = (readyAfterHits, workerAddr, opts = {}) => new Promise((resolve) => {
       let healthHits = 0;
       const srv = net.createServer((conn) => {
         conn.setEncoding('utf8');
@@ -10406,12 +10406,18 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
             body = JSON.stringify({ active_workers: healthHits >= readyAfterHits ? 1 : 0, llm_mode: 'worker' });
           } else if (reqPath === '/p2p/status') {
             const ready = healthHits >= readyAfterHits;
-            body = JSON.stringify({ ok: true, bridge: {
+            const bridge = {
               connections: ready ? 1 : 0,
               connected_peers: ready ? ['12D3KooWstub'] : [],
-              worker_addresses: ready && workerAddr ? [workerAddr] : [],
               tasks: { channels: ready ? 1 : 0, framesIn: ready ? 2 : 0 },
-            } });
+            };
+            /* `omitAddresses` изображает сервер старше 2.24.0: поля
+             * `worker_addresses` там нет вовсе. Пустой массив — ДРУГОЙ
+             * факт (поле есть, никто не подключён), и склеивать их нельзя. */
+            if (!opts.omitAddresses) {
+              bridge.worker_addresses = ready && workerAddr ? [workerAddr] : [];
+            }
+            body = JSON.stringify({ ok: true, bridge });
           }
           conn.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n` +
             `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
@@ -10470,6 +10476,23 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
         /ярлык в Startup не сработал|воркер упал/.test(r.out),
         r.out.slice(-160));
     } finally { never.srv.close(); }
+
+    /* СТАРЫЙ СЕРВЕР (2.24.0). Прод до раскатки не отдаёт `worker_addresses`.
+     * Без этой проверки скрипт тянул бы всё окно и завершался кодом 1 —
+     * «узел не появился». Владелец пошёл бы чинить автозапуск на исправном
+     * ПК. «Проверить нечем» и «проверил, не дождался» — разные диагнозы,
+     * поэтому разные коды: 3 против 1. */
+    const oldSrv = await startStub(2, MINE, { omitAddresses: true });
+    try {
+      const r = await runScript(oldSrv.port, 10, MINE);
+      ok('59.5 сервер без worker_addresses — код 3, а не таймаут',
+        r.code === 3, { code: r.code, tail: r.out.slice(-220) });
+      ok('59.5b отказ объясняет, что проверка НЕВОЗМОЖНА, а не провалена',
+        /НЕ значит, что узел не поднялся|проверка невозможна/i.test(r.out),
+        r.out.slice(-220));
+      ok('59.5c отказ называет виновника — старую сборку сервера',
+        /старше 2\.24\.0/.test(r.out), r.out.slice(-220));
+    } finally { oldSrv.srv.close(); }
   }
 
   /* ===== 60. Адресация задачи в мосте: не «первому живому» =====

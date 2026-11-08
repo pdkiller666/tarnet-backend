@@ -24,7 +24,8 @@
  *   node scripts/check-autostart.js --window 120 --interval 5
  *   node scripts/check-autostart.js --json
  *
- * Коды возврата: 0 — узел в сети в пределах окна; 1 — не дождались; 2 — плохой аргумент.
+ * Коды возврата: 0 — узел в сети в пределах окна; 1 — не дождались;
+ * 2 — плохой аргумент; 3 — сервер старой сборки, сверка по адресу невозможна.
  */
 'use strict';
 
@@ -61,13 +62,14 @@ function readLocalWorkerAddress() {
 }
 
 function parseArgs(argv) {
-  const out = { url: DEFAULT_URL, window: 600, interval: 10, json: false, help: false, address: null };
+  const out = { url: DEFAULT_URL, window: 600, interval: 10, json: false, help: false, address: null, any: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--url') out.url = String(argv[++i] || '').trim();
     else if (a === '--window') out.window = Number(argv[++i]);
     else if (a === '--interval') out.interval = Number(argv[++i]);
     else if (a === '--address') out.address = String(argv[++i] || '').trim();
+    else if (a === '--any') out.any = true;
     else if (a === '--json') out.json = true;
     else if (a === '--help' || a === '-h') out.help = true;
     else if (!out.unknown) out.unknown = a;
@@ -112,6 +114,14 @@ async function snapshot(base) {
     workerAddresses: Array.isArray(b.worker_addresses)
       ? b.worker_addresses.map((a) => String(a).toLowerCase())
       : [],
+    /* Есть ли поле в ответе ВООБЩЕ (2.24.0).
+     *
+     * Пустой массив и отсутствие поля — разные факты: первый значит
+     * «никто не подключён», второй — «сервер старой сборки и спросить
+     * нечем». Склеить их в `[]` значит искать причину не там: на проде
+     * `2.23.0` скрипт молчал бы всё окно и выдал «узел не появился»,
+     * хотя узел мог быть в сети. */
+    hasAddressField: Object.prototype.hasOwnProperty.call(b, 'worker_addresses'),
     errors: [h.error, p.error].filter(Boolean),
   };
 }
@@ -119,9 +129,10 @@ async function snapshot(base) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
-    console.log('check-autostart.js [--url URL] [--window 600] [--interval 10] [--address 0x…] [--json]');
+    console.log('check-autostart.js [--url URL] [--window 600] [--interval 10] [--address 0x…] [--any] [--json]');
     console.log('Ждёт active_workers>=1 и bridge.connections>=1 в пределах окна.');
     console.log('С адресом (или если найден ~/.tarnet/worker.json) — ждёт ЭТОТ узел, а не любой.');
+    console.log('--any отключает сверку по адресу (нужно, если сервер старше 2.24.0).');
     process.exit(0);
   }
   if (args.unknown) bad(2, `неизвестный аргумент ${args.unknown}`);
@@ -145,9 +156,13 @@ async function main() {
   if (explicit && !ADDRESS_RE.test(explicit)) {
     bad(2, `--address должен быть 0x + 40 hex, получено ${JSON.stringify(args.address)}`);
   }
-  const local = explicit
-    ? { address: explicit, file: null, error: null }
-    : readLocalWorkerAddress();
+  if (args.any && explicit) bad(2, '--any и --address взаимоисключающие: либо свой узел, либо любой');
+  /* `--any` отключает сверку по адресу ЯВНО и работает даже при наличии
+   * `~/.tarnet/worker.json`. Без него подсказка «проверьте без --address»
+   * была бы неправдой: скрипт всё равно нашёл бы файл и включил сверку. */
+  const local = args.any
+    ? { address: null, file: null, error: 'задан --any' }
+    : (explicit ? { address: explicit, file: null, error: null } : readLocalWorkerAddress());
   const expected = local.address;
 
   if (!args.json) {
@@ -163,6 +178,28 @@ async function main() {
     console.log('');
   }
 
+  /* Ранняя проверка возможностей сервера (2.24.0).
+   *
+   * Ждать всё окно бессмысленно, если сервер старой сборки: он не отдаёт
+   * `worker_addresses`, и сверка по адресу невозможна в принципе. Без этой
+   * ветки скрипт тянул бы 10 минут и завершался кодом 1 — «узел не
+   * появился». Владелец пошёл бы чинить автозапуск на исправном ПК, хотя
+   * причина — версия на сервере. Поэтому отдельный код 3 и мгновенный выход:
+   * «проверить нечем» ≠ «проверил, не дождался». */
+  if (expected) {
+    const probe = await snapshot(base);
+    if (!probe.error && probe.hasAddressField === false) {
+      const msg = `сервер ${base} не отдаёт worker_addresses — сборка старше 2.24.0. ` +
+        'Сверить именно этот ПК нечем; раскатайте сервер или проверьте с --any (тогда критерий — счётчик, а не адрес).';
+      if (args.json) console.log(JSON.stringify({ ok: false, error: 'SERVER_TOO_OLD', detail: msg, url: base }));
+      else {
+        console.log(`❌ ${msg}`);
+        console.log('   Это НЕ значит, что узел не поднялся: проверка невозможна, а не провалена.');
+      }
+      process.exit(3);
+    }
+  }
+
   while (Date.now() <= deadline) {
     ticks += 1;
     const s = await snapshot(base);
@@ -171,11 +208,14 @@ async function main() {
     if (!s.error) {
       /* Сверка адреса, когда он известен.
        *
-       * `worker_addresses` пуст, если мост старой версии: тогда сервер
-       * не присылает это поле, и `undefined` неотличим от «списка нет».
-       * Такой ответ НЕ засчитываем как «наш узел найден»: пустой список
-       * означает «никто не подключён» либо «спросить нечем», и оба случая
-       * не доказывают, что нужный ПК поднялся. */
+       * Три состояния, а не два (2.24.0):
+       *   `hasAddressField === false` — сервер старой сборки, спросить нечем;
+       *   `[]` — поле есть, но никто не подключён;
+       *   адрес в списке — наш узел в сети.
+       *
+       * Склеивать первое со вторым нельзя: на проде `2.23.0` скрипт
+       * молчал бы всё окно и выдал «узел не появился», хотя причиной был
+       * старый сервер. Владелец пошёл бы чинить автозапуск на исправном ПК. */
       const mine = expected
         ? s.workerAddresses.includes(expected)
         : s.activeWorkers >= 1;
@@ -186,8 +226,14 @@ async function main() {
           `[${String(elapsed).padStart(4)}с] workers=${s.activeWorkers} contacts=${s.contacts}` +
           ` channels=${s.channels} framesIn=${s.framesIn}` +
           `${s.llmMode ? ` mode=${s.llmMode}` : ''}` +
-          `${expected ? ` mine=${mine ? 'да' : 'нет'}` : ''}${ready ? '  ← ГОТОВО' : ''}`
+          `${expected && s.hasAddressField ? ` mine=${mine ? 'да' : 'нет'}` : ''}` +
+          `${expected && !s.hasAddressField ? ' mine=?' : ''}` +
+          `${ready ? '  ← ГОТОВО' : ''}`
         );
+        if (expected && !s.hasAddressField) {
+          console.log('   ВНИМАНИЕ: сервер не отдаёт worker_addresses — сборка старше 2.24.0.');
+          console.log('   Сверить именно ваш ПК нечем: результат будет по счётчику, а не по адресу.');
+        }
       }
       if (ready) {
         const result = {
