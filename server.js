@@ -36,6 +36,46 @@ const { startDemoMesh, describeMesh } = require('./p2p-demo');
  * Модуль на голом `net` и не бросает: отсутствие моста — штатное состояние,
  * backend-api не должен зависеть от p2p ни при старте, ни в работе. */
 const p2pBridge = require('./p2p-bridge-client');
+
+/* Capabilities Discovery как ФАКТ СЕТИ, а не как догадка о чужой машине
+ * (2.26.0, Блок 1.3).
+ *
+ * ЗАЧЕМ КЭШ. /health — самый частый эндпоинт: его опрашивают мониторинг,
+ * verify.sh и сам воркер при старте. Ходить в сокет моста на каждый вызов
+ * значило бы связать доступность HTTP со скоростью libp2p: пока мост
+ * занят DHT-поиском, /health отвечал бы секундами. Кэш на 15 с отвязывает
+ * два разных здоровья — HTTP и p2p.
+ *
+ * ЗАЧЕМ ТАЙМАУТ 300 мс. Мост может молчать (завис, перегружен). Ждать
+ * дольше — значит отвечать на health-check дольше, чем мониторинг считает
+ * отказом. Не успели — возвращаем null: «не знаю» честнее, чем медленный
+ * ответ, который будет прочитан как «сервер умер».
+ *
+ * ЗНАЧЕНИЕ:
+ *   true  — есть живая запись с непустыми modelFamilies;
+ *   false — мост ответил, но таких записей нет (установлен и молчит);
+ *   null  — мост не ответил/не успел: состояние НЕИЗВЕСТНО. */
+let _capsCache = { at: 0, value: null };
+async function p2pCapsFact() {
+  const TTL_MS = 15000;
+  const now = Date.now();
+  if (now - _capsCache.at < TTL_MS) return _capsCache.value;
+
+  let value = null;
+  try {
+    const r = await p2pBridge.send({ action: 'status' }, { timeoutMs: 300 });
+    if (r && r.ok === true) {
+      /* Поле может отсутствовать у моста старой версии. Тогда именно null:
+       * «версия не отдаёт» — это не «не настроено». */
+      const wr = r.worker_records;
+      value = wr && typeof wr.with_capabilities === 'number' ? wr.with_capabilities > 0 : null;
+    }
+  } catch (_e) {
+    value = null;
+  }
+  _capsCache = { at: now, value };
+  return value;
+}
 /* 2.22.7: архив p2p-node для установщика. Модуль чистый (fs + zlib, без сети
  * и без БД), поэтому проверяется обычными юнит-тестами — архив можно собрать
  * и распаковать, не поднимая сервер. */
@@ -135,22 +175,55 @@ function encryptSecret(plaintext) {
  * в двух записях дают одинаковый шифротекст, то есть файл выдаёт факт
  * повтора. Для датасета это приемлемо; для произвольных секретов — нет,
  * там остаётся encryptSecret(). */
-function encryptTextDeterministic(plaintext) {
+function encryptTextDeterministic(plaintext, opts = {}) {
   if (typeof plaintext !== 'string' || !plaintext.length) return null;
   const iv = crypto.createHmac('sha256', MASTER_KEY)
     .update(plaintext, 'utf8').digest().subarray(0, 12);
   const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
+
+  /* AAD (2.26.0, Блок 7.3).
+   *
+   * ЗАЧЕМ. Без AAD шифротекст поля `prompt` можно переставить в поле
+   * `response` (или в чужую строку) — тег подойдёт, потому что он подтверждает
+   * только «эти байты не менялись», но не «это байты ИМЕННО ЭТОГО поля».
+   * Датасет обучается на перепутанных парах, и никакая проверка не сработает.
+   *
+   * ПОЧЕМУ В AAD ИДЁТ `promptHash`, А НЕ id СТРОКИ В БД. AAD обязан
+   * воспроизводиться при проверке. id в файле не лежит, а `promptHash` — есть,
+   * открыто и стабильно. AAD, который нельзя пересчитать из самого артефакта,
+   * сделал бы файл непроверяемым.
+   *
+   * ПОЧЕМУ ВЕРСИЯ v2, А НЕ ПРАВКА v1. Уже записанные файлы и строки БД
+   * зашифрованы без AAD; смена формата на месте превратила бы их в
+   * нерасшифровываемый мусор. v2 читается рядом со старым v1. */
+  const aad = opts.aad ? Buffer.from(String(opts.aad), 'utf8') : null;
+  if (aad) cipher.setAAD(aad);
   const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-  return `enc:v1:${iv.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${ct.toString('base64')}`;
+  const tag = cipher.getAuthTag().toString('base64');
+
+  return aad
+    ? `enc:v2:${iv.toString('base64')}:${tag}:${ct.toString('base64')}`
+    : `enc:v1:${iv.toString('base64')}:${tag}:${ct.toString('base64')}`;
 }
 
-function decryptSecret(blob) {
+function decryptSecret(blob, opts = {}) {
   if (typeof blob !== 'string' || !blob.length) return null;
-  if (!blob.startsWith('enc:v1:')) return blob;
+  if (!blob.startsWith('enc:v1:') && !blob.startsWith('enc:v2:')) return blob;
   const parts = blob.split(':');
   if (parts.length !== 5) return null;
   try {
     const decipher = crypto.createDecipheriv('aes-256-gcm', MASTER_KEY, Buffer.from(parts[2], 'base64'));
+    /* AAD ставится ТОЛЬКО для v2: у v1 его не было, и вызов setAAD на нём
+     * изменил бы тег — то есть старые записи перестали бы читаться.
+     *
+     * ВАЖНО: `blob.split(':')` даёт ['enc','v2',iv,tag,ct] — версия лежит
+     * в parts[1], а НЕ в parts[0]. Проверка `parts[0] === 'enc:v2'` никогда
+     * не срабатывала бы, и любая v2-запись молча возвращала бы null,
+     * то есть датасет выглядел бы повреждённым. */
+    if (parts[1] === 'v2') {
+      if (!opts.aad) return null;
+      decipher.setAAD(Buffer.from(String(opts.aad), 'utf8'));
+    }
     decipher.setAuthTag(Buffer.from(parts[3], 'base64'));
     return Buffer.concat([decipher.update(Buffer.from(parts[4], 'base64')), decipher.final()]).toString('utf8');
   } catch (_e) {
@@ -3154,7 +3227,7 @@ function countCloudflaredProcesses() {
   return n;
 }
 
-app.get('/health', (_req, res) => {
+app.get('/health', async (_req, res) => {
   const totals = ledger.totals();
   const bad = get(`SELECT COUNT(*) AS c FROM work_receipts
                    WHERE ABS(burnTar + treasuryTar + royaltyTar + rewardTar - (feeGrossTar + blockRewardTar)) > 1e-6`).c;
@@ -3196,6 +3269,18 @@ app.get('/health', (_req, res) => {
       loraRoyaltyRate: CONFIG.LORA_ROYALTY_RATE,
     },
     tierWeights: TIER_WEIGHTS,
+    /* Capabilities для Discovery (2.26.0, Блок 1.3).
+     *
+     * ЧТО ЭТО ЧЕСТНО ОЗНАЧАЕТ. Это НЕ «на моей машине заданы
+     * P2P_MODEL_FAMILIES»: /health — процесс backend-api, а capabilities
+     * живут на машине воркера, куда у сервера нет доступа. Поэтому здесь
+     * проверяемый ФАКТ СЕТИ: есть ли живая запись с непустыми
+     * modelFamilies. Именно это отличает «объявился в DHT» от «установлен
+     * и молчит» — то, что до сих пор нельзя было увидеть снаружи.
+     *
+     * null — мост не ответил или не успел. Не false: «не знаю» и «точно не
+     * настроено» ведут к разным действиям, и склеивать их значило бы гадать. */
+    p2p_capabilities_configured: await p2pCapsFact(),
     /* Текущий режим LLM. Прозрачность вместо догадок: инвестор и агент
      * видят, работает ли настоящая модель или детерминированный fallback,
      * не читая логи. */
@@ -6517,6 +6602,79 @@ app.get('/p2p/bootstrap', async (_req, res) => {
     connections: typeof r.connections === 'number' ? r.connections : null,
     connected_peers: Array.isArray(r.connected_peers) ? r.connected_peers : [],
     uptime_s: r.uptime_s ?? null,
+  });
+});
+
+/* --- Поиск воркеров через DHT (2.26.0, Блок 3) ---
+ *
+ * GET /p2p/discover?model=qwen2.5-coder[&deviceClass=cpu]
+ *
+ * ЗАЧЕМ ОТДЕЛЬНЫЙ ЭНДПОИНТ. До этого `findProviders` жил ТОЛЬКО в
+ * E2E-тесте: воркер объявлял себя в DHT, но ни один путь в проде не
+ * спрашивал сеть «кто умеет X». Discovery работал в тесте и не работал
+ * для пользователя — это главный разрыв, который закрывает 2.26.0.
+ *
+ * ПОЧЕМУ НЕ ВЫЗОВ libp2p ЗДЕСЬ ЖЕ. У backend-api нет узла libp2p (105 МБ
+ * вынесены в отдельный процесс). DHT-запрос делает мост по сокету, а этот
+ * эндпоинт — HTTP-фасад над ним. Иначе пришлось бы держать второй узел
+ * рядом с сервером и ломать разделение, ради которого мост и выделен.
+ *
+ * ЧЕГО ОТВЕТ НЕ ДЕЛАЕТ: не выдаёт непроверенных воркеров. Каждый прошёл
+ * `verifyRecord` (подпись, TTL, sequence, адрес), и `rejected[]` показывает,
+ * кого отбросили и почему — «нашли одного» и «нашли двух, один с битой
+ * подписью» должны быть различимы.
+ */
+app.get('/p2p/discover', async (req, res) => {
+  const model = String(req.query.model || '').trim();
+  if (!model) {
+    /* 400, а не пустой список: пустой ответ на кривой запрос означал бы
+     * «в сети нет таких воркеров» и увёл бы диагностику в DHT. */
+    return res.status(400).json({
+      ok: false,
+      error: 'NO_MODEL',
+      detail: 'укажите ?model=<семейство>, например ?model=qwen2.5-coder',
+    });
+  }
+  const deviceClass = String(req.query.deviceClass || process.env.P2P_DEFAULT_DEVICE_CLASS || 'cpu').trim();
+
+  const r = await p2pBridge.send(
+    { action: 'discover', model, deviceClass },
+    /* Дольше, чем status: внутри — реальный DHT-поиск и опрос провайдеров
+     * по потокам. Но не бесконечно: HTTP-клиент должен получить ответ. */
+    { timeoutMs: 15000 }
+  );
+
+  if (!r || r.ok !== true) {
+    /* 503 для «мост не отвечает» и «libp2p выключен», 500 для остального:
+     * первое — состояние инфраструктуры, второе — сбой запроса. */
+    const infra = !r || r.error === 'LIBP2P_OFF' || r.error === 'P2P_BRIDGE_UNAVAILABLE';
+    return res.status(infra ? 503 : 500).json({
+      ok: false,
+      error: (r && r.error) || 'P2P_BRIDGE_UNAVAILABLE',
+      detail: infra
+        ? 'DHT недоступен: мост не отвечает или libp2p не поднят'
+        : 'поиск не удался',
+      model,
+      deviceClass,
+    });
+  }
+
+  res.json({
+    ok: true,
+    action: 'discover',
+    model,
+    deviceClass,
+    /* Найдено ЧЕРЕЗ DHT. Список `cached` намеренно отдельно: это записи,
+     * пришедшие по gossipsub, а не найденные поиском, и склеивать их в
+     * один список значило бы выдать кэш за результат DHT. */
+    workers: Array.isArray(r.workers) ? r.workers : [],
+    found: Array.isArray(r.workers) ? r.workers.length : 0,
+    providers: r.providers ?? 0,
+    truncated: Boolean(r.truncated),
+    rejected: Array.isArray(r.rejected) ? r.rejected : [],
+    cached: Array.isArray(r.cached) ? r.cached : [],
+    cid: r.cid || null,
+    elapsed_ms: r.elapsed_ms ?? null,
   });
 });
 

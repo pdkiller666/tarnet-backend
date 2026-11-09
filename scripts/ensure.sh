@@ -120,8 +120,31 @@ rc=$?
 rm -f "$REMOTE_SCRIPT"
 
 if printf '%s\n' "$OUT" | grep -q '^ALREADY'; then
-  info "ключ уже был в authorized_keys — ничего не менял"
-  exit 0
+  info "ключ уже был в authorized_keys — проверяю фактический вход"
+  # Блок 8.2: наличие строки — НЕ вход.
+  #
+  # ПОЧЕМУ НЕЛЬЗЯ ВЫХОДИТЬ СРАЗУ. Строка в файле может быть, а вход —
+  # нет: неверные права на каталог, `PermitRootLogin prohibit-password`
+  # сломано, ключ добавлен с битым телом, sshd не перечитал конфиг, файл
+  # подменён после записи. Во всех случаях прежний скрипт говорил «всё
+  # хорошо» и выходил — а человек оставался без доступа, узнав об этом
+  # только при попытке войти.
+  #
+  # Проверка тем же способом, что и после добавления (IdentitiesOnly), и
+  # без отката: мы ничего не меняли, поэтому откатывать нечего — надо
+  # честно сказать «вход не работает».
+  VKEY2=$(mktemp) || die "не создал временный ключ"
+  printf '%s\n' "$KEY_LINE" > "$VKEY2"
+  chmod 600 "$VKEY2"
+  VERIFY2=$(ssh -i "$VKEY2" -o IdentitiesOnly=yes -o BatchMode=yes \
+    -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new \
+    "$VPS" 'echo ENSURE_OK' 2>&1)
+  rm -f "$VKEY2"
+  if printf '%s' "$VERIFY2" | grep -q 'ENSURE_OK'; then
+    info "вход этим ключом работает"
+    exit 0
+  fi
+  die "ключ В ФАЙЛЕ ЕСТЬ, НО ВХОД НЕ РАБОТАЕТ: $(printf '%s' "$VERIFY2" | tail -3 | tr '\n' ' ')"
 fi
 printf '%s\n' "$OUT" | grep -q '^ADDED' || die "запись не удалась (rc=$rc): $OUT"
 

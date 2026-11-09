@@ -1777,6 +1777,28 @@ function findP2pWorker() {
   return null;
 }
 
+/* Capabilities для Discovery (2.26.0).
+ *
+ * ЗАЧЕМ ПРОВЕРКА ЗДЕСЬ, А НЕ ТОЛЬКО В УСТАНОВЩИКЕ. Установщик задаёт
+ * переменные, но человек может запустить воркер руками, обновиться поверх
+ * старой установки или поправить start.sh. Во всех этих случаях пустые
+ * capabilities дают ТИХИЙ отказ: `p2p-worker.js` пишет строку в лог и не
+ * объявляет себя, а снаружи это выглядит как «сеть не видит мой узел».
+ *
+ * Предупреждение печатается ДО запуска ребёнка: после него лог ребёнка
+ * идёт следом, и причина «почему в DHT никого» терялась бы в шуме. */
+function discoveryCapabilitiesReport(env = process.env) {
+  const list = (v) => String(v || '').split(',').map((s) => s.trim()).filter(Boolean)
+  const modelFamilies = list(env.P2P_MODEL_FAMILIES)
+  const deviceClass = list(env.P2P_DEVICE_CLASS)
+  return {
+    ok: modelFamilies.length > 0 && deviceClass.length > 0,
+    modelFamilies,
+    deviceClass,
+    runtimes: list(env.P2P_RUNTIMES),
+  }
+}
+
 function startP2pChild() {
   if (p2pChild) return p2pChild;
   const workerPath = findP2pWorker();
@@ -1809,6 +1831,26 @@ function startP2pChild() {
   else if (!/^https?:\/\/(localhost|127\.0\.0\.1)/.test(API)) env.TARNET_PUBLIC_URL = API;
   // Ключ уже на диске — ждать его появления ребёнку не нужно.
   if (!env.P2P_KEY_WAIT_MS) env.P2P_KEY_WAIT_MS = '5000';
+
+  /* Блок 1.2: без capabilities Discovery НЕ работает.
+   *
+   * Проверяем и НАЗЫВАЕМ причину ДО запуска: иначе человек видит живого
+   * ребёнка и тишину в DHT, и ищет проблему в сети. Не отказываемся
+   * запускать — задачи по WS/потоку идут и без объявления, и глушить
+   * рабочий транспорт из-за отсутствия DHT было бы хуже, чем шум в логе.
+   * Но «заявлено, что всё хорошо», когда оно не так, — не вариант. */
+  const caps = discoveryCapabilitiesReport(env);
+  if (!caps.ok) {
+    log('WARNING: capabilities не настроены, Discovery не работает');
+    log('  нет: ' + [
+      caps.modelFamilies.length ? null : 'P2P_MODEL_FAMILIES',
+      caps.deviceClass.length ? null : 'P2P_DEVICE_CLASS',
+    ].filter(Boolean).join(', '));
+    log('  следствие: узел примет задачи, но НЕ появится в поиске DHT');
+    log('  починить: переустановить (установщик определит сам) или задать переменные вручную');
+  } else {
+    log(`Discovery: ${caps.modelFamilies.join(',')} / ${caps.deviceClass.join(',')}`);
+  }
 
   try {
     p2pChild = spawn(process.execPath, [workerPath], {
@@ -1853,7 +1895,7 @@ module.exports = {
   startP2pChild, stopP2pChild, findP2pWorker, P2P_WANTED,
   /* `--test-p2p` (2.24.8): флаг и его диагностика наружу для тестов —
    * иначе проверить «называет причину, а не стектрейс» нечем. */
-  TEST_P2P, p2pDepsMissing, flagName,
+  TEST_P2P, p2pDepsMissing, flagName, discoveryCapabilitiesReport,
   /* Экспорт транспорта — для тестов handshake без запуска цикла опроса. */
   connectWs, signAuth, ed25519FromSeed, loadOrCreateSeed, wsState, wsUrl, wsSupported,
   runTask, AUTH_PREFIX, claimLinkCode, linkFromCli,

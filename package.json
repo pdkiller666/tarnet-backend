@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.25.4-two-seed",
+  "version": "2.26.0-discovery-completion",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

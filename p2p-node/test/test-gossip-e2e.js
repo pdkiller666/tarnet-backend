@@ -45,7 +45,7 @@ import { ping } from '@libp2p/ping'
 import { gossipsub } from '@libp2p/gossipsub'
 import { generateKeyPairFromSeed } from '@libp2p/crypto/keys'
 import { announceTopic, attachGossip, gossipOptions } from '../gossip-announce.js'
-import { DEFAULT_NETWORK_ID } from '../worker-record.js'
+import { DEFAULT_NETWORK_ID, publicKeyFromSeed, peerIdFromPublicKey } from '../worker-record.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const NODE_SCRIPT = path.join(HERE, 'gossip-node.js')
@@ -148,11 +148,27 @@ async function main() {
   const publisherSeed = crypto.randomBytes(32)
   const publisherAddress = '0x' + crypto.randomBytes(20).toString('hex')
 
+  /* peerId публикатора ВЫЧИСЛЯЕТСЯ ДО его запуска (2.26.0).
+   *
+   * ЗАЧЕМ. Подписчик стартует ПЕРВЫМ — иначе публикация уйдёт в пустоту.
+   * Но проверить «запись пришла от того, кого ждали» можно только если
+   * ожидаемый peerId известен заранее. Он выводится из seed детерминированно,
+   * так что ждать публикатора не нужно.
+   *
+   * БЕЗ ЭТОГО проверка 2.3 была декоративной: `peerMatches` в
+   * `gossip-node.js` равен true при отсутствующем `--expect-peer`, то есть
+   * тест зеленел, ничего не сравнивая. Это хуже отсутствия проверки: она
+   * создаёт ложную уверенность. */
+  const expectedPublisherPeerId = peerIdFromPublicKey(publicKeyFromSeed(publisherSeed))
+
   /* ---------- 2. Подписчик ПЕРВЫМ: иначе публикация уйдёт в пустоту ---------- */
   const sub = runNode([
     '--role', 'subscriber',
     '--seed', subscriberSeed.toString('hex'),
     '--bootstrap', seedAddr,
+    /* Ждём ИМЕННО этого публикатора. Строгое сравнение на стороне
+     * подписчика — единственное место, где видно подмену отправителя. */
+    '--expect-peer', expectedPublisherPeerId,
     '--timeout', '45000',
   ], { label: 'subscriber' })
 
@@ -178,6 +194,12 @@ async function main() {
    * действительно родился тем же ключом, которым подписывает. */
   ok('1.3 два процесса — разные peerId', !!publisherPeerId && !!ready && publisherPeerId !== ready.peerId,
     { pub: publisherPeerId, sub: ready && ready.peerId })
+  /* Сверка предсказания с фактом: если бы peerId не выводился из seed,
+   * `--expect-peer` указывал бы в пустоту и проверка 2.3 падала бы не по
+   * своей причине. Здесь это видно отдельно. */
+  ok('1.4 peerId публикатора предсказан из seed',
+    !!publisherPeerId && publisherPeerId === expectedPublisherPeerId,
+    { predicted: expectedPublisherPeerId, actual: publisherPeerId })
 
   /* ---------- 4. Приём ---------- */
   /* Ищем ИМЕННО финальный итог, а не кадр READY: у того тоже `ok: true`,

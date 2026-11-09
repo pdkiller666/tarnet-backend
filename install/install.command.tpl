@@ -247,6 +247,53 @@ else
   say "      ПРЕДУПРЕЖДЕНИЕ: архив p2p не скачался — p2p пропущен"
 fi
 
+# ---------- 4c. capabilities для Discovery (2.26.0) ----------
+# ЗАЧЕМ УСТАНОВЩИК ЗНАЕТ CAPABILITIES.
+#
+# `workerCapabilities()` читает P2P_MODEL_FAMILIES / P2P_RUNTIMES /
+# P2P_DEVICE_CLASS, а `announce()` при пустом списке ВЫХОДИТ ДО `provide()`.
+# До этой правки установщик эти переменные не задавал вообще: у человека
+# всё поднималось, воркер работал по WS, а Discovery молчал — то есть
+# «работает» было правдой для задач и ложью для сети.
+#
+# ПОЧЕМУ ОПРЕДЕЛЯЕМ ЗДЕСЬ, А НЕ В ЛАУНЧЕРЕ. Лаунчер запускается каждый
+# раз, а модель и железо меняются редко; лишний вызов `nvidia-smi` при
+# каждом старте — плата без пользы. Значение вшивается в start.sh и может
+# быть переопределено вручную (переменная только если пуста).
+
+# Семейство без тега: qwen2.5-coder:7b -> qwen2.5-coder.
+# Тег — это размер конкретной сборки, а не возможность узла: клиент ищет
+# «кто умеет qwen2.5-coder», и воркер с :7b обязан найтись по этому запросу.
+P2P_MODEL_FAMILY="${MODEL%%:*}"
+P2P_MODEL_FAMILY="$(printf '%s' "$P2P_MODEL_FAMILY" | tr -d '[:space:]')"
+
+# Если модель так и не встала (Ollama недоступна), объявлять её нельзя:
+# воркер заявил бы в DHT возможность, которой нет, и клиент пришёл бы с
+# задачей, которую некому выполнить. Пустая строка честнее выдумки.
+if [ "$SKIP_MODEL" = "1" ] 2>/dev/null; then
+  P2P_MODEL_FAMILY=""
+fi
+if ! command -v ollama >/dev/null 2>&1 && [ ! -x "${OLLAMA_BIN:-}" ]; then
+  P2P_MODEL_FAMILY=""
+fi
+
+# GPU: nvidia-smi есть и отвечает — gpu, иначе cpu.
+# Не `ls /dev/nvidia*`: файла может не быть при рабочем драйвере и наоборот.
+P2P_DEVICE="cpu"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  if nvidia-smi -L >/dev/null 2>&1; then P2P_DEVICE="gpu"; fi
+fi
+
+# Рантайм у нас один — ollama. Список, а не строка: формат env — через запятую.
+P2P_RUNTIME="ollama"
+
+if [ -n "$P2P_MODEL_FAMILY" ]; then
+  say "      Discovery: модели=$P2P_MODEL_FAMILY устройство=$P2P_DEVICE"
+else
+  say "      Discovery: capabilities не определены — воркер не объявится в DHT"
+  say "      Починить: переустановить с рабочей Ollama или задать P2P_MODEL_FAMILIES вручную"
+fi
+
 # Лаунчер на будущее: после перезагрузки не надо проходить установку заново.
 cat > "$TARNET_DIR/start.sh" <<LAUNCHER
 #!/bin/bash
@@ -261,6 +308,11 @@ if [ -n "$ADDR" ]; then
 fi
 export TARNET_API_URL="$API"
 export TARNET_MODEL="$MODEL"
+# Capabilities для Discovery. Значения вшиты установщиком (2.26.0);
+# `${VAR:-...}` — чтобы ручная правка start.sh побеждала, а не затиралась.
+export P2P_MODEL_FAMILIES="\${P2P_MODEL_FAMILIES:-$P2P_MODEL_FAMILY}"
+export P2P_DEVICE_CLASS="\${P2P_DEVICE_CLASS:-$P2P_DEVICE}"
+export P2P_RUNTIMES="\${P2P_RUNTIMES:-$P2P_RUNTIME}"
 # --p2p только когда транспорт действительно установлен: флаг без p2p-node
 # оставляет рабочий WS-воркер плюс строку предупреждения в каждом логе
 # запуска, то есть шум вместо пользы.

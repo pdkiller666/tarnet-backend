@@ -34,7 +34,7 @@ import { generateKeyPairFromSeed } from '@libp2p/crypto/keys'
 import { multiaddr } from '@multiformats/multiaddr'
 import { serveTaskStream, encodeLine, TASK_PROTOCOL } from './task-protocol.js'
 import { buildHello, waitForWorkerIdentity } from './peer-hello.js'
-import { provideCids, DEFAULT_NETWORK_ID, buildRecord, publicKeyFromSeed, nextSequence, RECORD_PROTOCOL } from './worker-record.js'
+import { provideCids, DEFAULT_NETWORK_ID, buildRecord, publicKeyFromSeed, nextSequence, RECORD_PROTOCOL, ANNOUNCE_MS, RECORD_TTL_MS } from './worker-record.js'
 import { gossipOptions, attachGossip } from './gossip-announce.js'
 import { gossipsub } from '@libp2p/gossipsub'
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2'
@@ -495,6 +495,19 @@ async function main() {
   let gossip = null
   /* Последняя подписанная запись — её отдаём по RECORD_PROTOCOL. */
   let currentRecord = null
+  /* Когда запись реально ушла в сеть.
+   *
+   * ЗАЧЕМ НЕ СЧИТАТЬ ПО ТАЙМЕРУ. `announce()` может не дойти до публикации
+   * (пустые capabilities, нет ключа, ошибка provide). Если отмечать время
+   * по расписанию, а не по факту, цикл будет считать «объявлено» и молча
+   * пропускать повторы — ровно тот отказ, ради которого этот блок и делается.
+   * Поэтому метка ставится в единственном месте — после успешного publish. */
+  let lastAnnounceAt = 0
+  /* Защита от наложения: announce() асинхронный (provide + подпись +
+   * gossip), а таймер тикает каждые 15 с. Без флага медленный цикл
+   * запускал бы второй поверх первого, и sequence рос бы быстрее, чем
+   * записи уходят в сеть. */
+  let announcing = false
 
   /* Отдача записи. Регистрируется сразу после старта: клиент, нашедший
    * нас в DHT, должен получить ответ с первой же попытки, а не после
@@ -570,6 +583,8 @@ async function main() {
       currentRecord = { record, signature }
       if (!gossip) gossip = await attachGossip(node, { networkId: NETWORK_ID, log })
       await gossip.publish(record, signature)
+      /* Метка — ТОЛЬКО здесь: ниже этой строки запись действительно в сети. */
+      lastAnnounceAt = Date.now()
       log(`запись объявлена: seq ${record.sequence}, до ${new Date(record.expiresAt).toISOString()}`)
     } catch (e) {
       log(`запись не объявлена: ${e.message}`)
@@ -682,11 +697,40 @@ async function main() {
         log('поток задач отсутствует — открываю заново')
         await openTaskStream(node, lastBridgeMa)
       }
+
+      /* ПОВТОРНОЕ ОБЪЯВЛЕНИЕ — то, без чего discovery не работает для
+       * пользователя. До этого здесь был только `return`: запись жила
+       * RECORD_TTL_MS (90 с) и тихо истекала, а узел продолжал логировать
+       * «жив». Снаружи такой воркер неотличим от выключенного: в DHT он
+       * есть, но `findProviders` по свежему бакету его уже не находит.
+       *
+       * Условие по ВРЕМЕНИ ПОСЛЕДНЕЙ ПУБЛИКАЦИИ, а не по счётчику тиков:
+       * `announce()` может не дойти до `provide()` (пустые capabilities, нет
+       * ключа), и тогда тик не должен считаться объявлением. */
+      const due = Date.now() - lastAnnounceAt >= ANNOUNCE_MS
+      if (due && !announcing) {
+        announcing = true
+        try {
+          await announce()
+        } catch (e) {
+          log(`пере-объявление не удалось: ${e.message}`)
+        } finally {
+          announcing = false
+        }
+      } else if (!due && currentRecord) {
+        /* Не молчим о сроке: если запись вот-вот истечёт, а пере-объявление
+         * не пройдёт, это должно быть видно в логе ДО того, как клиент
+         * получит «провайдеров нет». */
+        const leftMs = currentRecord.record.expiresAt - Date.now()
+        if (leftMs > 0 && leftMs < ANNOUNCE_MS) {
+          log(`запись истекает через ${Math.round(leftMs / 1000)} с`)
+        }
+      }
       return
     }
     log('соединений нет — переподключаюсь')
     await connectOnce()
-  }, RETRY_MS)
+  }, Math.min(RETRY_MS, ANNOUNCE_MS))
 }
 
 main().catch((e) => {

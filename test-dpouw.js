@@ -70,8 +70,14 @@ function freePort() {
  * сам с собой. Формат `enc:v1:iv:tag:ct` фиксирован отдельно.
  *
  * Возвращает null, если файл ключа или поле не в ожидаемом формате. */
-function decryptJsonlField(secretsDir, blob) {
-  if (typeof blob !== 'string' || !blob.startsWith('enc:v1:')) return null;
+function decryptJsonlField(secretsDir, blob, aad = null) {
+  /* Два формата живут одновременно (2.26.0): старые файлы — `enc:v1:` без
+   * AAD, новые — `enc:v2:` с AAD (promptHash:field). Поддержка только v1
+   * сделала бы тест слепым к новой защите, а только v2 — сломала бы
+   * чтение уже существующих датасетов. */
+  const isV2 = typeof blob === 'string' && blob.startsWith('enc:v2:');
+  const isV1 = typeof blob === 'string' && blob.startsWith('enc:v1:');
+  if (!isV1 && !isV2) return null;
   const parts = blob.split(':');
   if (parts.length !== 5) return null;
   let key;
@@ -82,6 +88,12 @@ function decryptJsonlField(secretsDir, blob) {
   }
   try {
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(parts[2], 'base64'));
+    /* AAD обязателен для v2: без него тег не сойдётся, и это ПРАВИЛЬНЫЙ
+     * отказ — именно так ловится перестановка полей. */
+    if (isV2) {
+      if (!aad) return null;
+      decipher.setAAD(Buffer.from(String(aad), 'utf8'));
+    }
     decipher.setAuthTag(Buffer.from(parts[3], 'base64'));
     return Buffer.concat([decipher.update(Buffer.from(parts[4], 'base64')), decipher.final()]).toString('utf8');
   } catch (_e) {
@@ -3657,23 +3669,31 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     const w7Lines = fs.readFileSync(w7JsonlPath, 'utf8').trim().split('\n');
     ok('24.9 в JSONL ровно 3 строки', w7Lines.length === 3, w7Lines.length);
     const w7First = JSON.parse(w7Lines[0]);
-    /* С 2.25.2 поля prompt/response в файле зашифрованы. Проверка поэтому
-     * двухчастная: в файле именно шифротекст (`enc:v1:`), и он
-     * расшифровывается настоящим master.key стенда в тот текст, что
-     * записали. Одно без другого не годится: «строка начинается с enc:v1»
-     * прошло бы и на мусоре, а расшифровка без проверки префикса не отличила
-     * бы шифрование от случайного совпадения. */
+    /* С 2.26.0 поля prompt/response в файле зашифрованы С AAD и имеют
+     * формат `enc:v2:` (старые файлы — `enc:v1:` без AAD). Проверка
+     * двухчастная: в файле именно шифротекст, И он расшифровывается
+     * настоящим master.key стенда — но только с ТЕМ ЖЕ AAD
+     * (`promptHash:field`). Без AAD расшифровка ОБЯЗАНА провалиться: именно
+     * это и доказывает, что поля нельзя переставить местами. */
     ok('24.9 prompt/response в JSONL зашифрованы, не открытым текстом',
-      typeof w7First.prompt === 'string' && w7First.prompt.startsWith('enc:v1:')
-        && typeof w7First.response === 'string' && w7First.response.startsWith('enc:v1:'),
+      typeof w7First.prompt === 'string' && /^enc:v[12]:/.test(w7First.prompt)
+        && typeof w7First.response === 'string' && /^enc:v[12]:/.test(w7First.response),
       { prompt: String(w7First.prompt).slice(0, 24) });
     const w7Secrets = path.join(tmpDir, 'secrets');
-    const w7Prompt = decryptJsonlField(w7Secrets, w7First.prompt);
-    const w7Response = decryptJsonlField(w7Secrets, w7First.response);
+    const w7Prompt = decryptJsonlField(w7Secrets, w7First.prompt, `${w7First.promptHash}:prompt`);
+    const w7Response = decryptJsonlField(w7Secrets, w7First.response, `${w7First.promptHash}:response`);
     ok('24.9 шифротекст расшифровывается обратно в записанный текст',
       /^задача номер [0-2] про сортировку$/.test(w7Prompt || '')
         && /^решение [0-2]$/.test(w7Response || ''),
       { prompt: w7Prompt, response: w7Response });
+    /* AAD ДОЛЖЕН БЫТЬ ОБЯЗАТЕЛЬНЫМ. Если бы шифрование осталось без него,
+     * эта проверка прошла бы и ничего не доказала: подмена `prompt` на
+     * `response` в файле осталась бы незамеченной. */
+    if (String(w7First.prompt).startsWith('enc:v2:')) {
+      ok('24.9 без AAD (чужое поле) расшифровка отклоняется',
+        decryptJsonlField(w7Secrets, w7First.prompt, `${w7First.promptHash}:response`) === null,
+        { aadUsed: 'promptHash:response для поля prompt' });
+    }
     ok('24.9 служебные поля остались открытыми (rating/домен нужны тренеру)',
       (w7First.rating === 1 || w7First.rating === -1) && w7First.domain === 'w7code'
         && w7First.encrypted === true,
@@ -10925,13 +10945,20 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
           ? JSON.parse(fs.readFileSync(jsonlPath62, 'utf8').trim().split('\n')[0]) : null;
         /* Перешифровка БД не должна ни испортить данные, ни оставить их
          * открытыми на диске: проверяются обе стороны одним ходом. */
+        /* 2.26.0: формат может быть любой из двух — v1 (без AAD) или v2
+         * (с AAD). Требовать только v1 — значит запретить новую защиту;
+         * требовать только v2 — сломать чтение старых датасетов. */
         ok('62.9 в JSONL шифротекст, а не открытый текст',
-          String(line62?.prompt || '').startsWith('enc:v1:')
-          && String(line62?.response || '').startsWith('enc:v1:'),
+          /^enc:v[12]:/.test(String(line62?.prompt || ''))
+          && /^enc:v[12]:/.test(String(line62?.response || '')),
           { p: String(line62?.prompt || '').slice(0, 20) });
+        /* AAD для v2 обязателен: без него расшифровка вернёт null, и это
+         * не изъян теста, а доказательство что поля нельзя переставить. */
         ok('62.9 шифротекст JSONL расшифровывается в исходные prompt/response',
-          decryptJsonlField(path.join(s62dir, 'secrets'), line62?.prompt) === plainPrompt
-          && decryptJsonlField(path.join(s62dir, 'secrets'), line62?.response) === plainResponse,
+          decryptJsonlField(path.join(s62dir, 'secrets'), line62?.prompt,
+            `${line62?.promptHash}:prompt`) === plainPrompt
+          && decryptJsonlField(path.join(s62dir, 'secrets'), line62?.response,
+            `${line62?.promptHash}:response`) === plainResponse,
           line62);
       } finally {
         s62b.stop();

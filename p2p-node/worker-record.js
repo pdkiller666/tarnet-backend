@@ -286,6 +286,60 @@ export function verifyRecord(record, signature, { now = Date.now(), networkId = 
     if (record.issuedAt > now + RECORD_TTL_MS) return { ok: false, error: 'ISSUED_IN_FUTURE' }
     if (typeof signature !== 'string' || !signature) return { ok: false, error: 'NO_SIGNATURE' }
 
+    /* ---------- ужесточение контракта ----------
+     *
+     * ВСЁ НИЖЕ — ПРО ЧУЖОЙ ВВОД. Запись приходит из сети, и до этой правки
+     * проверялись только схема, сеть, TTL и подпись. Подписант мог прислать
+     * sequence: -1, expiresAt через год или workerAddress: "мусор", и запись
+     * проходила: подпись-то настоящая. Подпись подтверждает АВТОРА, а не
+     * осмысленность полей — это разные вопросы, и путать их нельзя. */
+
+    /* sequence — монотонный целый в прямом смысле. Проверка типа "не число"
+     * пропускает 1.5 и NaN-подобные значения: первое ломает сравнение
+     * порядка, второе — арифметику. */
+    if (!Number.isSafeInteger(record.sequence) || record.sequence <= 0) {
+      return { ok: false, error: 'BAD_SEQUENCE' }
+    }
+
+    /* Максимальный TTL. RECORD_TTL_MS — то, что объявляем мы; принимаем не
+     * меньше, но не бесконечно: запись «на год» обошла бы пере-объявление
+     * и осталась бы в сети мёртвой. Допуск 2× — потому что у чужого
+     * воркера может быть свой WORKER_RECORD_TTL_MS. */
+    const maxTtlMs = RECORD_TTL_MS * 2
+    if (record.expiresAt - record.issuedAt > maxTtlMs) {
+      return { ok: false, error: 'TTL_TOO_LONG' }
+    }
+
+    /* canonical base64. Buffer прощает отступы, переносы строк и лишние
+     * символы, поэтому "AA==" и "AA==\n" декодируются одинаково, но
+     * строки разные. Проверка ловит перекодировку: подпись осталась бы
+     * валидной, а сравнение строк — нет. */
+    if (Buffer.from(signature, 'base64').toString('base64') !== signature) {
+      return { ok: false, error: 'NONCANONICAL_SIG' }
+    }
+
+    /* Адрес выплат — 0x + 40 hex. Без проверки произвольная строка
+     * доходила до эмиссии как "адрес". */
+    if (!/^0x[a-f0-9]{40}$/.test(String(record.workerAddress || ''))) {
+      return { ok: false, error: 'BAD_WORKER_ADDRESS' }
+    }
+
+    /* capabilities — непустой массив непустых строк. Пустой массив — не
+     * ошибка формата, но такой провайдер бесполезен: по нему нечего искать. */
+    const caps = record.capabilities || {}
+    if (!Array.isArray(caps.modelFamilies) || caps.modelFamilies.length === 0) {
+      return { ok: false, error: 'NO_MODEL_FAMILIES' }
+    }
+    if (!caps.modelFamilies.every((m) => typeof m === 'string' && m.trim())) {
+      return { ok: false, error: 'BAD_MODEL_FAMILY' }
+    }
+    if (caps.deviceClass !== undefined && !Array.isArray(caps.deviceClass)) {
+      return { ok: false, error: 'BAD_DEVICE_CLASS' }
+    }
+    if (caps.runtimes !== undefined && !Array.isArray(caps.runtimes)) {
+      return { ok: false, error: 'BAD_RUNTIMES' }
+    }
+
     const rawPub = Buffer.from(String(record.workerAuthKey || ''), 'base64')
     if (rawPub.length !== 32) return { ok: false, error: 'BAD_AUTH_KEY' }
 

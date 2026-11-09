@@ -40,6 +40,7 @@ const P2P_DIR = path.join(__dirname, 'p2p-node');
  * здесь, а не отказом `ERR_MODULE_NOT_FOUND` на машине пользователя. */
 const BUNDLED_FILES = [
   'bridge.js',
+  'discovery-client.js',
   'gossip-announce.js',
   'index.js',
   'p2p-worker.js',

@@ -407,18 +407,45 @@ class KnowledgeLoopCoordinator {
      *
      * Построчно, а не файлом целиком: mock_train.py считает непустые строки
      * как число примеров, и шифрование всего файла вернуло бы count = 1. */
-    const encField = (v) => (v === null || v === undefined ? null : this.encryptText(v));
+    /* AAD привязывает шифротекст к СТРОКЕ и ПОЛЮ (2.26.0, Блок 7.3).
+     * Без этого тег подтверждал только «байты не менялись», и `prompt`
+     * можно было переставить в `response` или в чужую строку — датасет
+     * обучился бы на перепутанных парах без единой ошибки.
+     *
+     * promptHash передаётся АРГУМЕНТОМ, а не читается из `r`. В первой
+     * версии здесь стоял `r.promptHash`, а `r` живёт только внутри
+     * `.map((r) => ...)` ниже — снаружи его нет. Функция падала на каждом
+     * вызове с `r is not defined`, и валился весь датасет, а не одна
+     * строка. */
+    const encField = (v, field, promptHash) => (v === null || v === undefined
+      ? null
+      : this.encryptText(v, { aad: `${promptHash}:${field}` }));
     const jsonlPath = path.join(this.outputDir, `distill-${safeDomain}-${Date.now()}.jsonl`);
     const jsonl = decryptedPairs.map((r) => JSON.stringify({
       promptHash: r.promptHash,
-      prompt: encField(r.promptText),
-      response: encField(r.response),
+      prompt: encField(r.promptText, 'prompt', r.promptHash),
+      response: encField(r.response, 'response', r.promptHash),
       rating: r.rating,
       modelId: r.modelId,
       domain: r.domain,
       encrypted: true,
     })).join('\n') + '\n';
-    fs.writeFileSync(jsonlPath, jsonl, { encoding: 'utf8', mode: 0o600 });
+
+    /* Атомарная запись (2.26.0, Блок 7.2).
+     *
+     * ПОЧЕМУ НЕ ПРОСТО writeFileSync. Процесс может умереть на середине
+     * (OOM, SIGTERM при деплое, кончилось место) — и тогда на диске
+     * останется ФАЙЛ С ОБРЕЗАННОЙ ПОСЛЕДНЕЙ СТРОКОЙ. Для тренера это
+     * валидный JSONL: он считает непустые строки и молча обучается на
+     * неполном примере. Ошибки нет нигде, результат тихо другой.
+     *
+     * Временный файл лежит В ТОМ ЖЕ каталоге, а не в /tmp: rename через
+     * границу файловых систем — это копирование, то есть не атомарно.
+     * Расширение .tmp и режим 0o600 с самого начала: файл с открытым
+     * текстом не должен ни секунды лежать читаемым для всех. */
+    const tmpPath = `${jsonlPath}.tmp`;
+    fs.writeFileSync(tmpPath, jsonl, { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmpPath, jsonlPath);
 
     let trainResult;
     try {

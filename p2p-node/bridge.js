@@ -40,7 +40,8 @@ import { loadOrCreatePeerId, keyFilePath } from './peer-id-store.js'
 import { resolvePublicAddrs, listenMismatch } from './public-addr.js'
 import { createTaskClient, TASK_PROTOCOL, encodeLine } from './task-protocol.js'
 import { loadAllowlist, verifyHello, allowlistPath } from './peer-auth.js'
-import { RECORD_PROTOCOL } from './worker-record.js'
+import { RECORD_PROTOCOL, verifyRecord } from './worker-record.js'
+import { createDiscovery } from './discovery-client.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
@@ -119,6 +120,17 @@ const announced = new Map() // nodeId -> { peerId, at }
  * Map сама не исчезает, и без проверки мост отдавал бы мёртвые узлы.
  */
 const workerRecords = new Map()
+
+/* Anti-rollback: последний принятый sequence по каждому peerId.
+ *
+ * ЗАЧЕМ ОТДЕЛЬНО ОТ workerRecords. Карта записей хранит то, что покажем
+ * клиенту, и запись может истечь и быть забыта. Но отбрасывать старые
+ * sequence нужно и после истечения: иначе перехваченный старый кадр
+ * можно проиграть заново и мост снова его примет — а вместе с ним и
+ * старый адрес выплат. Состояние живёт в памяти процесса; перезапуск
+ * моста его сбрасывает, и это осознанно: долговременный anti-rollback
+ * требует общего хранилища, которого у двух seed нет. */
+const lastSequence = new Map()
 const startedAt = Date.now()
 
 /* Каналы задач от воркеров.
@@ -312,13 +324,65 @@ async function startLibp2p() {
        * к несуществующему полю дало бы `undefined` — то есть «записи нет»
        * для КАЖДОГО запроса, без ошибки в логе. */
       const from = connection?.remotePeer?.toString()
-      const entry = from ? workerRecords.get(from) : null
+
+      /* ---------- Блок 4: запись по ЦЕЛЕВОМУ peerId ----------
+       *
+       * ЧТО БЫЛО СЛОМАНО. Обработчик брал `workerRecords.get(from)` —
+       * запись ТОГО, КТО СПРОСИЛ. То есть клиент, нашедший в DHT воркера X
+       * и спросивший мост про X, получал запись самого себя (или ничего).
+       * На loopback это не видно: там спрашивающий и есть воркер. В
+       * реальном сценарии «клиент ≠ воркер» discovery обрывался на шаге
+       * «куда платить», хотя провайдер-запись находилась.
+       *
+       * ЧИТАЕМ ЗАПРОС. Кадр — тот же формат, что у задач: один JSON +
+       * перевод строки. Ждём ограниченно: клиент, открывший поток и молчащий,
+       * не должен держать обработчик вечно. */
+      let request = null
+      try {
+        const readOnce = async () => {
+          let buf = ''
+          for await (const chunk of stream) {
+            buf += Buffer.from(chunk.subarray ? chunk.subarray() : chunk).toString('utf8')
+            const nl = buf.indexOf('\n')
+            if (nl >= 0) {
+              const line = buf.slice(0, nl).trim()
+              return line ? JSON.parse(line) : null
+            }
+          }
+          return null
+        }
+        request = await Promise.race([
+          readOnce(),
+          new Promise((resolve) => setTimeout(() => resolve(null), 3000).unref?.()),
+        ])
+      } catch (_e) {
+        request = null
+      }
+
+      /* Целевой peerId. Пустой запрос — это КЛИЕНТ СТАРОЙ ВЕРСИИ: он просто
+       * открыл поток, не прислав кадр. Для него сохраняем прежнее поведение
+       * (отдать запись самого соединения), иначе обновлённый мост сломал бы
+       * уже установленные воркеры — то есть починил бы новое, сломав старое. */
+      const targetPeerId = request && request.targetPeerId
+        ? String(request.targetPeerId)
+        : from
+
+      const entry = targetPeerId ? workerRecords.get(targetPeerId) : null
       const rec = entry && entry.record && entry.record.expiresAt > Date.now()
         ? entry.record
         : null
+
+      /* Почему NOT_FOUND, а не молчание: молчащий поток клиент видит как
+       * таймаут и не отличает «мост не знает такого воркера» от «мост умер».
+       * Разные причины — разные действия. */
       const body = rec
         ? { ok: true, record: rec, signature: entry.signature, payload: entry.payload }
-        : { ok: false, error: 'NO_RECORD' }
+        : {
+          ok: false,
+          error: 'NOT_FOUND',
+          targetPeerId: targetPeerId || null,
+          knownRecords: workerRecords.size,
+        }
       if (!stream.send(encodeLine(body))) {
         await new Promise((resolve) => {
           stream.once('drain', resolve)
@@ -344,7 +408,42 @@ async function startLibp2p() {
       networkId: NETWORK_ID,
       log: (m) => console.log(`[bridge] ${m}`),
       onRecord: (record, signature, payload) => {
-        workerRecords.set(record.peerId, { record, signature, payload, at: Date.now() })
+        /* ---------- Anti-rollback (Блок 5.2) ----------
+         *
+         * ЗАЧЕМ. Валидатор проверяет подпись и TTL, но не ПОРЯДОК. Без
+         * проверки sequence перехваченный старый кадр можно проиграть
+         * заново, пока он ещё не истёк, — и мост примет его поверх
+         * свежего. Для клиента это означает откат на прежний адрес выплат.
+         *
+         * ПОЧЕМУ `<=`, А НЕ `<`. Равный sequence — это тот же кадр,
+         * доставленный дважды (gossipsub не гарантирует единственность),
+         * либо переигровка. Оба случая надо отбросить: первого мы уже
+         * приняли, а второй — и есть атака. Переиздание всегда даёт
+         * строго больший sequence (nextSequence пишет на диск).
+         *
+         * Сначала проверка по lastSequence, затем по карте: карта может
+         * быть очищена от истёкшей записи, а номер отката — нет. */
+        const pid = String(record.peerId || '')
+        if (!pid) {
+          console.log('[bridge] запись без peerId отброшена')
+          return
+        }
+        const prevSeq = lastSequence.get(pid)
+        if (prevSeq !== undefined && Number(record.sequence) <= prevSeq) {
+          console.log(`[bridge] откат sequence отброшен: ${pid.slice(0, 12)}… seq ${record.sequence} <= ${prevSeq}`)
+          return
+        }
+        /* Перепроверяем на приёме, хотя валидатор уже прогнал verifyRecord:
+         * onRecord вызывается и из пути, где валидатор мог быть не подключён
+         * (gossipsub упал — мост продолжает работать). Один лишний вызов
+         * дешевле, чем приём непроверенной записи. */
+        const verdict = verifyRecord(record, signature, { networkId: NETWORK_ID })
+        if (!verdict.ok) {
+          console.log(`[bridge] запись отклонена: ${verdict.error}`)
+          return
+        }
+        lastSequence.set(pid, Number(record.sequence))
+        workerRecords.set(pid, { record, signature, payload, at: Date.now() })
       },
     })
   } catch (e) {
@@ -550,6 +649,32 @@ const handlers = {
       seed_peers: seedPeers,
       seeds_total: seedPeers.length,
       seeds_linked: seedPeers.filter((s) => s.ok).length,
+      /* Записи воркеров, принятые по gossipsub (2.26.0).
+       *
+       * ЗАЧЕМ НАРУЖУ. Без этого поля «capabilities настроены?» проверялось
+       * только чтением env на чужой машине, куда у сервера нет доступа.
+       * Здесь — факт: сколько живых записей мост реально получил и у скольких
+       * из них непустые modelFamilies. Именно это отличает «объявился» от
+       * «установлен и молчит».
+       *
+       * Срок проверяется при подсчёте, а не при записи: карта не чистится
+       * сама, и без фильтра счётчик показывал бы мёртвые узлы живыми. */
+      worker_records: (() => {
+        const now = Date.now()
+        const live = [...workerRecords.values()]
+          .filter((e) => e.record && e.record.expiresAt > now)
+        const withCaps = live.filter((e) => Array.isArray(e.record.capabilities?.modelFamilies)
+          && e.record.capabilities.modelFamilies.length > 0)
+        const families = new Set()
+        for (const e of withCaps) {
+          for (const f of e.record.capabilities.modelFamilies) families.add(String(f))
+        }
+        return {
+          live: live.length,
+          with_capabilities: withCaps.length,
+          model_families: [...families].sort(),
+        }
+      })(),
       announced_total: announced.size,
       uptime_s: Math.round((Date.now() - startedAt) / 1000),
       socket: SOCKET_PATH
@@ -683,6 +808,47 @@ const handlers = {
        * видна как факт, а не как догадка. */
       cancelled: sentTo,
       channels: taskClient.count()
+    }
+  },
+
+  /* ---------- Блок 3: поиск воркеров через DHT ----------
+   *
+   * ЗАЧЕМ ЧЕРЕЗ МОСТ. `findProviders` требует живого libp2p, а он есть
+   * только здесь: у backend-api нет ни узла, ни 105 МБ зависимостей.
+   * Команда по сокету — единственный способ дотянуться до DHT из HTTP.
+   *
+   * ВЫКЛЮЧЕННЫЙ УЗЕЛ — ЯВНЫЙ ОТКАЗ, А НЕ ПУСТОЙ СПИСОК. Пустой `workers`
+   * при `P2P_BRIDGE_LIBP2P=0` читался бы как «в сети никого нет» — то есть
+   * поломка настройки выдавала бы себя за отсутствие воркеров в сети. */
+  async discover(msg) {
+    if (!node) {
+      return { ok: false, action: 'discover', error: 'LIBP2P_OFF' }
+    }
+    const modelFamily = msg && msg.model ? String(msg.model).trim() : ''
+    const deviceClass = msg && msg.deviceClass
+      ? String(msg.deviceClass).trim()
+      : String(process.env.P2P_DEFAULT_DEVICE_CLASS || 'cpu')
+    if (!modelFamily) {
+      return { ok: false, action: 'discover', error: 'NO_MODEL' }
+    }
+    const started = Date.now()
+    try {
+      const res = await createDiscovery({ node, networkId: NETWORK_ID, log: (m) => console.log(`[bridge] ${m}`) })
+        .findWorkers({ modelFamily, deviceClass })
+      return {
+        ...res,
+        action: 'discover',
+        elapsed_ms: Date.now() - started,
+        /* Добавляем к тому, что нашли в DHT, записи, уже принятые по
+         * gossipsub. Это НЕ подмена: список помечен отдельно, и клиент
+         * видит, откуда каждый. На малой сети без этого новый клиент
+         * получал бы пусто, пока DHT не прогреется. */
+        cached: [...workerRecords.values()]
+          .filter((e) => e.record && e.record.expiresAt > Date.now())
+          .map((e) => ({ peerId: e.record.peerId, workerAddress: e.record.workerAddress })),
+      }
+    } catch (e) {
+      return { ok: false, action: 'discover', error: `DISCOVER_FAILED:${e.message}` }
     }
   }
 }

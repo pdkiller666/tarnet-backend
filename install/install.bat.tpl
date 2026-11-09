@@ -267,6 +267,40 @@ rem
 rem `--p2p` is added only when the transport really installed. Passing it
 rem with no p2p-node leaves a working WS worker plus a warning line, which
 rem is honest but makes every user's log start with an avoidable error.
+rem ---------- capabilities for Discovery (2.26.0) ----------
+rem
+rem WHY THE INSTALLER NEEDS THESE.
+rem `workerCapabilities()` reads P2P_MODEL_FAMILIES / P2P_RUNTIMES /
+rem P2P_DEVICE_CLASS, and `announce()` RETURNS EARLY, BEFORE `provide()`,
+rem when the list is empty. The installer never set them, so everything
+rem came up, the worker served tasks over WS, and Discovery was silent:
+rem "works" was true for tasks and false for the network.
+rem
+rem Model family WITHOUT the tag: qwen2.5-coder:7b -> qwen2.5-coder.
+rem The tag is the size of one build, not a node capability: a client asks
+rem "who can run qwen2.5-coder", and a :7b worker must match that query.
+set "P2P_MODEL_FAMILY="
+if not "%MODEL%"=="" for /f "tokens=1 delims=:" %%m in ("%MODEL%") do set "P2P_MODEL_FAMILY=%%m"
+
+rem Declaring a model that failed to install would put a capability in the
+rem DHT that nobody can serve: a client arrives with a task and nothing
+rem runs it. An empty value is more honest than a guess.
+if "%SKIP_MODEL%"=="1" set "P2P_MODEL_FAMILY="
+if not defined OLLAMA_EXE set "P2P_MODEL_FAMILY="
+
+rem GPU only when the driver actually answers. A bare `where nvidia-smi`
+rem finds the binary on machines where the card is not usable.
+set "P2P_DEVICE=cpu"
+if defined P2P_MODEL_FAMILY nvidia-smi -L >nul 2>nul && set "P2P_DEVICE=gpu"
+set "P2P_RUNTIME=ollama"
+
+if defined P2P_MODEL_FAMILY (
+  echo       Discovery: model=%P2P_MODEL_FAMILY% device=%P2P_DEVICE%
+) else (
+  echo       Discovery: capabilities unknown - worker will NOT announce in DHT
+  echo       Fix: reinstall with a working Ollama, or set P2P_MODEL_FAMILIES by hand
+)
+
 (
   echo @echo off
   echo title TarNet Worker
@@ -280,6 +314,12 @@ rem is honest but makes every user's log start with an avoidable error.
   echo set "WORKER_ADDRESS=%ADDR%"
   echo set "TARNET_API_URL=%API%"
   echo set "TARNET_MODEL=%MODEL%"
+  rem Capabilities. `if not defined` keeps a manual edit of start.cmd
+  rem authoritative: regenerating on reinstall must not silently revert a
+  rem value the owner set because his hardware differs from the defaults.
+  echo if not defined P2P_MODEL_FAMILIES set "P2P_MODEL_FAMILIES=%P2P_MODEL_FAMILY%"
+  echo if not defined P2P_DEVICE_CLASS set "P2P_DEVICE_CLASS=%P2P_DEVICE%"
+  echo if not defined P2P_RUNTIMES set "P2P_RUNTIMES=%P2P_RUNTIME%"
   if "%P2P_OK%"=="1" echo "%NODE_EXE%" "%WORKER_JS%" --p2p
   if not "%P2P_OK%"=="1" echo "%NODE_EXE%" "%WORKER_JS%"
   echo pause

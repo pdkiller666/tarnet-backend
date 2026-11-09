@@ -99,6 +99,33 @@ verify_tests() {
   run_suite "dpouw" "${TARNET_TEST_TIMEOUT_DPOUW:-900}" "node test-dpouw.js --test" dpouw
   run_suite "mesh" "${TARNET_TEST_TIMEOUT_MESH:-300}" "node test-mesh.js" mesh
   run_suite "treasury" "${TARNET_TEST_TIMEOUT_TREASURY:-300}" "node proof-treasury-gate.js" treasury
+
+  # p2p E2E (2.26.0, Блок 6.3) — ОБЯЗАТЕЛЬНЫЙ ГЕЙТ.
+  #
+  # ЗАЧЕМ В verify.sh, А НЕ ОТДЕЛЬНЫМ СКРИПТОМ.
+  # Скрипт, который запускают руками, рано или поздно перестают запускать.
+  # Именно это и случилось с discovery: тесты были зелёные, а в runtime
+  # `findProviders` не вызывался вообще — проверка существовала, но не
+  # стояла на пути релиза.
+  #
+  # ЭТИ НАБОРЫ ДОРОГИЕ (реальный libp2p, реальные порты, десятки секунд).
+  # Поэтому они идут ПОСЛЕ быстрых: если сломано очевидное, нет смысла
+  # ждать сетевые тесты, чтобы это узнать.
+  #
+  # ОТКАЗ ОДНОГО НЕ ГЛУШИТ ОСТАЛЬНЫЕ: run_suite пишет каждый в свой лог,
+  # и «discovery сломан, relay жив» остаётся различимой картиной.
+  run_suite "p2p-discovery" "${TARNET_TEST_TIMEOUT_P2P:-240}" \
+    "node p2p-node/test/test-discovery-e2e.js" p2pdiscovery
+  run_suite "p2p-gossip" "${TARNET_TEST_TIMEOUT_P2P:-240}" \
+    "node p2p-node/test/test-gossip-e2e.js" p2pgossip
+  run_suite "p2p-seed-failover" "${TARNET_TEST_TIMEOUT_P2P_SEED:-360}" \
+    "node p2p-node/test/test-seed-failover.js" p2pseed
+  # Relay — ОТДЕЛЬНЫЙ набор, а не часть discovery. Он проверяет другую
+  # вещь: дотянуться до узла за NAT через circuit-relay-v2. Если его не
+  # гонять на пути релиза, поломка relay выглядит как «discovery жив»,
+  # а в бою воркер за домашним роутером просто недостижим.
+  run_suite "p2p-relay" "${TARNET_TEST_TIMEOUT_P2P:-240}" \
+    "node p2p-node/test/test-relay-e2e.js" p2prelay
 }
 
 printf '\nTarNet verify — сверка VPS с GitHub\n'
