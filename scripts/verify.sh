@@ -78,13 +78,19 @@ run_suite() {
     no "тесты $label" "нет завершения за ${timeout}с — смотри $log"
     return
   fi
-  local rc summary
+  local rc summary passes
   rc=$(cat "$rcfile" 2>/dev/null)
   summary=$(grep -a 'Итого:' "$log" 2>/dev/null | tail -1 | sed 's/.*Итого: *//')
-  if [ "$rc" = "0" ] && [ -n "$summary" ]; then
+  # Ноль выполненных проверок — не «зелено», а поломка набора: строку «Итого»
+  # печатают и при нуле тестов, а exit-code при этом 0. Без этой проверки
+  # набор, который не запустил ни одного теста, давал зелёный вердикт.
+  passes=$(printf '%s' "$summary" | sed -n 's/^\([0-9]\{1,\}\).*/\1/p')
+  if [ "$rc" = "0" ] && [ -n "$summary" ] && [ "${passes:-0}" -gt 0 ]; then
     ok "тесты $label" "$summary"
   elif [ -z "$summary" ]; then
     no "тесты $label" "exit $rc, итоговой строки нет — набор не дошёл до конца ($log)"
+  elif [ "${passes:-0}" -eq 0 ]; then
+    no "тесты $label" "ноль выполненных проверок (exit $rc) — набор не запустил тесты ($log)"
   else
     no "тесты $label" "$summary (exit $rc)"
   fi
