@@ -241,6 +241,7 @@ SQLite, `/var/lib/tarnet` на проде. **45 таблиц** (проверен
 | `MANIFEST.v3.4-UNIFIED.md` | «что работает сейчас» | при каждой вехе, снимок в Приложении Б |
 | `PROJECT-HISTORY.md` | «как мы сюда пришли» | при каждой вехе |
 | `ROADMAP.md` | «что дальше и в каком порядке» | при смене приоритетов |
+| `MASTER-PLAN.md` | «где мы на пути от идеи до цели» — 14 этапов, статус каждого. Единственный документ, показывающий весь путь; остальные его дополняют, но не заменяют | при закрытии любого этапа — в том же коммите |
 | `docs/BACKLOG.md` | «что отложено и почему» | когда задачу откладывают |
 | `docs/REALITY-CHECK-v4.md` | «что обещали и что имеем» — Gap Analysis Манифест vs Код, срез `2.26.1`. Уровни доказательства A/B/C: Discovery готов к runtime, **уровень C (NAT) пуст** | при смене вехи; устаревает → заменяется v5, а не правится. `v3` — история среза `2.22.13` |
 | `docs/NAT-TEST.md` | **инструкция владельцу**: проверка воркера за домашним роутером. Установка (`worker.js` + `p2p-node.zip` + `npm ci`), `--test-p2p` против `--p2p`, строки `[p2p-worker]`, `check-autostart.js`, таблица «NAT не пробит / воркер не стартовал» | пока уровень C пуст — настольная инструкция; после прогона заменяется отчётом в `PROJECT-HISTORY` |
@@ -255,12 +256,13 @@ SQLite, `/var/lib/tarnet` на проде. **45 таблиц** (проверен
 
 ### 11.1. Раскладка папок (с 05.11.2026)
 
-В корне `backend-api/` — **только четыре канонических документа и `README.md`**.
-Всё остальное — в `docs/`. Перенос сделан 05.11.2026 (`git mv`, история сохранена).
+В корне `backend-api/` — **пять канонических документов и `README.md`**.
+Всё остальное — в `docs/`. Перенос сделан 05.11.2026 (`git mv`, история сохранена);
+`MASTER-PLAN.md` добавлен 09.11.2026 как пятый канонический.
 
 | Где | Что |
 | :--- | :--- |
-| корень `backend-api/` | `MANIFEST.v3.4-UNIFIED.md`, `PROJECT-HISTORY.md`, `PROJECT-MAP.md`, `ROADMAP.md`, `README.md` |
+| корень `backend-api/` | `MANIFEST.v3.4-UNIFIED.md`, `PROJECT-HISTORY.md`, `PROJECT-MAP.md`, `ROADMAP.md`, `MASTER-PLAN.md`, `README.md` |
 | `docs/` — отчёты и планы | `docs/BACKLOG.md`, `docs/PLAN-WAVE2.md`, `docs/PLAN-AGENT-RUNTIME.md`, `docs/LEGAL-DISTILLATION-PIPELINE.md`, `docs/V2.17.*-REPORT.md`, `docs/V2.17.13-REPORT.md`, `docs/REALITY-CHECK-v2.17.7.md`, `docs/REALITY-CHECK-v3.md` |
 | `docs/` — инвестору и демо | `docs/ONE-PAGER.md`, `docs/PITCH-DECK.md`, `docs/DEMO-SCRIPT.md`, `docs/DEMO-RUNBOOK.md`, `docs/EMAIL-TEMPLATE.md`, `docs/AUDIT-REALITY.md` |
 | `docs/` — контракты и решения | `docs/NETWORK-CONTRACT-v1.md`, `docs/BYOK-PRICING.md`, `docs/PII-DECISION.md`, `docs/VISION-8-COMPONENTS.md`, `docs/PROJECT-MEMORY.md` |
@@ -268,6 +270,10 @@ SQLite, `/var/lib/tarnet` на проде. **45 таблиц** (проверен
 **Корень workspace** (на уровень выше, вне git) держит **симлинки** на публичные документы.
 Копий намеренно нет: копии разъезжались молча (29.10 `EMAIL-TEMPLATE` в корне был 8080 б
 против 9207 в `docs/`). Проверяет `scripts/verify.sh` → шаг 3.8.
+
+Шаг 3.8 проверяет **11 симлинков**, а не 7, как было до 09.11.2026: `ROADMAP.md`,
+`PROJECT-MAP.md` и `PROJECT-MEMORY.md` симлинками были, но в список не входили —
+гейт показывал «7/7», хотя три документа могли молча стать копиями.
 
 **Ссылки внутри документов указывают путь от `backend-api/`**, то есть на перемещённое —
 через `docs/`: `docs/BACKLOG.md`, `docs/DEMO-RUNBOOK.md`. Голое имя теперь означает файл в корне.
@@ -301,7 +307,7 @@ Pages/Actions/webhooks/releases — не используются (провер�
 
 | Путь | Почему |
 | :--- | :--- |
-| `archive/python-app/crypto.py` | `sign_message()` на SHA-256 — хеш-заглушка, **не Ed25519**. Не использовать |
+| ~~`archive/python-app/crypto.py`~~ | ⚠️ **Файла не существует.** Каталога `archive/python-app/` в репозитории нет (в `archive/` только `lottery-tests/`), `find -name crypto.py` → 0. Историческая запись: `sign_message()` на SHA-256 — хеш-заглушка, не Ed25519. Текущие подписи — Ed25519 |
 | `archive/lottery-tests/` | Отозванная механика лотерей |
 | `node_modules/` | Не читать, не грепать при аудите |
 | `../archive/MANIFEST.md` (v3.1), `../archive/MANIFEST.v3.3.md` | Помечены «устарело», перенесены в `archive/` 2026-11-05. Побеждает v3.4-UNIFIED. В корне workspace остался только канон |
