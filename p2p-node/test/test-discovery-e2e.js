@@ -34,7 +34,7 @@ import { yamux } from '@libp2p/yamux'
 import { identify } from '@libp2p/identify'
 import { ping } from '@libp2p/ping'
 import { kadDHT, EventTypes, removePublicAddressesMapper } from '@libp2p/kad-dht'
-import { generateKeyPair } from '@libp2p/crypto/keys'
+import { generateKeyPairFromSeed } from '@libp2p/crypto/keys'
 import { multiaddr } from '@multiformats/multiaddr'
 import { CID } from 'multiformats/cid'
 import crypto from 'node:crypto'
@@ -44,9 +44,40 @@ import {
   verifyRecord,
   DEFAULT_NETWORK_ID,
   RECORD_SCHEMA,
+  peerIdFromPublicKey,
+  publicKeyFromSeed,
 } from '../worker-record.js'
 
 const VERBOSE = process.argv.includes('--verbose')
+
+/** `--expect-peer 12D3Koo...` — проверять ИМЕННО этот peerId.
+ *
+ * ЗАЧЕМ ФЛАГ. Без него проверка 4.2 сравнивала найденного провайдера с
+ * `worker.peerId`, который тест узнаёт ПОСЛЕ старта воркера. Это доказывает
+ * «что-то нашлось и это тот же узел», но не доказывает, что найденный узел
+ * — тот, кого мы ждали: если бы `findProviders` вернул постороннего
+ * провайдера, тест сравнил бы его с ним же и позеленел бы.
+ *
+ * С флагом ожидаемый peerId приходит СНАРУЖИ и известен ДО запуска
+ * воркера — сравнение становится проверкой, а не тавтологией. Тот же
+ * контракт, что у `gossip-node.js --expect-peer`. */
+const EXPECT_PEER = (() => {
+  const i = process.argv.indexOf('--expect-peer')
+  return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : null
+})()
+
+/** `--worker-seed <hex32>` — поднять воркера детерминированным ключом.
+ *
+ * ЗАЧЕМ. `--expect-peer` проверяет «нашли ИМЕННО того, кого ждали», но
+ * ждать можно только того, чей peerId известен ЗАРАНЕЕ. При случайном seed
+ * внутри теста внешний вызывающий не может знать peerId, и флаг выродился
+ * бы в самопроверку. Фиксированный seed делает пару
+ * «seed → peerId» предвычислимой снаружи — как в `test-gossip-e2e.js`,
+ * где seed публикатора создаётся до его запуска. */
+const WORKER_SEED_HEX = (() => {
+  const i = process.argv.indexOf('--worker-seed')
+  return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : null
+})()
 const PROTOCOL = '/tarnet/kad/1.0.0'
 const RECORD_PROTOCOL = '/tarnet/worker-record/1.0.0'
 const NETWORK_ID = DEFAULT_NETWORK_ID
@@ -148,8 +179,16 @@ async function main() {
      * свою пару, seed в записи окажется чужим, и `buildRecord` честно
      * откажет с PEER_ID_MISMATCH — ровно то, что и случилось в первом
      * прогоне. Личность узла и подпись обязаны быть одной парой. */
-    const workerKey = await generateKeyPair('Ed25519')
-    const seed = Buffer.from(workerKey.raw.subarray(0, 32))
+    /* Seed создаём ДО старта узла и выводим из него peerId. Это то, что
+     * делает `--expect-peer` проверкой: ожидание известно раньше факта. */
+    /* При `--worker-seed` ключ детерминирован: тогда peerId предвычислим
+     * снаружи, и `--expect-peer` становится настоящей сверкой. Без флага —
+     * случайный seed, как раньше: тест остаётся самодостаточным. */
+    const seed = WORKER_SEED_HEX
+      ? Buffer.from(WORKER_SEED_HEX, 'hex')
+      : crypto.randomBytes(32)
+    const predictedPeerId = peerIdFromPublicKey(publicKeyFromSeed(seed))
+    const workerKey = await generateKeyPairFromSeed('Ed25519', seed)
     const worker = await makeNode('worker', { server: false, privateKey: workerKey })
     nodes.push(worker)
     await worker.dial(s1.getMultiaddrs()[0])
@@ -164,6 +203,12 @@ async function main() {
     /* peerId берём у узла: он выведен из того же ключа, которым будем
      * подписывать запись. */
     const peerId = worker.peerId.toString()
+    /* Сверка предсказания с фактом. Если бы peerId не выводился из seed,
+     * `--expect-peer` указывал бы в пустоту, и проверка 4.2 падала бы не
+     * по своей причине — здесь это видно отдельной строкой. */
+    ok('2.1 peerId воркера предсказан из seed до старта',
+      peerId === predictedPeerId,
+      { predicted: predictedPeerId, actual: peerId })
     const caps = { modelFamilies: ['llama'], runtimes: ['ollama'], deviceClass: ['desktop'] }
     const { cid, key } = bucketCid({ networkId: NETWORK_ID, modelFamily: 'llama', deviceClass: 'desktop' })
 
@@ -218,6 +263,16 @@ async function main() {
     ok('4.1 findProviders вернул события', events.length > 0, { events: events.length })
     ok('4.2 клиент нашёл воркера по CID', peerIds.includes(peerId),
       { found: peerIds.map((p) => p.slice(0, 12)), want: peerId.slice(0, 12) })
+    /* Явная проверка «найден ИМЕННО ожидаемый узел». При отсутствии
+     * флага печатаем SKIP, а не молчаливый зелёный: декоративная
+     * проверка хуже отсутствующей. */
+    if (EXPECT_PEER) {
+      ok('4.3 найденный провайдер совпал с --expect-peer',
+        peerIds.includes(EXPECT_PEER),
+        { expected: EXPECT_PEER, found: peerIds.map((p) => p.slice(0, 12)) })
+    } else {
+      log('4.3 SKIP — --expect-peer не задан, сверка с ожидаемым узлом не выполнена')
+    }
 
     /* ---------- 5. Прямой поток и проверка записи ---------- */
     const target = found.find((p) => (p.id ? p.id.toString() : String(p)) === peerId)

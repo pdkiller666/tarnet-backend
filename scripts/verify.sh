@@ -114,8 +114,29 @@ verify_tests() {
   #
   # ОТКАЗ ОДНОГО НЕ ГЛУШИТ ОСТАЛЬНЫЕ: run_suite пишет каждый в свой лог,
   # и «discovery сломан, relay жив» остаётся различимой картиной.
-  run_suite "p2p-discovery" "${TARNET_TEST_TIMEOUT_P2P:-240}" \
-    "node p2p-node/test/test-discovery-e2e.js" p2pdiscovery
+  # --worker-seed + --expect-peer ОБЯЗАТЕЛЬНЫ в гейте, а не «для ручного
+  # прогона». Без них проверка 4.3 уходит в SKIP, и гейт годами показывает
+  # 11/11 при том, что сверка «нашли ИМЕННО ожидаемый узел» ни разу не
+  # выполнялась. Это ровно та болезнь, из-за которой Discovery был
+  # «зелёным, но мёртвым»: проверка существовала и не стояла на пути релиза.
+  #
+  # peerId ВЫЧИСЛЯЕТСЯ из seed, а не вписан константой: вписанный разошёлся
+  # бы с seed при первой правке и дал бы ложный красный (или хуже — SKIP).
+  DISCOVERY_SEED="$(printf 'a1%.0s' $(seq 1 32))"
+  DISCOVERY_PEER="$(node --input-type=module -e '
+    import { peerIdFromPublicKey, publicKeyFromSeed } from "./p2p-node/worker-record.js"
+    const seed = Buffer.from(process.argv[1], "hex")
+    process.stdout.write(peerIdFromPublicKey(publicKeyFromSeed(seed)))
+  ' "$DISCOVERY_SEED" 2>/dev/null)"
+  if [ -n "$DISCOVERY_PEER" ]; then
+    run_suite "p2p-discovery" "${TARNET_TEST_TIMEOUT_P2P:-240}" \
+      "node p2p-node/test/test-discovery-e2e.js --worker-seed $DISCOVERY_SEED --expect-peer $DISCOVERY_PEER" p2pdiscovery
+  else
+    # Не подменяем проверку тишиной: если peerId не вычислился, набор
+    # запускается без флагов, и SKIP в логе будет виден как SKIP.
+    run_suite "p2p-discovery" "${TARNET_TEST_TIMEOUT_P2P:-240}" \
+      "node p2p-node/test/test-discovery-e2e.js" p2pdiscovery
+  fi
   run_suite "p2p-gossip" "${TARNET_TEST_TIMEOUT_P2P:-240}" \
     "node p2p-node/test/test-gossip-e2e.js" p2pgossip
   run_suite "p2p-seed-failover" "${TARNET_TEST_TIMEOUT_P2P_SEED:-360}" \
@@ -126,6 +147,13 @@ verify_tests() {
   # а в бою воркер за домашним роутером просто недостижим.
   run_suite "p2p-relay" "${TARNET_TEST_TIMEOUT_P2P:-240}" \
     "node p2p-node/test/test-relay-e2e.js" p2prelay
+  # Пере-объявление (2.26.1, Блок 2) — то, что раньше было «утверждением о
+  # коде». Поднимает настоящий p2p-worker.js и ждёт дольше TTL: если
+  # пере-объявление сломают, запись истечёт и набор покраснеет. Ставить
+  # именно в гейт: без этого проверка «через TTL запись жива» снова станет
+  # верой, а не фактом — ровно так уже было в 2.25.x.
+  run_suite "p2p-reannounce" "${TARNET_TEST_TIMEOUT_P2P:-240}" \
+    "node p2p-node/test/test-reannounce-e2e.js" p2preannounce
 }
 
 printf '\nTarNet verify — сверка VPS с GitHub\n'
