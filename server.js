@@ -6438,6 +6438,40 @@ app.get('/p2p/bootstrap', async (_req, res) => {
 
   const multiaddrs = (Array.isArray(r.listen) ? r.listen : []).filter(Boolean);
 
+  /* ВТОРОЙ SEED (2.25.3a). Отдельный запрос к отдельному сокету, потому что
+   * это независимый процесс со своим ключом и peerId.
+   *
+   * ЗАЧЕМ ВООБЩЕ. Пока bootstrap отдавал адрес одного узла, второй seed
+   * существовал только в systemd: воркер о нём не узнавал и никогда не
+   * пробовал. Падение первого оставляло сеть без единственного известного
+   * адреса, хотя живой сосед стоял рядом.
+   *
+   * ПОЧЕМУ НЕ 503 ПРИ ЕГО ОТСУТСТВИИ. Отсутствие второго seed — штатное
+   * состояние: он необязателен, и новый хост может его не иметь. Отказ
+   * здесь сломал бы discovery на всех установках, где seed один.
+   * Поэтому ошибка второго запроса гасится, но её РЕЗУЛЬТАТ виден в ответе
+   * полем `seeds` — иначе «два seed в конфиге» и «два seed реально отдают
+   * адреса» снова стали бы верой. */
+  const SEED2_SOCKET = process.env.P2P_SEED2_SOCKET || '/tmp/tarnet-seed2.sock';
+  let r2 = null;
+  try {
+    r2 = await p2pBridge.send({ action: 'status' }, { timeoutMs: 1200, socketPath: SEED2_SOCKET });
+  } catch (_e) {
+    /* `send` не бросает на недоступный сокет (возвращает null), но
+     * try/catch остаётся: один неудачный discovery не должен отменять
+     * основной ответ. */
+    r2 = null;
+  }
+  const multiaddrs2 = r2 && r2.ok === true && Array.isArray(r2.listen)
+    ? r2.listen.filter(Boolean)
+    : [];
+
+  /* Дедупликация по строке: у двух процессов на одной машине адреса
+   * разные (порт входит в multiaddr), но если когда-нибудь появится общий
+   * listener, дубль в списке заставит воркера пробовать один и тот же
+   * адрес дважды и сообщит «два варианта» там, где он один. */
+  const allMultiaddrs = [...new Set([...multiaddrs, ...multiaddrs2])];
+
   /* Мост жив, но узел не поднят. Отдельная ветка, потому что это самый
    * вероятный вид поломки: сервис запущен и отвечает, а порт пуст.
    * Вернуть 200 здесь означало бы соврать про готовность сети. */
@@ -6456,8 +6490,21 @@ app.get('/p2p/bootstrap', async (_req, res) => {
     /* `multiaddrs` — массив, потому что адресов может быть несколько
      * (ipv4 + dns4). Воркер пробует по очереди; поле `multiaddr` — первый,
      * для тех клиентов, кому достаточно одного. */
-    multiaddr: multiaddrs[0],
-    multiaddrs,
+    multiaddr: allMultiaddrs[0],
+    multiaddrs: allMultiaddrs,
+    /* Откуда взялся каждый адрес. Разделение на два seed нужно приёмке:
+     * "воркер нашёл провайдера через любой из двух seed" проверяется
+     * именно здесь, а не по длине списка. */
+    seeds: [
+      { socket: p2pBridge.DEFAULT_SOCKET, ok: true, peerId: r.peerId ?? null, multiaddrs },
+      {
+        socket: SEED2_SOCKET,
+        ok: multiaddrs2.length > 0,
+        peerId: (r2 && r2.peerId) || null,
+        multiaddrs: multiaddrs2,
+        error: multiaddrs2.length ? null : (r2 && r2.error) || 'недоступен или не слушает'
+      }
+    ],
     peerId: r.peerId ?? null,
     protocol: 'libp2p',
     /* Транспорт и шифрование перечислены явно: воркер должен знать, что

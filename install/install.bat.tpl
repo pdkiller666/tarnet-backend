@@ -195,11 +195,13 @@ if not "%IMPORT_RC%"=="0" goto p2p_import_failed
 rem Discovery needs kad-dht and gossipsub on top of the transport itself.
 rem relay-v2 is required since 2.25.3: p2p-worker.js imports it statically, so
 rem a missing package breaks the whole module, not just NAT traversal.
+rem multiaddr is required since 2.25.3a: bridge.js imports it statically for
+rem seed-to-seed dialing, and 5 files depend on it overall.
 rem Checked separately on purpose: missing gossip modules must not throw
 rem away a transport that works, but the user has to know that announcing
 rem to the DHT is off. Hiding it would repeat the silent-WS-fallback bug.
 pushd "%P2P_DIR%"
-"%NODE_EXE%" -e "Promise.all([import('@libp2p/kad-dht'),import('@libp2p/gossipsub'),import('@libp2p/circuit-relay-v2')]).then(()=>process.exit(0)).catch(()=>process.exit(1))" >nul 2>nul
+"%NODE_EXE%" -e "Promise.all([import('@libp2p/kad-dht'),import('@libp2p/gossipsub'),import('@libp2p/circuit-relay-v2'),import('@multiformats/multiaddr')]).then(()=>process.exit(0)).catch(()=>process.exit(1))" >nul 2>nul
 set "DHT_RC=%errorlevel%"
 popd
 
@@ -209,7 +211,7 @@ echo       p2p transport: ok
 goto p2p_done
 
 :p2p_dht_missing
-echo       WARNING: DHT modules (kad-dht/gossipsub/relay) do not load.
+echo       WARNING: DHT modules (kad-dht/gossipsub/relay/multiaddr) do not load.
 echo       Discovery is OFF - the worker will use the WS bridge only.
 echo       Fix: run "npm ci --omit=dev" inside %P2P_DIR%
 goto p2p_done

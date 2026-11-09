@@ -348,6 +348,48 @@ H_APP=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/app/")
 H_DL=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/download/worker.js")
 [ "$H_DL" = "200" ] && ok "/download/worker.js" "HTTP 200" || no "/download/worker.js" "HTTP $H_DL"
 
+# ---------- 4.4 оба seed отвечают в /p2p/bootstrap ----------
+# ПОЧЕМУ ОТДЕЛЬНАЯ ПРОВЕРКА. `2.25.4` ставит второй seed отдельным юнитом,
+# и без этой строки «два seed» означает только «два файла в systemd»: в
+# ответ bootstrap мог бы попадать один адрес, а второй юнит — тихо падать
+# или не слушать порт. Требование P1.2d, п.4 — проверять ОБА, а не один.
+#
+# ПОЧЕМУ ЧЕРЕЗ node, А НЕ grep. Ответ — JSON с вложенным массивом `seeds`;
+# grep по строке нашёл бы «ok» и в тексте ошибки. Разбираем как данные.
+#
+# ВАЖНО: проверяется РАЗНЫЕ ли peerId. Одинаковый означал бы, что оба
+# процесса прочитали один ключ, и сети виден один узел дважды — то есть
+# второй seed есть в отчёте, но не в сети.
+BOOT_JSON=$(ssh "${SSH_OPTS[@]}" "$VPS" \
+  "curl -s --max-time 10 http://127.0.0.1:3001/p2p/bootstrap" 2>/dev/null)
+BOOT_VERDICT=$(printf '%s' "$BOOT_JSON" | node -e '
+  let s = "";
+  process.stdin.on("data", (d) => { s += d; }).on("end", () => {
+    let j;
+    try { j = JSON.parse(s); } catch { console.log("BAD_JSON"); return; }
+    if (!j.ok) { console.log("NO"); return; }
+    const seeds = Array.isArray(j.seeds) ? j.seeds : [];
+    const live = seeds.filter((x) => x && x.ok && Array.isArray(x.multiaddrs) && x.multiaddrs.length);
+    const ids = live.map((x) => x.peerId).filter(Boolean);
+    const uniq = new Set(ids);
+    if (live.length < 2) { console.log("LIVE=" + live.length); return; }
+    if (uniq.size !== ids.length) { console.log("SAME_PEER"); return; }
+    console.log("OK|" + live.length + "|" + ids.map((i) => i.slice(0, 8)).join(","));
+  });
+' 2>/dev/null)
+case "$BOOT_VERDICT" in
+  OK|*)
+    ok "оба seed в bootstrap" "${BOOT_VERDICT#OK|} (peerId разные)" ;;
+  LIVE=*)
+    no "оба seed в bootstrap" "живых ${BOOT_VERDICT#LIVE=} из 2 — второй не отдаёт адреса" ;;
+  SAME_PEER)
+    no "оба seed в bootstrap" "у обоих ОДИН peerId — читают общий ключ" ;;
+  NO)
+    no "оба seed в bootstrap" "мост не отвечает (503) или p2p не поднят" ;;
+  *)
+    no "оба seed в bootstrap" "${BOOT_VERDICT:-нет ответа}" ;;
+esac
+
 # ---------- 4.5 /config отдаёт ставку Tier 6 ----------
 # В 2.17.8 ставка B′ (0.0005 → 0.0002) была изменена, но проверить её снаружи
 # было нечем: /config знал только fee/emission. Это ломало Code-First Rule —

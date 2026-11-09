@@ -31,6 +31,11 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+/* Нужен для dial соседнего seed: `node.dial` принимает multiaddr, а не
+ * строку. Импортируется здесь же, а не внутри `startLibp2p`, потому что
+ * модуль уже в зависимостях `p2p-node` ради воркера — второй пакет не
+ * тянется. */
+import { multiaddr } from '@multiformats/multiaddr'
 import { loadOrCreatePeerId, keyFilePath } from './peer-id-store.js'
 import { resolvePublicAddrs, listenMismatch } from './public-addr.js'
 import { createTaskClient, TASK_PROTOCOL, encodeLine } from './task-protocol.js'
@@ -80,6 +85,11 @@ let peerKeyPath = keyFilePath(DATA_DIR)
  * только разбором лога. */
 let publicAddrs = []
 let announceNote = null
+/* Состояние связи с соседними seed: адрес, получилось ли, peerId соседа.
+ * Вынесено в `status()`, потому что «два seed в одном юните-списке» и
+ * «два seed видят друг друга» — разные факты, и второй проверяется
+ * только здесь. */
+let seedPeers = []
 
 /* Список тех, кому разрешено открывать поток задач.
  *
@@ -181,6 +191,40 @@ async function startLibp2p() {
    * запись `WorkerRecord` и кадр задачи укладываются с запасом, а
    * потоковое видео через relay не поедет. */
   const WANT_RELAY = process.env.P2P_RELAY !== '0'
+
+  /* Соседние seed-узлы, к которым этот узел подключается при старте.
+   *
+   * ЗАЧЕМ. Два моста на разных портах одной машины — это ДВА УЗЛА, а не
+   * один с двумя листенерами: у каждого свой ключ, свой peerId и своя
+   * таблица DHT. Без явного dial между ними запись, положенная через
+   * seed1, не видна через seed2, и «сеть» ведёт себя как два острова.
+   * Воркер, которому bootstrap отдал второй адрес, объявился бы в пустоту.
+   *
+   * ЗАЧЕМ ЧЕРЕЗ ENV, А НЕ ЧЕРЕЗ ОТКРЫТИЕ. Автопоиск соседей — это mDNS,
+   * который в дата-центре не работает (мультикаст режется), а публичный
+   * rendezvous — лишняя зависимость. Список из двух адресов задаётся в
+   * юните и виден в `systemctl cat`.
+   *
+   * ОШИБКА НЕ ВАЛИТ МОСТ. Сосед может быть ещё не поднят (systemd стартует
+   * оба юнита одновременно). Повтор идёт по кругу, как у воркера: первый
+   * неудачный dial — не приговор, а «сосед ещё поднимается». */
+  const SEED_PEERS = String(process.env.P2P_SEED_PEERS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+
+  /* Таймаут одного dial к соседу. Короткий и одинаковый для всех: обе
+   * попытки идут ПАРАЛЛЕЛЬНО, поэтому худший случай старта — один такой
+   * таймаут, а не их сумма. 5 с достаточно для локального порта; ждать
+   * дольше значило бы задерживать старт узла из-за отсутствующего соседа. */
+  const SEED_DIAL_TIMEOUT_MS = Number(process.env.P2P_SEED_DIAL_TIMEOUT_MS || 5000)
+  /* Сколько раз пробовать досвязаться. 18 попыток по 10 с — три минуты.
+   * Именно столько нужно systemd, чтобы перезапустить соседа после
+   * падения: одна попытка при одновременном старте двух юнитов почти
+   * всегда упирается в «порт ещё не слушается», и без повтора связь между
+   * seed теряется навсегда, до ручного рестарта. */
+  const SEED_RETRY_ATTEMPTS = Number(process.env.P2P_SEED_RETRY_ATTEMPTS || 18)
+  const SEED_RETRY_INTERVAL_MS = Number(process.env.P2P_SEED_RETRY_INTERVAL_MS || 10000)
 
   /* Слушать и объявлять — разные вопросы. `P2P_HOST=0.0.0.0` открывает
    * порт на всех интерфейсах, но в identify узел отдаёт адрес, на котором
@@ -306,6 +350,89 @@ async function startLibp2p() {
   } catch (e) {
     console.log(`[bridge] gossipsub не подключён: ${e.message}`)
   }
+  /* Подключение к соседним seed — ДО печати адресов, но ПОСЛЕ регистрации
+   * обработчиков: иначе сосед, подключившийся первым, открыл бы поток в
+   * протокол, который ещё никем не обслуживается.
+   *
+   * Ждём без фатального исхода: если соседа нет, мы остаёмся рабочим
+   * одиночным seed. Тихо пропускать нельзя — пишем, сколько из скольких
+   * сконнектилось, иначе «сеть из двух узлов» будет верой, а не фактом. */
+  /* Одна попытка связаться с теми соседями, которые ещё не связаны.
+   * Параллельно: два мёртвых соседа не должны складываться в два таймаута.
+   *
+   * `routingTable.add` вызывается явно: без него `routingTable.size`
+   * остаётся 0 даже при живом соединении (тот же дефект, что у воркера
+   * в 2.23 — таблица наполняется по событию topology, а оно требует
+   * видимого DHT-протокола у пира в peerStore). */
+  const dialSeedPeersOnce = async () => {
+    await Promise.all(
+      seedPeers.filter((s) => !s.ok).map(async (s) => {
+        s.attempts += 1
+        try {
+          const conn = await node.dial(multiaddr(s.addr), { timeout: SEED_DIAL_TIMEOUT_MS })
+          await node.services.dht.routingTable.add(conn.remotePeer)
+          s.ok = true
+          s.peerId = conn.remotePeer.toString()
+          s.error = null
+          console.log(`[bridge] seed-сосед подключён: ${s.peerId} (${s.addr})`)
+        } catch (e) {
+          s.error = e.message
+          /* Первую неудачу называем вслух, повторы — нет: иначе лог
+           * заполняется одинаковыми строками и настоящая ошибка тонет. */
+          if (s.attempts === 1) {
+            console.log(`[bridge] seed-сосед недоступен: ${s.addr} — ${e.message} (повторяю)`)
+          }
+        }
+      })
+    )
+  }
+
+  const logSeedSummary = () => {
+    const linked = seedPeers.filter((s) => s.ok).length
+    console.log(`[bridge] Seed    : ${linked}/${seedPeers.length} соседей в таблице DHT`)
+  }
+
+  seedPeers = SEED_PEERS.map((addr) => ({
+    addr, ok: false, peerId: null, error: null, attempts: 0
+  }))
+
+  if (!seedPeers.length) {
+    /* Одиночный seed — штатная конфигурация, но её надо назвать вслух:
+     * при разборе «почему второй узел не видит провайдера» первое, что
+     * нужно знать, — связан ли он с кем-нибудь вообще. */
+    console.log('[bridge] Seed    : одиночный (P2P_SEED_PEERS не задан)')
+  } else {
+    await dialSeedPeersOnce()
+    logSeedSummary()
+
+    /* Повтор в фоне — старт не ждёт. `unref()` обязателен: таймер не
+     * должен держать процесс живым, иначе остановка юнита повиснет на
+     * время до последней попытки. */
+    if (seedPeers.some((s) => !s.ok)) {
+      let retries = 1
+      const retryTimer = setInterval(async () => {
+        retries += 1
+        await dialSeedPeersOnce()
+        logSeedSummary()
+        if (seedPeers.every((s) => s.ok)) {
+          clearInterval(retryTimer)
+          return
+        }
+        if (retries >= SEED_RETRY_ATTEMPTS) {
+          clearInterval(retryTimer)
+          /* Итог неудачи обязан быть громким и содержать адрес: иначе
+           * «соседа нет» выглядит как нормальная работа одиночного seed, а
+           * не как недовыполненная настройка сети. */
+          for (const s of seedPeers.filter((x) => !x.ok)) {
+            console.log(
+              `[bridge] Seed    : НЕ СВЯЗАН ${s.addr} после ${s.attempts} попыток — ${s.error}`
+            )
+          }
+        }
+      }, SEED_RETRY_INTERVAL_MS)
+      if (typeof retryTimer.unref === 'function') retryTimer.unref()
+    }
+  }
   publicAddrs = publicIn.addrs
   announceNote = publicIn.note || listenMismatch(host, publicIn.addrs)
   console.log(
@@ -416,6 +543,13 @@ const handlers = {
       worker_addresses: taskClient.list()
         .filter((c) => c.authorized && !c.closed && c.address)
         .map((c) => String(c.address).toLowerCase()),
+      /* Связь с соседними seed. `peers_total` и `peers_linked` — именно
+       * счётчики по списку из юнита, а не размер таблицы DHT: таблица
+       * растёт от воркеров, и по ней нельзя ответить «видят ли два seed
+       * друг друга». */
+      seed_peers: seedPeers,
+      seeds_total: seedPeers.length,
+      seeds_linked: seedPeers.filter((s) => s.ok).length,
       announced_total: announced.size,
       uptime_s: Math.round((Date.now() - startedAt) / 1000),
       socket: SOCKET_PATH

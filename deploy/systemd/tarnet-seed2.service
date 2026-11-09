@@ -1,0 +1,62 @@
+[Unit]
+# Второй DHT-seed на той же машине, порт 4002.
+#
+# ЧЕСТНО О ГРАНИЦАХ. Это НЕ резервирование и не «второй оператор». Оба seed
+# живут на одном VPS, под одним systemd, на одном диске: падение машины
+# уносит оба, а переполнение диска ломает оба. Смысл этого юнита узкий и
+# конкретный — проверить МЕХАНИКУ: что discovery работает, когда адресов
+# больше одного, и что DHT связывает узлы между собой. Требование
+# «минимум два seed у РАЗНЫХ операторов» остаётся открытым (ROADMAP P1.2d).
+#
+# ЗАЧЕМ ОТДЕЛЬНЫЙ DATA-DIR. Ключ узла лежит в P2P_DATA_DIR. Если указать
+# общий с seed1 каталог, второй процесс прочитает тот же ключ, получит ТОТ ЖЕ
+# peerId и сеть будет считать его тем же узлом: второе соединение к себе же.
+# Два seed с одинаковым peerId — это один seed, раздвоенный в отчёте.
+Description=TarNet seed node #2 (libp2p DHT, port 4002)
+Documentation=file:///opt/tarnet/backend-api/MANIFEST.v3.4-UNIFIED.md
+
+After=network-online.target
+Wants=network-online.target
+# Мягкая связка с первым seed: порядок старта не важен (мост сам досвязывается
+# повтором), но так seed2 обычно поднимается вторым и сразу находит соседа.
+After=p2p-bridge.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tarnet/backend-api/p2p-node
+
+Environment=P2P_BRIDGE_LIBP2P=1
+Environment=P2P_HOST=0.0.0.0
+Environment=P2P_PORT=4002
+
+# Порт в URL указан ЯВНО. Без него public-addr.js возьмёт порт прослушивания,
+# но лучше не полагаться на неявное совпадение: адрес объявляется пирам, и
+# опечатка здесь означала бы «peerId есть, адрес ведёт в пустоту».
+Environment=P2P_PUBLIC_URL=https://v1107336.hosted-by-vdsina.com:4002
+
+# Отдельный ключ — отдельный peerId. См. комментарий в [Unit].
+Environment=P2P_DATA_DIR=/var/lib/tarnet/p2p-seed2
+
+# Отдельный сокет: мост отказывается стартовать, если на его сокете уже
+# слушает живой процесс (exit 2), и это правильно — иначе server.js не смог
+# бы отличить, чей ответ он читает.
+Environment=P2P_BRIDGE_SOCKET=/tmp/tarnet-seed2.sock
+
+# Сосед — первый seed. Адрес БЕЗ /p2p/<peerId> намеренно: peerId первого
+# seed выведен из его ключа, и вписать его в юнит значило бы захардкодить
+# идентичность, которая может быть пересоздана. libp2p узнаёт peerId через
+# identify при соединении; вручную поддерживать строку не нужно.
+Environment=P2P_SEED_PEERS=/ip4/127.0.0.1/tcp/4001
+
+ExecStart=/usr/bin/node bridge.js
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tarnet-p2p-seed2
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

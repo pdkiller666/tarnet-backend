@@ -1738,7 +1738,7 @@ let p2pChild = null;
  * relay, но и обычный TCP-путь: человек получил бы `ERR_MODULE_NOT_FOUND`
  * вместо «докачайте зависимости». Ровно тот класс отказа, что был 09.11
  * с gossipsub. */
-const P2P_REQUIRED_PACKAGES = ['libp2p', '@libp2p/kad-dht', '@libp2p/gossipsub', '@libp2p/circuit-relay-v2'];
+const P2P_REQUIRED_PACKAGES = ['libp2p', '@libp2p/kad-dht', '@libp2p/gossipsub', '@libp2p/circuit-relay-v2', '@multiformats/multiaddr'];
 
 function p2pDepsReport(workerPath) {
   const dir = path.dirname(workerPath);

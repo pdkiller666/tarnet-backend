@@ -403,6 +403,78 @@ systemctl list-timers tarnet-prune-distill.timer --no-pager | tail -n +2 | head 
 echo "TIMER_OK"
 REMOTE
 
+# ---------- 5d. второй seed ----------
+# Юнит лежит в `deploy/systemd/` и, как и таймер, сам на сервер не попадает.
+# Без этого шага tarnet-seed2.service существует в репозитории, но не в
+# systemd: второй адрес в bootstrap не появится никогда.
+#
+# ПОРТ 4002 И FIREWALL — ОДНА ПРОВЕРКА, А НЕ ДВЕ.
+# üfw открыт только 4001. Второй seed поднялся бы, слушал и был бы
+# недостижим СНАРУЖИ: изнутри машины всё зелёное, снаружи адрес ведёт в
+# пустоту. Ровно тот тихий отказ, ради которого мы и проверяем firewall.
+info "ставлю второй seed :4002"
+SEED2_UNIT="deploy/systemd/tarnet-seed2.service"
+[ -f "$REPO_DIR/$SEED2_UNIT" ] || die "нет файла $SEED2_UNIT в репозитории"
+
+ssh "${SSH_OPTS[@]}" "$VPS" "bash -s" -- "$REMOTE_DIR" "$SEED2_UNIT" <<'REMOTE' && printf 'второй seed активен\n' || printf 'ВНИМАНИЕ: второй seed не поднят — discovery работает на одном адресе\n' >&2
+set -uo pipefail
+DIR=$1; REL=$2
+SRC="$DIR/$REL"; DST="/etc/systemd/system/$(basename "$REL")"
+[ -f "$SRC" ] || { echo "ERR: нет $SRC"; exit 8; }
+install -m 0644 -o root -g root "$SRC" "$DST" || { echo "ERR: install $DST"; exit 8; }
+
+# Порт открывается ДО старта узла: иначе между рестартом и правилом ufw
+# есть окно, в котором сосед и воркеры видят закрытый порт.
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+  ufw allow 4002/tcp comment 'TarNet p2p seed2' >/dev/null 2>&1 || { echo "ERR: ufw allow 4002"; exit 9; }
+  # Проверяем ФАКТ правила, а не код возврата: ufw allow на существующем
+  # правиле возвращает 0 и пишет «Skipping», так что код ничего не доказывает.
+  ufw status | grep -qE '^4002/tcp' || { echo "ERR: правила 4002 нет в ufw"; exit 9; }
+  echo "ufw: 4002/tcp открыт"
+else
+  echo "WARN: ufw не активен — порт 4002 не проверен фаерволом"
+fi
+
+systemctl daemon-reload || { echo "ERR: daemon-reload"; exit 8; }
+systemctl enable --now tarnet-seed2.service >/dev/null 2>&1 || { echo "ERR: enable seed2"; exit 8; }
+for _ in $(seq 1 30); do
+  if systemctl is-active --quiet tarnet-seed2.service; then break; fi
+  sleep 1
+done
+systemctl is-active --quiet tarnet-seed2.service || {
+  echo "ERR: tarnet-seed2 не стал active"
+  journalctl -u tarnet-seed2 -n 25 --no-pager >&2
+  exit 7
+}
+
+# Слушает ли он реально 4002 — отдельно от «active»: процесс может быть
+# жив, а порт не занят (ошибка bind после старта).
+for _ in $(seq 1 20); do
+  if ss -lnt 2>/dev/null | grep -q ':4002 '; then break; fi
+  sleep 1
+done
+ss -lnt 2>/dev/null | grep -q ':4002 ' || { echo "ERR: seed2 не слушает 4002"; exit 7; }
+echo "seed2 слушает 4002"
+
+# Каждый seed обязан быть отдельным узлом. Одинаковый peerId означал бы,
+# что оба прочитали ОДИН ключ и сеть видит один узел дважды.
+P1=$(journalctl -u p2p-bridge --no-pager -n 200 | grep -oE 'libp2p поднят: [A-Za-z0-9]+' | tail -1 | awk '{print $3}')
+P2=$(journalctl -u tarnet-seed2 --no-pager -n 200 | grep -oE 'libp2p поднят: [A-Za-z0-9]+' | tail -1 | awk '{print $3}')
+echo "peerId seed1=${P1:-неизвестен} seed2=${P2:-неизвестен}"
+if [ -n "$P1" ] && [ "$P1" = "$P2" ]; then
+  echo "ERR: у обоих seed одинаковый peerId — они читают один ключ"
+  exit 9
+fi
+
+# Связь между seed — единственное, что отличает «сеть из двух узлов» от
+# «двух процессов на одной машине». Смотрим лог: мост пишет число
+# связанных соседей после каждой попытки.
+LINKED=$(journalctl -u p2p-bridge --no-pager -n 300 | grep -oE 'Seed    : [0-9]+/[0-9]+' | tail -1)
+echo "связь seed1: ${LINKED:-не найдено в логе}"
+LINKED2=$(journalctl -u tarnet-seed2 --no-pager -n 300 | grep -oE 'Seed    : [0-9]+/[0-9]+' | tail -1)
+echo "связь seed2: ${LINKED2:-не найдено в логе}"
+REMOTE
+
 # ---------- 6. health ----------
 rollback_hint() {
   printf '\nОТКАТ (вернёт предыдущий коммит и перезапустит сервис):\n'
