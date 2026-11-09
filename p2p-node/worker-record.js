@@ -49,6 +49,12 @@ export const RECORD_TTL_MS = Number(process.env.WORKER_RECORD_TTL_MS || 90000)
  * ещё оставляют запись живой, а один пропуск виден с запасом. */
 export const ANNOUNCE_MS = Math.floor(RECORD_TTL_MS / 3)
 
+/** Протокол отдачи записи. Экспортируется из ОДНОГО места: воркер по нему
+ *  обслуживает запрос, мост — тоже (иначе клиент, спросивший мост, получил
+ *  бы отказ, хотя запись у моста есть). Скопированная строка в двух файлах
+ *  разошлась бы на первой же правке, и обе стороны выглядели бы живыми. */
+export const RECORD_PROTOCOL = '/tarnet/worker-record/1.0.0'
+
 const PKCS8_ED25519_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex')
 const BASE58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 

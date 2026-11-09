@@ -150,7 +150,7 @@ export async function attachGossip(node, {
     if (!msg || msg.topic !== topic) return
     try {
       const body = JSON.parse(new TextDecoder().decode(msg.data))
-      if (body && body.record) onRecord(body.record, body.signature)
+      if (body && body.record) onRecord(body.record, body.signature, body.payload)
     } catch (_e) {
       /* Уже отсеяно валидатором; сюда попадает только то, что прошло
        * между проверкой и разбором. Молчим, чтобы не забивать лог. */

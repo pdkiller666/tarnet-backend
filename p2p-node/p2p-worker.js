@@ -30,10 +30,11 @@ import { yamux } from '@libp2p/yamux'
 import { identify } from '@libp2p/identify'
 import { ping } from '@libp2p/ping'
 import { kadDHT } from '@libp2p/kad-dht'
+import { generateKeyPairFromSeed } from '@libp2p/crypto/keys'
 import { multiaddr } from '@multiformats/multiaddr'
 import { serveTaskStream, encodeLine, TASK_PROTOCOL } from './task-protocol.js'
 import { buildHello, waitForWorkerIdentity } from './peer-hello.js'
-import { provideCids, DEFAULT_NETWORK_ID, buildRecord, publicKeyFromSeed, nextSequence } from './worker-record.js'
+import { provideCids, DEFAULT_NETWORK_ID, buildRecord, publicKeyFromSeed, nextSequence, RECORD_PROTOCOL } from './worker-record.js'
 import { gossipOptions, attachGossip } from './gossip-announce.js'
 import { gossipsub } from '@libp2p/gossipsub'
 import fs from 'node:fs'
@@ -68,8 +69,9 @@ const DHT_PROTOCOL = '/tarnet/kad/1.0.0'
 
 /* Протокол отдачи записи. Третий шаг Discovery: по провайдер-индексу
  * нашли «кто», но адрес для выплат и TTL берутся из записи. Поток
- * открывается к найденному пиру, и он отдаёт свою подписанную запись. */
-const RECORD_PROTOCOL = '/tarnet/worker-record/1.0.0'
+ * открывается к найденному пиру, и он отдаёт свою подписанную запись.
+ * Константа — в `worker-record.js`, чтобы мост обслуживал ТОТ ЖЕ протокол:
+ * две копии строки в двух файлах разъехались бы на первой правке. */
 
 /* Сеть, к которой относятся объявления провайдера. Меняется только
  * вместе с сетью: бакеты подписаны ею, и узел тестнета не должен
@@ -166,12 +168,37 @@ async function fetchBootstrap() {
  * DHT в clientMode: воркер за NAT не может быть сервером — к нему не
  * достучатся, и запись о нём в DHT была бы неправдой. Клиентский режим
  * означает «спрашивать можно, хранить чужое — нет».
+ *
+ * ПОЧЕМУ `provide()` РАБОТАЕТ В КЛИЕНТСКОМ РЕЖИМЕ (проверено, а не
+ * предположено). В Kademlia клиент не хранит ЧУЖИЕ записи — это и есть
+ * смысл `clientMode`. Но `provide()` — не запись в свою таблицу: он
+ * делает `ADD_PROVIDER` и рассылает его K ближайшим пирам, которые
+ * запись хранят у себя. Клиенту для этого нужен только живой сосед.
+ * В исходниках `@libp2p/kad-dht@16.4.9` в `content-routing/index.js`
+ * функция `provide()` не содержит ни одной проверки `clientMode`
+ * (`grep -c clientMode` → 0); она добавляет себя в локальный
+ * `providers` и шлёт сообщение через `peerRouting.getClosestPeers`.
+ * Запрет «клиент не может публиковать» — свойство других реализаций
+ * Kademlia, не этой. Проверено запуском: воркер с `clientMode: true`
+ * объявляет провайдера, и чужой узел находит его через `findProviders`
+ * (test-discovery-e2e.js 3.1 и 4.2).
  * ПРОТОКОЛ. `/tarnet/kad/1.0.0` — свой, а не общий IPFS: чужая DHT
  * наполнилась бы нашими записями и наоборот, а совместимость с ней
  * никто не проверял.
  */
-async function startNode() {
+async function startNode({ privateKey } = {}) {
   const node = await createLibp2p({
+    /* Ключ узла — ТОТ ЖЕ seed, которым воркер подписывает запись.
+     *
+     * ПОЧЕМУ ЭТО НЕ ДЕТАЛЬ. `buildRecord` проверяет, что `peerId`
+     * выводится из ключа подписи и бросает `PEER_ID_MISMATCH` иначе.
+     * Со случайным ключом узла (как было) `node.peerId` не соответствовал
+     * seed воркера, `buildRecord` бросал, и объявление молча уходило в
+     * `catch` — то есть GossipSub-путь не работал НИКОГДА, при внешне
+     * живом узле (`log: «запись не объявлена»` в потоке не видно).
+     * Теперь опубликовавший и подписавший — один и тот же ключ, и
+     * валидатор `message.from === record.peerId` проходит по существу. */
+    ...(privateKey ? { privateKey } : {}),
     addresses: { listen: ['/ip4/127.0.0.1/tcp/0'] },
     transports: [tcp()],
     connectionEncrypters: [noise()],
@@ -424,7 +451,31 @@ async function openTaskStream(node, ma) {
 async function main() {
   log(`bootstrap: ${BOOTSTRAP_BASE}/p2p/bootstrap`)
 
-  const node = await startNode()
+  /* Ключ воркера нужен ДО старта узла.
+   *
+   * ПОЧЕМУ ЗДЕСЬ, А НЕ ПОСЛЕ. `peerId` узла неизменяем: он выводится из
+   * приватного ключа в момент `createLibp2p`. Если стартовать со случайным
+   * ключом, а seed воркера найти позже, `buildRecord` навсегда получит
+   * `PEER_ID_MISMATCH` — и объявления не пойдут до перезапуска.
+   *
+   * ЧТО ДЕЛАЕМ, ЕСЛИ КЛЮЧА НЕТ. Ждём ограниченно (`P2P_KEY_WAIT_MS`),
+   * затем стартуем на случайном и ГОВОРИМ ОБ ЭТОМ В ЛОГ. Транспорт задач
+   * и приём работы важнее индекса в DHT: воркер без объявления всё равно
+   * получает задачи по WS, а вот воркер, не поднявшийся из-за
+   * отсутствующего файла, не делает ничего. */
+  const identAtStart = await waitForWorkerIdentity({ timeoutMs: KEY_WAIT_MS })
+  let nodePrivateKey
+  if (!identAtStart.error && identAtStart.seed) {
+    nodePrivateKey = await generateKeyPairFromSeed('Ed25519', identAtStart.seed)
+    log(`ключ воркера: ${identAtStart.sources.seed} — узел поднимаю тем же ключом (peerId стабилен)`)
+  } else {
+    log(
+      `ключ воркера не найден (${identAtStart.error || 'нет seed'}) — ` +
+      'узел со случайным ключом: задачи пойдут, объявления WorkerRecord невозможны до перезапуска'
+    )
+  }
+
+  const node = await startNode({ privateKey: nodePrivateKey })
   log(`мой peerId: ${node.peerId.toString()}`)
 
   /* Объявление своих возможностей. Без этого DHT отвечает «провайдеров

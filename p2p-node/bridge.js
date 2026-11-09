@@ -33,8 +33,9 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadOrCreatePeerId, keyFilePath } from './peer-id-store.js'
 import { resolvePublicAddrs, listenMismatch } from './public-addr.js'
-import { createTaskClient, TASK_PROTOCOL } from './task-protocol.js'
+import { createTaskClient, TASK_PROTOCOL, encodeLine } from './task-protocol.js'
 import { loadAllowlist, verifyHello, allowlistPath } from './peer-auth.js'
+import { RECORD_PROTOCOL } from './worker-record.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
@@ -215,6 +216,44 @@ async function startLibp2p() {
   })
   console.log(`[bridge] приём задач: ${TASK_PROTOCOL}`)
 
+  /* Отдача принятых записей. Без этого обработчика мост СОБИРАЛ
+   * записи из gossipsub в `workerRecords` и НИКОГДА их не отдавал:
+   * карта писалась и не читалась. Клиент, нашедший мост в DHT
+   * провайдер-записью, открывал `/tarnet/worker-record/1.0.0` и получал
+   * пустой поток или таймаут — то есть discovery доводил до «кто», но
+   * обрывался на «куда платить».
+   *
+   * Срок проверяется ПРИ ЧТЕНИИ, а не при записи: карта сама не
+   * исчезает, и без проверки мост отдавал бы мёртвые узлы — клиент
+   * доверился бы записи, истёкшей минуту назад. */
+  await node.handle(RECORD_PROTOCOL, async (stream, connection) => {
+    try {
+      /* peerId берём из аргумента `connection`, а не из `stream.connection`:
+       * в libp2p 3.x поток не несёт ссылки на соединение, и обращение
+       * к несуществующему полю дало бы `undefined` — то есть «записи нет»
+       * для КАЖДОГО запроса, без ошибки в логе. */
+      const from = connection?.remotePeer?.toString()
+      const entry = from ? workerRecords.get(from) : null
+      const rec = entry && entry.record && entry.record.expiresAt > Date.now()
+        ? entry.record
+        : null
+      const body = rec
+        ? { ok: true, record: rec, signature: entry.signature, payload: entry.payload }
+        : { ok: false, error: 'NO_RECORD' }
+      if (!stream.send(encodeLine(body))) {
+        await new Promise((resolve) => {
+          stream.once('drain', resolve)
+          stream.once('close', resolve)
+        })
+      }
+    } catch (_e) {
+      /* Поток закрыт — отвечать некому. */
+    } finally {
+      try { await stream.close() } catch (_e) { /* уже закрыт */ }
+    }
+  })
+  console.log(`[bridge] отдача записи: ${RECORD_PROTOCOL}`)
+
   /* Подписка на объявления. Мост их не публикует — он их принимает и
    * запоминает, чтобы отдать по запросу тем, кто ещё не в DHT.
    *
@@ -225,8 +264,8 @@ async function startLibp2p() {
     await attachGossip(node, {
       networkId: NETWORK_ID,
       log: (m) => console.log(`[bridge] ${m}`),
-      onRecord: (record) => {
-        workerRecords.set(record.peerId, { record, at: Date.now() })
+      onRecord: (record, signature, payload) => {
+        workerRecords.set(record.peerId, { record, signature, payload, at: Date.now() })
       },
     })
   } catch (e) {
