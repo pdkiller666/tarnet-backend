@@ -337,9 +337,27 @@ REMOTE
 # падение означает только «discovery недоступен», а не поломку API.
 # Но молча пропускать его нельзя — это и был двухдневный разрыв выше.
 info "перезапускаю мост $BRIDGE_SERVICE"
-ssh "${SSH_OPTS[@]}" "$VPS" "bash -s" -- "$BRIDGE_SERVICE" <<'REMOTE' || printf 'ВНИМАНИЕ: мост не перезапущен — P2P-маршрут задач может работать на старом коде\n' >&2
-BSVC=$1
-if ! systemctl list-unit-files "$BSVC.service" >/dev/null 2>&1 || ! systemctl cat "$BSVC" >/dev/null 2>&1; then
+ssh "${SSH_OPTS[@]}" "$VPS" "bash -s" -- "$REMOTE_DIR" "$BRIDGE_SERVICE" "deploy/systemd/p2p-bridge.service" <<'REMOTE' || printf 'ВНИМАНИЕ: мост не перезапущен — P2P-маршрут задач может работать на старом коде\n' >&2
+set -uo pipefail
+DIR=$1; BSVC=$2; REL=$3
+SRC="$DIR/$REL"; DST="/etc/systemd/system/${BSVC}.service"
+
+# ЮНИТ МОСТА ТОЖЕ РАСКАТЫВАЕТСЯ, А НЕ ТОЛЬКО ПЕРЕЗАПУСКАЕТСЯ.
+# 09.11.2026: ровно здесь была дыра. deploy.sh перезапускал p2p-bridge, но
+# файл юнита не обновлял НИКОГДА — на VPS с 05.11 лежала версия без
+# P2P_SEED_PEERS. Мост поднимался и писал «Seed : одиночный (P2P_SEED_PEERS
+# не задан)»: dial seed1→seed2 не выполнялся вообще, связь держалась только
+# встречным seed2→seed1. Снаружи это выглядело как рабочая связь, потому
+# что seed2 в своём логе показывал 1/1 — проверка на одной стороне
+# подтверждала односторонний канал как двусторонний.
+if [ -f "$SRC" ]; then
+  install -m 0644 -o root -g root "$SRC" "$DST" || { echo "ERR: install $DST"; exit 8; }
+  systemctl enable "$BSVC" >/dev/null 2>&1 || true
+  systemctl daemon-reload || { echo "ERR: daemon-reload"; exit 8; }
+  echo "юнит $BSVC обновлён из репозитория"
+fi
+
+if ! systemctl cat "$BSVC" >/dev/null 2>&1; then
   echo "юнита $BSVC нет — пропускаю (P2P не настроен на этом хосте)"
   exit 0
 fi
@@ -469,10 +487,39 @@ fi
 # Связь между seed — единственное, что отличает «сеть из двух узлов» от
 # «двух процессов на одной машине». Смотрим лог: мост пишет число
 # связанных соседей после каждой попытки.
-LINKED=$(journalctl -u p2p-bridge --no-pager -n 300 | grep -oE 'Seed    : [0-9]+/[0-9]+' | tail -1)
-echo "связь seed1: ${LINKED:-не найдено в логе}"
-LINKED2=$(journalctl -u tarnet-seed2 --no-pager -n 300 | grep -oE 'Seed    : [0-9]+/[0-9]+' | tail -1)
-echo "связь seed2: ${LINKED2:-не найдено в логе}"
+#
+# ТРИ РАЗНЫХ ИСХОДА, А НЕ ОДИН.
+# 09.11.2026 здесь было `${LINKED:-не найдено в логе}`, и это скрывало
+# главный дефект: мост писал «Seed : одиночный (P2P_SEED_PEERS не задан)»,
+# grep не находил `N/M`, и деплой печатал безобидное «не найдено в логе».
+# То есть ОТСУТСТВИЕ НАСТРОЙКИ выглядело как ОТСУТСТВИЕ ЛОГА — а это
+# разные вещи: первое лечится правкой юнита, второе — ожиданием.
+# Одиночный режим — это ошибка конфигурации, а не «ещё не успело»: в нём
+# dial к соседу не выполняется НИКОГДА.
+SEED_LINE=$(journalctl -u p2p-bridge --no-pager -n 400 \
+  | grep -a 'Seed    :' | tail -1)
+case "$SEED_LINE" in
+  *"одиночный"*)
+    echo "ERR: seed1 одинок — в юните нет P2P_SEED_PEERS, dial к seed2 не выполняется"
+    exit 9 ;;
+  *"НЕ СВЯЗАН"*)
+    echo "ERR: seed1 не связался с seed2: $SEED_LINE"
+    exit 9 ;;
+  *[0-9]/[0-9]*)
+    echo "связь seed1: $(printf '%s' "$SEED_LINE" | grep -oE 'Seed    : [0-9]+/[0-9]+')" ;;
+  *)
+    echo "ERR: в логе p2p-bridge нет ни строки о связи — мост не дошёл до dial"
+    journalctl -u p2p-bridge -n 20 --no-pager >&2
+    exit 9 ;;
+esac
+LINKED2=$(journalctl -u tarnet-seed2 --no-pager -n 400 | grep -a 'Seed    :' | tail -1)
+case "$LINKED2" in
+  *[0-9]/[0-9]*)
+    echo "связь seed2: $(printf '%s' "$LINKED2" | grep -oE 'Seed    : [0-9]+/[0-9]+')" ;;
+  *)
+    echo "ERR: seed2 не связан с seed1: $LINKED2"
+    exit 9 ;;
+esac
 REMOTE
 
 # ---------- 6. health ----------
