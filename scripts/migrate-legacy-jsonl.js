@@ -16,6 +16,15 @@
  *   3. Файл, уже зашифрованный целиком, ПРОПУСКАЕТ.
  *   4. Файл, где зашифрована часть строк, чинит построчно.
  *
+ * ДВА ФОРМАТА, А НЕ ОДИН (2.26.3). Штатная запись с 2.26.0 пишет `enc:v2:`
+ * с AAD `${promptHash}:${field}`; всё, что старше, — `enc:v1:` без AAD.
+ * Здесь раньше стояла проверка только на `enc:v1:`, и это делало скрипт
+ * ОПАСНЫМ: 34 файла с v2 считались «открытым текстом», `--apply` шифровал
+ * саму строку `enc:v2:...` как plaintext, и расшифровка возвращала
+ * шифротекст вместо промпта — то есть датасет уничтожался без единой
+ * ошибки в выводе. Правило простое: шифр — это ЛЮБОЙ `enc:v1:`/`enc:v2:`,
+ * и оба варианта пишутся так, чтобы сервер (`decryptSecret`) их читал.
+ *
  * ПОЧЕМУ ДЕТЕРМИНИРОВАННО, А НЕ СЛУЧАЙНЫМ IV. `adapterHash` считается по
  * содержимому файла (см. mock_train.py). Случайный IV дал бы новый хеш при
  * каждом прогоне и наполнил бы реестр версий дублями, которые нечем
@@ -79,24 +88,45 @@ function loadMasterKey(secretsDir) {
  * импортировать как модуль, не подняв весь сервер. Проверка совместимости
  * — обратная расшифровка тем же ключом в конце файла, а не «написано так же».
  */
-function encryptDeterministic(plaintext, key) {
+function encryptDeterministic(plaintext, key, aad) {
   if (typeof plaintext !== 'string' || !plaintext.length) return null;
   const iv = crypto.createHmac('sha256', key).update(plaintext, 'utf8').digest().subarray(0, 12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  /* AAD ставится только когда он есть: у v1 его не было, и вызов setAAD
+   * на нём изменил бы тег — старые записи перестали бы читаться. */
+  const aadBuf = aad ? Buffer.from(String(aad), 'utf8') : null;
+  if (aadBuf) cipher.setAAD(aadBuf);
   const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-  return `enc:v1:${iv.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${ct.toString('base64')}`;
+  const tag = cipher.getAuthTag().toString('base64');
+  return aadBuf
+    ? `enc:v2:${iv.toString('base64')}:${tag}:${ct.toString('base64')}`
+    : `enc:v1:${iv.toString('base64')}:${tag}:${ct.toString('base64')}`;
 }
 
-function decryptDeterministic(blob, key) {
-  if (typeof blob !== 'string' || !blob.startsWith('enc:v1:')) return null;
+function decryptDeterministic(blob, key, aad) {
+  if (typeof blob !== 'string') return null;
+  if (!blob.startsWith('enc:v1:') && !blob.startsWith('enc:v2:')) return null;
   const parts = blob.split(':');
   if (parts.length !== 5) return null;
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(parts[2], 'base64'));
-  decipher.setAuthTag(Buffer.from(parts[3], 'base64'));
-  return Buffer.concat([decipher.update(Buffer.from(parts[4], 'base64')), decipher.final()]).toString('utf8');
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(parts[2], 'base64'));
+    /* `split(':')` даёт ['enc','v1'|'v2',iv,tag,ct] — версия в parts[1]. */
+    if (parts[1] === 'v2') {
+      if (!aad) return null;
+      decipher.setAAD(Buffer.from(String(aad), 'utf8'));
+    }
+    decipher.setAuthTag(Buffer.from(parts[3], 'base64'));
+    return Buffer.concat([decipher.update(Buffer.from(parts[4], 'base64')), decipher.final()]).toString('utf8');
+  } catch (_e) {
+    return null;
+  }
 }
 
-const isEnc = (v) => typeof v === 'string' && v.startsWith('enc:v1:');
+/* Шифр — оба формата. Проверка только на v1 (было до 2.26.3) заставляла
+ * скрипт считать 34 уже зашифрованных файла открытым текстом и шифровать
+ * шифротекст повторно. */
+const isEnc = (v) => typeof v === 'string'
+  && (v.startsWith('enc:v1:') || v.startsWith('enc:v2:'));
 
 function main() {
   const opts = parseArgs(process.argv.slice(2));
@@ -159,12 +189,20 @@ function main() {
         break;
       }
 
+      /* AAD берётся из самой строки — `${promptHash}:${field}`, ровно как
+       * в knowledge-loop.js. Без него v2 не записать, а v1 поверх v2
+       * вернул бы шифротекст вместо текста. Если `promptHash` в строке нет
+       * (совсем старый формат), AAD не ставим и пишем v1: выдумывать хеш
+       * нельзя — сервер не смог бы пересчитать AAD при чтении. */
+      const rowHash = typeof obj.promptHash === 'string' && obj.promptHash
+        ? obj.promptHash : null;
+
       let changed = false;
       for (const field of ['prompt', 'response']) {
         const v = obj[field];
         if (typeof v !== 'string' || !v.length) continue;
         if (isEnc(v)) continue;
-        const enc = encryptDeterministic(v, key);
+        const enc = encryptDeterministic(v, key, rowHash ? `${rowHash}:${field}` : null);
         if (enc === null) continue;
         obj[field] = enc;
         changed = true;
