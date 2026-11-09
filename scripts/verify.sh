@@ -486,7 +486,7 @@ WS_ROOT="$(cd "$REPO_DIR/.." && pwd)"
 # проверялись, хотя симлинками были. Дыра нашлась при добавлении MASTER-PLAN:
 # гейт показывал «7/7», хотя три документа могли молча стать копиями.
 # Пять канонических идут первыми — их поломка дороже всего.
-DOC_LINKS="MANIFEST.v3.4-UNIFIED.md PROJECT-HISTORY.md PROJECT-MAP.md ROADMAP.md MASTER-PLAN.md ONE-PAGER.md PITCH-DECK.md DEMO-SCRIPT.md EMAIL-TEMPLATE.md AUDIT-REALITY.md PROJECT-MEMORY.md"
+DOC_LINKS="MANIFEST.v3.4-UNIFIED.md PROJECT-HISTORY.md PROJECT-MAP.md ROADMAP.md MASTER-PLAN.md NARRATIVE.md ONE-PAGER.md PITCH-DECK.md DEMO-SCRIPT.md EMAIL-TEMPLATE.md AUDIT-REALITY.md PROJECT-MEMORY.md"
 if [ -d "$WS_ROOT" ]; then
   LINKS_BAD=""
   LINKS_OK=0
