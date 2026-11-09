@@ -52,6 +52,16 @@ const DATA_DIR = process.env.P2P_DATA_DIR || path.join(HERE, 'data')
 /* Запускать ли настоящий libp2p-узел. Выключено по умолчанию — см. шапку. */
 const WANT_LIBP2P = process.env.P2P_BRIDGE_LIBP2P === '1'
 
+/* Протокол DHT сети TarNet — тот же, что у воркера. Разные значения
+ * означали бы, что воркер и мост сидят в двух несвязанных сетях и не
+ * находят друг друга никогда. */
+const DHT_PROTOCOL = '/tarnet/kad/1.0.0'
+
+/* Сеть для бакетов и темы объявлений — та же, что у воркера. Разные
+ * значения означали бы два несвязанных мира: воркер объявляет в одну
+ * тему, мост слушает другую, и оба считают, что сети нет. */
+const NETWORK_ID = process.env.TARNET_NETWORK_ID || 'tarnet-testnet-1'
+
 /* Кто мы для server.js. Пока у backend-api нет собственного peerId
  * (в нём нет ни ключа узла, ни таблицы идентичностей), мост отдаёт
  * свой. Когда появится `P2P_PEER_ID`, значение возьмётся из env и
@@ -89,6 +99,15 @@ function currentAllowlist() {
 }
 
 const announced = new Map() // nodeId -> { peerId, at }
+
+/* Принятые WorkerRecord с сети: peerId -> { record, at }.
+ *
+ * ЗАЧЕМ ХРАНИМ. ГossipSub доставил запись один раз; кто спросит позже,
+ * должен получить ответ без ожидания следующего цикла объявления.
+ * TTL проверяется при чтении (`expiresAt`), а не при записи: запись в
+ * Map сама не исчезает, и без проверки мост отдавал бы мёртвые узлы.
+ */
+const workerRecords = new Map()
 const startedAt = Date.now()
 
 /* Каналы задач от воркеров.
@@ -131,6 +150,10 @@ async function startLibp2p() {
   const { noise } = await import('@libp2p/noise')
   const { yamux } = await import('@libp2p/yamux')
   const { identify } = await import('@libp2p/identify')
+  const { ping } = await import('@libp2p/ping')
+  const { kadDHT } = await import('@libp2p/kad-dht')
+  const { gossipsub } = await import('@libp2p/gossipsub')
+  const { gossipOptions, attachGossip } = await import('./gossip-announce.js')
 
   const port = Number(process.env.P2P_PORT || 4001)
   const host = process.env.P2P_HOST || '127.0.0.1'
@@ -164,7 +187,21 @@ async function startLibp2p() {
     transports: [tcp()],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
-    services: { identify: identify() }
+    services: {
+      identify: identify(),
+      /* `ping` — не для красоты: kad-dht объявляет capability
+       * "@libp2p/ping" и без него падает на старте с
+       * UnmetServiceDependenciesError. Проверено запуском. */
+      ping: ping(),
+      /* clientMode: false — мост ПУБЛИЧНЫЙ seed. Он принимает входящие
+       * соединения, значит может хранить записи за других; воркер за NAT
+       * этого не может и обязан быть клиентом. */
+      dht: kadDHT({ protocol: DHT_PROTOCOL, clientMode: false }),
+      /* Тема и политика подписи — из общего модуля с воркером. Копия
+       * в этом файле разъехалась бы с воркером на первой же правке,
+       * и мост слушал бы тему, в которую никто не публикует. */
+      pubsub: gossipsub(gossipOptions()),
+    }
   })
   await node.start()
   peerId = node.peerId.toString()
@@ -177,6 +214,24 @@ async function startLibp2p() {
     taskClient.attach(stream, connection?.remotePeer?.toString() ?? 'unknown')
   })
   console.log(`[bridge] приём задач: ${TASK_PROTOCOL}`)
+
+  /* Подписка на объявления. Мост их не публикует — он их принимает и
+   * запоминает, чтобы отдать по запросу тем, кто ещё не в DHT.
+   *
+   * ОШИБКА ЗДЕСЬ НЕ ВАЛИТ МОСТ. Раздача задач и DHT — разные функции;
+   * упавший из-за gossipsub мост означал бы «нет задач» вместо
+   * «нет объявлений», а это разные диагнозы. */
+  try {
+    await attachGossip(node, {
+      networkId: NETWORK_ID,
+      log: (m) => console.log(`[bridge] ${m}`),
+      onRecord: (record) => {
+        workerRecords.set(record.peerId, { record, at: Date.now() })
+      },
+    })
+  } catch (e) {
+    console.log(`[bridge] gossipsub не подключён: ${e.message}`)
+  }
   publicAddrs = publicIn.addrs
   announceNote = publicIn.note || listenMismatch(host, publicIn.addrs)
   console.log(

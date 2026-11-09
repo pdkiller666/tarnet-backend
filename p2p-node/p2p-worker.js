@@ -29,12 +29,21 @@ import { noise } from '@libp2p/noise'
 import { yamux } from '@libp2p/yamux'
 import { identify } from '@libp2p/identify'
 import { ping } from '@libp2p/ping'
+import { kadDHT } from '@libp2p/kad-dht'
 import { multiaddr } from '@multiformats/multiaddr'
 import { serveTaskStream, encodeLine, TASK_PROTOCOL } from './task-protocol.js'
 import { buildHello, waitForWorkerIdentity } from './peer-hello.js'
+import { provideCids, DEFAULT_NETWORK_ID, buildRecord, publicKeyFromSeed, nextSequence } from './worker-record.js'
+import { gossipOptions, attachGossip } from './gossip-announce.js'
+import { gossipsub } from '@libp2p/gossipsub'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+/* CID нужен объектом, а не строкой: `dht.provide` читает
+ * `key.multihash.bytes`. Строка даёт `undefined` и падение внутри DHT
+ * (`Cannot read properties of undefined (reading 'bytes')`), причём
+ * выглядит это как баг библиотеки, а не как наш. */
+import { CID } from 'multiformats/cid'
 
 const BOOTSTRAP_BASE = (
   process.env.TARNET_PUBLIC_URL || 'https://v1107336.hosted-by-vdsina.com'
@@ -51,6 +60,42 @@ const BOOTSTRAP_TIMEOUT_MS = Number(process.env.P2P_BOOTSTRAP_TIMEOUT_MS || 8000
 const RETRY_MS = Number(process.env.P2P_RETRY_MS || 15000)
 
 const ONCE = process.argv.includes('--once')
+
+/* Протокол DHT сети TarNet. Отдельный от публичного IPFS намеренно: общая
+ * DHT означала бы, что наши записи видны чужой сети, а совместимость
+ * форматов никто не проверял. */
+const DHT_PROTOCOL = '/tarnet/kad/1.0.0'
+
+/* Протокол отдачи записи. Третий шаг Discovery: по провайдер-индексу
+ * нашли «кто», но адрес для выплат и TTL берутся из записи. Поток
+ * открывается к найденному пиру, и он отдаёт свою подписанную запись. */
+const RECORD_PROTOCOL = '/tarnet/worker-record/1.0.0'
+
+/* Сеть, к которой относятся объявления провайдера. Меняется только
+ * вместе с сетью: бакеты подписаны ею, и узел тестнета не должен
+ * попадать в выдачу мейннета. */
+const NETWORK_ID = process.env.TARNET_NETWORK_ID || DEFAULT_NETWORK_ID
+
+/* Что воркер умеет — из env, а не из догадки.
+ *
+ * ЗАЧЕМ ENV. Список моделей у человека зависит от того, что он реально
+ * поставил (Ollama с llama3 или с qwen), и от железа. Выдумать его здесь
+ * значило бы объявить в DHT возможности, которых нет, — клиент придёт с
+ * задачей, которую некому выполнить.
+ *
+ * Формат: P2P_MODEL_FAMILIES="llama,qwen" , P2P_DEVICE_CLASS="desktop".
+ * Пусто — объявлять нечего, и это честнее пустого бакета. */
+function workerCapabilities(env = process.env) {
+  const list = (v) => String(v || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  return {
+    modelFamilies: list(env.P2P_MODEL_FAMILIES),
+    runtimes: list(env.P2P_RUNTIMES),
+    deviceClass: list(env.P2P_DEVICE_CLASS),
+  }
+}
 
 /* Сколько ждать появления ключа воркера на диске.
  *
@@ -117,6 +162,13 @@ async function fetchBootstrap() {
  * Слушаем только loopback и на порту 0: воркер — клиент, ему не нужно
  * принимать входящие. Порт 0 означает «любой свободный», иначе второй
  * запуск на той же машине падал бы EADDRINUSE из-за первого.
+ *
+ * DHT в clientMode: воркер за NAT не может быть сервером — к нему не
+ * достучатся, и запись о нём в DHT была бы неправдой. Клиентский режим
+ * означает «спрашивать можно, хранить чужое — нет».
+ * ПРОТОКОЛ. `/tarnet/kad/1.0.0` — свой, а не общий IPFS: чужая DHT
+ * наполнилась бы нашими записями и наоборот, а совместимость с ней
+ * никто не проверял.
  */
 async function startNode() {
   const node = await createLibp2p({
@@ -125,7 +177,17 @@ async function startNode() {
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
     // identify нужен, чтобы узел на той стороне узнал наш peerId и адрес
-    services: { identify: identify(), ping: ping() },
+    services: {
+      identify: identify(),
+      // `ping` не для проверки связи: kad-dht объявляет capability
+      // "@libp2p/ping" и без него падает на старте с
+      // UnmetServiceDependenciesError (проверено запуском).
+      ping: ping(),
+      dht: kadDHT({ protocol: DHT_PROTOCOL, clientMode: true }),
+      /* Политика и тема — из общего модуля: разъехавшиеся копии дали
+       * бы воркер, публикующий в одну тему, и мост, слушающий другую. */
+      pubsub: gossipsub(gossipOptions()),
+    },
   })
   await node.start()
   return node
@@ -365,6 +427,93 @@ async function main() {
   const node = await startNode()
   log(`мой peerId: ${node.peerId.toString()}`)
 
+  /* Объявление своих возможностей. Без этого DHT отвечает «провайдеров
+   * нет», и `findProviders` возвращает пусто — снаружи это выглядит как
+   * «DHT не работает», хотя узел жив и просто ничего не заявил. */
+  let gossip = null
+  /* Последняя подписанная запись — её отдаём по RECORD_PROTOCOL. */
+  let currentRecord = null
+
+  /* Отдача записи. Регистрируется сразу после старта: клиент, нашедший
+   * нас в DHT, должен получить ответ с первой же попытки, а не после
+   * первого цикла объявления. */
+  await node.handle(RECORD_PROTOCOL, async (stream) => {
+    try {
+      const body = currentRecord
+        ? { ok: true, ...currentRecord }
+        : { ok: false, error: 'NO_RECORD_YET' }
+      if (!stream.send(encodeLine(body))) {
+        await new Promise((resolve) => {
+          stream.once('drain', resolve)
+          stream.once('close', resolve)
+        })
+      }
+    } catch (_e) {
+      /* Поток уже закрыт — отвечать некому. */
+    } finally {
+      try { await stream.close() } catch (_e) { /* уже закрыт */ }
+    }
+  })
+  log(`отдача записи: ${RECORD_PROTOCOL}`)
+
+  /* `provide` и `findProviders` возвращают AsyncIterable, а НЕ Promise.
+   * `await dht.provide(cid)` на таком объекте возвращается немедленно:
+   * запрос создаётся и никем не потребляется, то есть ОБЪЯВЛЕНИЯ НЕ
+   * ПРОИСХОДИТ, а ошибки нет. Пришлось бы искать причину «пустых
+   * провайдеров» руками. Дренаж до конца — и есть выполнение запроса. */
+  const drain = async (iterable) => {
+    let last = null
+    for await (const evt of iterable) last = evt
+    return last
+  }
+
+  const announce = async () => {
+    const caps = workerCapabilities()
+    const cids = provideCids(caps, { networkId: NETWORK_ID })
+    if (!cids.length) {
+      log('нечего объявлять: capabilities пусты (P2P_MODEL_FAMILIES / P2P_DEVICE_CLASS)')
+      return
+    }
+    for (const cid of cids) {
+      try {
+        await drain(node.services.dht.provide(CID.parse(cid)))
+        log(`объявлен провайдер: ${cid}`)
+      } catch (e) {
+        /* Не валим воркер: transport и задачи важнее индекса. Но и не
+         * молчим — иначе «нет провайдеров» будет выглядеть как баг DHT. */
+        log(`провайдер ${cid.slice(0, 16)}… не объявлен: ${e.message}`)
+      }
+    }
+
+    /* Подписанная запись — вторая половина объявления. По провайдер-индексу
+     * находят «кто», а из записи узнают адрес для выплат и срок жизни. */
+    try {
+      const ident = await waitForWorkerIdentity({ timeoutMs: KEY_WAIT_MS })
+      if (ident.error) {
+        log(`запись не подписана: ${ident.error}`)
+        return
+      }
+      const built = buildRecord({
+        peerId: node.peerId.toString(),
+        workerAddress: ident.address,
+        seed: ident.seed,
+        sequence: nextSequence(),
+        capabilities: caps,
+        networkId: NETWORK_ID,
+      })
+      const { record, signature } = built
+      /* Запоминаем ТУ ЖЕ запись для отдачи по потоку: если бы обработчик
+       * собирал её заново, sequence и issuedAt в объявлении и в ответе
+       * разъехались бы, и проверяющий отбросил бы верную запись. */
+      currentRecord = { record, signature }
+      if (!gossip) gossip = await attachGossip(node, { networkId: NETWORK_ID, log })
+      await gossip.publish(record, signature)
+      log(`запись объявлена: seq ${record.sequence}, до ${new Date(record.expiresAt).toISOString()}`)
+    } catch (e) {
+      log(`запись не объявлена: ${e.message}`)
+    }
+  }
+
   const shutdown = async (code = 0) => {
     try { await node.stop() } catch {}
     process.exit(code)
@@ -398,6 +547,25 @@ async function main() {
         log(`подключено: ${conn.remotePeer.toString()}`)
         log(`адрес соединения: ${conn.remoteAddr.toString()}`)
 
+        /* ВАЖНО: явно кладём бридж в таблицу маршрутизации DHT.
+         *
+         * Само по себе оно НЕ происходит, и это проверено запуском
+         * (probe-bootstrap.mjs): без этой строки `routingTable.size`
+         * оставался 0, а `provide()` висел до таимаута, не отдав ни одного
+         * события. Причина: `kadDHT` наполняет таблицу из события topology
+         * `peer`, а оно требует, чтобы в peerStore у пира уже был виден
+         * его DHT-протокол. В первом рукопожатии `identify` отдаёт только
+         * `/ipfs/id/1.0.0`, поэтому событие не считается — и на loopback, и
+         * в проде поведение одно и то же. Явный add снимает зависимость от
+         * порядка рукопожатий. С ним: rt=1, 8 событий provide, провайдер
+         * находится с чужого узла. */
+        try {
+          await node.services.dht.routingTable.add(conn.remotePeer)
+          log(`в таблице DHT: ${node.services.dht.routingTable.size}`)
+        } catch (e) {
+          log(`не добавился в таблицу DHT: ${e.message}`)
+        }
+
         /* Это и есть приёмка Этапа 3 с нашей стороны: живое соединение,
          * а не «команда отправлена». Считаем только установленные. */
         const conns = node.getConnections()
@@ -410,6 +578,9 @@ async function main() {
          * пригодным для маршрутизации: без потока задача ушла бы по HTTP. */
         lastBridgeMa = ma
         await openTaskStream(node, ma)
+        /* Объявляемся ПОСЛЕ подключения: provide требует живого соседа,
+         * иначе запись ляжет в локальную таблицу и в сеть не попадёт. */
+        await announce()
         return true
       } catch (e) {
         lastErr = e

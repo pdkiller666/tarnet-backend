@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.24.8-p2p-ux",
+  "version": "2.25.0-distributed-discovery",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

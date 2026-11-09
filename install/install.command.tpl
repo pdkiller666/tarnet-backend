@@ -213,7 +213,22 @@ if [ -f "$P2P_DIR/p2p-worker.js" ]; then
       # на WS — ровно тот дефект, ради которого этот шаг и появился.
       if (cd "$P2P_DIR" && "$NODE_BIN" -e "import('libp2p').then(()=>process.exit(0)).catch(()=>process.exit(1))" >/dev/null 2>&1); then
         P2P_OK=1
-        say "      p2p-транспорт: ok"
+        # Discovery нужен kad-dht и gossipsub сверх самого транспорта.
+        # Проверяем отдельно: без них транспорт жив, но объявления в DHT
+        # нет — и это надо сказать вслух, а не оставить молчаливым.
+        if ! (cd "$P2P_DIR" && "$NODE_BIN" -e "Promise.all([import('@libp2p/kad-dht'),import('@libp2p/gossipsub')]).then(()=>process.exit(0)).catch(()=>process.exit(1))" >/dev/null 2>&1); then
+          DHT_OK=0
+        else
+          DHT_OK=1
+        fi
+        if [ "$DHT_OK" = "1" ]; then
+          say "      p2p-транспорт: ok"
+        else
+          say "      p2p-транспорт: ok (WS)"
+          say "      ПРЕДУПРЕЖДЕНИЕ: МОДУЛИ DHT (kad-dht/gossipsub) НЕ ЗАГРУЖАЮТСЯ"
+          say "      Discovery выключен — воркер будет работать только через WS-мост"
+          say "      Починить: cd \"$P2P_DIR\" && npm ci --omit=dev"
+        fi
       else
         say "      ПРЕДУПРЕЖДЕНИЕ: libp2p не загрузился после npm ci — p2p пропущен"
       fi

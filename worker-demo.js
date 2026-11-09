@@ -1727,9 +1727,26 @@ let p2pChild = null;
  * человек видит стектрейс чужого модуля. Симптом неотличим от «транспорт
  * не подключился», а причина — одна папка. Проверяем ДО запуска ребёнка
  * и называем её прямо. */
-function p2pDepsMissing(workerPath) {
+/* Пакеты, без которых Discovery не поднимется. Проверяем по отдельности,
+ * а не одним `libp2p`: транспорт может стоять, а `@libp2p/kad-dht` — нет, и
+ * тогда узел молча не объявит себя в DHT. Одна общая строка «deps ok»
+ * скрыла бы ровно этот случай (ошибка, из-за которой владелец видел
+ * `connections: 0` при живом `--p2p`). */
+const P2P_REQUIRED_PACKAGES = ['libp2p', '@libp2p/kad-dht', '@libp2p/gossipsub'];
+
+function p2pDepsReport(workerPath) {
   const dir = path.dirname(workerPath);
-  return !fs.existsSync(path.join(dir, 'node_modules', 'libp2p', 'package.json'));
+  const missing = P2P_REQUIRED_PACKAGES.filter((name) => {
+    const parts = name.split('/');
+    return !fs.existsSync(path.join(dir, 'node_modules', ...parts, 'package.json'));
+  });
+  return { missing, ok: missing.length === 0 };
+}
+
+/* Контракт сохранён: булево «чего-то не хватает». Тесты 53.10 читают
+ * именно `String(...)=true`, поэтому детали отдаёт p2pDepsReport. */
+function p2pDepsMissing(workerPath) {
+  return !p2pDepsReport(workerPath).ok;
 }
 
 /* Имя флага в сообщениях — то, что человек набрал. Печатать жёстко `--p2p`
@@ -1763,9 +1780,17 @@ function startP2pChild() {
     log('  переустановите программу установщиком с сайта — он привозит p2p-node');
     return null;
   }
-  if (p2pDepsMissing(workerPath)) {
-    log(`${flagName()}: транспорт найден, но зависимости НЕ установлены`);
-    log(`  нет: ${path.join(path.dirname(workerPath), 'node_modules', 'libp2p')}`);
+  const deps = p2pDepsReport(workerPath);
+  if (!deps.ok) {
+    const onlyDht = deps.missing.every((n) => n !== 'libp2p');
+    if (onlyDht) {
+      log(`${flagName()}: транспорт есть, но ЗАВИСИМОСТИ DHT НЕ УСТАНОВЛЕНЫ`);
+    } else {
+      log(`${flagName()}: транспорт найден, но зависимости НЕ установлены`);
+    }
+    for (const name of deps.missing) {
+      log(`  нет: ${path.join(path.dirname(workerPath), 'node_modules', ...name.split('/'))}`);
+    }
     log('  причина: не выполнен `npm ci` в папке p2p-node (баг старого установщика)');
     log(`  починить вручную: cd "${path.dirname(workerPath)}" && npm ci --omit=dev`);
     return null;

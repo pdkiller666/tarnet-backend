@@ -2285,3 +2285,67 @@ tarnet-worker.js --p2p` — флаг Node, который легко переп�
 **Условие закрытия P1.2 (без изменений).** Воркер на ПК владельца запускается `start.cmd`,
 `/p2p/status` показывает его адрес в `bridge.worker_addresses` и `connections >= 1`,
 `active_workers >= 1`. Только после этого — тест роя с `CANCEL` проигравшему.
+
+---
+
+### Б.40. Срез 09.11.2026 07:10 MSK — `2.25.0-distributed-discovery`: воркера находят без сервера
+
+**Версия:** `2.25.0-distributed-discovery` (локально; на VPS остаётся `2.24.0-p0-hardening`).
+
+**Что теперь работает.** Воркер кладёт в DHT провайдер-запись по CID бакета
+`{networkId, modelFamily, deviceClass}`, переиздаёт её каждые 30 с (треть TTL 90 с) и
+отдаёт свою подписанную `WorkerRecord` прямым потоком. Клиент, зная только CID,
+находит провайдера через `findProviders`, открывает `/tarnet/worker-record/1.0.0`
+и проверяет Ed25519-подпись до того, как доверит узлу задачу.
+
+**Новые модули (`p2p-node/`, оба без зависимости от libp2p на импорте):**
+
+| Модуль | Строк | Роль |
+| :--- | ---: | :--- |
+| `worker-record.js` | 339 | Схема `tarnet.worker-record.v1`, сборка CIDv1/raw вручную, base58btc для `peerId`, `bucketKey`/`bucketCid`/`provideCids`, `buildRecord`, `verifyRecord`, `nextSequence`. JCS берётся из корневого `jcs.js`, а не пишется второй раз |
+| `gossip-announce.js` | 164 | `announceTopic(networkId)`, `gossipOptions()` (`StrictSign`), `createRecordValidator` (схема + `expiresAt` + `message.from === record.peerId` + подпись), `attachGossip` |
+
+**Что изменено в существующих файлах:**
+
+- `p2p-worker.js` (+173): `kadDHT({ protocol: '/tarnet/kad/1.0.0', clientMode: true })` —
+  воркер за NAT не может быть хранилищем; `workerCapabilities(env)` читает
+  `P2P_MODEL_FAMILIES` / `P2P_RUNTIMES` / `P2P_DEVICE_CLASS` вместо выдуманного списка;
+  поток `/tarnet/worker-record/1.0.0` отдаёт `currentRecord`.
+- `bridge.js` (+57): `clientMode: false` (мост — публичный seed, принимать входящие может),
+  `gossipsub` + `ping` в `services`, `workerRecords: Map` — принятая запись отдаётся
+  тому, кто спросит позже, с проверкой `expiresAt` при чтении, а не при записи.
+- `p2p-bundle.js`: в список архива добавлены `worker-record.js` и `gossip-announce.js`.
+  Это не косметика: без них установщик отдал бы воркер, падающий на `ERR_MODULE_NOT_FOUND`.
+
+**Главный дефект, найденный только E2E-тестом.** `provide()` не отдавал ни одного события
+и висел до таймаута, `routingTable.size === 0` у обоих узлов — при живом соединении.
+Три причины, каждая проверена отдельной пробой:
+1. `peerInfoMapper` по умолчанию — `removePrivateAddressesMapper`; адрес `127.0.0.1`
+   вырезается, и локальные пиры для DHT не существуют. Заменён на `removePublicAddressesMapper`.
+2. В первом `identify` узел видит у пира только `/ipfs/id/1.0.0`, хотя тот объявляет три
+   протокола. Событие `peer` не срабатывает, таблица не наполняется.
+3. `dht.provide(cid)` принимает **объект** `CID` (читает `key.multihash.bytes`). Строка
+   падает с `Cannot read properties of undefined (reading 'bytes')` — выглядит как баг
+   библиотеки, а не как наш.
+
+Починка: явный `routingTable.add(peerId)` после `dial` — не полагаться на топологическое
+событие, которое на первом рукопожатии не приходит.
+
+**Приёмка (09.11 07:08 MSK).**
+- `node scripts/test-discovery-e2e.js` → **10 ✅ / 0 ❌**, EXIT=0. Проверяет оба сервера
+  в таблицах друг друга, `provide`, `findProviders`, адреса провайдера, открытие потока,
+  схему записи, совпадение `peerId`, Ed25519-подпись и отказ подделанной записи.
+- `node test-dpouw.js --test` → **1227 ✅ / 0 ❌**, EXIT=0. Тест `54.4` поймал реальный
+  дефект: новые рантайм-модули не были в списке архива. E2E-тест при этом убран из
+  `p2p-node/` в `p2p-node/test/` — он не рантайм и не должен уезжать пользователям;
+  `readdirSync` верхнего уровня его больше не видит.
+
+**Что этот срез НЕ доказывает.**
+- **Discovery в проде не проверен.** На VPS всё ещё `2.24.0-p0-hardening`, где
+  `kad-dht` не подключён вовсе. Три независимых seed-адреса и раскатка заблокированы
+  отсутствием SSH-ключа (`root@195.63.131.172: Permission denied (publickey,password)`).
+- **Второй узел найден только на loopback.** Два процесса на одной машине — не сеть.
+  Проверка «через NAT, между двумя ПК» ещё не делалась.
+- **GossipSub-объявления проверены косвенно.** Валидатор написан и подключён, но живой
+  обмен через тему `/tarnet/tarnet-testnet-1/workers/1.0.0` между двумя машинами
+  не наблюдался.

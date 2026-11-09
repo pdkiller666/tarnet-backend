@@ -192,8 +192,24 @@ set "IMPORT_RC=%errorlevel%"
 popd
 if not "%IMPORT_RC%"=="0" goto p2p_import_failed
 
+rem Discovery needs kad-dht and gossipsub on top of the transport itself.
+rem Checked separately on purpose: missing gossip modules must not throw
+rem away a transport that works, but the user has to know that announcing
+rem to the DHT is off. Hiding it would repeat the silent-WS-fallback bug.
+pushd "%P2P_DIR%"
+"%NODE_EXE%" -e "Promise.all([import('@libp2p/kad-dht'),import('@libp2p/gossipsub')]).then(()=>process.exit(0)).catch(()=>process.exit(1))" >nul 2>nul
+set "DHT_RC=%errorlevel%"
+popd
+
 set "P2P_OK=1"
+if not "%DHT_RC%"=="0" goto p2p_dht_missing
 echo       p2p transport: ok
+goto p2p_done
+
+:p2p_dht_missing
+echo       WARNING: DHT modules (kad-dht/gossipsub) do not load.
+echo       Discovery is OFF - the worker will use the WS bridge only.
+echo       Fix: run "npm ci --omit=dev" inside %P2P_DIR%
 goto p2p_done
 
 :p2p_no_npm
