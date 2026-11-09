@@ -18,6 +18,7 @@
 | Команда | `npm start` → `node server.js`; порт `3001` |
 | Приёмка | `node test-dpouw.js --test` — поднимает изолированный сервер на `mktemp`-БД |
 | Прод | systemd `tarnet.service`, каталог `/opt/tarnet/backend-api`, БД `/var/lib/tarnet` |
+| **SSH-ключ к проду** | Ключ живёт на **постоянном томе**: `~/.openclaw/ssh/tarnet_vps` (+ `.pub`, `config`, `known_hosts`); `~/.ssh` — **симлинк** на этот каталог. ПОЧЕМУ: `~/.ssh` лежал на overlay-слое контейнера и исчезал при пересборке целиком (так терялся доступ 08–09.11). Восстановление — `bash ~/.openclaw/ssh/ensure.sh` (идемпотентно); алиас `ssh tarnet-vps` работает. Не просить пароль, пока `ensure.sh` не прогнан |
 | Мост к libp2p | systemd `p2p-bridge.service` (юнит в `deploy/systemd/p2p-bridge.service`), ключ узла `/var/lib/tarnet/p2p/peer-id.bin`, порт `4001` |
 | **Порты: боевой vs демо** | `4001` — **только** `p2p-node/bridge.js` (настоящий libp2p, `P2P_PORT`, открыт в ufw). Демо-меш (`p2p-demo.js`, стартует из `server.js` через `ensureDemoMesh()`) — `4101`/`4102`. **Не возвращать демо-мешу `4001`:** `server.js` поднимается раньше моста и выигрывает гонку, мост падает `EADDRINUSE` и уходит в цикл рестартов, а `tarnet.service` при этом `active` и `/health` — `200` (09.11.2026, `NRestarts=28`) |
 | Проверка снаружи | `https://v1107336.hosted-by-vdsina.com/health` и `/p2p/bootstrap` (за **Caddy** на `443`; порт `3001` наружу **закрыт** — не судить о доступности по нему) |
