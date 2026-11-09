@@ -1,0 +1,22 @@
+[Unit]
+# Расписание уборки датасетов Knowledge Loop.
+#
+# ПОЧЕМУ ВОСКРЕСЕНЬЕ 03:00. Уборка не срочная, а `unlink` сотни файлов
+# поднимает I/O. 03:00 — окно, когда ни оператор, ни нагрузка не мешают.
+# `Persistent=true`: если машина была выключена в это время, прогон
+# случится при следующем старте, а не будет пропущен до следующей недели.
+# Без него timer молча пропускает тик — и это выглядит как «всё хорошо».
+Description=Weekly timer for TarNet prune distill datasets
+Documentation=file:///opt/tarnet/backend-api/MANIFEST.v3.4-UNIFIED.md
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00:00
+Persistent=true
+
+# Разброс: прогон в 03:00:00 ровно у всех машин сразу — не наша проблема
+# при одном VPS, но RandomDelaySec защищает от будущей синхронной нагрузки,
+# если таймер размножится по seed-нодам.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

@@ -37,6 +37,7 @@ import { buildHello, waitForWorkerIdentity } from './peer-hello.js'
 import { provideCids, DEFAULT_NETWORK_ID, buildRecord, publicKeyFromSeed, nextSequence, RECORD_PROTOCOL } from './worker-record.js'
 import { gossipOptions, attachGossip } from './gossip-announce.js'
 import { gossipsub } from '@libp2p/gossipsub'
+import { circuitRelayTransport } from '@libp2p/circuit-relay-v2'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -199,8 +200,18 @@ async function startNode({ privateKey } = {}) {
      * Теперь опубликовавший и подписавший — один и тот же ключ, и
      * валидатор `message.from === record.peerId` проходит по существу. */
     ...(privateKey ? { privateKey } : {}),
-    addresses: { listen: ['/ip4/127.0.0.1/tcp/0'] },
-    transports: [tcp()],
+    /*`/p2p-circuit` в listen — не второй транспортный адрес, а запрос
+     * резервации: при появлении слушателя на этом адресе `RelayDiscovery`
+     * регистрирует топологию на HOP-кодеке и берёт слот у каждого
+     * подключённого relay. Без этой строки транспорт в сборке есть, но
+     * резервации не запрашиваются, и relay-адреса у узла не появляются.
+     *
+     * ПОЧЕМУ RELAY НЕ ВЫКЛЮЧАЕТСЯ ФЛАГОМ. Прямой dial остаётся
+     * предпочтительным: relay — третий адрес, а не замена TCP. Узел без
+     * NAT соединяется напрямую и лишь ДОПОЛНИТЕЛЬНО держит слот — трафик
+     * через relay идёт только когда прямого пути нет. */
+    addresses: { listen: ['/ip4/127.0.0.1/tcp/0', '/p2p-circuit'] },
+    transports: [tcp(), circuitRelayTransport()],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
     // identify нужен, чтобы узел на той стороне узнал наш peerId и адрес

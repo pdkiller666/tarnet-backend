@@ -154,10 +154,33 @@ async function startLibp2p() {
   const { ping } = await import('@libp2p/ping')
   const { kadDHT } = await import('@libp2p/kad-dht')
   const { gossipsub } = await import('@libp2p/gossipsub')
+  const { circuitRelayServer } = await import('@libp2p/circuit-relay-v2')
   const { gossipOptions, attachGossip } = await import('./gossip-announce.js')
 
   const port = Number(process.env.P2P_PORT || 4001)
   const host = process.env.P2P_HOST || '127.0.0.1'
+
+  /* Relay-сервер: включён по умолчанию, выключается `P2P_RELAY=0`.
+   *
+   * ЗАЧЕМ. DHT-сервер (`clientMode: false`) и relay — разные вещи, и одно
+   * не заменяет другого. DHT отвечает на вопрос «кто умеет X и по какому
+   * адресу», но адрес за строгим NAT недостижим: узел вправе объявить
+   * себя провайдером, а подключиться к нему снаружи нельзя. Relay даёт
+   * третью сторону: клиент держит ИСХОДЯЩЕЕ соединение к нам, а мы
+   * проксируем входящие потоки в него по этому уже открытому каналу.
+   * Без relay discovery находит узел и обрывается на соединении.
+   *
+   * ПОЧЕМУ ОГРАНИЧЕНИЯ ЯВНЫЕ. По умолчанию `maxReservations` — 15, этого
+   * мало для сети: шестнадцатый воркер молча не получит слот и будет
+   * выглядеть «живым в DHT, недоступным на деле». Поднимаем до 256 и
+   * задаём TTL, чтобы брошенные резервации освобождали место.
+   *
+   * ПОЧЕМУ ЛИМИТЫ ДАННЫХ. Relay пропускает через себя чужой трафик.
+   * Без `defaultDataLimit` один клиент качает через нас неограниченно,
+   * и VPS платит трафиком за чужую работу. Лимит — 2 МБ на соединение:
+   * запись `WorkerRecord` и кадр задачи укладываются с запасом, а
+   * потоковое видео через relay не поедет. */
+  const WANT_RELAY = process.env.P2P_RELAY !== '0'
 
   /* Слушать и объявлять — разные вопросы. `P2P_HOST=0.0.0.0` открывает
    * порт на всех интерфейсах, но в identify узел отдаёт адрес, на котором
@@ -198,6 +221,18 @@ async function startLibp2p() {
        * соединения, значит может хранить записи за других; воркер за NAT
        * этого не может и обязан быть клиентом. */
       dht: kadDHT({ protocol: DHT_PROTOCOL, clientMode: false }),
+      /* Relay только на сервере. Воркер за NAT физически не может быть
+       * relay: к нему не достучатся, проксировать некуда. */
+      ...(WANT_RELAY ? { circuitRelay: circuitRelayServer({
+        reservations: {
+          maxReservations: Number(process.env.P2P_RELAY_MAX_RESERVATIONS || 256),
+          reservationTtl: Number(process.env.P2P_RELAY_RESERVATION_TTL || 7200000),
+          defaultDataLimit: BigInt(process.env.P2P_RELAY_DATA_LIMIT || 2097152),
+          applyDefaultLimit: true
+        },
+        maxInboundHopStreams: 256,
+        maxOutboundStopStreams: 256
+      }) } : {}),
       /* Тема и политика подписи — из общего модуля с воркером. Копия
        * в этом файле разъехалась бы с воркером на первой же правке,
        * и мост слушал бы тему, в которую никто не публикует. */

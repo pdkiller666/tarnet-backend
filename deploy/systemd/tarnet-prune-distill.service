@@ -1,0 +1,37 @@
+[Unit]
+# Еженедельная уборка датасетов Knowledge Loop.
+#
+# ЗАЧЕМ ЮНИТ, А НЕ crontab. На VPS уже живут systemd-таймеры (включая
+# litestream-tarnet), crontab пуст. Два планировщика на одной машине — это
+# два места, где искать причину «почему не запустилось». Один.
+#
+# ЗАЧЕМ ОТДЕЛЬНЫЙ СЕРВИС. `prune-distill.js` по умолчанию dry-run, и это
+# правильно для ручного запуска. Но в расписании dry-run означает, что
+# файлы копятся вечно, а лог бодро пишет «будет освобождено». Здесь `--apply`
+# задан явно и только здесь.
+Description=TarNet prune distill datasets (Knowledge Loop)
+Documentation=file:///opt/tarnet/backend-api/MANIFEST.v3.4-UNIFIED.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/tarnet/backend-api
+
+# База нужна, чтобы отличить обученный датасет от брошенного: сверка идёт по
+# adapter_versions. Без неё скрипт честно предупредит и удалит только по
+# возрасту — но полагаться на это в расписании не надо.
+Environment=TARNET_DATA_DIR=/var/lib/tarnet
+Environment=TARNET_EXPERIENCE_DIR=/opt/tarnet/backend-api/storage/experience
+
+ExecStart=/usr/bin/node scripts/prune-distill.js --apply --days 30
+
+# ReadWritePaths не ограничиваем: скрипт пишет только unlink в каталоге
+# датасетов. Защита здесь была бы декоративной — он всё равно root.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tarnet-prune-distill
+
+# Долгий прогон не должен блокировать следующий тик. Файлов сотни, не
+# миллионы; минуты хватает с запасом.
+TimeoutStartSec=300

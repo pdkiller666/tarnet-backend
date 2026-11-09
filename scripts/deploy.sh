@@ -368,6 +368,41 @@ journalctl -u "$BSVC" -n 25 --no-pager >&2
 exit 7
 REMOTE
 
+# ---------- 5c. таймер уборки датасетов ----------
+# Юнит и таймер лежат в `deploy/systemd/`, то есть НЕ в рабочем дереве, которое
+# обновляет `git reset`, и сами на сервер не попадают. Без этого шага
+# `prune-distill.js` существует в репозитории, но не запускается никогда:
+# датасеты копятся, а в `systemctl list-timers` его нет.
+#
+# Не роняем деплой: уборка — обслуживание, а не работа API. Но и молчать
+# нельзя — поэтому внятный WARN, а не тихий `|| true`.
+info "ставлю таймер уборки датасетов"
+TIMER_UNITS="deploy/systemd/tarnet-prune-distill.service deploy/systemd/tarnet-prune-distill.timer"
+for u in $TIMER_UNITS; do
+  [ -f "$REPO_DIR/$u" ] || die "нет файла $u в репозитории"
+done
+
+ssh "${SSH_OPTS[@]}" "$VPS" "bash -s" -- "$REMOTE_DIR" $TIMER_UNITS <<'REMOTE' && printf 'таймер уборки датасетов активен\n' || printf 'ВНИМАНИЕ: таймер уборки не поставлен — датасеты копятся без автоудаления\n' >&2
+set -uo pipefail
+DIR=$1; shift
+for rel in "$@"; do
+  src="$DIR/$rel"; dst="/etc/systemd/system/$(basename "$rel")"
+  [ -f "$src" ] || { echo "ERR: нет $src"; exit 8; }
+  # install, а не cp: права и владелец юнита не должны зависеть от того,
+  # под каким umask его положили в git.
+  install -m 0644 -o root -g root "$src" "$dst" || { echo "ERR: install $dst"; exit 8; }
+done
+systemctl daemon-reload || { echo "ERR: daemon-reload"; exit 8; }
+# enable --now и проверка ФАКТА, а не кода возврата: таймер может быть
+# загружен, но не запущен, и `systemctl status` при этом скажет «inactive»
+# только если смотреть внимательно.
+systemctl enable --now tarnet-prune-distill.timer >/dev/null 2>&1 || { echo "ERR: enable timer"; exit 8; }
+systemctl is-active --quiet tarnet-prune-distill.timer || { echo "ERR: таймер не активен"; exit 8; }
+# NEXT — единственное доказательство, что расписание реально вычислено.
+systemctl list-timers tarnet-prune-distill.timer --no-pager | tail -n +2 | head -1
+echo "TIMER_OK"
+REMOTE
+
 # ---------- 6. health ----------
 rollback_hint() {
   printf '\nОТКАТ (вернёт предыдущий коммит и перезапустит сервис):\n'

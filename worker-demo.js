@@ -1731,8 +1731,14 @@ let p2pChild = null;
  * а не одним `libp2p`: транспорт может стоять, а `@libp2p/kad-dht` — нет, и
  * тогда узел молча не объявит себя в DHT. Одна общая строка «deps ok»
  * скрыла бы ровно этот случай (ошибка, из-за которой владелец видел
- * `connections: 0` при живом `--p2p`). */
-const P2P_REQUIRED_PACKAGES = ['libp2p', '@libp2p/kad-dht', '@libp2p/gossipsub'];
+ * `connections: 0` при живом `--p2p`).
+ *
+ * `@libp2p/circuit-relay-v2` с 2.25.3 в списке потому, что `p2p-worker.js`
+ * импортирует его СТАТИЧЕСКИ. Без пакета падает весь модуль — не только
+ * relay, но и обычный TCP-путь: человек получил бы `ERR_MODULE_NOT_FOUND`
+ * вместо «докачайте зависимости». Ровно тот класс отказа, что был 09.11
+ * с gossipsub. */
+const P2P_REQUIRED_PACKAGES = ['libp2p', '@libp2p/kad-dht', '@libp2p/gossipsub', '@libp2p/circuit-relay-v2'];
 
 function p2pDepsReport(workerPath) {
   const dir = path.dirname(workerPath);

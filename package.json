@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.25.2-privacy-and-pitch",
+  "version": "2.25.3-nat-readiness",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {
