@@ -60,6 +60,35 @@ function freePort() {
  * начислений требуется сервер с другим окружением (INITIAL_BLOCK_REWARD=0),
  * а не тот, на котором идёт остальная приёмка: менять окружение у живого
  * сервера нельзя, его можно только перезапустить. */
+/* Расшифровка поля JSONL настоящим ключом стенда.
+ *
+ * С 2.25.2 датасет на диске зашифрован, поэтому проверка «в файле лежит
+ * то, что мы записали» больше не может читать поле напрямую — она обязана
+ * расшифровать его тем же master.key, что у сервера. Расшифровка здесь
+ * повторена, а не взята из server.js, сознательно: тест, импортирующий
+ * проверяемый код для проверки, доказывал бы только, что код согласован
+ * сам с собой. Формат `enc:v1:iv:tag:ct` фиксирован отдельно.
+ *
+ * Возвращает null, если файл ключа или поле не в ожидаемом формате. */
+function decryptJsonlField(secretsDir, blob) {
+  if (typeof blob !== 'string' || !blob.startsWith('enc:v1:')) return null;
+  const parts = blob.split(':');
+  if (parts.length !== 5) return null;
+  let key;
+  try {
+    key = fs.readFileSync(path.join(secretsDir, 'master.key'));
+  } catch (_e) {
+    return null;
+  }
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(parts[2], 'base64'));
+    decipher.setAuthTag(Buffer.from(parts[3], 'base64'));
+    return Buffer.concat([decipher.update(Buffer.from(parts[4], 'base64')), decipher.final()]).toString('utf8');
+  } catch (_e) {
+    return null;
+  }
+}
+
 async function spawnServer(envOverrides = {}, opts = {}) {
   const port = await freePort();
   /* `opts.dir` — поднять сервер на СУЩЕСТВУЮЩЕМ каталоге. Нужен там, где
@@ -3628,10 +3657,27 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     const w7Lines = fs.readFileSync(w7JsonlPath, 'utf8').trim().split('\n');
     ok('24.9 в JSONL ровно 3 строки', w7Lines.length === 3, w7Lines.length);
     const w7First = JSON.parse(w7Lines[0]);
-    ok('24.9 строка JSONL несёт prompt/response/rating/домен',
-      typeof w7First.prompt === 'string' && typeof w7First.response === 'string'
-        && (w7First.rating === 1 || w7First.rating === -1) && w7First.domain === 'w7code',
-      { prompt: w7First.prompt, rating: w7First.rating, domain: w7First.domain });
+    /* С 2.25.2 поля prompt/response в файле зашифрованы. Проверка поэтому
+     * двухчастная: в файле именно шифротекст (`enc:v1:`), и он
+     * расшифровывается настоящим master.key стенда в тот текст, что
+     * записали. Одно без другого не годится: «строка начинается с enc:v1»
+     * прошло бы и на мусоре, а расшифровка без проверки префикса не отличила
+     * бы шифрование от случайного совпадения. */
+    ok('24.9 prompt/response в JSONL зашифрованы, не открытым текстом',
+      typeof w7First.prompt === 'string' && w7First.prompt.startsWith('enc:v1:')
+        && typeof w7First.response === 'string' && w7First.response.startsWith('enc:v1:'),
+      { prompt: String(w7First.prompt).slice(0, 24) });
+    const w7Secrets = path.join(tmpDir, 'secrets');
+    const w7Prompt = decryptJsonlField(w7Secrets, w7First.prompt);
+    const w7Response = decryptJsonlField(w7Secrets, w7First.response);
+    ok('24.9 шифротекст расшифровывается обратно в записанный текст',
+      /^задача номер [0-2] про сортировку$/.test(w7Prompt || '')
+        && /^решение [0-2]$/.test(w7Response || ''),
+      { prompt: w7Prompt, response: w7Response });
+    ok('24.9 служебные поля остались открытыми (rating/домен нужны тренеру)',
+      (w7First.rating === 1 || w7First.rating === -1) && w7First.domain === 'w7code'
+        && w7First.encrypted === true,
+      { rating: w7First.rating, domain: w7First.domain, encrypted: w7First.encrypted });
   }
 
   /* ---------- 24.10: пары помечены использованными ---------- */
@@ -10877,8 +10923,16 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
         const jsonlPath62 = train62.body?.jsonlPath;
         const line62 = jsonlPath62 && fs.existsSync(jsonlPath62)
           ? JSON.parse(fs.readFileSync(jsonlPath62, 'utf8').trim().split('\n')[0]) : null;
-        ok('62.9 в JSONL открытый текст, а не enc:v1',
-          line62?.prompt === plainPrompt && line62?.response === plainResponse, line62);
+        /* Перешифровка БД не должна ни испортить данные, ни оставить их
+         * открытыми на диске: проверяются обе стороны одним ходом. */
+        ok('62.9 в JSONL шифротекст, а не открытый текст',
+          String(line62?.prompt || '').startsWith('enc:v1:')
+          && String(line62?.response || '').startsWith('enc:v1:'),
+          { p: String(line62?.prompt || '').slice(0, 20) });
+        ok('62.9 шифротекст JSONL расшифровывается в исходные prompt/response',
+          decryptJsonlField(path.join(s62dir, 'secrets'), line62?.prompt) === plainPrompt
+          && decryptJsonlField(path.join(s62dir, 'secrets'), line62?.response) === plainResponse,
+          line62);
       } finally {
         s62b.stop();
       }

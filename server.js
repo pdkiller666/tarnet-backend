@@ -115,6 +115,35 @@ function encryptSecret(plaintext) {
   return `enc:v1:${iv.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${ct.toString('base64')}`;
 }
 
+/* Детерминированное шифрование для файлов, содержимое которых служит
+ * идентификатором версии.
+ *
+ * ПОЧЕМУ НЕ encryptSecret(): там случайный IV, и на одном и том же наборе
+ * данных каждый прогон давал бы новый шифротекст. JSONL-датасет хешируется
+ * в adapterHash, поэтому случайный IV превращал бы один датасет в новую
+ * версию адаптера при каждом запуске и наполнял бы adapter_versions
+ * дублями, которые нечем отличить друг от друга (это же записано в
+ * mock_train.py как причина хешировать содержимое, а не время).
+ *
+ * IV здесь выведен из открытого текста через HMAC-SHA256 под мастер-ключом
+ * (схема synthetic IV). Для GCM это безопасно, пока один IV не встречается
+ * у двух РАЗНЫХ текстов: совпадение IV означает совпадение текста, то есть
+ * повторное шифрование того же значения, а не повторное использование nonce
+ * на новом сообщении. Примитив остаётся AES-256-GCM.
+ *
+ * Цена предсказуемости честная и её надо знать: одинаковые prompt/response
+ * в двух записях дают одинаковый шифротекст, то есть файл выдаёт факт
+ * повтора. Для датасета это приемлемо; для произвольных секретов — нет,
+ * там остаётся encryptSecret(). */
+function encryptTextDeterministic(plaintext) {
+  if (typeof plaintext !== 'string' || !plaintext.length) return null;
+  const iv = crypto.createHmac('sha256', MASTER_KEY)
+    .update(plaintext, 'utf8').digest().subarray(0, 12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
+  const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  return `enc:v1:${iv.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${ct.toString('base64')}`;
+}
+
 function decryptSecret(blob) {
   if (typeof blob !== 'string' || !blob.length) return null;
   if (!blob.startsWith('enc:v1:')) return blob;
@@ -1689,6 +1718,10 @@ const knowledgeCoordinator = new knowledgeLoop.KnowledgeLoopCoordinator({
    * из SECRETS_DIR, и второй копии этого знания быть не должно. Координатор
    * получает функцию и не знает, чем именно зашифровано. */
   decryptText: decryptSecret,
+  /* Обратная сторона того же ключа: датасет на диске не должен лежать
+   * открытым текстом. Ключ остаётся в server.js — координатор по-прежнему
+   * не знает, чем именно зашифровано. */
+  encryptText: encryptTextDeterministic,
 });
 
 /* Сумма всех резервов по счетам.

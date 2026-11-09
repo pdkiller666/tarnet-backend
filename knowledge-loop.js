@@ -281,16 +281,23 @@ class KnowledgeLoopCoordinator {
    *   выгрузка шифротекста дала бы JSONL, который выглядит как датасет, а
    *   обучать на нём нечего. Ключ знает только сервер — поэтому это
    *   зависимость, а не встроенная криптография.
+   * @param {(text:string)=>string|null} [deps.encryptText] зашифровка полей
+   *   при выгрузке в JSONL. С 2.25.2 датасет на диске не пишется открытым
+   *   текстом: файл переживает запрос и лежит в `storage/experience` до
+   *   ручной уборки, то есть это данные at-rest, а не временный буфер.
+   *   Без этой функции координатор отказывается собирать датасет (иначе
+   *   шифрование в БД обходилось бы одним вызовом на диск).
    */
   constructor({ db, outputDir, pythonScript, p2p = null,
     minPairs = MIN_PAIRS_FOR_TRAINING, stakeLockTar = VALIDATOR_STAKE_LOCK_TAR,
-    decryptText = null } = {}) {
+    decryptText = null, encryptText = null } = {}) {
     if (!db || typeof db.run !== 'function' || typeof db.all !== 'function') {
       throw new Error('KNOWLEDGE_LOOP_DB_REQUIRED');
     }
     this.db = db;
     this.p2p = p2p;
     this.decryptText = typeof decryptText === 'function' ? decryptText : null;
+    this.encryptText = typeof encryptText === 'function' ? encryptText : null;
     this.minPairs = minPairs;
     this.stakeLockTar = stakeLockTar;
     this.outputDir = outputDir || path.join(__dirname, 'storage', 'experience');
@@ -310,6 +317,19 @@ class KnowledgeLoopCoordinator {
       throw new Error('INVALID_DOMAIN');
     }
     const minPairs = Number.isInteger(opts.minPairs) ? opts.minPairs : this.minPairs;
+
+    /* Отказ до запросов к БД: без шифрования на диск собранный датасет лёг бы
+     * открытым текстом, и «шифрование буфера» перестало бы что-либо значить.
+     * Проверка стоит здесь, а не рядом с записью, чтобы отказ был одинаковым
+     * и при нехватке данных, и при полном наборе. */
+    if (!this.encryptText) {
+      return {
+        status: 'error',
+        error: 'ENCRYPT_UNAVAILABLE',
+        domain,
+        note: 'координатору не передан encryptText — датасет не собран, иначе он ушёл бы на диск открытым',
+      };
+    }
 
     /* Фильтрация в SQL, а не в JS: иначе отозванное согласие продолжало бы
      * действовать на уже выгруженной выборке, и «opt-in» держался бы только
@@ -379,14 +399,24 @@ class KnowledgeLoopCoordinator {
      * датасет предыдущего. Домен санируется — иначе '../' в домене увёл бы
      * запись за пределы outputDir. */
     const safeDomain = String(domain).replace(/[^a-zA-Z0-9_-]/g, '_');
+    /* Значения prompt/response шифруются, служебные поля — нет.
+     * `promptHash`, `rating`, `modelId`, `domain` — не содержимое диалога:
+     * hash необратим, остальные три нужны тренеру и валидатору для отбора
+     * по домену и не раскрывают текст. Шифровать их значило бы сломать
+     * фильтрацию, ничего не защитив.
+     *
+     * Построчно, а не файлом целиком: mock_train.py считает непустые строки
+     * как число примеров, и шифрование всего файла вернуло бы count = 1. */
+    const encField = (v) => (v === null || v === undefined ? null : this.encryptText(v));
     const jsonlPath = path.join(this.outputDir, `distill-${safeDomain}-${Date.now()}.jsonl`);
     const jsonl = decryptedPairs.map((r) => JSON.stringify({
       promptHash: r.promptHash,
-      prompt: r.promptText,
-      response: r.response,
+      prompt: encField(r.promptText),
+      response: encField(r.response),
       rating: r.rating,
       modelId: r.modelId,
       domain: r.domain,
+      encrypted: true,
     })).join('\n') + '\n';
     fs.writeFileSync(jsonlPath, jsonl, { encoding: 'utf8', mode: 0o600 });
 
@@ -436,6 +466,7 @@ class KnowledgeLoopCoordinator {
       adapterHash: trainResult.adapterHash,
       jsonlPath,
       count,
+      encrypted: true,
     };
   }
 
