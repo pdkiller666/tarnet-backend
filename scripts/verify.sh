@@ -37,7 +37,9 @@ if [ -z "$GH_CREDS" ]; then
   done
 fi
 VPS="${TARNET_VPS:-root@195.63.131.172}"
-SSH_KEY="${TARNET_SSH_KEY:-$HOME/.ssh/tarnet_vps}"
+# Ключ — с постоянного тома (см. комментарий в deploy.sh).
+SSH_KEY="${TARNET_SSH_KEY:-$HOME/.openclaw/ssh/tarnet_vps}"
+[ -r "$SSH_KEY" ] || { [ -x "$HOME/.openclaw/ssh/ensure.sh" ] && "$HOME/.openclaw/ssh/ensure.sh" >&2 || true; }
 REMOTE_DIR="${TARNET_REMOTE_DIR:-/opt/tarnet/backend-api}"
 SERVICE="${TARNET_SERVICE:-tarnet}"
 PUBLIC_URL="${TARNET_PUBLIC_URL:-https://v1107336.hosted-by-vdsina.com}"

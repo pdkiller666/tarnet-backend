@@ -34,7 +34,11 @@ if [ -z "$GH_CREDS" ]; then
   done
 fi
 VPS="${TARNET_VPS:-root@195.63.131.172}"
-SSH_KEY="${TARNET_SSH_KEY:-$HOME/.ssh/tarnet_vps}"
+# Ключ лежит на ПОСТОЯННОМ томе: ~/.ssh — overlay-слой контейнера и
+# исчезает при пересборке (08.11–09.11 так терялся доступ). ensure.sh
+# восстанавливает симлинк из постоянного тома, если его нет.
+SSH_KEY="${TARNET_SSH_KEY:-$HOME/.openclaw/ssh/tarnet_vps}"
+[ -r "$SSH_KEY" ] || { [ -x "$HOME/.openclaw/ssh/ensure.sh" ] && "$HOME/.openclaw/ssh/ensure.sh" >&2 || true; }
 REMOTE_DIR="${TARNET_REMOTE_DIR:-/opt/tarnet/backend-api}"
 REMOTE_BUNDLE="/tmp/tarnet-deploy.bundle"
 LOCAL_BUNDLE="/tmp/tarnet-deploy.bundle"
