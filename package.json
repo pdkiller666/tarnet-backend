@@ -1,6 +1,6 @@
 {
   "name": "tarnet-mvp",
-  "version": "2.24.1-manus-audit-fixes",
+  "version": "2.24.8-p2p-ux",
   "description": "TarNet MVP - Full-Stack Decentralized Compute Network",
   "main": "server.js",
   "scripts": {

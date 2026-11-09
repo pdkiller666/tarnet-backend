@@ -1278,6 +1278,15 @@ async function main() {
   let usingWs = false;
   if (!wsSupported()) {
     log('в этой версии Node нет глобального WebSocket — работаю на опросе');
+  } else if (TEST_P2P) {
+    /* `--test-p2p`: WS выключен намеренно, опрос тоже — иначе задача
+     * придёт не по P2P, и проверка ничего не докажет. Если транспорт не
+     * поднялся, воркер останется жив, но задач не возьмёт: это честнее
+     * тихого отката на WS, из-за которого тест P2P проходил на WS. */
+    log('--test-p2p: WS и опрос выключены — задачи только по libp2p');
+    if (!p2pChild) {
+      log('--test-p2p: транспорт НЕ поднялся — задач не будет, пока не почините причину выше');
+    }
   } else {
     log(`подключаюсь по ws: ${wsUrl()}`);
     usingWs = await connectWs();
@@ -1293,6 +1302,12 @@ async function main() {
      * только когда WS нет — включая случай, когда он отвалился и реконнект
      * ещё не прошёл. Без этого условия воркер забирал бы одну и ту же
      * задачу дважды: кадром и опросом. */
+    if (TEST_P2P && !p2pChild) {
+      /* Ждём, ничего не опрашивая: иначе «тест P2P» незаметно станет
+       * тестом WS, а это ровно тот обман, который флаг убирает. */
+      await new Promise((r) => setTimeout(r, 5000));
+      continue;
+    }
     if (wsState.connected) {
       /* Присутствие по WS продлевается кадром, а не опросом.
        *
@@ -1683,8 +1698,45 @@ function startP2pExecutor() {
  * молча протухает при переезде узла, а через bootstrap расхождение видно
  * сразу. Переопределить сервер можно `TARNET_PUBLIC_URL`, а не правкой кода.
  */
-const P2P_WANTED = process.argv.includes('--p2p') || process.env.TARNET_P2P === '1';
+/* `--test-p2p` (2.24.8): прогнать задачу ТОЛЬКО по P2P-транспорту.
+ *
+ * ЗАЧЕМ. Чтобы проверить P2P, человеку приходилось писать
+ * `node --no-experimental-websocket tarnet-worker.js --p2p`: флаг Node,
+ * а не наш, длинный, и его легко перепутать с `--p2p`. Ошибка в нём не
+ * даёт понятного отказа — воркер просто молча уходит на WS, и проверка
+ * P2P превращается в проверку WS.
+ *
+ * ПОЧЕМУ ФЛАГ ВОРКЕРА, А НЕ ФЛАГ NODE. `--no-experimental-websocket`
+ * выключает глобальный `WebSocket` в самом Node. Нам нужно ровно то же
+ * следствие, но решением самого воркера: тогда оно работает на любой
+ * версии Node и объясняется одной строкой в логе.
+ *
+ * ОТЛИЧИЕ ОТ `--p2p`: `--p2p` поднимает транспорт, но WS остаётся
+ * приоритетным, и задача уходит по WS, если он жив. `--test-p2p`
+ * выключает WS принудительно — значит успешная задача ДОКАЗЫВАЕТ P2P,
+ * а не «что-то из двух». */
+const TEST_P2P = process.argv.includes('--test-p2p');
+const P2P_WANTED = TEST_P2P || process.argv.includes('--p2p') || process.env.TARNET_P2P === '1';
 let p2pChild = null;
+
+/* Есть ли рядом с p2p-воркером установленный `libp2p`.
+ *
+ * ЗАЧЕМ ОТДЕЛЬНАЯ ПРОВЕРКА. Установщик ставит зависимости `npm ci`, но
+ * если он этого не сделал (старая версия файла, npm не найден, сеть
+ * отвалилась), `p2p-worker.js` падает на `ERR_MODULE_NOT_FOUND`, и
+ * человек видит стектрейс чужого модуля. Симптом неотличим от «транспорт
+ * не подключился», а причина — одна папка. Проверяем ДО запуска ребёнка
+ * и называем её прямо. */
+function p2pDepsMissing(workerPath) {
+  const dir = path.dirname(workerPath);
+  return !fs.existsSync(path.join(dir, 'node_modules', 'libp2p', 'package.json'));
+}
+
+/* Имя флага в сообщениях — то, что человек набрал. Печатать жёстко `--p2p`
+ * было бы неправдой: при ошибке `--test-p2p` он ищет в описании свой флаг. */
+function flagName() {
+  return TEST_P2P ? '--test-p2p' : '--p2p';
+}
 
 /* Путь к p2p-воркеру ищем рядом с собой и на уровень выше: собранный файл
  * лежит в `dist/`, исходник — в корне репозитория. Если не нашли — это не
@@ -1706,8 +1758,16 @@ function startP2pChild() {
   if (p2pChild) return p2pChild;
   const workerPath = findP2pWorker();
   if (!workerPath) {
-    log('--p2p: рядом нет p2p-node/p2p-worker.js — транспорт не поднят, работаю на WS');
-    log('  (libp2p — 105 МБ, его нельзя вшить в один файл: нужен клон репозитория)');
+    log(`${flagName()}: рядом нет p2p-node/p2p-worker.js — транспорт не поднят`);
+    log('  (libp2p — 105 МБ, его нельзя вшить в один файл: нужен пакет p2p-node)');
+    log('  переустановите программу установщиком с сайта — он привозит p2p-node');
+    return null;
+  }
+  if (p2pDepsMissing(workerPath)) {
+    log(`${flagName()}: транспорт найден, но зависимости НЕ установлены`);
+    log(`  нет: ${path.join(path.dirname(workerPath), 'node_modules', 'libp2p')}`);
+    log('  причина: не выполнен `npm ci` в папке p2p-node (баг старого установщика)');
+    log(`  починить вручную: cd "${path.dirname(workerPath)}" && npm ci --omit=dev`);
     return null;
   }
 
@@ -1760,6 +1820,9 @@ module.exports = {
   startP2pExecutor, P2P_EXEC_FILE,
   /* Запуск libp2p отдельным процессом по флагу `--p2p` (2.22.6). */
   startP2pChild, stopP2pChild, findP2pWorker, P2P_WANTED,
+  /* `--test-p2p` (2.24.8): флаг и его диагностика наружу для тестов —
+   * иначе проверить «называет причину, а не стектрейс» нечем. */
+  TEST_P2P, p2pDepsMissing, flagName,
   /* Экспорт транспорта — для тестов handshake без запуска цикла опроса. */
   connectWs, signAuth, ed25519FromSeed, loadOrCreateSeed, wsState, wsUrl, wsSupported,
   runTask, AUTH_PREFIX, claimLinkCode, linkFromCli,

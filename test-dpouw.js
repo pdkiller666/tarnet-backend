@@ -9714,6 +9714,67 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     ok('53.6 без p2p-node startP2pChild вернул null, а не упал',
       !!soloOut && soloOut.childNull === true, { out: soloOut });
 
+    /* --- 53.7–53.10: `--test-p2p` (2.24.8) ---
+     * Флаг существует ради доказательства: задача пришла по libp2p, а не
+     * по WS. Поэтому проверяем не только «включает транспорт», но и то,
+     * что он назван в сообщениях своим именем — иначе человек читает
+     * `--p2p`, которого не набирал, и ищет не ту причину. */
+    const probe = (args) => spawnSync(process.execPath, ['-e', [
+      'const w = require(process.argv[1]);',
+      'process.stdout.write(JSON.stringify({',
+      '  test: w.TEST_P2P,',
+      '  wanted: w.P2P_WANTED,',
+      '  name: w.flagName(),',
+      '}));',
+    ].join('\n'), WORKER_SRC, ...args], {
+      cwd: ROOT_DIR,
+      env: {
+        ...process.env,
+        HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-testp2p-')),
+        TARNET_P2P: '',
+      },
+      encoding: 'utf8',
+      timeout: 30000,
+    });
+    const readProbe = (r) => {
+      const last = String(r.stdout || '').trim().split('\n').pop();
+      try { return JSON.parse(last); } catch (_e) { return null; }
+    };
+
+    /* TARNET_P2P пуст, а не удалён: пустая строка не равна '1', и это
+     * отдельная проверка того, что флаг берётся из argv, а не из env. */
+    const testP2p = readProbe(probe(['--test-p2p']));
+    ok('53.7 --test-p2p включает TEST_P2P и транспорт',
+      !!testP2p && testP2p.test === true && testP2p.wanted === true,
+      { out: testP2p });
+    ok('53.8 flagName называет --test-p2p, а не --p2p',
+      !!testP2p && testP2p.name === '--test-p2p',
+      { out: testP2p && testP2p.name });
+
+    const plainProbe = readProbe(probe([]));
+    ok('53.9 без флага TEST_P2P ложен, имя флага --p2p',
+      !!plainProbe && plainProbe.test === false && plainProbe.name === '--p2p',
+      { out: plainProbe });
+
+    /* Диагностика зависимостей: каталог без `node_modules/libp2p` —
+     * ровно то состояние, в котором оказался ПК владельца. */
+    const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-bare-'));
+    const bareWorker = path.join(bareDir, 'p2p-worker.js');
+    fs.writeFileSync(bareWorker, '// заглушка\n');
+    const depsProbe = spawnSync(process.execPath, ['-e', [
+      'const w = require(process.argv[1]);',
+      'process.stdout.write(String(w.p2pDepsMissing(process.argv[2])));',
+    ].join('\n'), WORKER_SRC, bareWorker], {
+      cwd: ROOT_DIR,
+      env: { ...process.env, HOME: bareDir },
+      encoding: 'utf8',
+      timeout: 30000,
+    });
+    ok('53.10 без node_modules/libp2p p2pDepsMissing говорит «нет»',
+      String(depsProbe.stdout).trim().endsWith('true'),
+      { out: String(depsProbe.stdout).trim(), err: String(depsProbe.stderr || '').slice(0, 120) });
+    fs.rmSync(bareDir, { recursive: true, force: true });
+
     fs.rmSync(soloDir, { recursive: true, force: true });
   }
 
@@ -9980,9 +10041,17 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     ok('55.9 ROADMAP: реестр больше НЕ назван условием готовности',
       !/Условие готовности[^\n]*registry\.has_public_nodes/.test(road55),
       { stale: /Условие готовности[^\n]*registry\.has_public_nodes/.test(road55) });
+    /* Якорь — ЗАГОЛОВКИ разделов, а не первое вхождение строки.
+     * `indexOf('P1.2')` находил упоминание в шапке (строка 57) раньше
+     * заголовка P1.1, поэтому срез был пустым и проверка не могла стать
+     * зелёной НИКОГДА — то есть тест утверждал не то, что написано в его
+     * имени. `### ` делает якорь однозначным. */
+    const p11Start = road55.indexOf('### P1.1.');
+    const p12Start = road55.indexOf('### P1.2.');
+    const p11Section = p11Start >= 0 && p12Start > p11Start ? road55.slice(p11Start, p12Start) : '';
     ok('55.10 ROADMAP объясняет причину: NAT и отсутствие публичного адреса',
-      /за NAT/.test(road55.slice(road55.indexOf('P1.1'), road55.indexOf('P1.2'))),
-      { hasNat: /за NAT/.test(road55.slice(road55.indexOf('P1.1'), road55.indexOf('P1.2'))) });
+      /за NAT/.test(p11Section),
+      { hasNat: /за NAT/.test(p11Section), sectionLen: p11Section.length });
 
     /* --- ГЛАВНОЕ: критерий МОЖЕТ загореться ---
      * Без этой проверки секция доказывала бы только форму ответа, а

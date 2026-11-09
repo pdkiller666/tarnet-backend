@@ -251,6 +251,12 @@ rem is honest but makes every user's log start with an avoidable error.
   echo @echo off
   echo title TarNet Worker
   echo setlocal
+  rem cd /d is REQUIRED (2.24.8). Without it start.cmd inherits whatever
+  rem folder the caller was in - double-clicking from Explorer gives the
+  rem right place by luck, but a shortcut with a different working dir,
+  rem a terminal run, or autostart can all land elsewhere. The worker then
+  rem resolves p2p-node/ relative to cwd and silently loses the transport.
+  echo cd /d "%TARNET_DIR%"
   echo set "WORKER_ADDRESS=%ADDR%"
   echo set "TARNET_API_URL=%API%"
   echo set "TARNET_MODEL=%MODEL%"
