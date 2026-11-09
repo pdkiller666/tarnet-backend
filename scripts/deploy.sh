@@ -339,6 +339,21 @@ if ! systemctl list-unit-files "$BSVC.service" >/dev/null 2>&1 || ! systemctl ca
   echo "юнита $BSVC нет — пропускаю (P2P не настроен на этом хосте)"
   exit 0
 fi
+
+# Зависимости моста ставятся ЯВНО, до рестарта.
+# ПОЧЕМУ: p2p-node — отдельный npm-пакет со своим package.json внутри
+# репозитория, и `npm ci` для backend-api его НЕ покрывает. 09.11 деплой
+# раскатал 2.25.0, где bridge.js импортирует @libp2p/gossipsub, а модуля на
+# диске не было: мост падал с ERR_MODULE_NOT_FOUND и уходил в цикл
+# рестартов (counter 28). При этом tarnet.service был active, /health отвечал
+# 200, и deploy.sh завершался зелёным — отказ был невидим снаружи.
+# `npm ci` (а не install) — чтобы ставилось ровно то, что в package-lock.
+BWD=$(systemctl show "$BSVC" -p WorkingDirectory --value)
+if [ -n "$BWD" ] && [ -f "$BWD/package.json" ]; then
+  echo "ставлю зависимости моста: $BWD"
+  ( cd "$BWD" && npm ci --no-audit --no-fund ) || { echo "ERR: npm ci в $BWD"; exit 9; }
+fi
+
 systemctl restart "$BSVC" || { echo "ERR: restart $BSVC"; exit 6; }
 for _ in $(seq 1 30); do
   if systemctl is-active --quiet "$BSVC"; then echo "active после рестарта"; exit 0; fi
