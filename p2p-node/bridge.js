@@ -316,6 +316,16 @@ async function startLibp2p() {
   console.log(
     `[bridge] WAN     : ${publicIn.addrs.join(', ') || '(не объявлен)'}`
   )
+  /* Строка о relay обязательна. Без неё состояние relay не видно ни в
+   * логе, ни в `status()`: при разборе 09.11 пришлось читать исходник,
+   * чтобы понять, включён он или нет. `P2P_RELAY=0` — штатное действие,
+   * и оно должно оставлять след в логе, а не молчание. */
+  console.log(
+    `[bridge] Relay   : ${WANT_RELAY
+      ? `сервер (maxReservations=${Number(process.env.P2P_RELAY_MAX_RESERVATIONS || 256)}, ` +
+        `dataLimit=${BigInt(process.env.P2P_RELAY_DATA_LIMIT || 2097152)} Б)`
+      : 'ВЫКЛЮЧЕН (P2P_RELAY=0) — узлы за NAT не смогут подключиться'}`
+  )
   if (announceNote) console.log(`[bridge] WAN note: ${announceNote}`)
 }
 
