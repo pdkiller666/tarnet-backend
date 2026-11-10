@@ -393,7 +393,7 @@ document.querySelectorAll('.tab').forEach((tab) => {
 const MODES = {
   worker: '🖥 домашний воркер подключён',
   external_api: '☁️ внешний API',
-  deterministic_fallback: '🧪 демо-режим: модель не подключена',
+  deterministic_fallback: '🧪 демо-режим: нет активных воркеров',
 };
 
 let bannerTimer = null;
@@ -535,6 +535,11 @@ async function refreshWorkerBanner() {
     setBannerState(box, 'unknown');
     setNetStatus('unknown');
     howto.hidden = true;
+    /* Сбрасываем, а не оставляем прошлое значение: иначе сайдбар вечно
+     * показывал бы «воркеров: 1» от последнего удачного опроса — и именно
+     * в тот момент, когда сервер молчит, это читалось бы как факт. */
+    lastHealth = null;
+    paintNetworkStatus();
     text.textContent = e.code === 'RATE_LIMIT'
       ? '⏳ Лимит запросов — статус воркера обновится через минуту'
       : '⚠️ Сервер недоступен — статус воркера неизвестен';
@@ -545,6 +550,11 @@ async function refreshWorkerBanner() {
   const mode = health.llm_mode || 'unknown';
   $('modeLine').textContent = `${MODES[mode] || mode} · воркеров: ${active}`;
   syncSwarmGate(active);
+
+  /* Сайдбар берёт число воркеров отсюда, а не своим запросом: /health уже
+   * получен, и второй запрос ради той же цифры — лишний трафик на лимит. */
+  lastHealth = health;
+  paintNetworkStatus();
 
   if (mode === 'deterministic_fallback' || active === 0) {
     box.hidden = false;
@@ -2957,7 +2967,12 @@ function traceBox(res, ms) {
      обещаний о криптографии, которой в этом пути не было. */
   let head;
   if (isCloud) head = `🔑 Внешний API (${esc(res.provider)}) · ${esc(modelName)} · ${ms} мс`;
-  else if (isFallback) head = `🧪 Демо-ответ — модель не подключена · ${ms} мс`;
+  /* «Модель не подключена» ничего не объясняет: человек только что включил
+   * ПК и ждёт модель. Называем причину, которую сервер и так прислал
+   * (`no_workers`), а не общую фразу про несуществующую настройку. */
+  else if (isFallback) head = res.fallback_reason === 'no_workers'
+    ? `🧪 Демо-ответ — в сети нет активных воркеров · ${ms} мс`
+    : `🧪 Демо-ответ — модель не ответила · ${ms} мс`;
   else head = `🖥 Локальный воркер · ${esc(modelName)} · ${ms} мс`;
 
   const sum = document.createElement('summary');
@@ -2982,6 +2997,35 @@ function traceBox(res, ms) {
     chain.innerHTML = node('📱 Клиент') + arrow + node(`🧠 Воркер ${short(res.workerAddress || '')}`, 'worker');
   }
   body.appendChild(chain);
+
+  /* Откуда TAR, если модель не работала.
+   *
+   * Без этого абзаца человек видит «демо-ответ», потом чек — и делает
+   * вывод, что платят за воздух либо что его обманывают. На самом деле
+   * заглушка не выпускает чек сразу: её работа копится в pending_work и
+   * суммируется с следующей работой того же воркера, пока не наберётся
+   * порог тира. Числа берём из ответа: 40 и 50 — факт этого запроса, а не
+   * константа, которую надо переписывать при смене тира (у nano порог 500).
+   *
+   * Номера чеков в этот текст не подставляются намеренно: он не выдан в
+   * момент ответа, и вписать его значило бы показать номер, которого в
+   * базе ещё нет. */
+  if (isFallback) {
+    const note = document.createElement('div');
+    note.className = 'trace-note';
+    const pend = res.pending_work ?? res.breakdown?.cwu ?? null;
+    const thr = res.threshold ?? null;
+    const acc = pend !== null && thr !== null
+      ? ` Сейчас накоплено ${esc(pend)} из ${esc(thr)} токенов до чека.`
+      : pend !== null
+        ? ` Сейчас накоплено ${esc(pend)} токенов до чека.`
+        : '';
+    note.innerHTML = 'Ответ сгенерирован заглушкой: в сети нет активных воркеров с моделью, '
+      + 'поэтому задачу некому выполнить. Заглушка выдаёт текст и копит работу '
+      + 'на счётчике — чек за неё выпускается только после порога и помечается '
+      + 'как «демо: порог обойдён». Начисленные TAR видны в карточке ниже.' + acc;
+    body.appendChild(note);
+  }
 
   const row = (label, value) => {
     const el = document.createElement('div');
@@ -3043,25 +3087,78 @@ function traceBox(res, ms) {
  * Читает уже отрисованные значения. Дублировать запросы к /balance ради
  * второй цифры на том же экране — лишний трафик и второй источник истины. */
 const P2P_TEXT = {
-  online: 'P2P в сети',
   offline: 'P2P офлайн',
   unknown: 'P2P: нет данных',
 };
 let p2pChecked = false;
 
-async function syncP2P() {
+/* Два числа, а не одно.
+ *
+ * Раньше строка показывала только узлы и красила их зелёным, когда их было
+ * больше нуля. При этом /inference отвечал `no_workers`: узлы — это рельсы,
+ * а работу везут воркеры с моделью, и одно не следует из другого. Владелец
+ * выключил ПК, увидел «P2P в сети · 3 узла» и справедливо не понял, почему
+ * сеть есть, а работать некому.
+ *
+ * `routeNodes` здесь НЕ используется намеренно. Это демо-меш на 127.0.0.1
+ * (server.js: «три процесса в одной машине сетью не являются»): считать его
+ * узлами сети значило бы показать «3 узла» там, где реальное соединение
+ * одно. Берём `bridge.connections` — счётчик живых соединений libp2p.
+ * `null`, а не 0, когда мост не ответил: «не знаю» и «ноль» — разные факты. */
+let p2pNodes = null;
+
+/* Последний /health. Источник `active_workers` для сайдбара: свой запрос
+ * ради второй цифры на том же экране — лишний трафик и второй источник
+ * истины. Обновляется тем же опросом, что и баннер. */
+let lastHealth = null;
+
+/* Перерисовка из уже полученных значений. Вынесена отдельно, потому что
+ * два числа приходят разными путями (мост и /health) в разное время:
+ * перерисовывать по факту прихода каждого — единственный способ не
+ * показать устаревшее «воркеров: 1» после того, как ПК выключили. */
+function paintNetworkStatus() {
   const dot = $('p2pDot');
   const text = $('p2pText');
+  const wEl = $('workerText');
   if (!dot || !text) return;
-  try {
-    const s = await call('/p2p/status');
-    const nodes = Array.isArray(s.routeNodes) ? s.routeNodes.length : 0;
-    dot.className = `dot ${s.ok && nodes ? 'on' : 'off'}`;
-    text.textContent = s.ok && nodes ? `${P2P_TEXT.online} · ${nodes} узла` : P2P_TEXT.offline;
-  } catch (_e) {
+
+  const workers = lastHealth ? Number(lastHealth.active_workers ?? 0) : null;
+
+  /* Зелёный — только когда есть кому работать. Транспорт без воркеров
+   * янтарный: сеть не упала, но и задачу сейчас не примет. Серый — когда
+   * про соединения не знаем: обещать «всё хорошо» без данных нельзя. */
+  if (p2pNodes === null) {
     dot.className = 'dot';
     text.textContent = P2P_TEXT.unknown;
+  } else if (p2pNodes === 0) {
+    dot.className = 'dot off';
+    text.textContent = P2P_TEXT.offline;
+  } else {
+    dot.className = workers > 0 ? 'dot on' : 'dot warn';
+    text.textContent = `P2P: узлов ${p2pNodes}`;
   }
+
+  if (wEl) {
+    wEl.textContent = workers === null
+      ? '· воркеров: ?'
+      : `· воркеров: ${workers}`;
+    /* Отдельным цветом только ноль: «воркеров: 0» — это и есть ответ на
+     * вопрос «почему no_workers», и он должен читаться, а не теряться в
+     * сером тексте рядом с числом узлов. */
+    wEl.style.color = workers === 0 ? 'var(--accent-amber)' : '';
+  }
+}
+
+async function syncP2P() {
+  try {
+    const s = await call('/p2p/status');
+    p2pNodes = s && s.ok && s.bridge && typeof s.bridge.connections === 'number'
+      ? s.bridge.connections
+      : null;
+  } catch (_e) {
+    p2pNodes = null;
+  }
+  paintNetworkStatus();
   p2pChecked = true;
 }
 

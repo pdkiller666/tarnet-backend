@@ -101,14 +101,14 @@
 | :--- | --: | :--- |
 | `identity.js` | 232 | TarNet ID: детерминированный вывод ключей из мастер-энтропии |
 | `jcs.js` | 74 | RFC 8785. **Применяется только в Device Linking** (`server.js:4108`), не в подписи `/work` |
-| `app/app.js` | 3082 | PWA-клиент: чат, кошелёк, агенты, `CryptoKey` с `extractable: false` в IndexedDB |
+| `app/app.js` | 3261 | PWA-клиент: чат, кошелёк, агенты, `CryptoKey` с `extractable: false` в IndexedDB. **С 2.26.13** сайдбар показывает два разных факта вместо одного: узлы из `bridge.connections` (`paintNetworkStatus`, `null` если мост не ответил) и воркеры из `lastHealth.active_workers`; демо-ответ объясняет `pending_work`/`threshold` через `.trace-note` и не подставляет номер чека |
 | `app/agents.js` | 811 | Агенты в браузере, вендорный `noble-ed25519` (`app/vendor/ed25519.js`) |
 | `app/sw.js` | 212 | Service worker, кэш `tarnet-app-v35` |
-| `app/index.html` | 740 | Разметка чата, инструкция привязки: код вводится в окне воркера |
+| `app/index.html` | 746 | Разметка чата, инструкция привязки: код вводится в окне воркера |
 | `install/install.bat.tpl` | 489 | Установщик Windows: `start.cmd` запускает `node` в видимом окне (не `start /min`), чистый ASCII. **С 2.22.7** качает `/download/p2p-node.zip`, распаковывает в `%LOCALAPPDATA%\TarNet\p2p-node`, ставит зависимости `npm ci --omit=dev`, проверяет `import('libp2p')` и только тогда добавляет `--p2p` в лаунчер (`P2P_OK=1`). Любой отказ p2p — `WARNING` и работа на WS, а не падение установки. **С 2.22.10** кладёт ярлык `TarNet Worker.lnk` в Startup (только Windows) через `GetFolderPath('Startup')`, цель — `start.cmd`, сбой ведёт в `:autostart_failed`. **С 2.24.8** `start.cmd` начинается с `cd /d "%TARNET_DIR%"`: без него запуск из чужой папки (ярлык, автозапуск, терминал) терял `p2p-node/` молча **С 2.26.12** проверяет `jcs.js` после распаковки (`:p2p_no_jcs`) и печатает строки запуска как `%%*`, чтобы `start.cmd --test-p2p` действительно передавал аргумент; семейство модели добирается из `ollama list`, если `pull` пропущен |
 | `install/install.command.tpl` | 384 | Установщик macOS/Linux: то же для p2p (распаковка `unzip`, фолбэк `ditto` на macOS без CLT); `start.sh` получает `--p2p` только при `P2P_OK=1`. **С 2.24.8** `start.sh` начинается с `cd "$TARNET_DIR"`: без него запуск из чужой папки терял `p2p-node/` молча **С 2.26.12** проверяет `jcs.js` до `npm ci` (`JCS_OK=0` — транспорт пропускается с названной причиной) и добирает семейство из `ollama list` |
 | `p2p-bundle.js` | 252 | **Новое в 2.22.7.** Сборка ZIP с `p2p-node` для установщика своим писателем на `node:zlib`: `buildZip`, `crc32` (свой — `zlib.crc32` только с Node 22.2), `buildP2pArchive`, `getP2pArchive` (кеш по mtime). Явный список `BUNDLED_FILES`: забытый модуль — ошибка сборки, а не `ERR_MODULE_NOT_FOUND` у человека. `data/` (ключ узла) и `node_modules` не входят никогда **С 2.26.12** второй список `ROOT_FILES = ['jcs.js']`: корневые файлы кладутся без префикса `p2p-node/`, иначе `requireFromHere('../jcs.js')` промахивался на уровень; штамп кеша учитывает и их |
-| `app/styles.css` | 2067 | Стили |
+| `app/styles.css` | 2087 | Стили |
 | `ui/console.html`, `ui/index.html` | — | Отдельная консоль оператора |
 
 ---

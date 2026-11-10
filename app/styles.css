@@ -1340,7 +1340,14 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 .sidebar-status { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 11.5px; color: var(--muted-2); }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted-2); flex: 0 0 auto; }
 .dot.on { background: var(--accent-emerald); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-emerald) 22%, transparent); animation: pulse 2.4s ease-in-out infinite; }
-.dot.off { background: var(--accent-amber); }
+/* warn (2.26.13): транспорт поднят, но работать некому. Раньше это состояние
+ * красилось тем же зелёным, что и готовность, — и человек читал «сеть в
+ * порядке» там, где /inference отвечает no_workers. Янтарный цвет говорит
+ * «что-то не так», не выдавая сеть за упавшую целиком. */
+.dot.warn { background: var(--accent-amber); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-amber) 20%, transparent); }
+/* off — «не знаем»: мост не ответил или запрос упал. Серый, без пульса:
+ * пульсация обещает живой процесс, а его как раз и нет. */
+.dot.off { background: var(--muted-2); }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 
 .sidebar-backdrop {
@@ -1857,6 +1864,19 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 .trace-row { display: flex; justify-content: space-between; gap: 10px; }
 .trace-row b { color: var(--text); font-weight: 600; }
 .trace-warn { color: var(--accent-amber); }
+/* Пояснение под трассой (демо-ответ): обычный текст в рамке, а не ещё одна
+ * строка «ключ: значение». Длинная фраза в trace-row сломала бы сетку
+ * «метка — значение» и вытолкнула цифры за край на телефоне. */
+.trace-note {
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent-amber);
+  border-radius: var(--radius);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
 
 
 /* ---------- Адаптив: телефон → планшет → ПК ----------
