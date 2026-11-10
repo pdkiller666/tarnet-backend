@@ -711,6 +711,26 @@ ensureColumn('worker_tasks', 'promptHashVerified', 'promptHashVerified INTEGER')
  *
  * Меняется ТОЛЬКО source: `emulated` и так верен (37 = 37), и переписывать
  * его значило бы «исправить» правильное поле. Идемпотентно — повтор находит 0. */
+/* ===== Миграция: TEE-флаг без аттестации (2.26.7) =====
+ *
+ * Правка приёма закрыла ЗАПИСЬ ложного флага, но не пересчитала уже лежащие
+ * строки: на проде после деплоя оставались 53 узла с isTeeAttested=1 при
+ * ОДНОЙ аттестации в статусе pending. pickWorker для tier='expert' выбирает
+ * пул именно по этому флагу, поэтому старая ложь продолжала давать привилегию.
+ *
+ * Снимаем флаг у всех, у кого НЕТ одобренной аттестации. Это не «обнулить
+ * всё»: узел с approved-строкой флаг сохраняет. Идемпотентно. */
+(function migrateTeeFlagToAttestations() {
+  const cleared = db.prepare(
+    `UPDATE nodes SET isTeeAttested = 0
+      WHERE isTeeAttested = 1
+        AND address NOT IN (SELECT workerAddress FROM node_attestations WHERE status = 'approved')`,
+  ).run();
+  if (cleared.changes > 0) {
+    console.log(`🩹 nodes: ${cleared.changes} узлов снят isTeeAttested — одобренной аттестации нет`);
+  }
+})();
+
 (function migrateSourceOnEmulation() {
   const fixed = db.prepare(
     `UPDATE inferenceLogs SET source = 'deterministic_fallback'
