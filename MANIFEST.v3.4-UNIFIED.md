@@ -111,7 +111,7 @@
 | Батчинг коротких работ | ✅ порог генерации чека — `max(50, tokens_for_nonzero_payout(tier))`: `base` = 50, `nano` = 500, `expert` = 13. Работы ниже порога копятся в `pending_work` и объединяются в следующий чек | `POST /work` → `202 {queued, pending_work, threshold}`; чек несёт `batchedFrom[]` |
 | Идемпотентность `actionId` | ✅ работает: `POST /work` — ключ, а не подсказка. Повтор → `200 {duplicate:true, existing:'receipt'}` (тот же `seq`, без второго начисления); повтор короткой работы → `202 {reason:'already_pending'}`, накопление не удваивается; повтор работы из `batchedFrom` → тот чек, `batchedInto = seq`; тот же ключ на другого воркера → `409`; без `actionId` ключа нет — два одинаковых запроса дают две работы | `POST /work` → раздел 8.11 приёмки |
 | Soft delete адаптеров | ✅ `DELETE /adapter/:id` ставит `deleted_at`; физического удаления нет, история роялти цела, новые работы → 409 | `GET /adapters` → `deleted_at`; чек несёт `adapterDeletedAt` |
-| Реальный LLM-инференс | ⚠️ **механика работает, сеть не постоянна**: на замере 29.10 14:41 — `active_workers: 1`, `llm_mode: worker` (воркер `0xe56c…`, `qwen2.5-coder:1.5b`, 4343 опроса). Окно жизни воркера — 60 с, поэтому «сейчас 1» не значит «сеть». Это по-прежнему **один узел, включаемый руками** | `GET /worker/status`, `GET /health` → `llm_mode`. Сквозной путь доказан 28.10 (телефон → VPS → дом → Ollama) |
+| Реальный LLM-инференс | ⚠️ **механика работает, сеть не постоянна**: на замере 29.10 14:41 — `active_workers: 1`, `llm_mode: worker` (воркер `0xe56c…`, `qwen2.5-coder:1.5b`, 4343 опроса). **На замере 10.11 16:1x — `active_workers: 1`, `llm_mode: worker`, ПК владельца `0x3b7928c8…`; `POST /inference` вернул `source: live_llm`, `provider: home_worker`, «Париж», `promptHashVerified: true`, `emulated: false`, чек `seq 794`** (§Б.61). Окно жизни воркера — 60 с, поэтому «сейчас 1» не значит «сеть». Это по-прежнему **один узел, включаемый руками** | `GET /worker/status`, `GET /health` → `llm_mode`. Сквозной путь доказан 28.10 (телефон → VPS → дом → Ollama) и повторён 10.11 с домашнего ПК |
 | **Внутренняя утилизация токена (`TAR_UTILITY`)** | ✅ **в коде с 2.17.0**: `paymentMode: TAR_UTILITY` в `POST /work` и `/inference` списывает **2%**, поровну в burn и казну. Ставка берётся из `TAR_UTILITY_BURN_RATE: 0.01` + `TAR_UTILITY_TREASURY_RATE: 0.01` (`config.js:130-131`), единственное место применения — `economics.js:115-116`. **Мёртвая константа «ставка в bps» УДАЛЕНА в 2.22.7** — она объявлялась с 2.17.0 и не читалась нигде; `grep` по всему коду → **0** (тест 54.9) | `economics.js:115-116`; приёмка 43.14 + 54.9/54.10. **[срез 03.11]** `totalUtilizedTar: 1.2e-05`, `totalUtilizedCount: 3` — механизм сработал трижды |
 | **Подпись `POST /work`** | ✅ **в коде с 2.17.15**: Ed25519 над `TARNET_WORK_SUBMIT:<address>:<tokens>:<tier>:<actionId>:<ts>`; без подписи — `403 HANDSHAKE_REQUIRED`. **Это НЕ JCS (RFC 8785):** `grep -c 'canonicalize\|JCS\|8785'` по коду → **0**, канонизации JSON нет, подпись считается над позиционной склейкой через `:` | `server.js:4984-5025` |
 | **Входящий WS воркера (`/p2p/worker`)** | ✅ **в коде с 2.17.0**: `ws-inbound.js` — Ed25519-хендшейк с nonce (`AUTH_PREFIX = TARNET_WS_AUTH`), TOFU по адресу (`ADDRESS_KEY_MISMATCH` при подмене ключа). Воркер держит **исходящее** соединение и получает задачу кадром `TASK`, фолбэк на `/worker/poll` сохранён | `ws-inbound.js`; `worker-demo.js:671` (`new WebSocket`); `GET /worker/ws`. Портов воркер не открывает → `registry.total: 0` остаётся верным |
@@ -3348,4 +3348,37 @@ approved нет» — **0** строк. `verify.sh`: 8/8 ✅. Гейт: **1233 �
 ноль падений, каждый набор с ненулевым счётом.
 
 **Чего это НЕ доказывает.** 1326 проверок — это механика. Ни одна из них не проверяет
-NAT, TEE и платящий спрос; `active_workers: 0`, `expert`-пул пуст.
+NAT, TEE и платящий спрос; `active_workers` в покое `0`, `expert`-пул пуст.
+
+### Б.61. Срез 10.11.2026 16:1x MSK — воркер владельца на домашнем ПК: WebSocket-путь да, P2P-путь нет
+
+**Что сделал владелец.** Запустил воркер на домашнем Windows-ПК (`C:\Users\Z-Boss\.tarnet\`)
+без флага `--test-p2p`. Воркер: зарегистрировал узел `0x3b7928c8…` (`routingWeight` 1.5811),
+привязал ключ к адресу, подключился по `wss://v1107336.hosted-by-vdsina.com/p2p/worker`,
+прошёл Ed25519-хендшейк (`ws авторизован`).
+
+**Что это доказало — и это реальный шаг вперёд.** Через этот узел прошёл живой инференс:
+`POST /inference` → `source: live_llm`, `provider: home_worker`, `model: qwen2.5-coder:1.5b`,
+`response: "Париж"`, `usage {prompt_tokens:48, completion_tokens:4}`, `promptHashVerified: true`,
+`emulated: false`, `workerTaskId: wt_98d83b5f…`, чек `seq 794`. То есть путь
+**домашний ПК → живая модель → ответ клиенту** работает и с машины за роутером.
+
+**Что это НЕ доказало.** P2P-канал не открылся: в тот же момент `/p2p/status` →
+`worker_addresses: []`, `channels: 0`, `framesIn: 0`, `connections: 1` (и это второй seed
+на `127.0.0.1:4002`, а не воркер). Задача пришла по WebSocket, а не по libp2p. Уровень C
+(«воркер за NAT находит мост без входящего порта») остаётся **пустым**: нужен запуск именно
+с `--test-p2p` по `docs/NAT-TEST-SHORT.md`.
+
+**Побочное наблюдение, важное для наблюдаемости.** `polls` в `/worker/status` почти не рос
+(158→160 за минуты), хотя `lastSeenAgoMs` держался в пределах секунд. Причина:
+`ws-inbound.js:296` пишет `lastSeenAt` на WS-heartbeat раз в 10 с **без** инкремента `polls`,
+а `polls` растёт только на HTTP `/worker/poll`. Это не баг, а два разных пути присутствия;
+но вывод «`polls` не растёт → воркер мёртв» был бы ложным при живом WS.
+
+**Инварианты на срезе.** `conservation {gross:157.223281, distributed:157.223281, delta:0, holds:true}` ·
+`burnAudit.holds:true` · `treasuryAudit.holds:true` · чеков `794`, воркеров `96` ·
+`active_workers: 1`, `llm_mode: worker` · `committee {candidates:23, eligible:1, required:5,
+drawn:0, reason:insufficient_stake}` · `buildVersion 2.26.10`.
+
+**Чего это НЕ доказывает.** Один ручной узел — не сеть. `expert`-пул пуст, TEE нет,
+платящего спроса нет, P2P за NAT не проверен.

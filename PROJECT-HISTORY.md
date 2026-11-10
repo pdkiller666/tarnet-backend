@@ -4731,3 +4731,41 @@ PROMPT_REQUIRED` (шаблона больше нет); `/health` содержи�
 
 **Чего это не доказывает.** 1326 проверок — механика. NAT не проверен ни разу, TEE не
 существует, платящего спроса нет.
+
+## 10.11.2026 (16:1x) — воркер владельца на домашнем ПК: WebSocket-путь да, P2P-путь нет
+
+**Что произошло.** Владелец запустил воркер на домашнем Windows-ПК
+(`C:\Users\Z-Boss\.tarnet\`) — без флага `--test-p2p`. Воркер зарегистрировал узел
+`0x3b7928c88de427c5b27d78ca63dde8c80823267f` (`routingWeight` 1.5811), привязал ключ,
+подключился по `wss://v1107336.hosted-by-vdsina.com/p2p/worker` и прошёл хендшейк
+(«ws авторизован»). `/health`: `active_workers: 1`, `llm_mode: worker`.
+
+**Что проверено живым запросом, а не по логу.** `POST /inference` через этот узел вернул
+`source: live_llm`, `provider: home_worker`, `model: qwen2.5-coder:1.5b`, `response: "Париж"`,
+`usage {prompt_tokens:48, completion_tokens:4, total_tokens:52}`, `promptHashVerified: true`,
+`emulated: false`, `workerTaskId: wt_98d83b5fe1925ec5fed641bc`, чек `seq 794`.
+Цепочка «домашний ПК → живая модель → ответ клиенту» подтверждена с машины за роутером.
+
+**Что это НЕ значит — и почему важно не спутать.** Задача пришла по **WebSocket**, а не по
+libp2p. В тот же момент `/p2p/status` → `worker_addresses: []`, `channels: 0`, `framesIn: 0`,
+`connections: 1` (и этот один — второй seed на `127.0.0.1:4002`, не воркер). Уровень C
+(«воркер за NAT находит мост без входящего порта») **остаётся пустым**. Закроет его только
+запуск с `--test-p2p` (`docs/NAT-TEST-SHORT.md`). Первая мысль была «NAT пройден» — она
+неверна: WebSocket дозванивается до сервера сам, DHT-поиск при этом не проверяется вообще.
+
+**Наблюдение по наблюдаемости.** `polls` в `/worker/status` почти не рос (158→160), хотя
+`lastSeenAgoMs` держался в пределах секунд. Не баг: `ws-inbound.js:296` пишет `lastSeenAt` на
+WS-heartbeat раз в 10 с без инкремента `polls`, а `polls` растёт только на HTTP `/worker/poll`.
+Отсюда правило: «`polls` стоит» ≠ «воркер мёртв», пока живо WS-соединение.
+
+**Инварианты на срезе.** `conservation {gross:157.223281, distributed:157.223281, delta:0,
+holds:true}` · `burnAudit.holds:true` · `treasuryAudit.holds:true` · чеков `794`, воркеров `96` ·
+`buildVersion 2.26.10` · `committee {candidates:23, eligible:1, required:5, drawn:0,
+reason:insufficient_stake}`.
+
+**Документы.** Поправлены там, где стояло «воркер не запускался ни разу»: `INVESTOR-CHECKLIST.md`
+(«Живых воркеров» и «NAT не проверен»), `ROADMAP.md` (срез + P0.1b), `MASTER-PLAN.md` (этап 9),
+`MANIFEST` §Б.61, `docs/NARRATIVE.md`. Формулировка везде одна: проверен WebSocket, не P2P.
+
+**Чего это не доказывает.** Один ручной узел — не сеть. `expert`-пул пуст, TEE нет,
+платящего спроса нет, P2P за NAT не проверен.
