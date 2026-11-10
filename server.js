@@ -36,6 +36,9 @@ const { startDemoMesh, describeMesh } = require('./p2p-demo');
  * Модуль на голом `net` и не бросает: отсутствие моста — штатное состояние,
  * backend-api не должен зависеть от p2p ни при старте, ни в работе. */
 const p2pBridge = require('./p2p-bridge-client');
+/* Решение «кому отдавать задачу» — отдельным модулем, чтобы проверялось
+ * тестом, а не глазами. См. комментарий в `dispatch-gate.js`. */
+const dispatchGate = require('./dispatch-gate');
 
 /* Capabilities Discovery как ФАКТ СЕТИ, а не как догадка о чужой машине
  * (2.26.0, Блок 1.3).
@@ -7580,7 +7583,10 @@ async function dispatchTaskOverP2p({
    * остаётся `pending`, и её заберёт `/worker/poll`. */
   const chosen = channelPick.pickChannel(channels, { preferAddress, excludeSet });
   if (!chosen.channel) {
-    return { attempted: false, reason: chosen.reason === 'ALL_EXCLUDED' ? 'all_excluded' : 'no_channel' };
+    const why = chosen.reason === 'ALL_EXCLUDED' ? 'all_excluded' : 'no_channel';
+    console.log(`[dispatch] p2p: задача ${taskId} не отправлена — ${why}` +
+      ` (каналов ${channels.length}, просили ${preferAddress ?? 'любой'})`);
+    return { attempted: false, reason: why };
   }
   const pick = chosen.channel;
 
@@ -7626,6 +7632,7 @@ async function dispatchTaskOverP2p({
   };
 
   let reply;
+  console.log(`[dispatch] p2p: задача ${taskId} → ${addr.slice(0, 10)}… (каналов ${channels.length})`);
   try {
     /* `address` — чтобы задача ушла ИМЕННО тому воркеру, для которого
      * строка уже claim'нута выше. Без него мост брал первый живой канал,
@@ -9274,7 +9281,21 @@ async function runInference(req, res) {
   let routing = { mode: 'explicit' };
   if (!workerAddress) {
     const picked = pickWorker(tier);
-    if (!picked) return res.status(503).json({
+    /* В реестре `nodes` узла может не быть, а канал задач — быть открытым.
+     *
+     * `pickWorker` читает `nodes` (`routingWeight > 0`), и строка там берётся
+     * из `POST /node`. Воркер, поднятый руками и не зарегистрированный, в
+     * реестре отсутствует, но мост уже авторизовал его канал и знает адрес.
+     * Ответить `503 no_workers` значило бы соврать: работать есть кому, нет
+     * только веса маршрутизации для выбора. Адрес берём у моста — он
+     * подтверждён подписью `hello`, в отличие от присланного клиентом. */
+    const chanAddr = picked
+      ? null
+      : dispatchGate.channelAddressInRegistry(
+        P2P_TASK_ROUTING ? await p2pTaskChannels() : [],
+        (addr) => get('SELECT 1 AS ok FROM nodes WHERE LOWER(address) = LOWER(?)', [addr]),
+      );
+    if (!picked && !chanAddr) return res.status(503).json({
       error: 'No worker nodes available — register a node first',
       fallback_reason: 'no_workers',
       /* Клиент просил параллель — говорим прямо, что её не будет и почему.
@@ -9284,8 +9305,14 @@ async function runInference(req, res) {
         ? { enabled: false, requested: true, reason: 'no_workers' }
         : null,
     });
-    workerAddress = picked.address;
-    routing = { mode: 'weighted', routingWeight: picked.routingWeight, teeOnly: tier === 'expert', teeFallback: picked.teeFallback };
+    if (picked) {
+      workerAddress = picked.address;
+      routing = { mode: 'weighted', routingWeight: picked.routingWeight, teeOnly: tier === 'expert', teeFallback: picked.teeFallback };
+    } else {
+      workerAddress = chanAddr;
+      routing = { mode: 'p2p_channel', channelAddress: chanAddr };
+      console.log(`[dispatch] узел в реестре есть, но веса маршрутизации нет — адресат из канала ${chanAddr.slice(0, 10)}…`);
+    }
   } else {
     const node = get('SELECT routingWeight, isTeeAttested FROM nodes WHERE address = ?', [workerAddress]);
     routing.routingWeight = node?.routingWeight ?? null;
@@ -9596,7 +9623,26 @@ async function runInference(req, res) {
     }
   }
 
-  if (hasActiveWorker()) {
+  /* Присутствие в `worker_presence` пишут опрос `/worker/poll` и WS-кадр.
+   * Воркер с `--test-p2p` намеренно не делает ни того, ни другого — иначе
+   * задача пришла бы не по P2P и проверка транспорта ничего бы не значила.
+   * В итоге `hasActiveWorker()` про него молчит, и запрос уходил в шаблон
+   * `no_workers`, хотя канал был открыт и воркер ждал работу.
+   *
+   * Поэтому гейт спрашивает ДВА источника: присутствие и каналы моста.
+   * Спрашиваем только когда присутствия нет — лишний поход в сокет на
+   * каждом запросе задерживал бы обычный путь без причины. */
+  const activeNow = hasActiveWorker();
+  const p2pChannelsForGate = activeNow || !P2P_TASK_ROUTING ? [] : await p2pTaskChannels();
+  const dispatchSource = dispatchGate.describeWorkerSources({
+    activeWorkers: activeNow,
+    p2pChannels: p2pChannelsForGate,
+  });
+
+  if (dispatchGate.hasWorkerSource({ activeWorkers: activeNow, p2pChannels: p2pChannelsForGate })) {
+    if (dispatchSource === 'p2p') {
+      console.log(`[dispatch] присутствия нет, но каналов ${p2pChannelsForGate.length} — пробую P2P`);
+    }
     // Режим A: домашний узел забирает задачу и присылает результат.
     try {
       /* ===== Private Swarm (2.18.0) =====

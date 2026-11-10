@@ -164,7 +164,7 @@ async function spawnServer(envOverrides = {}, opts = {}) {
     }
     try {
       const r = await fetch(base + '/health');
-      if (r.ok) return { base, proc, dir, stop };
+      if (r.ok) return { base, proc, dir, stop, log: () => out };
     } catch (_e) { /* ещё не слушает */ }
     await new Promise((r) => setTimeout(r, 150));
   }
@@ -6984,6 +6984,144 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       partial.code === 0 && /WARNING/.test(partial.out) && /libp2p/.test(partial.out),
       partial);
   }
+  }
+
+  /* --- 38.16 Задача уходит по P2P, когда WS и опрос выключены (2.27.0) ---
+   *
+   * Дефект, который видел владелец. Воркер, запущенный с `--test-p2p`,
+   * намеренно не делает ни WS, ни опрос — иначе задача пришла бы не по P2P и
+   * проверка транспорта ничего не доказывала. Оба канала пишут в
+   * `worker_presence`, поэтому `hasActiveWorker()` про такой воркер молчал, и
+   * `/inference` уходил в шаблон `no_workers` — ПРИ ОТКРЫТОМ канале. То есть
+   * сервер отвечал «работать некому», хотя канал был и воркер ждал работу.
+   *
+   * Строковый тест здесь бесполезен: `hasWorkerSource` в исходнике остаётся
+   * зелёным, если гейт его не вызывает. Поэтому проверка настоящая —
+   * поддельный мост на сокете, живой сервер, настоящий `/inference`. */
+  {
+    const gate = require('./dispatch-gate');
+    const LIVE16 = '0x' + '1'.repeat(40);
+    ok('38.16 открытый канал — источник работы без присутствия',
+      gate.hasWorkerSource({ activeWorkers: 0, p2pChannels: [{ address: LIVE16 }] })
+      && gate.describeWorkerSources({ activeWorkers: 0, p2pChannels: [{ address: LIVE16 }] }) === 'p2p');
+    ok('38.16 пусто с обеих сторон — работы нет',
+      !gate.hasWorkerSource({ activeWorkers: 0, p2pChannels: [] }));
+    /* Строка '0' приходит из env и означает «ноль воркеров»; булево
+     * приведение сделало бы её единицей и вернуло бы ту же ложь. */
+    ok('38.16 строка "0" из окружения не считается воркером',
+      !gate.hasWorkerSource({ activeWorkers: '0', p2pChannels: [] }));
+    ok('38.16 адрес берётся только из годного канала',
+      gate.firstChannelAddress([]) === null
+      && gate.firstChannelAddress([null, { address: '' }]) === null
+      && gate.firstChannelAddress([{ address: LIVE16 }]) === LIVE16);
+    /* Канал без строки в реестре в работу не годится: `recordWork` бросает
+     * «Unknown worker node», и запрос стал бы 500 уже ПОСЛЕ отправки. */
+    ok('38.16 адрес канала без строки в реестре не берётся',
+      gate.channelAddressInRegistry([{ address: LIVE16 }], () => null) === null
+      && gate.channelAddressInRegistry([{ address: LIVE16 }], () => ({ ok: 1 })) === LIVE16
+      && gate.channelAddressInRegistry([], () => ({ ok: 1 })) === null);
+
+    const ADDR16 = runAddress('d16');
+    const UNREG16 = runAddress('u16');
+    const dir16 = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-p2p-dispatch-'));
+
+    /* Поддельный мост: говорит на том же протоколе (JSON-строка в сокет),
+     * поэтому проверяется реальный клиент, а не заглушка в коде сервера. */
+    const makeBridge = (sockPath, channels) => new Promise((resolve, reject) => {
+      const seen = [];
+      const srv = net.createServer((sock) => {
+        let buf = '';
+        sock.setEncoding('utf8');
+        sock.on('data', (chunk) => {
+          buf += chunk;
+          let i;
+          while ((i = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, i);
+            buf = buf.slice(i + 1);
+            let msg = null;
+            try { msg = JSON.parse(line); } catch (_e) { continue; }
+            seen.push(msg);
+            let reply = { ok: true };
+            if (msg.action === 'status') {
+              reply = { ok: true, peerId: '12D3KooWtest16', libp2p: 'listening 0.0.0.0:4001',
+                connections: 1, connected_peers: ['12D3KooWpeer16'],
+                worker_addresses: channels.map((c) => c.address) };
+            } else if (msg.action === 'channels') {
+              reply = { ok: true, channels };
+            } else if (msg.action === 'task') {
+              /* Отказ, при котором ничего не исполнялось: строка вернётся в
+               * очередь. Проверяется не выполнение, а сам факт отправки —
+               * раньше до неё не доходило вообще. */
+              reply = { ok: false, error: 'NO_LOCAL_EXECUTOR' };
+            }
+            try { sock.write(JSON.stringify(reply) + '\n'); } catch (_e) { /* закрыт */ }
+          }
+        });
+      });
+      srv.once('error', reject);
+      srv.listen(sockPath, () => resolve({ srv, seen }));
+    });
+
+    const sockOn = path.join(dir16, 'on.sock');
+    const sockOff = path.join(dir16, 'off.sock');
+    /* Во втором мосте канал ЕСТЬ, но узел не зарегистрирован: проверяем, что
+     * такой канал не превращается в 500, а остаётся честным отказом. */
+    const bridgeOn = await makeBridge(sockOn, [{ address: ADDR16 }]);
+    const bridgeOff = await makeBridge(sockOff, [{ address: UNREG16 }]);
+    let hOn = null;
+    let hOff = null;
+    try {
+      /* TTL короткий: без ответа воркера запрос истечёт за секунду с
+       * небольшим, и тест не будет ждать 30 с, доказывая ту же мысль. */
+      hOn = await spawnServer({ P2P_BRIDGE_SOCKET: sockOn, WORKER_TASK_TTL_MS: '1200' });
+
+      /* Регистрация ровно та, что делает настоящий воркер на старте. Без неё
+       * работа дойдёт, а начислить будет некому — и это правильно. */
+      const reg = await apiAt(hOn.base, '/node', 'POST', { address: ADDR16 });
+      ok('38.16 узел зарегистрирован без WS и без присутствия', reg.status === 200, reg.body);
+
+      /* Ключ, запечатанный на воркера, — условие P2P-отправки. Привязка идёт
+       * тем же путём, что у настоящего воркера: подпись ed25519 над
+       * `TARNET_WORKER_POLL:<адрес>:<ts>`. */
+      const kp = crypto.generateKeyPairSync('ed25519');
+      const pubRaw = kp.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
+      const pubHex = pubRaw.toString('hex');
+      const ts16 = Date.now();
+      const sig16 = crypto.sign(null,
+        Buffer.from(`TARNET_WORKER_POLL:${ADDR16}:${ts16}`, 'utf8'), kp.privateKey).toString('base64');
+      const hs = await apiAt(hOn.base, '/worker/handshake', 'POST', {
+        pubkey: pubHex, timestamp: ts16, signature: sig16, claimedAddress: ADDR16,
+      });
+      ok('38.16 ключ привязан к адресу канала', hs.status === 200, hs.body);
+
+      const inf = await apiAt(hOn.base, '/inference', 'POST', {
+        prompt: 'Скажи одно слово: Париж', maxTokens: 32,
+      });
+      ok('38.16 с каналом и без присутствия нет ответа "некому работать"',
+        inf.status !== 503 && inf.body?.fallback_reason !== 'no_workers',
+        { status: inf.status, reason: inf.body?.fallback_reason });
+      const taskFrames = bridgeOn.seen.filter((m) => m.action === 'task');
+      ok('38.16 задача отправлена в мост по адресу канала',
+        taskFrames.length > 0
+        && String(taskFrames[0].address).toLowerCase() === ADDR16.toLowerCase(),
+        bridgeOn.seen.map((m) => m.action));
+      ok('38.16 в логе сервера видна отправка по P2P',
+        /\[dispatch\] p2p: задача/.test(hOn.log()));
+
+      /* Обратная сторона: канал есть, но узла в реестре нет — отказ обязан
+       * остаться честным, а не превратиться в 500 после отправки. */
+      hOff = await spawnServer({ P2P_BRIDGE_SOCKET: sockOff, WORKER_TASK_TTL_MS: '1200' });
+      const none = await apiAt(hOff.base, '/inference', 'POST', { prompt: 'hi', maxTokens: 32 });
+      ok('38.16 канал без регистрации не даёт 500 — честный 503 no_workers',
+        none.status === 503 && none.body?.fallback_reason === 'no_workers',
+        { status: none.status, reason: none.body?.fallback_reason });
+    } finally {
+      if (hOn) hOn.stop();
+      if (hOff) hOff.stop();
+      await new Promise((r) => bridgeOn.srv.close(r));
+      await new Promise((r) => bridgeOff.srv.close(r));
+      fs.rmSync(dir16, { recursive: true, force: true });
+    }
   }
 
   /* ---------- 39. Адаптив: телефон → планшет → ПК ----------
