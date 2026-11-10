@@ -5802,11 +5802,17 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
        * генератор start.cmd: он пишет --p2p только при P2P_OK=1, и
        * автозапуск наследует это, потому что запускает тот же файл.
        * Условие проверяем в шаблоне, а не в отдаче: баг живёт здесь. */
-      const p2pInStartCmd = tplBat.includes('if "%P2P_OK%"=="1" echo "%NODE_EXE%" "%WORKER_JS%" --p2p');
+      /* 31.26c (2.26.12): строка проверяется с `%%*`, потому что лаунчер
+       * обязан ПРОБРАСЫВАТЬ аргументы. До 2.26.12 `start.cmd --test-p2p`
+       * молча запускал обычный `--p2p` воркер: человек просил P2P-only
+       * проверку, получал WS-путь и читал `channels: 0` как отказ NAT.
+       * Точное совпадение без `%%*` закрепляло именно этот дефект. */
+      const p2pInStartCmd = tplBat.includes('if "%P2P_OK%"=="1" echo "%NODE_EXE%" "%WORKER_JS%" --p2p %%*');
+      const argsPassed = tplBat.includes('--p2p %%*') && tplBat.includes('"%WORKER_JS%" %%*');
 
-      ok('31.26c --p2p попадает в start.cmd, откуда его берёт автозапуск',
-        p2pInStartCmd,
-        { p2pBranch: p2pInStartCmd });
+      ok('31.26c --p2p попадает в start.cmd и аргументы пробрасываются',
+        p2pInStartCmd && argsPassed,
+        { p2pBranch: p2pInStartCmd, argsPassed });
 
       ok('31.26d сбой автозапуска сообщается, а не проглатывается',
         tplBat.includes('goto autostart_failed')
@@ -9904,10 +9910,34 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       return names;
     })();
 
-    ok('54.2 в архиве ровно ожидаемые файлы под p2p-node/',
-      !!zipEntries && zipEntries.length === PB.BUNDLED_FILES.length
-      && PB.BUNDLED_FILES.every((f) => zipEntries.includes('p2p-node/' + f)),
-      { entries: zipEntries, want: PB.BUNDLED_FILES.length });
+    /* 54.2 (2.26.12): в архиве ДВА класса файлов с разными префиксами.
+     * `p2p-node/*` — исходники транспорта, их ищет findP2pWorker().
+     * Корневые (`jcs.js`) — то, что транспорт требует как `../jcs.js`.
+     * Проверка «ровно BUNDLED_FILES.length» держала только первый класс и
+     * после добавления jcs.js падала бы на верном архиве — то есть тест
+     * мешал бы исправлению, а не ловил регрессию. Сверяем оба списка. */
+    const wantEntries = [
+      ...PB.BUNDLED_FILES.map((f) => 'p2p-node/' + f),
+      ...PB.ROOT_FILES,
+    ];
+    ok('54.2 в архиве ровно ожидаемые файлы (p2p-node/* и корневые)',
+      !!zipEntries && zipEntries.length === wantEntries.length
+      && wantEntries.every((f) => zipEntries.includes(f)),
+      { entries: zipEntries, want: wantEntries.length });
+
+    /* 54.2a (2.26.12): jcs.js лежит БЕЗ префикса `p2p-node/`.
+     *
+     * Это не косметика пути. `worker-record.js` делает
+     * `requireFromHere('../jcs.js')`; из `<TarNet>/p2p-node/` это ровно
+     * `<TarNet>/jcs.js`. Положи архив его внутрь p2p-node/ — и require
+     * промахнётся на уровень, транспорт умрёт с MODULE_NOT_FOUND, а снаружи
+     * это выглядит как «P2P не работает». Проверяем именно расположение,
+     * а не факт наличия в архиве. */
+    ok('54.2a jcs.js в корне архива, а не внутри p2p-node/',
+      !!zipEntries && zipEntries.includes('jcs.js')
+      && !zipEntries.includes('p2p-node/jcs.js'),
+      { hasRoot: !!zipEntries && zipEntries.includes('jcs.js'),
+        nested: !!zipEntries && zipEntries.includes('p2p-node/jcs.js') });
 
     /* Самый важный тест блока: в архиве не должно быть приватного ключа
      * узла. `data/peer-id.bin` лежит в ТОЙ ЖЕ папке p2p-node, и соблазн

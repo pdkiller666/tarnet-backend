@@ -201,7 +201,15 @@ if curl -fL --retry 2 --connect-timeout 20 -o "$TARNET_DIR/p2p-node.zip" "$API/d
   fi
 fi
 
-if [ -f "$P2P_DIR/p2p-worker.js" ]; then
+# jcs.js (2.26.12). `worker-record.js` подключает канонизатор из родительской
+# папки (`../jcs.js`), а в установленной раскладке это `<TarNet>/jcs.js`.
+# До этой версии архив вёз только p2p-node/*, require промахивался, и
+# транспорт падал с MODULE_NOT_FOUND ещё до первого announce — снаружи это
+# выглядело как «P2P не работает», а не как отсутствующий файл.
+JCS_OK=1
+if [ ! -f "$TARNET_DIR/jcs.js" ]; then JCS_OK=0; fi
+
+if [ -f "$P2P_DIR/p2p-worker.js" ] && [ "$JCS_OK" = "1" ]; then
   NPM_BIN="$(dirname "$NODE_BIN")/npm"
   if [ -x "$NPM_BIN" ]; then
     # `ci`, а не `install`: lock-файл лежит в архиве, а ci отказывается
@@ -244,7 +252,13 @@ if [ -f "$P2P_DIR/p2p-worker.js" ]; then
     say "      ПРЕДУПРЕЖДЕНИЕ: npm не найден рядом с node — p2p пропущен"
   fi
 else
-  say "      ПРЕДУПРЕЖДЕНИЕ: архив p2p не скачался — p2p пропущен"
+  if [ "$JCS_OK" = "0" ]; then
+    say "      ПРЕДУПРЕЖДЕНИЕ: jcs.js не найден рядом с воркером — p2p пропущен"
+    say "      Причина: worker-record.js требует ../jcs.js"
+    say "      Починить: переустановить (архив на сервере мог устареть)"
+  else
+    say "      ПРЕДУПРЕЖДЕНИЕ: архив p2p не скачался — p2p пропущен"
+  fi
 fi
 
 # ---------- 4c. capabilities для Discovery (2.26.0) ----------
@@ -275,6 +289,28 @@ if [ "$SKIP_MODEL" = "1" ] 2>/dev/null; then
 fi
 if ! command -v ollama >/dev/null 2>&1 && [ ! -x "${OLLAMA_BIN:-}" ]; then
   P2P_MODEL_FAMILY=""
+fi
+
+# Запасной путь (2.26.12): спросить Ollama, что реально установлено.
+#
+# Реальный случай: модель уже была скачана на ПК владельца, шаг pull
+# пропустился, семейство осталось пустым — и установщик объявил «возможностей
+# нет», хотя рабочая модель лежала рядом. Discovery молчал по причине,
+# которую снаружи не видно.
+#
+# `ollama list` — честная проверка: там то, что есть СЕЙЧАС, а не то, что мы
+# надеялись поставить. `tail -n +2` отбрасывает заголовок, `cut -d: -f1`
+# срезает тег: `qwen2.5-coder:1.5b` -> `qwen2.5-coder`, ровно та форма
+# семейства, по которой ищет клиент. Только если семейство всё ещё пусто:
+# явный TARNET_MODEL главнее.
+if [ -z "$P2P_MODEL_FAMILY" ]; then
+  OLLAMA_BIN_RESOLVED="${OLLAMA_BIN:-}"
+  if [ -z "$OLLAMA_BIN_RESOLVED" ] && command -v ollama >/dev/null 2>&1; then
+    OLLAMA_BIN_RESOLVED="$(command -v ollama)"
+  fi
+  if [ -n "$OLLAMA_BIN_RESOLVED" ] && [ -x "$OLLAMA_BIN_RESOLVED" ]; then
+    P2P_MODEL_FAMILY="$("$OLLAMA_BIN_RESOLVED" list 2>/dev/null | tail -n +2 | head -n 1 | cut -d: -f1 | tr -d '[:space:]')"
+  fi
 fi
 
 # GPU: nvidia-smi есть и отвечает — gpu, иначе cpu.

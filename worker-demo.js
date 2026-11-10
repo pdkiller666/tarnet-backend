@@ -1930,6 +1930,33 @@ if (require.main === module) {
       if (typeof LINK_PROMPT !== 'string' || !/6/.test(LINK_PROMPT)) {
         throw new Error('приглашение привязки не сформировано');
       }
+
+      /* P2P-транспорт, если он установлен рядом (2.26.12).
+       *
+       * УСЛОВНО, а не всегда. Воркер самодостаточен и ЗАКОННО живёт без
+       * p2p-node: тогда он работает по WS. Требовать транспорт здесь значило
+       * бы валить установку на машине, где P2P не нужен или недоступен — а
+       * тест 31.24 запускает файл в пустой папке именно как у пользователя.
+       * Проверяем только ту папку, где транспорт ЕСТЬ: молчаливо неполный
+       * транспорт — это `channels: 0`, который человек читает как отказ NAT.
+       *
+       * `worker-record.js` требует `../jcs.js` (один канонизатор на репозиторий,
+       * а не второй экземпляр), и до 2.26.12 архив установщика его не привозил:
+       * ребёнок падал с MODULE_NOT_FOUND до первого announce. Ловим это здесь,
+       * потому что снаружи отказ выглядит как «P2P не работает», а не как
+       * отсутствующий файл. */
+      const p2pDir = path.join(__dirname, 'p2p-node');
+      if (fs.existsSync(path.join(p2pDir, 'p2p-worker.js'))) {
+        if (!fs.existsSync(path.join(__dirname, 'jcs.js'))) {
+          throw new Error('p2p-node установлен, но рядом нет jcs.js (worker-record.js требует ../jcs.js)');
+        }
+        for (const dep of ['@libp2p/gossipsub', '@libp2p/circuit-relay-v2']) {
+          if (!fs.existsSync(path.join(p2pDir, 'node_modules', ...dep.split('/')))) {
+            throw new Error(`p2p-node установлен, но нет ${dep} — Discovery не заработает`);
+          }
+        }
+      }
+
       console.log('self-check: ok');
       process.exit(0);
     } catch (e) {

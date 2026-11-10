@@ -54,6 +54,22 @@ const BUNDLED_FILES = [
   'package-lock.json',
 ];
 
+/* Файлы из КОРНЯ backend-api, нужные p2p-node в рантайме.
+ *
+ * `worker-record.js` берёт канонизатор JCS из родительской папки
+ * (`requireFromHere('../jcs.js')`): один канонизатор на репозиторий, а не
+ * второй экземпляр рядом — два канонизатора дают две подписи на одних
+ * данных. В клоне это работает само собой, а в `%LOCALAPPDATA%\TarNet`
+ * `../jcs.js` — это файл В КОРНЕ папки воркера, и до 2.26.12 установщик его
+ * не привозил. Симптом: `p2p-worker.js` падает с `Cannot find module
+ * '../jcs.js'` ещё до первого announce, и весь транспорт умирает молча —
+ * ровно то, что человек принял за «P2P не работает».
+ *
+ * Поэтому архив кладёт `jcs.js` БЕЗ префикса `p2p-node/`: распаковка в папку
+ * воркера даёт `<папка воркера>/jcs.js`, и `../jcs.js` из `p2p-node/`
+ * указывает точно на него. */
+const ROOT_FILES = ['jcs.js'];
+
 /* ---------- CRC32 ---------- */
 const CRC_TABLE = (() => {
   const t = new Int32Array(256);
@@ -168,29 +184,39 @@ function buildP2pArchive() {
   const entries = [];
   let newest = 0;
 
-  for (const name of BUNDLED_FILES) {
-    const file = path.join(P2P_DIR, name);
+  /* Два списка с разными префиксами, потому что пути в архиве повторяют
+   * раскладку на диске после установки:
+   *   p2p-node/<name>  — исходники транспорта (findP2pWorker() ищет их
+   *                      ровно в `<папка воркера>/p2p-node/`);
+   *   <name>           — корневые модули, которые транспорт требует как
+   *                      `../<name>` (сейчас это только `jcs.js`).
+   * Один общий список с префиксом «p2p-node/» положил бы jcs.js внутрь
+   * p2p-node/, и `../jcs.js` промахнулся бы на уровень. */
+  const wanted = [
+    ...BUNDLED_FILES.map((n) => ({ name: 'p2p-node/' + n, file: path.join(P2P_DIR, n) })),
+    ...ROOT_FILES.map((n) => ({ name: n, file: path.join(__dirname, n) })),
+  ];
+
+  for (const { name, file } of wanted) {
     if (!fs.existsSync(file)) { missing.push(name); continue; }
     const stat = fs.statSync(file);
     newest = Math.max(newest, stat.mtimeMs);
-    entries.push({
-      /* Префикс `p2p-node/` внутри архива: распаковка в папку воркера
-       * кладёт файлы ровно туда, где `findP2pWorker()` их ищет
-       * (`<папка воркера>/p2p-node/p2p-worker.js`). Без префикса файлы
-       * рассыпались бы рядом с `tarnet-worker.js`. */
-      name: 'p2p-node/' + name,
-      data: fs.readFileSync(file),
-      mtime: stat.mtime,
-    });
+    entries.push({ name, data: fs.readFileSync(file), mtime: stat.mtime });
   }
 
   if (missing.length) {
-    const err = new Error('в p2p-node нет файлов: ' + missing.join(', '));
+    const err = new Error('нет файлов для архива: ' + missing.join(', '));
     err.missing = missing;
     throw err;
   }
 
-  return { buffer: buildZip(entries), files: BUNDLED_FILES.slice(), newest, bytes: entries.reduce((n, e) => n + e.data.length, 0) };
+  return {
+    buffer: buildZip(entries),
+    files: BUNDLED_FILES.slice(),
+    rootFiles: ROOT_FILES.slice(),
+    newest,
+    bytes: entries.reduce((n, e) => n + e.data.length, 0),
+  };
 }
 
 /* ---------- кэш ----------
@@ -203,9 +229,18 @@ function buildP2pArchive() {
 let cache = null;
 
 function getP2pArchive() {
-  const parts = BUNDLED_FILES.map((n) => {
-    try { return fs.statSync(path.join(P2P_DIR, n)).mtimeMs; } catch { return -1; }
-  });
+  /* Корневые файлы в штампе тоже: правка `jcs.js` меняет содержимое архива
+   * так же, как правка любого исходника транспорта. Без них кеш отдавал бы
+   * старый `jcs.js` до перезапуска сервиса — и разбор расхождения подписи
+   * начинался бы с неверного файла. */
+  const parts = [
+    ...BUNDLED_FILES.map((n) => {
+      try { return fs.statSync(path.join(P2P_DIR, n)).mtimeMs; } catch { return -1; }
+    }),
+    ...ROOT_FILES.map((n) => {
+      try { return fs.statSync(path.join(__dirname, n)).mtimeMs; } catch { return -1; }
+    }),
+  ];
   const stamp = Math.max(...parts);
   if (cache && cache.stamp === stamp && stamp > 0) return cache;
 
@@ -214,4 +249,4 @@ function getP2pArchive() {
   return cache;
 }
 
-module.exports = { buildP2pArchive, getP2pArchive, buildZip, crc32, BUNDLED_FILES, P2P_DIR };
+module.exports = { buildP2pArchive, getP2pArchive, buildZip, crc32, BUNDLED_FILES, ROOT_FILES, P2P_DIR };

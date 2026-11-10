@@ -172,6 +172,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '%P
 if not exist "%P2P_DIR%\p2p-worker.js" goto p2p_skip
 del "%P2P_ZIP%" >nul 2>nul
 
+rem jcs.js (2.26.12). `worker-record.js` reaches for `../jcs.js`, which in the
+rem installed layout is `<TarNet>\jcs.js`. Until this version the archive
+rem carried only p2p-node/*, so the require missed and the transport died with
+rem MODULE_NOT_FOUND before its first announce - visible only as "P2P does not
+rem work". Checked here, not later: a worker that starts on WS and never
+rem appears in the DHT looks healthy from every other angle.
+if not exist "%TARNET_DIR%\jcs.js" goto p2p_no_jcs
+
 if not defined NPM_EXE goto p2p_no_npm
 rem `ci` and not `install`: the lockfile is in the archive, and `ci` refuses
 rem to invent versions. `--omit=dev` keeps test-only packages out.
@@ -233,6 +241,16 @@ goto p2p_done
 echo       WARNING: p2p archive not downloaded - p2p transport skipped.
 goto p2p_done
 
+:p2p_no_jcs
+rem Deliberately NOT P2P_OK=1: launching --p2p without jcs.js gives a child
+rem that dies instantly while the outer worker carries on over WS, and the
+rem user then believes the P2P test ran. Skipping the transport and naming the
+rem reason is the only honest outcome.
+echo       WARNING: jcs.js is missing next to the worker.
+echo       P2P transport needs it (worker-record.js requires ../jcs.js).
+echo       Re-run the installer; if it repeats, the served archive is stale.
+goto p2p_done
+
 :p2p_done
 rem Step numbering is kept as 4/4: the p2p transport is part of "4/4", not
 rem a fifth manual step. A skipped transport is REPORTED below, never
@@ -288,6 +306,20 @@ rem runs it. An empty value is more honest than a guess.
 if "%SKIP_MODEL%"=="1" set "P2P_MODEL_FAMILY="
 if not defined OLLAMA_EXE set "P2P_MODEL_FAMILY="
 
+rem LAST RESORT (2.26.12): ask Ollama what it actually has.
+rem
+rem Real case: the model was already pulled on the owner's PC, so the pull
+rem step was skipped and the family never got set - the installer then
+rem declared no capability while a working model sat right there. Discovery
+rem was off for a reason nobody could see from the outside.
+rem
+rem `ollama list` is the honest test: it reports models that exist NOW, not
+rem ones we hoped to install. `skip=1` drops the header row, `delims=:` cuts
+rem the tag, so `qwen2.5-coder:1.5b` becomes `qwen2.5-coder` - the same
+rem family form a client queries. Only when the family is still empty: an
+rem explicit TARNET_MODEL wins, and `if not defined` keeps the first row.
+if not defined P2P_MODEL_FAMILY if defined OLLAMA_EXE for /f "skip=1 tokens=1 delims=:" %%m in ('"%OLLAMA_EXE%" list 2^>nul') do if not defined P2P_MODEL_FAMILY set "P2P_MODEL_FAMILY=%%m"
+
 rem GPU only when the driver actually answers. A bare `where nvidia-smi`
 rem finds the binary on machines where the card is not usable.
 set "P2P_DEVICE=cpu"
@@ -320,8 +352,13 @@ if defined P2P_MODEL_FAMILY (
   echo if not defined P2P_MODEL_FAMILIES set "P2P_MODEL_FAMILIES=%P2P_MODEL_FAMILY%"
   echo if not defined P2P_DEVICE_CLASS set "P2P_DEVICE_CLASS=%P2P_DEVICE%"
   echo if not defined P2P_RUNTIMES set "P2P_RUNTIMES=%P2P_RUNTIME%"
-  if "%P2P_OK%"=="1" echo "%NODE_EXE%" "%WORKER_JS%" --p2p
-  if not "%P2P_OK%"=="1" echo "%NODE_EXE%" "%WORKER_JS%"
+  rem `%%*` prints a literal `%*` into start.cmd (batch collapses `%%` to `%`).
+  rem Without it the launcher ignored every argument, so `start.cmd --test-p2p`
+  rem ran the usual `--p2p` worker: the owner asked for a P2P-only probe and
+  rem got the WS path, then read `channels: 0` as a NAT failure. Passing the
+  rem arguments through is what makes the documented test command real.
+  if "%P2P_OK%"=="1" echo "%NODE_EXE%" "%WORKER_JS%" --p2p %%*
+  if not "%P2P_OK%"=="1" echo "%NODE_EXE%" "%WORKER_JS%" %%*
   echo pause
 ) > "%TARNET_DIR%\start.cmd"
 
