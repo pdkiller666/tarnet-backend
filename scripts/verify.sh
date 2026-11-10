@@ -400,6 +400,31 @@ H_LOCAL=$(ssh "${SSH_OPTS[@]}" "$VPS" \
   "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:3001/health" 2>/dev/null)
 [ "$H_LOCAL" = "200" ] && ok "/health на VPS" "HTTP 200" || no "/health на VPS" "HTTP ${H_LOCAL:-нет}"
 
+# ---------- 3.9 версия прода = версия в package.json ----------
+# ПОЧЕМУ ОТДЕЛЬНАЯ ПРОВЕРКА. До 10.11.2026 гейт проверял /health только на КОД
+# ОТВЕТА (200) и никогда — на ЗНАЧЕНИЕ buildVersion. Из-за этого документы
+# утверждали «на проде 2.26.4», когда прод уже отдавал 2.26.5, и жило это
+# незамеченным через четыре релиза: единственная проверка смотрела не туда.
+# Здесь сравнивается то, что реально отдаёт живой сервис, с тем, что обещает
+# package.json в проверяемом коммите. Раскатка без bump'а и bump без раскатки —
+# оба случая становятся красными.
+#
+# Читаем с VPS, а не снаружи: внешний адрес может обслуживаться старым
+# контейнером при уже обновлённом локальном, и тогда проверка мерила бы не то.
+H_BODY=$(ssh "${SSH_OPTS[@]}" "$VPS" \
+  "curl -s --max-time 10 http://127.0.0.1:3001/health" 2>/dev/null)
+BUILD_LIVE=$(printf '%s' "$H_BODY" | sed -n 's/.*"buildVersion": *"\([^"]*\)".*/\1/p' | head -1)
+BUILD_PKG=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1)
+if [ -z "$BUILD_LIVE" ]; then
+  no "версия прода" "/health не отдал buildVersion (ответ длиной ${#H_BODY})"
+elif [ -z "$BUILD_PKG" ]; then
+  no "версия прода" "не разобрал version в package.json"
+elif [ "$BUILD_LIVE" = "$BUILD_PKG" ]; then
+  ok "версия прода" "$BUILD_LIVE = package.json"
+else
+  no "версия прода" "прод $BUILD_LIVE != package.json $BUILD_PKG — раскатай или поправь номер"
+fi
+
 H_PUB=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/health")
 [ "$H_PUB" = "200" ] && ok "/health снаружи" "HTTP 200" || no "/health снаружи" "HTTP $H_PUB"
 
@@ -492,7 +517,11 @@ WS_ROOT="$(cd "$REPO_DIR/.." && pwd)"
 # проверялись, хотя симлинками были. Дыра нашлась при добавлении MASTER-PLAN:
 # гейт показывал «7/7», хотя три документа могли молча стать копиями.
 # Пять канонических идут первыми — их поломка дороже всего.
-DOC_LINKS="MANIFEST.v3.4-UNIFIED.md PROJECT-HISTORY.md PROJECT-MAP.md ROADMAP.md MASTER-PLAN.md NARRATIVE.md ONE-PAGER.md PITCH-DECK.md DEMO-SCRIPT.md EMAIL-TEMPLATE.md AUDIT-REALITY.md PROJECT-MEMORY.md"
+# 10.11.2026: добавлен INVESTOR-CHECKLIST — в корне стало 13 ссылок, а список
+# остался на 12. Ровно этот дефект комментарий выше и описывает: симлинк
+# существует и гейтом не виден. Список обязан совпадать с набором, а не быть
+# его выборкой.
+DOC_LINKS="MANIFEST.v3.4-UNIFIED.md PROJECT-HISTORY.md PROJECT-MAP.md ROADMAP.md MASTER-PLAN.md NARRATIVE.md ONE-PAGER.md PITCH-DECK.md DEMO-SCRIPT.md EMAIL-TEMPLATE.md AUDIT-REALITY.md PROJECT-MEMORY.md INVESTOR-CHECKLIST.md"
 if [ -d "$WS_ROOT" ]; then
   LINKS_BAD=""
   LINKS_OK=0
