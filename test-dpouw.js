@@ -591,7 +591,13 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
 
   // ---------- 8.6. client_signature проверяется по Ed25519 ----------
   section('8.6. client_signature: подпись клиента обязана сходиться');
-  const client = await api('/wallet', 'POST');
+  const clientPair = crypto.generateKeyPairSync('ed25519');
+  const clientPubPem = clientPair.publicKey.export({ type: 'spki', format: 'pem' });
+  /* Кошелёк регистрируется ПУБЛИЧНЫМ ключом (2.26.7). Раньше ключ брался из
+   * ответа POST /wallet, но отдавать приватный ключ по HTTP нельзя: адрес,
+   * созданный сервером, клиент подписывать не смог бы. Теперь тест делает то
+   * же, что настоящий клиент: генерирует пару у себя. */
+  const client = await api('/wallet', 'POST', { publicKeyPem: clientPubPem });
   const clientAddress = client.body.address;
   const sigTier = 'base';
   const sigTokens = 250000;
@@ -600,8 +606,13 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
   /* Канонический payload фиксирован в server.js (clientSignPayload):
    * clientAddress:workerAddress:tokens:tier:actionId */
   const canonical = [clientAddress, wB, String(sigTokens), sigTier, sigAction].join(':');
-  const sig = crypto.sign(null, Buffer.from(canonical, 'utf8'),
-    crypto.createPrivateKey(client.body.privateKeyPem)).toString('base64');
+  const sig = crypto.sign(null, Buffer.from(canonical, 'utf8'), clientPair.privateKey).toString('base64');
+  /* Адрес обязан выводиться из ключа, а не браться из тела: иначе можно
+   * объявить чужой ключ своим. Проверяется парой к адресу. */
+  ok('адрес кошелька выведен из присланного ключа',
+    /^0x[0-9a-f]{40}$/.test(String(clientAddress)), clientAddress);
+  ok('приватный ключ не возвращается из POST /wallet',
+    client.body.privateKeyPem === undefined, Object.keys(client.body));
 
   const signed = await api('/work', 'POST', {
     workerAddress: wB, clientAddress, tokens: sigTokens, tier: sigTier,

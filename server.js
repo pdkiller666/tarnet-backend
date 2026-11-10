@@ -22,7 +22,7 @@ const { CONFIG, TIER6, FAUCET, TIER_WEIGHTS, normalizeTier, round } = require('.
 const { classifyDomain, selectModel, selectSwarmModels } = require('./model-router');
 const { CWUCalculator, RewardEngine, verifyQuality, epochEmission, epochIndex, omega } = require('./economics');
 const { CumulativeLedger, receiptPayload, epochState, releasedFor, bumpEpoch } = require('./ledger');
-const { getGenesisHash, receiptPayloadV2, computeReceiptHash, verifyWorkerDagChain } = require('./dag-chain');
+const { getGenesisHash, verifyWorkerDagChain } = require('./dag-chain');
 const workerBox = require('./worker-box');
 const LLM = require('./llm-adapter');
 /* Фаза 2.5: консервативный PII-классификатор (regex + ONNX NER для имён).
@@ -106,6 +106,13 @@ const { createWsInbound } = require('./ws-inbound');
 // ===== Configuration =====
 const PORT = process.env.PORT || 3001;
 const DB_PATH = process.env.TARNET_DB || path.join(__dirname, 'tarnet.db');
+/* Снимок ДО открытия базы. SQLite создаёт заголовок 4096 байт при первом
+ * открытии, поэтому проверка "размер === 0" ПОСЛЕ старта не срабатывает
+ * никогда: пустой файл к моменту ответа /health уже не пустой. Замер здесь —
+ * единственное место, где видно исходное состояние. */
+const DB_WAS_EMPTY_AT_START = (() => {
+  try { return fs.statSync(DB_PATH).size === 0; } catch (_e) { return false; }
+})();
 
 const TIERS = Object.keys(TIER_WEIGHTS);
 const BASE_MODEL = 'base-model';
@@ -695,6 +702,24 @@ ensureColumn('worker_tasks', 'maxTokens', 'maxTokens INTEGER');
  * и не «провалила»). */
 ensureColumn('worker_tasks', 'promptHash', 'promptHash TEXT');
 ensureColumn('worker_tasks', 'promptHashVerified', 'promptHashVerified INTEGER');
+
+/* ===== Миграция: source при эмуляции (2.26.7) =====
+ *
+ * До 2.26.7 при фолбэке менялся только `emulated`, а `source` оставался
+ * 'live_llm'. Итог: 80 строк «живой LLM» при 43 настоящих — любая сводка
+ * GROUP BY source завышала живую генерацию на 86%.
+ *
+ * Меняется ТОЛЬКО source: `emulated` и так верен (37 = 37), и переписывать
+ * его значило бы «исправить» правильное поле. Идемпотентно — повтор находит 0. */
+(function migrateSourceOnEmulation() {
+  const fixed = db.prepare(
+    `UPDATE inferenceLogs SET source = 'deterministic_fallback'
+      WHERE source = 'live_llm' AND emulated = 1`,
+  ).run();
+  if (fixed.changes > 0) {
+    console.log(`🩹 inferenceLogs: ${fixed.changes} строк live_llm с emulated=1 → deterministic_fallback`);
+  }
+})();
 
 /* ===== Миграция: burn-строки без fromAddress =====
  *
@@ -3249,13 +3274,26 @@ app.get('/health', async (_req, res) => {
   const st = epochState(dbx, epoch, emissionTar);
   const released = releasedFor(epoch, emissionTar);
 
+  /* Размер файла БД: 0 байт — это не «пустая база по смыслу», а признак,
+   * что открыт не тот файл. Оператор увидит предупреждение рядом с путём,
+   * а не будет искать 'no such table' на пустом месте. */
+  let dbSizeBytes = null;
+  try { dbSizeBytes = fs.statSync(DB_PATH).size; } catch (_e) { dbSizeBytes = null; }
+
   res.json({
     status: 'ok',
     timestamp: Date.now(),
-    /* Путь берётся из DB_PATH, а не литералом: на стенде TARNET_DB задаётся
-     * переменной окружения, и жёсткая строка 'sqlite://tarnet.db' вводила в
-     * заблуждение — отчёт показывал одну базу, работа шла с другой. */
-    database: `sqlite://${path.basename(DB_PATH)}`,
+    /* Полный путь, а НЕ basename. Раньше здесь стоял path.basename(DB_PATH),
+     * и /health отдавал 'sqlite://tarnet.db' — каталог отрезался, хотя работа
+     * шла с /var/lib/tarnet/tarnet.db. Оператор открывал нулевой tarnet.db из
+     * рабочего каталога и получал 'no such table' на всех таблицах. */
+    database: `sqlite://${DB_PATH}`,
+    databaseBytes: dbSizeBytes,
+    /* Признак берётся со снимка ДО открытия, а не из текущего размера:
+     * после старта SQLite уже записал 4096-байтный заголовок, и пустой файл
+     * перестал быть пустым. Проверка по текущему размеру не сработала бы
+     * никогда — поймано приёмкой, а не на глаз. */
+    ...(DB_WAS_EMPTY_AT_START ? { warning: 'database file was empty at startup' } : {}),
     version: SCHEMA_VERSION,
     buildVersion: BUILD_VERSION,
     rewardMode: CONFIG.REWARD_MODE,
@@ -3349,6 +3387,47 @@ app.get('/health', async (_req, res) => {
       };
     })(),
     treasuryBalanceTar: Number((treas?.balanceTar ?? 0).toFixed(6)),
+    /* ===== Комитет валидаторов (2.26.7) =====
+     * До этой правки /health о состоянии комитета молчал вовсе, и отказ
+     * INSUFFICIENT_VALIDATORS замечали только внутри вызова benchmark gate.
+     * Оператору нужно видеть, можно ли собрать комитет, не запуская приёмку.
+     *
+     * Критерии взяты ИЗ knowledge-loop.js, а не написаны здесь заново:
+     * три числа, разошедшиеся в двух местах, хуже отсутствия сигнала.
+     * `candidates` — те, кто проходит по тиру/стейку/репутации;
+     * `eligible` — у кого ещё и свободный баланс покрывает блокировку
+     * (жребий блокирует stakeLockTar условным UPDATE, поэтому без денег
+     * кандидат в комитет не попадёт, хоть три раза подходи по тиру). */
+    committee: (() => {
+      const need = knowledgeLoop.REQUIRED_COMMITTEE_SIZE;
+      const lock = knowledgeLoop.VALIDATOR_STAKE_LOCK_TAR;
+      const cand = get(`SELECT COUNT(*) AS c FROM nodes n
+          WHERE n.tier IN ('expert','heavy')
+            AND n.stake >= ? AND n.reputation > ?`,
+        [knowledgeLoop.MIN_VALIDATOR_STAKE_TAR, knowledgeLoop.MIN_VALIDATOR_REPUTATION]);
+      const elig = get(`SELECT COUNT(*) AS c FROM nodes n
+          LEFT JOIN balances b ON b.address = n.address
+          WHERE n.tier IN ('expert','heavy')
+            AND n.stake >= ? AND n.reputation > ?
+            AND (COALESCE(b.balanceTar,0) - COALESCE(b.reservedTar,0)) >= ?`,
+        [knowledgeLoop.MIN_VALIDATOR_STAKE_TAR, knowledgeLoop.MIN_VALIDATOR_REPUTATION, lock]);
+      const drawn = get(`SELECT COUNT(*) AS c FROM adapter_versions
+          WHERE committee IS NOT NULL AND committee != ''`);
+      const candidates = Number(cand?.c ?? 0);
+      const eligible = Number(elig?.c ?? 0);
+      return {
+        candidates,
+        eligible,
+        required: need,
+        drawn: Number(drawn?.c ?? 0),
+        /* Причина сухая, потому что это машинное поле. Нехватка кандидатов и
+         * нехватка свободных денег — РАЗНЫЕ действия: первое требует железа,
+         * второе — пополнения баланса. Склеивать их в одну строку значило бы
+         * отправлять оператора чинить не то. */
+        reason: candidates < need ? 'insufficient_validators'
+          : eligible < need ? 'insufficient_stake' : null,
+      };
+    })(),
     /* Честная маркировка он-чейна: записи в onchain_settlements созданы
      * локально, txHash — randomBytes(32), статус `confirmed` к блокчейну
      * отношения не имеет. Флаг отдаётся в /health, потому что именно
@@ -3437,10 +3516,58 @@ app.get('/epoch', (req, res) => {
 });
 
 /* --- Wallet --- */
-app.post('/wallet', (_req, res) => {
+app.post('/wallet', (req, res) => {
+  const body = req.body || {};
+  /* 2.26.7: приватный ключ больше НЕ возвращается по HTTP.
+   *
+   * Раньше `res.json(w)` отдавал privateKeyPem открытым текстом — эндпоинт,
+   * который любой мог дёрнуть без аутентификации, выдавал ключ подписи
+   * только что созданного адреса. Утечки не было только потому, что клиента
+   * у него нет; это не свойство безопасности, а совпадение.
+   *
+   * Практический след: ключ, сгенерированный сервером и оставленный на
+   * сервере, бесполезен клиенту — подписывать им он не может. Поэтому
+   * честный контракт: клиент генерирует пару У СЕБЯ и присылает публичную
+   * часть. Адрес выводится из ключа, а не берётся из тела: иначе можно
+   * объявить чужой ключ своим. */
+  if (body.publicKeyPem !== undefined && body.publicKeyPem !== null) {
+    const pem = String(body.publicKeyPem);
+    let pub;
+    try {
+      pub = crypto.createPublicKey(pem);
+    } catch (_e) {
+      return res.status(400).json({
+        error: 'BAD_PUBLIC_KEY',
+        message: 'publicKeyPem должен быть SPKI PEM для Ed25519',
+      });
+    }
+    if (pub.asymmetricKeyType !== 'ed25519') {
+      return res.status(400).json({
+        error: 'BAD_PUBLIC_KEY',
+        message: `ожидался ed25519, получен ${pub.asymmetricKeyType}`,
+      });
+    }
+    const address = '0x' + crypto.createHash('sha256')
+      .update(pub.export({ type: 'spki', format: 'der' })).digest('hex').slice(0, 40);
+    /* Приватного ключа у сервера нет и быть не должно: подпись целиком на
+     * стороне клиента, сервер хранит только проверочный материал. */
+    storeWallet({ address, publicKeyPem: pem, privateKeyPem: null });
+    return res.json({ address, publicKeyPem: pem, keySource: 'client' });
+  }
+
   const w = generateWallet();
   storeWallet(w); // создаёт и счёт с нулевым балансом
-  res.json(w);
+  res.json({
+    address: w.address,
+    publicKeyPem: w.publicKeyPem,
+    keySource: 'server',
+    /* Явно, а не молчанием: клиент должен понимать, ПОЧЕМУ он не может
+     * подписать от этого адреса. Молчащее отсутствие поля читалось бы как
+     * баг, а не как ограничение. */
+    privateKeyHeldByServer: true,
+    note: 'Приватный ключ не отдаётся по HTTP. Чтобы подписывать client_signature '
+      + 'от этого адреса, сгенерируйте пару у себя и пришлите publicKeyPem в POST /wallet.',
+  });
 });
 
 app.get('/wallets', (_req, res) => {
@@ -5224,7 +5351,12 @@ app.get('/ledger', (req, res) => {
 
 /* --- Node --- */
 app.post('/node', (req, res) => {
-  const { address, stake, reputation, isTeeAttested, rsaPublicKeyPem, tier, publicUrl } = req.body || {};
+  /* isTeeAttested в теле НЕ читается намеренно. Флаг TEE — утверждение о
+   * железе, и принимать его от того, кто претендует на привилегию, значит
+   * не проверять ничего: любой клиент присылал true и попадал в пул, из
+   * которого приватная маршрутизация выбирает исполнителя. Единственный
+   * источник — одобренная аттестация (node_attestations.status='approved'). */
+  const { address, stake, reputation, rsaPublicKeyPem, tier, publicUrl } = req.body || {};
   if (typeof address !== 'string' || !address.length) {
     return res.status(400).json({ error: 'address is required' });
   }
@@ -5352,13 +5484,21 @@ app.post('/node', (req, res) => {
   const finalPublicUrl = nodePublicUrl !== null
     ? nodePublicUrl
     : (existing ? (existing.publicUrl || null) : null);
+  /* TEE-флаг пишется ТОЛЬКО из одобренной аттестации. Заявка (pending)
+   * привилегий не даёт: иначе «аттестован» означало бы «попросил».
+   * Пока доверенной стороны нет, флаг остаётся 0 у всех — это честное
+   * состояние [SPEC / ROADMAP], а не недоделка. */
+  const teeApproved = get(
+    `SELECT 1 AS ok FROM node_attestations
+      WHERE workerAddress = ? AND status = 'approved' LIMIT 1`, [address]);
+  const teeFlag = teeApproved ? 1 : 0;
   run('INSERT OR REPLACE INTO nodes (address, stake, reputation, isTeeAttested, routingWeight, rsaPublicKeyPem, tier, publicUrl) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    [address, finalStake, finalReputation, isTeeAttested ? 1 : 0, rw, pubKey, finalTier, finalPublicUrl]);
+    [address, finalStake, finalReputation, teeFlag, rw, pubKey, finalTier, finalPublicUrl]);
   run(`INSERT INTO balances (address, balanceTar, stakedTar, updatedAt) VALUES (?, 0, ?, ?)
        ON CONFLICT(address) DO UPDATE SET stakedTar = excluded.stakedTar, updatedAt = excluded.updatedAt`,
     [address, finalStake, new Date().toISOString()]);
   res.json({ address, stake: finalStake, reputation: finalReputation,
-    isTeeAttested: !!isTeeAttested, routingWeight: rw, tier: finalTier,
+    isTeeAttested: teeFlag === 1, routingWeight: rw, tier: finalTier,
     validatorEligible: ['expert', 'heavy'].includes(finalTier),
     onionCapable: Boolean(pubKey),
     /* Отдаём сохранённый адрес, а не присланный: клиент должен видеть, что
@@ -8524,7 +8664,19 @@ app.get('/worker/ws', (_req, res) => {
  * Один вызов: выбрать воркера -> инференс -> CWU -> начисление -> чек. */
 async function runInference(req, res) {
   const body = req.body || {};
-  const prompt = typeof body.prompt === 'string' && body.prompt.length ? body.prompt : 'Hello from TarNet!';
+  /* Промпт обязателен. Раньше пустое поле молча подменялось на
+   * 'Hello from TarNet!', и запрос с одним `messages` получал 200 и ответ
+   * на ДРУГОЙ вопрос — форма «ignored input»: контракт называет поле,
+   * обработчик его не читает и подставляет своё. `messages` не
+   * поддерживается, и честный отказ лучше тихой подмены. */
+  const prompt = typeof body.prompt === 'string' ? body.prompt : '';
+  if (!prompt.trim()) {
+    return res.status(400).json({
+      error: 'PROMPT_REQUIRED',
+      message: 'используйте поле `prompt`, `messages` не поддерживается',
+      received: body.messages !== undefined ? 'messages' : null,
+    });
+  }
   const adapterId = typeof body.adapterId === 'string' && body.adapterId.length ? body.adapterId : BASE_MODEL;
   /* let, а не const: при фолбэке Tier 6 на локальный воркер тир
    * переписывается на base (external-тир не имеет κ). С const это
@@ -9669,6 +9821,11 @@ async function runInference(req, res) {
             if (w.workerAddress) workerAddress = w.workerAddress;
             if (w.source === 'deterministic_fallback') {
               fallbackReason = w.error || 'model_unavailable';
+              /* source описывает ПРОИСХОЖДЕНИЕ ответа, а не транспорт. Раньше
+               * менялся только emulated, и имя оставалось 'live_llm': любой
+               * GROUP BY source завышал живую генерацию — 80 «живых» против
+               * 43 настоящих. */
+              result.source = 'deterministic_fallback';
               result.emulated = true;
               result.warning = w.error === 'OLLAMA_NOT_RUNNING'
                 ? 'Ollama не запущена на ПК воркера — запустите её или выберите «Свой ключ»'
@@ -9771,6 +9928,9 @@ async function runInference(req, res) {
          * загружена» лечатся разными действиями, и общий код заставлял бы
          * человека угадывать. Неизвестная причина — model_unavailable. */
         fallbackReason = w.error || 'model_unavailable';
+        /* Тот же дефект, что и в ветке роя: имя источника обязано меняться
+         * вместе с emulated, иначе одиночный путь продолжает врать. */
+        result.source = 'deterministic_fallback';
         result.emulated = true;
         result.warning = w.error === 'OLLAMA_NOT_RUNNING'
           ? 'Ollama не запущена на ПК воркера — запустите её или выберите «Свой ключ»'
@@ -10299,7 +10459,13 @@ app.post('/batch-test', wrapAsync(async (req, res) => {
     const stake = 10000 + (h.readUInt32BE(0) % 90000);
     const reputation = 0.7 + ((h.readUInt32BE(4) % 300) / 1000);
     const rw = routingWeight(stake, reputation);
-    const tee = i % 3 === 0 ? 1 : 0; // примерно треть узлов аттестована
+    /* Раньше здесь стояло `i % 3 === 0` — «примерно треть узлов аттестована».
+     * Это тот же дефект, что и приём флага из тела POST /node, только другим
+     * путём: флаг объявлялся без всякой проверки железа. Демо-батч нарочно
+     * синтетический, и выдавать его узлы за аттестованные значит подмешивать
+     * в /nodes записи, на которые опирается приватная маршрутизация.
+     * Аттестации нет — флаг 0. */
+    const tee = 0;
     run('INSERT OR REPLACE INTO nodes (address, stake, reputation, isTeeAttested, routingWeight) VALUES (?, ?, ?, ?, ?)',
       [addr, stake, reputation, tee, rw]);
     workers.push({ address: addr, stake, reputation: Number(reputation.toFixed(2)),
