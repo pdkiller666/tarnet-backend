@@ -86,6 +86,19 @@ rem keeps the p2p dependency install working for both.
 for %%p in ("%NODE_EXE%") do set "NODE_DIR=%%~dp"
 set "NPM_EXE="
 if exist "%NODE_DIR%npm.cmd" set "NPM_EXE=%NODE_DIR%npm.cmd"
+rem Fallback (2.27.0). `where node` returns the FIRST match, and that folder is
+rem not guaranteed to hold npm.cmd: nvm/fnm shims, a hand-unpacked portable
+rem copy, or a second Node installed later all produce a node.exe whose folder
+rem has no npm. Before this line the installer then reported "npm not found
+rem next to node.exe" and skipped the transport, although a perfectly usable
+rem npm was on PATH the whole time. `where npm` is the real question.
+rem `for /f` takes the first line only, so a second npm later in PATH cannot
+rem override the one the system itself resolves first.
+if not defined NPM_EXE for /f "delims=" %%i in ('where npm.cmd 2^>nul') do if not defined NPM_EXE set "NPM_EXE=%%i"
+if not defined NPM_EXE for /f "delims=" %%i in ('where npm 2^>nul') do if not defined NPM_EXE set "NPM_EXE=%%i"
+rem Last resort: the npm that ships INSIDE node - it needs no .cmd wrapper and
+rem runs on the very node.exe already resolved above.
+if not defined NPM_EXE if exist "%NODE_DIR%node_modules\npm\bin\npm-cli.js" set "NPM_CLI=%NODE_DIR%node_modules\npm\bin\npm-cli.js"
 rem npm.cmd spawns node by name, so the folder has to be on PATH.
 set "PATH=%NODE_DIR%;%PATH%"
 echo [1/4] Node.js: ok
@@ -180,13 +193,23 @@ rem work". Checked here, not later: a worker that starts on WS and never
 rem appears in the DHT looks healthy from every other angle.
 if not exist "%TARNET_DIR%\jcs.js" goto p2p_no_jcs
 
-if not defined NPM_EXE goto p2p_no_npm
+if not defined NPM_EXE if not defined NPM_CLI goto p2p_no_npm
 rem `ci` and not `install`: the lockfile is in the archive, and `ci` refuses
 rem to invent versions. `--omit=dev` keeps test-only packages out.
 rem Installed INTO the p2p folder: that is where node resolves `libp2p`
 rem from, so no NODE_PATH tricks are needed.
+rem
+rem Two ways to run it, and the CLI one is not a fallback for looks: npm.cmd
+rem is a shell wrapper that calls `node` BY NAME, so it breaks when PATH is
+rem unusual. `node npm-cli.js` uses the very node.exe already resolved above.
+rem Before 2.27.0 only NPM_EXE existed, so a machine with node but no npm.cmd
+rem in that folder lost P2P even though node_modules/npm was right there.
 pushd "%P2P_DIR%"
-call "%NPM_EXE%" ci --omit=dev --no-audit --no-fund >"%TARNET_DIR%\p2p-install.log" 2>&1
+if defined NPM_EXE (
+  call "%NPM_EXE%" ci --omit=dev --no-audit --no-fund >"%TARNET_DIR%\p2p-install.log" 2>&1
+) else (
+  "%NODE_EXE%" "%NPM_CLI%" ci --omit=dev --no-audit --no-fund >"%TARNET_DIR%\p2p-install.log" 2>&1
+)
 set "NPM_RC=%errorlevel%"
 popd
 if not "%NPM_RC%"=="0" goto p2p_npm_failed

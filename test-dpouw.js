@@ -6923,6 +6923,69 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       !/#796/.test(appSrc));
   }
 
+  /* --- 38.15 Установщик: npm находится, а неполный p2p не валит установку (2.27.0) ---
+   *
+   * Два дефекта, и оба видел человек, а не тест.
+   *
+   * ПЕРВЫЙ. Установщик искал npm ОДНИМ способом: `%NODE_DIR%npm.cmd`, где
+   * NODE_DIR — папка первого `node.exe` из `where node`. Это верно только для
+   * обычной установки Node. У nvm/fnm-шимов, у распакованного вручную
+   * портативного архива и у второй версии Node в системе папка с node.exe не
+   * содержит npm.cmd — и установщик писал "npm not found next to node.exe",
+   * хотя рабочий npm лежал в PATH всё это время. Молча пропущенный транспорт
+   * читается человеком как «P2P сломан».
+   *
+   * ВТОРОЙ, и он дороже. `--self-check` бросал исключение при неполном
+   * p2p-транспорте, а установщик на нём делал `exit /b 1`. То есть ЛЮБОЙ
+   * внешний отказ `npm ci` (прокси, диск, оффлайн) отнимал у человека
+   * рабочего WS-воркера: он видел красный текст и удалял программу. Но воркер
+   * без транспорта работает — по WebSocket. Проверка обязана назвать причину
+   * и пропустить транспорт, а не отменять установку.
+   *
+   * Строковый тест здесь недостаточен: «WARNING есть в исходнике» остаётся
+   * зелёным, даже если код всё равно бросает. Поэтому 38.15d ЗАПУСКАЕТ
+   * сборку в папке с транспортом без node_modules и требует код выхода 0. */
+  /* Скачиваем ровно то, что получит человек. Блок 38 читает файлы из
+   * репозитория, но установщик и воркер сервер ПОДСТАВЛЯЕТ (адрес, сборку),
+   * поэтому проверять шаблон на диске значило бы проверять не тот артефакт. */
+  {
+    const ADDR15 = runAddress('d15');
+    const bat15 = await apiAt(BASE, `/install/install.bat?addr=${ADDR15}`);
+    const batText = typeof bat15.body === 'string' ? bat15.body : '';
+    const dl15 = await apiAt(BASE, '/download/worker.js');
+    const dlText = typeof dl15.body === 'string' ? dl15.body : '';
+
+  ok('38.15 установщик ищет npm через where, а не только рядом с node.exe',
+    /where npm\.cmd/.test(batText) && /where npm /.test(batText));
+  ok('38.15 запасной запуск npm через npm-cli.js действительно используется',
+    /npm-cli\.js/.test(batText) && /"%NODE_EXE%" "%NPM_CLI%" ci/.test(batText));
+  ok('38.15 проверка после npm ci называет libp2p и kad-dht',
+    /import\('libp2p'\)/.test(batText) && /@libp2p\/kad-dht/.test(batText));
+  ok('38.15 self-check не бросает исключение из-за неполного p2p',
+    /WARNING — p2p-транспорт неполный/.test(dlText)
+    && !/throw new Error\('p2p-node установлен, но нет/.test(dlText));
+  {
+    const { spawnSync } = require('child_process');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-p2p-broken-'));
+    let partial = { code: null, out: '' };
+    try {
+      fs.writeFileSync(path.join(dir, 'tarnet-worker.js'), dlText);
+      /* Транспорт ЕСТЬ (его файл на месте), зависимостей НЕТ — ровно то, что
+       * остаётся у человека после упавшего `npm ci`. */
+      fs.mkdirSync(path.join(dir, 'p2p-node'));
+      fs.writeFileSync(path.join(dir, 'p2p-node', 'p2p-worker.js'), '// stub\n');
+      const r = spawnSync(process.execPath, [path.join(dir, 'tarnet-worker.js'), '--self-check'],
+        { cwd: dir, encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] });
+      partial = { code: r.status, out: `${r.stdout || ''}${r.stderr || ''}`.trim().slice(0, 200) };
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    ok('38.15 без зависимостей установка не отменяется: код 0 и названная причина',
+      partial.code === 0 && /WARNING/.test(partial.out) && /libp2p/.test(partial.out),
+      partial);
+  }
+  }
+
   /* ---------- 39. Адаптив: телефон → планшет → ПК ----------
    * Проверяем не «есть ли media-запросы» (они есть всегда), а то, что
    * каждый диапазон закрывает свою поломку: тач-цели на телефоне, зум
