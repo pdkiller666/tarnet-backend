@@ -145,6 +145,41 @@ function base32Encode(bytes) {
 /* ---------- бакет провайдера ---------- */
 
 /**
+ * Семейство модели из строки запроса: снять тег версии.
+ *
+ * ЗАЧЕМ. `/p2p/discover?model=qwen2.5-coder:1.5b` попадал в ключ бакета
+ * ЦЕЛИКОМ, вместе с `:1.5b`. Воркер объявляет семейство без тега
+ * (`P2P_MODEL_FAMILIES=qwen2.5-coder`), поэтому CID-ы не совпадали НИКОГДА:
+ * замер 11.11 — `qwen2.5-coder:1.5b` → `bafkreievemq…`, `qwen2.5-coder` →
+ * `bafkreifkuzj…`. Клиент с полным именем модели не мог найти воркера
+ * при живой DHT, и это выглядело как «discovery сломан».
+ *
+ * ПОЧЕМУ НЕ РЕЖЕМ БОЛЬШЕ. `qwen2.5-coder` → `qwen` — это уже маппинг
+ * «модель → семейство», которого в репозитории нет: в каталоге `/models`
+ * поля `family` не существует. Угадывать такое соответствие значило бы
+ * менять адреса бакетов по догадке. Здесь снимается только то, что
+ * однозначно: тег после `:`.
+ *
+ * ОДНА ФУНКЦИЯ НА ОБЕ СТОРОНЫ. Воркер (через `provideCids`) и клиент
+ * (через `findWorkers`) идут сюда, поэтому разойтись не могут.
+ *
+ * @param {string} modelFamily строка из запроса или из capabilities
+ * @returns {string} семейство без тега версии
+ */
+export function normalizeModelFamily(modelFamily) {
+  const raw = String(modelFamily || '').trim()
+  if (!raw) return ''
+  /* Тег — только ПОСЛЕДНИЙ сегмент после двоеточия и только если он не
+   * содержит `/` или пробелов: `qwen2.5-coder:1.5b` → `qwen2.5-coder`,
+   * а `org/model` остаётся собой. */
+  const i = raw.lastIndexOf(':')
+  if (i <= 0) return raw
+  const tag = raw.slice(i + 1)
+  if (!tag || /[\s/]/.test(tag)) return raw
+  return raw.slice(0, i)
+}
+
+/**
  * Ключ провайдер-индекса: сеть + семейство моделей + класс устройства.
  *
  * `deviceClass` в ключе намеренно: «умею llama на сервере» и «умею llama
@@ -152,7 +187,7 @@ function base32Encode(bytes) {
  * не должен получать сервер. Требования точнее — меньше ложных находок.
  */
 export function bucketKey({ networkId = DEFAULT_NETWORK_ID, modelFamily, deviceClass }) {
-  const fam = String(modelFamily || '').trim()
+  const fam = normalizeModelFamily(modelFamily)
   const dev = String(deviceClass || '').trim()
   if (!fam) throw new Error('BAD_MODEL_FAMILY')
   if (!dev) throw new Error('BAD_DEVICE_CLASS')

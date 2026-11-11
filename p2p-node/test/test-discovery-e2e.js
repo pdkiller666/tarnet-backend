@@ -42,6 +42,7 @@ import {
   bucketCid,
   buildRecord,
   verifyRecord,
+  normalizeModelFamily,
   DEFAULT_NETWORK_ID,
   RECORD_SCHEMA,
   peerIdFromPublicKey,
@@ -289,6 +290,41 @@ async function main() {
     ok('4.0 ловушка: [object Object] и пустые PeerInfo не дают провайдеров',
       trap.length === 0 && !trap.includes('[object Object]'),
       { got: trap })
+
+    /* ---------- 4.0a ЛОВУШКА: тег версии не должен менять бакет ----------
+     *
+     * Второй дефект того же класса, найденный замером 11.11. `/p2p/discover`
+     * передавал `?model=qwen2.5-coder:1.5b` в ключ бакета ЦЕЛИКОМ, вместе
+     * с тегом, а воркер объявляет семейство без тега. CID-ы не совпадали
+     * никогда: `bafkreievemq…` против `bafkreifkuzj…`. При живой DHT и
+     * исправном разборе прод отвечал `found: 0`, и это читалось как
+     * «discovery сломан», хотя искались в другом месте.
+     *
+     * ПОЧЕМУ ЛОВУШКА, А НЕ HAPPY PATH. Проверка падает, если кто-то
+     * вернёт полную строку в ключ: тогда `qwen2.5-coder:1.5b` и
+     * `qwen2.5-coder` дадут РАЗНЫЕ CID, и клиент снова перестанет
+     * находить воркера. Одинаковый CID — единственный признак, что обе
+     * стороны говорят об одном бакете. */
+    const cidTagged = bucketCid({
+      networkId: NETWORK_ID, modelFamily: 'qwen2.5-coder:1.5b', deviceClass: 'cpu',
+    }).cid
+    const cidPlain = bucketCid({
+      networkId: NETWORK_ID, modelFamily: 'qwen2.5-coder', deviceClass: 'cpu',
+    }).cid
+    ok('4.0a ловушка: тег модели не меняет бакет (иначе клиент не найдёт воркера)',
+      cidTagged === cidPlain,
+      { tagged: cidTagged, plain: cidPlain })
+
+    /* И обратная сторона: нормализация не должна склеивать РАЗНЫЕ
+     * семейства. Иначе ловушка выше проходила бы за счёт того, что все
+     * модели попадают в один бакет, и «нашли воркера» означало бы
+     * «нашли любого». */
+    const cidQwen = bucketCid({
+      networkId: NETWORK_ID, modelFamily: 'qwen', deviceClass: 'cpu',
+    }).cid
+    ok('4.0b семейства не склеились: qwen ≠ qwen2.5-coder',
+      cidPlain !== cidQwen && normalizeModelFamily('qwen2.5-coder') === 'qwen2.5-coder',
+      { qwen: cidQwen, coder: cidPlain })
     ok('4.1 findProviders вернул события', events.length > 0, { events: events.length })
     ok('4.2 клиент нашёл воркера по CID', peerIds.includes(peerId),
       { found: peerIds.map((p) => p.slice(0, 12)), want: peerId.slice(0, 12) })

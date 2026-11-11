@@ -275,11 +275,11 @@ treasuryBalanceTar (на счету) 0.194500
 | `conservation` | `delta: 0`, `holds: true` | `/health` |
 | Чеков | `774` | `/summary` |
 | Адресов с историей | `91` | `/summary` |
-| `totalCwu` | `754 300 692` | `/summary` |
-| Выплачено (`totalRewardTar`) | `109.56319` | `/summary` |
+| `totalCwu` | `754 304 113` | `/summary` |
+| Выплачено (`totalRewardTar`) | `171.393938` | `/summary` |
 | **Утилизация** | **`totalUtilizedTar: 1.2e-05`, `totalUtilizedCount: 3`** | `/summary` |
-| Казна | `0.19815 TAR`, `reserveStatus: critical` | `/health.treasury` |
-| Диск шлюза | `overlay 9.8G, avail 26M, 100%` | `df -h /` |
+| Казна | `0.1982 TAR`, `reserveStatus: critical` | `/health.treasury` |
+| Диск шлюза | `overlay 9.8G, avail 803M, 92%` (было `avail 26M, 100%` — разгружено 11.11) | `df -h /` |
 | Тесты | treasury `13/13` после починки фикстуры | `proof-treasury-gate.js` |
 
 **Дисбаланс Fee/Block:** Block `102.410739 TAR` против Fee `~7.15 TAR` — эмиссия по-прежнему
