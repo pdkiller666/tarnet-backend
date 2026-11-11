@@ -1,0 +1,114 @@
+# HOSTING-CHECKLIST — требования к хосту TarNet
+
+Чеклист для выбора нового хоста. Каждый пункт — проверяемый, с командой и порогом. Не «желательно», а «да/нет».
+
+**Контекст:** переезд нужен потому, что из России прод недоступен (11.11.2026, `check-host.net`: 11/12 узлов HTTP 200, российский `ru2` — `Connection timed out`, 18.2 с). Значит один из пунктов — доступность из РФ, и он проверяется первым.
+
+---
+
+## 1. Обязательное (без этого не работает)
+
+| # | Требование | Как проверить | Порог |
+|---|---|---|---|
+| 1 | **root/SSH** | `ssh root@HOST 'id -u'` | `0` |
+| 2 | **systemd (PID 1)** | `ssh root@HOST 'ps -p 1 -o comm='` | `systemd`, не `bash`/`tini` |
+| 3 | **ОС** | `cat /etc/os-release \| grep PRETTY` | Debian 12+ или Ubuntu 22.04+ |
+| 4 | **Архитектура** | `uname -m` | `x86_64` (`onnxruntime-node` под arm64 требует отдельной сборки) |
+| 5 | **RAM** | `free -m \| awk '/Mem:/{print $2}'` | ≥ 1024 МБ; при < 2 ГБ `bootstrap.sh` создаст swap на 2 ГБ (с 1 ГБ `npm ci` падает с `code 137`) |
+| 6 | **Диск** | `df -Pk / \| awk 'NR==2{print int($4/1024)}'` | ≥ 5000 МБ (код 91 + `node_modules` 567 + БД + логи) |
+| 7 | **apt** | `command -v apt-get` | есть |
+| 8 | **Свой домен + A-запись** | `dig +short DOMAIN` | возвращает IP этого хоста |
+| 9 | **Порты 80/443 снаружи** | `curl -I http://HOST` | не таймаут (нужно для ACME) |
+| 10 | **Порты 4001/4002 снаружи** | `nc -zv HOST 4001` | `succeeded` (libp2p, вход воркера) |
+| 11 | **Исходящий HTTPS** | `curl -sI https://registry.npmjs.org` | `200`/`301` (иначе `npm ci` не поставит пакеты) |
+| 12 | **Исходящий к GitHub** | `git ls-remote https://github.com/pdkiller666/tarnet-backend.git HEAD` | отдаёт SHA |
+
+Пункт 11 — самый частый сюрприз: хост с «белым» IP, но закрытым egress ставит пакеты в бесконечный таймаут, и это выглядит как сломанный npm.
+
+---
+
+## 2. Доступность из России (главная причина переезда)
+
+Проверять **до** оплаты. Два независимых способа:
+
+```bash
+# способ 1: check-host.net, российские узлы (ru2, ru4, ru6)
+curl -s "https://check-host.net/check-http?host=https://NEW_HOST/&node=ru2.node.check-host.net" \
+  -H "Accept: application/json"
+# → request_id, затем:
+curl -s "https://check-host.net/check-result/REQUEST_ID" -H "Accept: application/json"
+```
+
+```bash
+# способ 2: с российской точки (VPS владельца в РФ, если есть)
+curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' --max-time 20 https://NEW_HOST/health
+```
+
+**Порог:** ≥ 2 из 3 российских узлов дают HTTP 200 за < 3 с. Если 0 из 3 — хостинг не решает задачу, и переезд бессмысленен независимо от цены.
+
+Что делает недоступным из РФ и как распознать:
+
+| Симптом | Причина | Что делать |
+|---|---|---|
+| таймаут только из РФ, из мира 200 | маршрут/фильтрация у провайдера | сменить провайдера или локацию |
+| 403 с российской точки | блокировка по IP-подсети (Cloudflare и др.) | другой диапазон |
+| резолвится, но TLS не проходит | DPI/SNI-фильтрация | нужен домен не из «чёрных» зон |
+
+---
+
+## 3. Рекомендуемое (не блокирует, но экономит нервы)
+
+| # | Что | Зачем |
+|---|---|---|
+| 13 | ≥ 2 ГБ RAM | `npm ci` без swap, запас на пики |
+| 14 | 20+ ГБ диска | бэкапы (`/var/backups/tarnet`), `storage/experience`, логи |
+| 15 | `sqlite3` CLI | удобно проверять БД; **не обязателен** — есть `scripts/sqlite-tool.js` на `node:sqlite` |
+| 16 | Отдельный IP (не shared) | не делить репутацию с соседями по rate-limit |
+| 17 | TTL DNS ≤ 300 с | переезд и откат за минуты |
+| 18 | Панель с recovery console | не блокироваться при поломке сети |
+| 19 | Ежедневный snapshot провайдера | второй слой защиты помимо `backup.sh` |
+
+---
+
+## 4. Несовместимое (что сломает установку)
+
+| Что | Почему |
+|---|---|
+| Docker-only хостинг без `systemd` на хосте | `bootstrap.sh` управляет юнитами и Caddy через `systemctl` |
+| OpenVZ/LXC с общим ядром без systemd | юниты не запустятся |
+| arm64 без готовых `onnxruntime-node` | нативный модуль не встанет |
+| Node < 22 | нет `node:sqlite`, сервер падает на старте |
+| Shared hosting / панель без root | нет доступа к `/etc/systemd`, `/var/lib` |
+| Сервисы в РФ с блокировкой egress | `npm ci` и Letsencrypt не отработают |
+
+---
+
+## 5. Проверка перед оплатой (5 минут, один скрипт)
+
+```bash
+HOST=new.example.com
+echo "--- 1. ОС и архитектура"
+ssh root@$HOST 'cat /etc/os-release | grep PRETTY; uname -m; ps -p 1 -o comm='
+
+echo "--- 2. ресурсы"
+ssh root@$HOST 'free -m | awk "/Mem:/{print \"RAM: \"\$2\" MB\"}"; df -Pk / | awk "NR==2{print \"диск: \"int(\$4/1024)\" MB\"}"'
+
+echo "--- 3. egress"
+ssh root@$HOST 'curl -sI --max-time 10 https://registry.npmjs.org | head -1; git ls-remote https://github.com/pdkiller666/tarnet-backend.git HEAD | cut -c1-7'
+
+echo "--- 4. входящие порты снаружи (запустить НЕ на хосте)"
+nc -zv $HOST 22 && nc -zv $HOST 80 && nc -zv $HOST 443 && nc -zv $HOST 4001
+
+echo "--- 5. доступность из РФ"
+curl -s "https://check-host.net/check-http?host=https://$HOST/&node=ru2.node.check-host.net" -H "Accept: application/json"
+```
+
+Итог: пункты 1–12 из раздела 1 все «да» → хост годится. Любое «нет» → не покупать.
+
+---
+
+## 6. Что этот чеклист не покрывает
+
+- **Юридическую сторону** (перенос персональных данных, ToS провайдера).
+- **Цену и SLA** — это не технические факторы, здесь их нет намеренно.
+- **Проверку на реальном чистом хосте.** На 11.11.2026 полного прогона `bootstrap.sh` на чистой машине не было: у gateway нет docker, у прода нет `debootstrap`, покупка требует владельца. Пункты 1–12 проверяемы на любом хосте, но связка «чистая ОС → `/health` 200» ещё не пройдена целиком. См. `docs/STAGE-PORTABILITY.md`.
