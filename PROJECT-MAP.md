@@ -4,7 +4,10 @@
 а не «что работает» (это `MANIFEST.v3.4-UNIFIED.md`) и не «как мы сюда пришли»
 (это `PROJECT-HISTORY.md`).
 
-**Сверено с кодом:** 2026-11-11 10:5x MSK, локально `2.28.0`, гейт **1355 ✅ / 0 ❌** —
+**Сверено с кодом:** 2026-11-11 21:5x MSK, локально `2.29.1`, гейт **1266 ✅ / 0 ❌** +
+`test-conversation.js` **30 ✅ / 0 ❌** — `2.29.1` добавляет два файла: `conversation.js`
+(память диалога, без зависимостей) и `test-conversation.js` (E2E памяти), см. `MANIFEST` §Б.76.
+Предыдущая сверка 2026-11-11 10:5x MSK, локально `2.28.0`, гейт **1355 ✅ / 0 ❌** —
 `2.28.0` не меняет состав файлов: правки текста в `worker-demo.js` (`--self-check` называет транспорт)
 и `app/app.js` (`OLLAMA_NOT_RUNNING` называет `ollama list`), см. `MANIFEST` §Б.67.
 Предыдущая сверка 2026-11-10 16:0x MSK, локально и на проде `2.26.10-pre-nat-final`
@@ -97,6 +100,7 @@
 | `model-router.js` | 166 | `classifyDomain` + `selectModel`. **Только это** — `Planner`/`MapReduce` здесь нет |
 | `swarm-synthesis.js` | 251 | Выбор лучшего из двух ответов: сначала проверка синтаксиса кода, потом Dice ≥ 0.8, потом длина |
 | `pii-classifier.js` | 291 | Regex-ветка + ONNX NER за `TARNET_PII_ONNX=1` (по умолчанию `ready: false`) |
+| `conversation.js` | 271 | **С 2.29.1.** Память диалога: `normalizeMessages`, `messagesToPrompt`, `truncateMessages`, `conversationFromBody`, `chatMessagesFor`, `estimateTokens`. Без внешних зависимостей — вклеивается в сборку воркера (`build-worker.js` → `LOCAL_MODULES`). **Один модуль на четыре точки** (`/inference`, тело `worker_tasks`, `worker-demo.js`, PWA): разойдись нормализация в двух из них — разошлась бы ровно на том поле, что сверяется хешем |
 
 ---
 
@@ -142,6 +146,7 @@
 | `proof-onion-restart.js` | 161 | — | Переживание рестарта |
 | `test-mesh-worker.js` | 50 | — | Воркер для mesh-теста |
 | `check-payment-gate.js` | 130 | **7** | Гейт оплаты на живом сервере: `/work` без `clientAddress` → 400 и ноль начислений; пустой клиент → 402; `TARNET_REQUIRE_PAYMENT=0` возвращает стенд |
+| `test-conversation.js` | 388 | **30** | **С 2.29.1.** Память диалога E2E: мульти-раунд `/inference` с `messages[]`, канонический `prompt`, сверка `promptHash` на воркере, старый путь `prompt` байт-в-байт (два ключа, без `messages`), `400 PROMPT_MESSAGES_MISMATCH`, `400 PROMPT_REQUIRED`, обрезка с сохранением первого и последнего хода |
 | `p2p-node/check-correlation.mjs` | 95 | **8** | Корреляция ответов по `taskId`: поздний ответ не достаётся следующему ожиданию, чужой id — сирота, `ping` отдельной полосой |
 
 **Итого приёмки: 1227** (`test-dpouw.js`), прогон 09.11 05:58, `0 ❌`. Плюс отдельные стенды: `check-payment-gate.js` 7/7 и `check-correlation.mjs` 8/8.

@@ -34,7 +34,7 @@ const ENTRY = 'worker-demo.js';
 /* Единственный локальный модуль воркера на 2.21.3. Список оставлен явным,
  * но проверка ниже падает, если в исходнике появится `require('./…')`,
  * которого здесь нет, — тогда сборка не соберётся молча в нерабочий файл. */
-const LOCAL_MODULES = ['worker-box'];
+const LOCAL_MODULES = ['worker-box', 'conversation'];
 
 function localRequireNames(code) {
   const re = /require\(\s*['"]\.\/([A-Za-z0-9_.-]+)(?:\.js)?['"]\s*\)/g;
@@ -122,11 +122,18 @@ function build() {
   }
 
   /* Внешние пакеты запрещены: воркер ставится одной загрузкой, ставить ему
-   * `node_modules` некому. Ловим это здесь, а не у пользователя. */
+   * `node_modules` некому. Ловим это здесь, а не у пользователя.
+   *
+   * КОММЕНТАРИИ МАСКИРУЮТСЯ И ЗДЕСЬ. Раньше проверка шла по исходному
+   * тексту, и упоминание `require('…')` в пояснении принималось за
+   * настоящую зависимость: сборка падала с «воркер требует внешние пакеты:
+   * …» — на тексте, а не на коде. Оба детектора обязаны смотреть на одну
+   * и ту же версию исходника: детектор локальных модулей уже маскировал,
+   * этот — нет, и они расходились по построению. */
   const external = [];
   const externalRe = /require\(\s*['"]([^'"]+)['"]\s*\)/g;
   let mm;
-  const allCode = [entryCode, ...needed.map(readSource)].join('\n');
+  const allCode = [maskComments(entryCode), ...needed.map((n) => maskComments(readSource(n)))].join('\n');
   while ((mm = externalRe.exec(allCode)) !== null) {
     const id = mm[1];
     if (id.startsWith('.') || id.startsWith('node:') || require('module').builtinModules.includes(id)) continue;

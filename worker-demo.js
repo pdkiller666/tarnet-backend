@@ -38,6 +38,10 @@ const { spawn } = require('node:child_process');
  * импортированы из server.js: воркер ставится отдельно от сервера и не должен
  * тянуть за собой весь серверный код ради двух функций. */
 const workerBox = require('./worker-box');
+/* Сборка истории и оценка токенов — тот же модуль, что на сервере (2.29.1).
+ * Он обязан быть без внешних зависимостей: воркер склеивается в один файл,
+ * и любой `require('…')` из npm сломал бы установку без зависимостей. */
+const conversation = require('./conversation');
 
 /* ---------- Конфигурация ---------- */
 const API = (process.env.TARNET_API_URL || 'http://localhost:3001').replace(/\/+$/, '');
@@ -352,20 +356,21 @@ async function fetchAbortable(url, opts, signal, timeoutMs = 120000) {
   }
 }
 
-async function askOllama(prompt, requestedModel, maxTokens = null, signal = null) {
+async function askOllama(prompt, requestedModel, maxTokens = null, signal = null, history = null) {
   /* Модель из задачи имеет приоритет над OLLAMA_MODEL: клиент выбрал её в
    * каталоге, и подменять её своей значило бы врать в ответе. */
   const model = await resolveOllamaModel(requestedModel);
+  /* Массив для модели собирается ОДНОЙ функцией на оба бэкенда. Раньше
+   * системная рамка была скопирована сюда и в `askCloud`; теперь копия
+   * одна, и история ходит тем же путём, что и одиночный вопрос. */
+  const chat = conversation.chatMessagesFor(history, prompt);
   const res = await fetchAbortable(`${OLLAMA}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model,
       stream: false,
-      messages: [
-        { role: 'system', content: 'Ты полезный ассистент. Отвечай кратко и по существу.' },
-        { role: 'user', content: prompt },
-      ],
+      messages: chat,
       /* num_predict — потолок генерации у Ollama. Без него модель пишет,
        * пока не упрётся в свой контекст: воркер тратит время, сервер держит
        * чужой запрос, а клиент просил коротко. Значение пришло из
@@ -396,8 +401,13 @@ async function askOllama(prompt, requestedModel, maxTokens = null, signal = null
   if (!response.trim()) throw new Error('ollama вернул пустой ответ');
 
   /* Токены берём из счётчиков Ollama, если он их дал: это точнее оценки
-   * по длине символов, а именно от них зависит начисление. */
-  const prompt_tokens = j.prompt_eval_count || Math.ceil(prompt.length / 4);
+   * по длине символов, а именно от них зависит начисление.
+   *
+   * Запасная оценка — по ВСЕМУ отправленному массиву, а не по последнему
+   * вопросу: с историей `prompt.length` посчитал бы только её хвост, и
+   * начисление за длинный диалог вышло бы заниженным. */
+  const prompt_tokens = j.prompt_eval_count
+    || chat.reduce((s, m) => s + conversation.estimateTokens(m.content), 0);
   const completion_tokens = j.eval_count || Math.ceil(response.length / 4);
   return {
     response, source: 'ollama', model,
@@ -411,7 +421,7 @@ async function askOllama(prompt, requestedModel, maxTokens = null, signal = null
  * (`qwen2.5-coder-7b`) провайдеру не принадлежит, и отправка его в облако
  * дала бы 404 «model not found» вместо ответа. В таком случае честно
  * считаем дефолтом и объявляем в ответе именно то, что запустили. */
-async function askCloud(prompt, requestedModel, maxTokens = null, signal = null) {
+async function askCloud(prompt, requestedModel, maxTokens = null, signal = null, history = null) {
   const conf = GROQ_KEY
     ? { url: 'https://api.groq.com/openai/v1/chat/completions', key: GROQ_KEY,
         model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', name: 'groq', prefix: 'groq/' }
@@ -432,15 +442,13 @@ async function askCloud(prompt, requestedModel, maxTokens = null, signal = null)
     : null;
   const model = asked || conf.model;
 
+  const chat = conversation.chatMessagesFor(history, prompt);
   const res = await fetchAbortable(conf.url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${conf.key}` },
     body: JSON.stringify({
       model,
-      messages: [
-        { role: 'system', content: 'Ты полезный ассистент. Отвечай кратко и по существу.' },
-        { role: 'user', content: prompt },
-      ],
+      messages: chat,
       ...(maxTokens ? { max_tokens: maxTokens } : {}),
     }),
   }, signal);
@@ -450,7 +458,8 @@ async function askCloud(prompt, requestedModel, maxTokens = null, signal = null)
   if (!response.trim()) throw new Error(`${conf.name} вернул пустой ответ`);
 
   const u = j.usage || {};
-  const prompt_tokens = u.prompt_tokens || Math.ceil(prompt.length / 4);
+  const prompt_tokens = u.prompt_tokens
+    || chat.reduce((s, m) => s + conversation.estimateTokens(m.content), 0);
   const completion_tokens = u.completion_tokens || Math.ceil(response.length / 4);
   return {
     /* Объявляем РЕАЛЬНО запущенную модель: если провайдер ответил не тем
@@ -461,12 +470,23 @@ async function askCloud(prompt, requestedModel, maxTokens = null, signal = null)
 }
 
 /* ---------- 3. Честный fallback ---------- */
-function askFallback(prompt, errorCode, errorDetail) {
+function askFallback(prompt, errorCode, errorDetail, history = null) {
+  /* В шаблоне показываем ПОСЛЕДНИЙ ВОПРОС, а не весь транскрипт: с историей
+   * `prompt` — это канонический текст разговора, и заглушка «воркер получил
+   * запрос: system: ... user: ... assistant: ...» выглядела бы как сбой
+   * форматирования, хотя это честный дамп контекста. */
+  const shown = history && history.length
+    ? (conversation.lastUserContent(history) || prompt)
+    : prompt;
   const response =
-    `Воркер получил запрос: «${String(prompt).slice(0, 160)}».\n\n` +
+    `Воркер получил запрос: «${String(shown).slice(0, 160)}».\n\n` +
     'Модель на этом ПК не настроена, поэтому текст собран по шаблону. ' +
     'Чтобы получать настоящие ответы, запустите Ollama или задайте GROQ_API_KEY.';
-  const prompt_tokens = Math.ceil(prompt.length / 4);
+  /* Токены — по ВСЕМУ отправленному контексту, а не по последнему вопросу:
+   * от этого числа зависит начисление, и занизить его значило бы брать
+   * плату за короткий запрос, обслужив длинный. */
+  const chatForFallback = conversation.chatMessagesFor(history, prompt);
+  const prompt_tokens = chatForFallback.reduce((s, m) => s + conversation.estimateTokens(m.content), 0);
   const completion_tokens = Math.ceil(response.length / 4);
   return {
     response, source: 'deterministic_fallback',
@@ -532,11 +552,11 @@ function ollamaErrorCode(e) {
   return 'OLLAMA_ERROR';
 }
 
-async function generate(prompt, requestedModel, maxTokens = null, signal = null) {
+async function generate(prompt, requestedModel, maxTokens = null, signal = null, history = null) {
   let ollamaErr = null;
   if (Date.now() >= ollamaDeadUntil) {
     try {
-      return await askOllama(prompt, requestedModel, maxTokens, signal);
+      return await askOllama(prompt, requestedModel, maxTokens, signal, history);
     } catch (e) {
       /* Отмена — не поломка бэкенда: не записывать её в паузу Ollama и не
        * переходить на облако по «ошибке». Иначе CANCEL ухудшал бы следующий
@@ -563,7 +583,7 @@ async function generate(prompt, requestedModel, maxTokens = null, signal = null)
   }
   if (GROQ_KEY || OPENROUTER_KEY) {
     try {
-      return await askCloud(prompt, requestedModel, maxTokens, signal);
+      return await askCloud(prompt, requestedModel, maxTokens, signal, history);
     } catch (e) {
       log(`облачный API не ответил (${e.message})`);
     }
@@ -577,7 +597,8 @@ async function generate(prompt, requestedModel, maxTokens = null, signal = null)
   }
   return askFallback(prompt, ollamaErr || 'MODEL_NOT_CONFIGURED',
     ollamaErr ? (lastOllamaFailure && lastOllamaFailure.code === ollamaErr
-      ? lastOllamaFailure.detail : null) : null);
+      ? lastOllamaFailure.detail : null) : null,
+    history);
 }
 
 /* ---------- Шифрование задачи ----------
@@ -799,6 +820,9 @@ const wsState = {
  * поведения, которые расходятся ровно в самом редком случае. */
 async function runTask(task, via = 'http') {
   let prompt;
+  /* История разговора (2.29.1). `null` — сервер прислал старый формат
+   * `{prompt}`, и тогда контекст — один текущий вопрос, как было всегда. */
+  let history = null;
   let taskMaxTokens = null;
   /* Отмена, пришедшая до старта: задачу не начинаем. Ответа не будет —
    * сервер её уже снял в `cancelled`, и присылать туда 409 бессмысленно. */
@@ -839,6 +863,16 @@ async function runTask(task, via = 'http') {
     }
     if (parsed && typeof parsed.prompt === 'string') {
       prompt = parsed.prompt;
+      /* История приходит только от сервера 2.29.1+. Отсутствие поля —
+       * нормальный случай: в очереди могли остаться строки старого формата,
+       * и воркер обязан их дочитать, а не падать после обновления сервера. */
+      history = Array.isArray(parsed.messages)
+        ? conversation.truncateMessages(
+          conversation.normalizeMessages(parsed.messages) || [],
+          conversation.DEFAULT_BUDGET_TOKENS,
+        )
+        : null;
+      if (history && !history.length) history = null;
       const mt = Number(parsed.maxTokens);
       taskMaxTokens = Number.isFinite(mt) && mt > 0 ? Math.trunc(mt) : null;
     } else {
@@ -863,7 +897,7 @@ async function runTask(task, via = 'http') {
   const pulse = setInterval(heartbeat, 7000);
   let gen;
   try {
-    gen = await generate(prompt, task.model || null, taskMaxTokens, abortCtrl.signal);
+    gen = await generate(prompt, task.model || null, taskMaxTokens, abortCtrl.signal, history);
   } catch (e) {
     /* Отмена: это не ошибка воркера и не повод для ERROR-кадра — сервер
      * отменил задачу сам. Возвращаем причину, чтобы onWsTask просто

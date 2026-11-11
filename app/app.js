@@ -1016,6 +1016,173 @@ function newMsgId() {
     : 'm-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
 }
 
+/* ---------- Локальная память диалогов (2.29.1) ----------
+ *
+ * ЗАЧЕМ ВТОРОЕ ХРАНИЛИЩЕ, ЕСЛИ ЕСТЬ /chat/sync. Серверное хранилище —
+ * синхронизация между устройствами, и оно асинхронное: ответ уже на экране,
+ * а запись ещё летит. Если сеть пропала или сервер ответил 429, после F5
+ * история исчезает — при том, что человек её видел. Локальная база закрывает
+ * ровно этот разрыв: запись на диск до того, как сообщение посчитано
+ * отправленным.
+ *
+ * ЧЕГО ЭТО НЕ ДЕЛАЕТ. Не заменяет /chat/sync и не хранит открытый текст
+ * дольше, чем нужно: здесь лежит именно текст, потому что иначе после F5 его
+ * не восстановить без ключа синхронизации. Ключ синхронизации уже живёт
+ * в этом же браузере (localStorage), так что отдельного риска не возникает.
+ * На сервер отсюда ничего не уходит.
+ *
+ * ПОЧЕМУ IndexedDB, А НЕ localStorage. История — это список растущих
+ * объектов, а не одна строка. localStorage пришлось бы читать и
+ * перезаписывать целиком на каждое сообщение, и на длинном диалоге это
+ * заметно. Плюс лимит 5 МБ общий на домен.
+ */
+const MEM_DB_NAME = 'tarnet_memory_v1';
+const MEM_DB_VERSION = 1;
+const MEM_STORE_THREADS = 'threads';
+const MEM_STORE_MESSAGES = 'messages';
+
+let memDbPromise = null;
+function memDb() {
+  if (!memDbPromise) {
+    memDbPromise = new Promise((resolve, reject) => {
+      if (!globalThis.indexedDB) return reject(new Error('IndexedDB недоступен'));
+      const req = indexedDB.open(MEM_DB_NAME, MEM_DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(MEM_STORE_THREADS)) {
+          /* keyPath threadId: один тред — одна запись, перезапись по ключу
+           * обновляет её, а не плодит дубликаты. */
+          const t = db.createObjectStore(MEM_STORE_THREADS, { keyPath: 'threadId' });
+          t.createIndex('updatedAt', 'updatedAt');
+        }
+        if (!db.objectStoreNames.contains(MEM_STORE_MESSAGES)) {
+          const m = db.createObjectStore(MEM_STORE_MESSAGES, { keyPath: 'id' });
+          /* Индекс по треду: без него загрузка одного диалога читала бы
+           * все сообщения всех диалогов. */
+          m.createIndex('threadId', 'threadId');
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error || new Error('IndexedDB не открылась'));
+    });
+  }
+  return memDbPromise;
+}
+
+function memTx(store, mode, fn) {
+  return memDb().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(store, mode);
+    const os = tx.objectStore(store);
+    let out;
+    try { out = fn(os); } catch (e) { reject(e); return; }
+    tx.oncomplete = () => resolve(out && out.result !== undefined ? out.result : out);
+    tx.onerror = () => reject(tx.error || new Error('запись отклонена'));
+    tx.onabort = () => reject(tx.error || new Error('запись отменена'));
+  }));
+}
+
+/* Активный диалог. Пустая строка — «ещё не выбран», и тогда старт создаёт
+ * первый тред сам. */
+let activeThreadId = '';
+
+function memCreateThread(title) {
+  const now = Date.now();
+  const thread = {
+    threadId: 't-' + (crypto.randomUUID ? crypto.randomUUID() : now.toString(36) + Math.random().toString(36).slice(2, 8)),
+    title: String(title || 'Новый диалог').slice(0, 80),
+    createdAt: now,
+    updatedAt: now,
+  };
+  return memTx(MEM_STORE_THREADS, 'readwrite', (os) => { os.put(thread); return thread; })
+    .then(() => thread);
+}
+
+function memTouchThread(threadId, title) {
+  if (!threadId) return Promise.resolve(null);
+  return memTx(MEM_STORE_THREADS, 'readwrite', (os) => {
+    const req = os.get(threadId);
+    req.onsuccess = () => {
+      const t = req.result;
+      if (!t) return;
+      t.updatedAt = Date.now();
+      /* Заголовок ставится по ПЕРВОМУ вопросу и больше не меняется:
+       * иначе список в сайдбаре переименовывался бы на каждом ходу, и
+       * найти диалог по названию стало бы невозможно. */
+      if (title && (!t.title || t.title === 'Новый диалог')) t.title = String(title).slice(0, 80);
+      os.put(t);
+    };
+  });
+}
+
+function memSaveMessage(threadId, role, text) {
+  if (!threadId) return Promise.resolve(null);
+  const row = {
+    id: newMsgId(),
+    threadId,
+    role: role === 'user' ? 'user' : 'bot',
+    text: String(text == null ? '' : text),
+    at: Date.now(),
+  };
+  return memTx(MEM_STORE_MESSAGES, 'readwrite', (os) => { os.put(row); return row; })
+    .then(() => { memTouchThread(threadId, role === 'user' ? row.text : null); return row; });
+}
+
+function memListThreads() {
+  return memTx(MEM_STORE_THREADS, 'readonly', (os) => os.getAll())
+    .then((rows) => (Array.isArray(rows) ? rows : []).sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt)))
+    .catch(() => []);
+}
+
+function memMessagesOf(threadId) {
+  if (!threadId) return Promise.resolve([]);
+  return memTx(MEM_STORE_MESSAGES, 'readonly', (os) => os.index('threadId').getAll(threadId))
+    .then((rows) => (Array.isArray(rows) ? rows : []).sort((a, b) => Number(a.at) - Number(b.at)))
+    .catch(() => []);
+}
+
+/* История для /inference (2.29.1).
+ *
+ * ПОЧЕМУ ОТДЕЛЬНАЯ ФУНКЦИЯ, А НЕ ЧТЕНИЕ БАЗЫ НА МЕСТЕ. Запись текущего
+ * вопроса в локальную базу асинхронная, и читать её сразу после вызова
+ * syncSave() значит читать в гонке: иногда сообщение уже там, иногда ещё
+ * нет. Тогда один и тот же вопрос иногда попадал бы в историю дважды.
+ *
+ * Здесь гонка снята по существу: текущий вопрос добавляется В КОНЦЕ явно,
+ * а из сохранённой истории выбрасываются его хвостовые копии. Поэтому
+ * последний ход истории всегда равен `prompt` — а сервер отвергает запрос
+ * именно при их расхождении (PROMPT_MESSAGES_MISMATCH).
+ *
+ * ПУСТАЯ ИСТОРИЯ НЕ ОТПРАВЛЯЕТСЯ: при одном вопросе остаётся старый путь
+ * `prompt` без `messages`. Он проверен на 2.28.4, и незачем менять формат
+ * запроса там, где память ничего не добавляет. */
+async function messagesForInference(currentText) {
+  let stored = [];
+  try { stored = await memMessagesOf(activeThreadId); } catch (_e) { stored = []; }
+  const out = [];
+  for (const m of stored) {
+    const content = String(m.text == null ? '' : m.text);
+    if (!content.trim()) continue;
+    out.push({ role: m.role === 'user' ? 'user' : 'assistant', content });
+  }
+  const now = String(currentText == null ? '' : currentText).trim();
+  /* Снимаем хвостовые копии текущего вопроса: их может быть 0, 1 или
+   * несколько (повтор после ошибки пишет его же в историю). */
+  while (out.length && out[out.length - 1].role === 'user' && out[out.length - 1].content.trim() === now) {
+    out.pop();
+  }
+  out.push({ role: 'user', content: String(currentText) });
+  return out;
+}
+
+function memDeleteThread(threadId) {
+  if (!threadId) return Promise.resolve();
+  return memTx(MEM_STORE_MESSAGES, 'readwrite', (os) => {
+    const req = os.index('threadId').getAllKeys(threadId);
+    req.onsuccess = () => { for (const k of (req.result || [])) os.delete(k); };
+  }).then(() => memTx(MEM_STORE_THREADS, 'readwrite', (os) => { os.delete(threadId); }))
+    .catch(() => { /* удаление не критично для работы чата */ });
+}
+
 /* ---------- Markdown: рендер + санитайзер ----------
  * marked отдаёт HTML как есть, а ответ модели — недоверенный ввод: строка
  * вида <img src=x onerror=...> превратилась бы в исполняемый код. Поэтому
@@ -1165,6 +1332,23 @@ function addActions(wrap, opts) {
 /* Сохранение пары в зашифрованную историю. Ошибка синхронизации НЕ должна
  * ломать чат: сообщение уже отрисовано, а причина уходит в консоль. */
 async function syncSave(role, text) {
+  /* ЛОКАЛЬНАЯ ЗАПИСЬ — ПЕРВОЙ, И ОНА НЕ ЖДЁТ СЕТЬ.
+   *
+   * Раньше при ошибке /chat/sync сообщение оставалось только на экране:
+   * после F5 диалог исчезал, хотя человек его видел. Теперь сначала пишем
+   * на диск (это быстро и локально), потом шифруем и отправляем.
+   *
+   * Ошибка локальной записи НЕ должна ломать чат: если IndexedDB недоступна
+   * (приватный режим), сообщение всё равно уходит на сервер, как раньше. */
+  try {
+    if (!activeThreadId) {
+      const t = await memCreateThread(role === 'user' ? text : 'Новый диалог').catch(() => null);
+      if (t) activeThreadId = t.threadId;
+    }
+    await memSaveMessage(activeThreadId, role, text);
+  } catch (e) {
+    console.warn('memory:', e.message);
+  }
   try {
     const enc = await encryptMsg({ role, text });
     const row = {
@@ -1185,9 +1369,58 @@ async function syncSave(role, text) {
   } catch (e) {
     console.warn('chat sync:', e.message);
   }
+  /* Список в сайдбаре обновляем после любой попытки: если запись прошла
+   * локально, диалог уже существует и должен быть виден. */
+  renderHistoryList();
 }
 
-/* Загрузка истории при старте. Возвращает число восстановленных сообщений.
+/* Восстановление при старте (2.29.1).
+ *
+ * ПОРЯДОК ВАЖЕН. Сначала локальная память — она есть всегда и отвечает
+ * мгновенно, без сети. Только если локально пусто, идём в /chat/sync:
+ * это случай нового браузера или очищенных данных.
+ *
+ * Почему не наоборот: серверный запрос занимает круг сети, и ждать его,
+ * когда история уже лежит на диске, значит показывать пустой чат там,
+ * где он не пустой.
+ */
+async function restoreLastThread() {
+  let threads = [];
+  try { threads = await memListThreads(); } catch (_e) { threads = []; }
+
+  for (const t of threads) {
+    const msgs = await memMessagesOf(t.threadId).catch(() => []);
+    if (!msgs.length) continue;
+    activeThreadId = t.threadId;
+    const empty = log.querySelector('.empty-chat');
+    if (empty) empty.remove();
+    for (const m of msgs) {
+      const w = bubble(m.role, m.text);
+      if (m.role === 'bot') renderBot(w, m.text);
+      else addActions(w, { role: 'user', text: m.text });
+    }
+    renderHistoryList();
+    return msgs.length;
+  }
+
+  /* Локально пусто — тогда тянем с сервера, как раньше. */
+  const restored = await loadChatHistory();
+  if (restored.length) {
+    /* Серверные сообщения надо положить в локальную базу, иначе следующая
+     * перезагрузка опять шла бы в сеть. Тред при этом новый: привязать
+     * старые сообщения к нему честнее, чем оставить их без треда. */
+    try {
+      const t = await memCreateThread('Восстановленный диалог');
+      activeThreadId = t.threadId;
+      for (const m of restored) await memSaveMessage(t.threadId, m.role, m.text);
+      renderHistoryList();
+    } catch (_e) { /* без локальной базы история всё равно показана */ }
+  }
+  return restored.length;
+}
+
+/* Загрузка истории с сервера. Возвращает массив восстановленных сообщений
+ * (пустой массив, а не 0 — вызывающий кладёт их в локальную базу).
  * Чужие устройства пишут своим ключом — их блобы не расшифруются, и это
  * ожидаемо, а не ошибка. */
 async function loadChatHistory() {
@@ -1200,7 +1433,7 @@ async function loadChatHistory() {
     rows = Array.isArray(r && r.messages) ? r.messages : [];
   } catch (e) {
     console.warn('history:', e.message);
-    return 0;
+    return [];
   }
 
   const msgs = [];
@@ -1215,7 +1448,7 @@ async function loadChatHistory() {
       }
     } catch (_e) { /* другой ключ — не наша запись */ }
   }
-  if (!msgs.length) return 0;
+  if (!msgs.length) return [];
 
   msgs.sort((a, b) => a.lt - b.lt);
   const empty = log.querySelector('.empty-chat');
@@ -1226,7 +1459,7 @@ async function loadChatHistory() {
     else addActions(w, { role: 'user', text: m.text });
   }
   renderHistoryList();
-  return msgs.length;
+  return msgs;
 }
 
 /* Блок чека. Показывает ровно те поля, что пришли: если начисления не было
@@ -1417,6 +1650,17 @@ async function sendPrompt(prompt, opts = {}) {
        * кошелёк на каждый вопрос и мусорил в БД. */
       clientAddress: ADDR,
     };
+    /* Память диалога (2.29.1).
+     *
+     * `messages` отправляется ТОЛЬКО когда в диалоге есть предыдущие ходы.
+     * При первом вопросе остаётся прежний формат с одним `prompt`: сервер
+     * и так построит из него односообщенческую историю, а лишнее поле —
+     * лишний повод для PROMPT_MESSAGES_MISMATCH.
+     *
+     * Последний ход обязан совпасть с `prompt` — сервер именно это и
+     * сверяет, и не совпадение это отказ, а не подгонка молча. */
+    const history = await messagesForInference(text);
+    if (history.length > 1) body.messages = history;
     /* modelId шлём только если выбрана конкретная модель: пустое значение
      * означает «базовая», и тогда сервер берёт BASE_MODEL сам. */
     const modelId = $('model')?.value;
@@ -2694,11 +2938,43 @@ function newDialog() {
   logEl.innerHTML = EMPTY_STATE_HTML;
   bindSuggestions(logEl);
   bindBento(logEl);
-  renderHistoryList();
+  /* Новый тред создаётся СРАЗУ, а не по первому сообщению.
+   *
+   * Почему: если создавать его в момент отправки, то перезагрузка между
+   * «Новый диалог» и первым вопросом возвращала бы в предыдущий тред,
+   * и человек продолжал бы чужую ветку, считая её новой. Цена — пустые
+   * треды в базе; их вычищает рендер списка, который пустые не показывает. */
+  activeThreadId = '';
+  memCreateThread('Новый диалог').then((t) => {
+    activeThreadId = t.threadId;
+    renderHistoryList();
+  }).catch(() => { /* без локальной базы чат всё равно работает */ });
   $('prompt')?.focus();
   closeSidebar();
 }
 $('newChatBtn')?.addEventListener('click', newDialog);
+
+/* Открыть существующий тред: очистить экран и восстановить его сообщения. */
+async function loadThread(threadId) {
+  const logEl = $('chatLog');
+  if (!logEl || !threadId) return;
+  activeThreadId = threadId;
+  logEl.innerHTML = EMPTY_STATE_HTML;
+  bindSuggestions(logEl);
+  bindBento(logEl);
+  const msgs = await memMessagesOf(threadId).catch(() => []);
+  const empty = logEl.querySelector('.empty-chat');
+  if (msgs.length && empty) empty.remove();
+  for (const m of msgs) {
+    const w = bubble(m.role, m.text);
+    if (m.role === 'bot') renderBot(w, m.text);
+    else addActions(w, { role: 'user', text: m.text });
+  }
+  renderHistoryList();
+  goToTab('chat');
+  closeSidebar();
+  $('prompt')?.focus();
+}
 
 /* Подсказки и Bento пересоздаются вместе с пустым состоянием, поэтому
    обработчики навешиваются функцией, а не один раз при загрузке. */
@@ -2731,21 +3007,49 @@ function bindBento(root) {
 /* ---------- История в сайдбаре ----------
  * Показываем ровно то, что есть: один тред устройства и число сообщений в
  * нём. Список из выдуманных «диалогов» выглядел бы богаче и был бы ложью. */
-function renderHistoryList() {
+/* Список диалогов в сайдбаре (2.29.1).
+ *
+ * БЫЛО: одна кнопка «Текущий диалог · N», потому что тред на устройство
+ * был один (`chat_thread_id === ADDR`). Теперь тредов несколько, и список
+ * берётся из локальной базы — той же, что переживает F5.
+ *
+ * ПУСТОÉ И ПУСТОЙ ТРЕД — РАЗНЫЕ ВЕЩИ. Если в базе нет ни одного треда,
+ * показываем «пока пусто»; если тред есть, но в нём нет сообщений —
+ * он не попадает в список вовсе (иначе после каждого «Новый диалог»
+ * в истории висели бы пустые записи). */
+async function renderHistoryList() {
   const box = $('chatHistory');
   if (!box) return;
-  const n = $('chatLog') ? $('chatLog').querySelectorAll('.msg').length : 0;
-  if (!n) {
+  let threads = [];
+  try { threads = await memListThreads(); } catch (_e) { threads = []; }
+  /* Тред, который сейчас открыт, но ещё пуст, не показываем: он появится
+   * в списке после первого сообщения. */
+  const rows = [];
+  for (const t of threads) {
+    const msgs = await memMessagesOf(t.threadId).catch(() => []);
+    if (!msgs.length) continue;
+    rows.push({ thread: t, count: msgs.length });
+  }
+  if (!rows.length) {
     box.innerHTML = '<div class="chat-history-empty">пока пусто</div>';
     return;
   }
   box.innerHTML = '';
-  const item = document.createElement('button');
-  item.type = 'button';
-  item.className = 'chat-history-item';
-  item.innerHTML = `<span aria-hidden="true">🔒</span> Текущий диалог · ${n}`;
-  item.addEventListener('click', () => { goToTab('chat'); });
-  box.appendChild(item);
+  for (const { thread, count } of rows) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'chat-history-item' + (thread.threadId === activeThreadId ? ' active' : '');
+    const label = document.createElement('span');
+    label.className = 'chat-history-title';
+    label.textContent = thread.title || 'Новый диалог';
+    const n = document.createElement('span');
+    n.className = 'chat-history-count';
+    n.textContent = String(count);
+    item.appendChild(label);
+    item.appendChild(n);
+    item.addEventListener('click', () => { loadThread(thread.threadId); });
+    box.appendChild(item);
+  }
 }
 
 /* ---------- Режимы в омнибоксе ----------
@@ -3261,7 +3565,7 @@ syncP2P();
   loadConsent();
   /* История грузится ПОСЛЕ первого рендера и не блокирует его: если она
    * недоступна, чат всё равно рабочий — просто пустой. */
-  loadChatHistory().then((n) => {
+  restoreLastThread().then((n) => {
     if (n > 0) console.info(`история: восстановлено ${n} сообщений`);
   });
 })();

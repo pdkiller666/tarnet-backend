@@ -25,6 +25,10 @@ const { CumulativeLedger, receiptPayload, epochState, releasedFor, bumpEpoch } =
 const { getGenesisHash, verifyWorkerDagChain } = require('./dag-chain');
 const workerBox = require('./worker-box');
 const LLM = require('./llm-adapter');
+/* Conversation Memory (2.29.1). Один модуль на сервер и воркер: форму
+ * истории и оценку токенов нельзя держать в двух копиях — они разойдутся
+ * ровно на том поле, которое сверяется хешем промпта. */
+const conversation = require('./conversation');
 /* Фаза 2.5: консервативный PII-классификатор (regex + ONNX NER для имён).
  * Заменяет голый regex в llm-adapter на гибрид: замер показал, что NER-модель
  * bert-base-NER не видит телефонов и email, поэтому regex остаётся обязательным. */
@@ -7852,22 +7856,49 @@ async function dispatchTaskOverP2p({
   return { attempted: true, delivered: true, executed: true, accepted: out.status === 200 };
 }
 
-function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxTokens = null, excludeWsAddr = null, forceWsAddr = null, onEnqueued = null }) {
+function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxTokens = null, excludeWsAddr = null, forceWsAddr = null, onEnqueued = null, messages = null, canonicalPrompt = null }) {
   const taskId = 'wt_' + crypto.randomBytes(12).toString('hex');
   const now = Date.now();
   const sessionKey = crypto.randomBytes(32);
   workerTaskKeys.set(taskId, sessionKey);
-  /* Хеш промпта, который сервер ОТПРАВЛЯЕТ (2.23.3). Считается здесь, пока
-   * открытый текст ещё в руках, и воркеру НЕ сообщается: иначе сверка была
-   * бы проверкой эха, а не целостности. Воркер обязан хешировать то, что
-   * расшифровал, и вернуть хеш вместе с результатом. */
-  const promptHash = crypto.createHash('sha256').update(String(prompt), 'utf8').digest('hex');
+  /* Канонический текст разговора — то, что воркер обязан воспроизвести.
+   *
+   * ПОЧЕМУ ДЛЯ ХЕША НЕ ГОДИТСЯ ПОСЛЕДНИЙ ВОПРОС. `promptHash` — это
+   * связка: сервер заверяет содержимое задачи, воркер возвращает хеш того,
+   * что расшифровал. Если хешировать только текущий вопрос, история
+   * останется вне заверения, и одобрение HITL на дешёвую задачу открывало
+   * бы дорогую с тем же вопросом и другой историей.
+   *
+   * ПОЧЕМУ БЕЗ `messages` ВСЁ ОСТАЁТСЯ КАК БЫЛО. `canonicalPrompt` не
+   * задан — хешируется `prompt`, и в тело едет ровно `{prompt, maxTokens}`.
+   * Байтовое совпадение со старым форматом: установленные воркеры не
+   * должны ничего заметить, и 1266 тестов шлют именно этот путь. */
+  const hashText = typeof canonicalPrompt === 'string' ? canonicalPrompt : String(prompt);
+  const promptHash = crypto.createHash('sha256').update(hashText, 'utf8').digest('hex');
   /* Предел генерации едет ВНУТРИ зашифрованной части задачи, а не отдельным
    * полем в кадре. Иначе потолок, названный сервером, лежал бы открытым
    * текстом и мог быть подменён на любом посреднике — а смысл потолка в том,
    * чтобы ограничить именно воркер. */
   const taskBody = JSON.stringify({
-    prompt,
+    /* В `prompt` всегда канонический текст, даже когда едет `messages`:
+     * воркер, установленный ДО этой версии, поля `messages` не знает и
+     * отправит в модель именно `prompt`. Положив туда транскрипт, мы
+     * сохраняем ему контекст без обрезки до последнего вопроса — старый
+     * воркер деградирует по качеству, но не теряет историю целиком. */
+    prompt: hashText,
+    /* Структурированная история. Новый воркер использует её вместо
+     * `prompt`; хеш всё равно считается по `prompt`, чтобы сверка не
+     * зависела от версии воркера.
+     *
+     * Условие — `canonicalPrompt`, а не наличие `messages`. Сервер собирает
+     * `messages` И для старого входа `prompt` (один ход user): это удобно
+     * внутри кода, но выгружать это в тело нельзя — тогда запрос,
+     * присланный без истории, получил бы поле, которого в контракте
+     * 2.28.4 не было. Тест поймал ровно это: обещанная байт-в-байт
+     * совместимость нарушалась в самом теле задачи. */
+    ...(typeof canonicalPrompt === 'string' && Array.isArray(messages) && messages.length
+      ? { messages }
+      : {}),
     maxTokens: Number(maxTokens) > 0 ? Math.trunc(Number(maxTokens)) : CONFIG.MAX_TOKENS_PER_TASK,
   });
   /* Тот же потолок кладём в строку: на приёме результата его надо СВЕРИТЬ с
@@ -8857,19 +8888,63 @@ app.get('/worker/ws', (_req, res) => {
  * Один вызов: выбрать воркера -> инференс -> CWU -> начисление -> чек. */
 async function runInference(req, res) {
   const body = req.body || {};
-  /* Промпт обязателен. Раньше пустое поле молча подменялось на
-   * 'Hello from TarNet!', и запрос с одним `messages` получал 200 и ответ
-   * на ДРУГОЙ вопрос — форма «ignored input»: контракт называет поле,
-   * обработчик его не читает и подставляет своё. `messages` не
-   * поддерживается, и честный отказ лучше тихой подмены. */
-  const prompt = typeof body.prompt === 'string' ? body.prompt : '';
-  if (!prompt.trim()) {
+  /* Вход — `prompt` ИЛИ `messages[]` (2.29.1).
+   *
+   * ПОЧЕМУ НЕ «ПРОСТО ДОБАВИТЬ ВТОРОЕ ПОЛЕ». До этой версии `messages`
+   * отбивался с 400 намеренно: пустой `prompt` раньше молча подменялся на
+   * 'Hello from TarNet!', и запрос с одной историей получал 200 и ответ на
+   * ДРУГОЙ вопрос. Теперь `messages` — полноценный вход, а `prompt` остаётся
+   * совместимым: 1266 тестов и все установленные воркеры шлют именно его.
+   *
+   * `conversationFromBody` решает три случая: только история; только вопрос;
+   * оба сразу. В третьем случае `prompt` обязан совпасть с последним ходом
+   * пользователя — расхождение это отказ, а не выбор победителя молча:
+   * одобрение HITL связывается хешем с содержимым, и подменить историю,
+   * оставив старый `prompt`, значило бы обойти это связывание. */
+  const conv = conversation.conversationFromBody(body);
+  if (!conv.ok) {
     return res.status(400).json({
-      error: 'PROMPT_REQUIRED',
-      message: 'используйте поле `prompt`, `messages` не поддерживается',
-      received: body.messages !== undefined ? 'messages' : null,
+      error: conv.error,
+      message: conv.error === 'PROMPT_MESSAGES_MISMATCH'
+        ? '`prompt` не совпадает с последним сообщением пользователя в `messages`'
+        : 'передайте `prompt` (строка) или `messages` (массив {role, content})',
+      received: body.messages !== undefined
+        ? (Array.isArray(body.messages) ? `messages[${body.messages.length}]` : typeof body.messages)
+        : null,
     });
   }
+  /* `prompt` — канонический текст разговора. Дальше он используется везде,
+   * где раньше стояла одна строка: PII-проверка, хеш промпта, лог, буфер
+   * дистилляции. Менять там тип на массив значило бы тронуть сверку хешей
+   * на воркере — а она снимается с расшифрованного текста и обязана
+   * совпасть байт-в-байт. */
+  const messages = conv.messages;
+  const prompt = conv.prompt;
+  /* Обрезка под бюджет контекста — ТОЛЬКО для входа через `messages`.
+   *
+   * ПОЧЕМУ НЕ ДЛЯ `prompt`. Длинный однократный запрос — это не история,
+   * которую нужно прореживать: обрезав его на 3072 токенах, мы бы молча
+   * выкинули часть файла/кода, который человек попросил разобрать, и он
+   * получил бы ответ на обрывок. Для `prompt` потолок один и прежний —
+   * `MAX_TOKENS_PER_TASK` в теле задачи.
+   *
+   * ПРИОРИТЕТЫ ОБРЕЗКИ (system → первый user → последний user → пары LIFO)
+   * живут в `conversation.js`, чтобы сервер и воркер резали одинаково.
+   * Разойдись они — воркер хешировал бы другой текст, и `promptHashVerified`
+   * стал бы false на ровном месте. */
+  const history = conv.from === 'messages'
+    ? conversation.truncateMessages(messages, conversation.DEFAULT_BUDGET_TOKENS)
+    : messages;
+  /* Канонический текст для хеша — ТОЛЬКО когда история пришла массивом.
+   *
+   * Для входа через `prompt` возвращается `null`, и выше хешируется голая
+   * строка, как в 2.28.4. Если бы канонизация применялась всегда,
+   * `prompt:"привет"` давал бы хеш от `"user: привет"` — то есть форма
+   * задачи изменилась бы для всех 1266 тестов и всех установленных
+   * воркеров ради фичи, которую они не просили. */
+  const canonicalPrompt = conv.from === 'messages'
+    ? conversation.messagesToPrompt(history)
+    : null;
   const adapterId = typeof body.adapterId === 'string' && body.adapterId.length ? body.adapterId : BASE_MODEL;
   /* let, а не const: при фолбэке Tier 6 на локальный воркер тир
    * переписывается на base (external-тир не имеет κ). С const это
@@ -9885,6 +9960,8 @@ async function runInference(req, res) {
           const taskIds = [];
           const arm = (addr, modelForArm) => enqueueWorkerTask({
             prompt,
+            messages: history,
+            canonicalPrompt,
             model: modelForArm || fallbackModel,
             tier,
             workerAddress: addr,
@@ -10134,7 +10211,10 @@ async function runInference(req, res) {
        * число из строки как потолок оплаты — значит, не передав его здесь,
        * мы теряем весь смысл потолка. */
       const w = await enqueueWorkerTask({
-        prompt, model: modelId || body.model || null, tier, workerAddress, maxTokens,
+        prompt,
+        messages: history,
+        canonicalPrompt,
+        model: modelId || body.model || null, tier, workerAddress, maxTokens,
       });
       result = {
         source: 'live_llm',

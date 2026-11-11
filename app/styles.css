@@ -1290,6 +1290,20 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   text-overflow: ellipsis;
 }
 .chat-history-item:hover { background: var(--panel); color: var(--text); }
+/* Активный диалог отличается фоном и цветом текста: без этого при нескольких
+ * тредах невозможно понять, какой из них открыт. */
+.chat-history-item.active {
+  background: var(--panel);
+  color: var(--text-strong);
+  border-color: var(--border);
+}
+.chat-history-title { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.chat-history-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--muted-2);
+  font-variant-numeric: tabular-nums;
+}
 
 .sidebar-foot {
   margin-top: auto;
