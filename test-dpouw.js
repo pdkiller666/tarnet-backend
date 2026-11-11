@@ -7124,6 +7124,83 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     }
   }
 
+  /* --- 38.17 Выбор среди ЖИВЫХ, а не среди истории (2.27.2) ---
+   *
+   * Дефект, который владелец видел 11.11.2026. Воркер был подключён, канал
+   * открыт, но задача не приходила: в `nodes` лежало 152 строки (демо-узлы,
+   * тестовые адреса, мусор вида `0xnoollama…`), живой воркер имел вес 1.58
+   * из суммы 389.7. Взвешенный выбор попадал в него с вероятностью 0.4%,
+   * и задача привязывалась в `intendedWorker` к мёртвому адресу. Дальше
+   * P2P отвечал `no_channel` (у мёртвого канала нет), а `/worker/poll`
+   * такую строку не выдаёт — он берёт только свой адрес или `NULL`. Задача
+   * истекала, не дойдя ни до кого.
+   *
+   * Проверка настоящая: живой сервер, 20 мёртвых узлов с огромным весом и
+   * один живой воркер, который опрашивает очередь. Мёртвые даны с весом ×100
+   * к живому намеренно — при старом правиле выбор практически никогда не
+   * попадал в живого, и тест падал бы на возврате задачи, а не на строке. */
+  {
+    const gate17 = require('./dispatch-gate');
+    const A17 = '0x' + 'a'.repeat(40);
+    const B17 = '0x' + 'b'.repeat(40);
+    ok('38.17 пул сужается до живых адресов',
+      gate17.filterToLive([{ address: A17 }, { address: B17 }], [B17.toLowerCase()])
+        .map((n) => n.address).join() === B17);
+    ok('38.17 регистр адреса не мешает совпадению',
+      gate17.filterToLive([{ address: '0xAB' }], new Set(['0xab'])).length === 1);
+    ok('38.17 без живых пул остаётся прежним',
+      gate17.filterToLive([{ address: A17 }], []).length === 1
+      && gate17.filterToLive([{ address: A17 }], ['0x' + 'c'.repeat(40)]).length === 1);
+
+    const dir17 = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-live-pick-'));
+    const h17 = await spawnServer({ WORKER_TASK_TTL_MS: '4000' });
+    try {
+      /* Мёртвые: по 1e6 stake → вес ≈ 900 каждый, суммарно ≈ 18000.
+       * Живой: stake 100 → вес 9. При старом выборе шанс 0.05%. */
+      for (let i = 0; i < 20; i++) {
+        await apiAt(h17.base, '/node', 'POST', {
+          address: runAddress('dead17' + i), stake: 1000000, reputation: 0.9,
+        });
+      }
+      const live17 = runAddress('live17');
+      await apiAt(h17.base, '/node', 'POST', { address: live17, stake: 100, reputation: 0.9 });
+
+      /* Присутствие пишется подписанным опросом — тем же путём, что у
+       * настоящего воркера. Без этого «живых» не было бы вовсе, и старый
+       * пул не сузился бы ни до чего. */
+      const warm17 = await apiAt(h17.base, await signedPollPath(live17, '', h17.base));
+      ok('38.17 живой воркер опросил пустую очередь', warm17.status === 200, warm17.body);
+
+      const inflight17 = apiAt(h17.base, '/inference', 'POST', {
+        prompt: 'проверка выбора живого воркера', maxTokens: 16,
+      });
+      let got17 = null;
+      for (let i = 0; i < 40 && !got17; i++) {
+        const p17 = await apiAt(h17.base, await signedPollPath(live17, '', h17.base));
+        if (p17.body?.task) got17 = p17.body.task;
+        else await new Promise((r) => setTimeout(r, 100));
+      }
+      ok('38.17 задача досталась живому воркеру, а не мёртвому адресу',
+        Boolean(got17), got17 ? got17.taskId : 'задача привязана к мёртвому адресу и истекла');
+
+      if (got17) {
+        await apiAt(h17.base, '/worker/submit', 'POST', {
+          taskId: got17.taskId, workerAddress: live17, response: 'ответ живого воркера',
+          model: 'qwen2.5-coder:1.5b', source: 'ollama',
+          usage: { completion_tokens: 4, total_tokens: 8 },
+        });
+        const inf17 = await inflight17;
+        ok('38.17 ответ живого воркера дошёл до клиента',
+          /ответ живого воркера/.test(String(inf17.body?.response || '')), inf17.body?.response);
+      } else {
+        await inflight17;
+      }
+    } finally {
+      h17.stop();
+      fs.rmSync(dir17, { recursive: true, force: true });
+    }
+  }
+
   /* ---------- 39. Адаптив: телефон → планшет → ПК ----------
    * Проверяем не «есть ли media-запросы» (они есть всегда), а то, что
    * каждый диапазон закрывает свою поломку: тач-цели на телефоне, зум

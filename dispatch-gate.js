@@ -98,10 +98,44 @@ function channelAddressInRegistry(p2pChannels, lookup) {
   return null;
 }
 
+/**
+ * Сузить пул выбора воркера до живых адресов.
+ *
+ * Зачем. `pickWorker` выбирает взвешенно по ВСЕМ строкам `nodes`, а их
+ * 152: демо-узлы, тестовые адреса, мусор вида `0xnoollama…`. Живой воркер
+ * один, его вес 1.58 из общей суммы 389.7 — шанс попасть в него 0.4%.
+ * Практически каждый запрос уходил мёртвому адресу: задача привязывалась к
+ * нему в `intendedWorker`, P2P-ветка отвечала `no_channel`, а `/worker/poll`
+ * такую строку не выдаёт вовсе (он берёт только свои или `NULL`). Задача
+ * истекала, не дойдя ни до кого. Это и был «сервер игнорирует открытый
+ * канал» 11.11.2026: канал был жив, выбирали не того.
+ *
+ * Вес остаётся весом — меняется только множество кандидатов: если живые
+ * известны, выбирать надо среди них, а не среди исторических строк.
+ *
+ * Пустой или несовпавший набор возвращает пул целиком: без живых узлов
+ * прежнее поведение (в том числе выбор по весам для опроса) сохраняется.
+ *
+ * @param {Array<{address: string}>} pool  строки `nodes` с `routingWeight > 0`
+ * @param {Set<string>|Array<string>} liveSet адреса в нижнем регистре
+ * @returns {Array} pool или его живая часть
+ */
+function filterToLive(pool, liveSet) {
+  const rows = Array.isArray(pool) ? pool : [];
+  if (!rows.length) return rows;
+  let live = null;
+  if (liveSet instanceof Set) live = liveSet;
+  else if (Array.isArray(liveSet)) live = new Set(liveSet.map((a) => String(a).toLowerCase()));
+  if (!live || live.size === 0) return rows;
+  const kept = rows.filter((n) => n && typeof n.address === 'string' && live.has(n.address.toLowerCase()));
+  return kept.length ? kept : rows;
+}
+
 module.exports = {
   workerSources,
   hasWorkerSource,
   describeWorkerSources,
   firstChannelAddress,
   channelAddressInRegistry,
+  filterToLive,
 };

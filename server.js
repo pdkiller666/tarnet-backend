@@ -2263,18 +2263,52 @@ function routingWeight(stake, reputation) {
   return omega(stake, reputation);
 }
 
+/* Адреса, которые недавно подавали признак жизни (опрос или WS-кадр).
+ *
+ * Нужно ровно затем, чтобы выбор не уходил мёртвому адресу из истории
+ * `nodes`. Смотри `dispatch-gate.filterToLive` и комментарий к `pickWorker`.
+ * Окно то же, что у `hasActiveWorker`: один признак жизни — одно окно,
+ * иначе «живой» для выбора и «живой» для гейта значили бы разное. */
+function liveWorkerAddresses() {
+  try {
+    const cutoff = Date.now() - WORKER_ACTIVE_WINDOW_MS;
+    return all('SELECT DISTINCT workerAddress FROM worker_presence WHERE lastSeenAt >= ?', [cutoff])
+      .map((r) => String(r.workerAddress || '').toLowerCase())
+      .filter(Boolean);
+  } catch (_e) {
+    return [];
+  }
+}
+
 /* Детерминированный выбор воркера: взвешенный round-robin по золотому
  * сечению. Даёт равномерное распределение без Math.random(), поэтому
- * повторный прогон с теми же данными воспроизводим. */
+ * повторный прогон с теми же данными воспроизводим.
+ *
+ * ВЫБИРАТЬ НАДО СРЕДИ ЖИВЫХ, а не среди всех, кто когда-либо
+ * регистрировался. 11.11.2026 в `nodes` было 152 строки с суммарным весом
+ * 389.7, а живой воркер — один с весом 1.58. Взвешенный выбор по всей
+ * таблице попадал в него с вероятностью 0.4%: задача привязывалась в
+ * `intendedWorker` к мёртвому адресу, P2P отвечал `no_channel` (канала у
+ * мёртвого нет), а `/worker/poll` такую строку не выдаёт вовсе — он берёт
+ * только свой адрес или `NULL`. Задача истекала, не дойдя ни до кого, и
+ * со стороны это выглядело как «сервер игнорирует открытый канал».
+ *
+ * Веса не отменяются — сужается только множество кандидатов. Если живых
+ * нет, пул остаётся прежним: без признака жизни выбирать по-старому честнее,
+ * чем не выбирать никого. */
 let routingCounter = 0;
-function pickWorker(tier) {
+function pickWorker(tier, liveSet = null) {
+  const live = liveSet === null ? liveWorkerAddresses() : liveSet;
   const sql = tier === 'expert'
     ? 'SELECT address, routingWeight, isTeeAttested FROM nodes WHERE routingWeight > 0 AND isTeeAttested = 1'
     : 'SELECT address, routingWeight, isTeeAttested FROM nodes WHERE routingWeight > 0';
-  let pool = all(`${sql} ORDER BY address`);
+  let pool = dispatchGate.filterToLive(all(`${sql} ORDER BY address`), live);
   let fallback = false;
   if (!pool.length) {
-    pool = all('SELECT address, routingWeight, isTeeAttested FROM nodes WHERE routingWeight > 0 ORDER BY address');
+    pool = dispatchGate.filterToLive(
+      all('SELECT address, routingWeight, isTeeAttested FROM nodes WHERE routingWeight > 0 ORDER BY address'),
+      live,
+    );
     fallback = true;
   }
   if (!pool.length) return null;
@@ -7581,12 +7615,32 @@ async function dispatchTaskOverP2p({
    *
    * Отказ при отсутствии канала именно у этого адреса — не ошибка: строка
    * остаётся `pending`, и её заберёт `/worker/poll`. */
+  /* Отказ здесь БОЛЬШЕ НЕ ОСТАВЛЯЕТ задачу привязанной к мёртвому адресу.
+   *
+   * Что было. Строка уходила в `pending` с `intendedWorker = <адрес>`, а
+   * `/worker/poll` берёт только свои или `NULL`. Если адресат не отвечает,
+   * задачу не видит НИКТО: она висит до TTL и истекает. Именно так 11.11.2026
+   * две задачи (`wt_801d…`, `wt_9ac2…`) умерли, имея живой воркер рядом.
+   *
+   * Почему это безопасно. `releaseToPool` срабатывает только пока строка
+   * `pending` — то есть пока никто её не забрал, и двойной генерации быть
+   * не может. Если бы её уже схватил WS, статус был бы `claimed`, и функция
+   * ничего не меняет. */
+  const releaseToPool = (reason) => {
+    try {
+      run(`UPDATE worker_tasks SET intendedWorker = NULL
+           WHERE taskId = ? AND status = 'pending'`, [taskId]);
+    } catch (_e) { /* освобождение не должно ломать сам отказ */ }
+    return { attempted: false, reason };
+  };
+
   const chosen = channelPick.pickChannel(channels, { preferAddress, excludeSet });
   if (!chosen.channel) {
     const why = chosen.reason === 'ALL_EXCLUDED' ? 'all_excluded' : 'no_channel';
     console.log(`[dispatch] p2p: задача ${taskId} не отправлена — ${why}` +
-      ` (каналов ${channels.length}, просили ${preferAddress ?? 'любой'})`);
-    return { attempted: false, reason: why };
+      ` (каналов ${channels.length}, просили ${preferAddress ?? 'любой'})` +
+      (preferAddress ? ' — снимаю привязку, чтобы забрал опрос' : ''));
+    return releaseToPool(why);
   }
   const pick = chosen.channel;
 
@@ -7602,7 +7656,11 @@ async function dispatchTaskOverP2p({
       sealedKey = workerBox.sealToWorker(bound.pubkeyHex, sessionKey.toString('base64'));
     }
   } catch (_e) { sealedKey = null; }
-  if (!sealedKey) return { attempted: false, reason: 'no_bound_key', address: addr };
+  if (!sealedKey) {
+    console.log(`[dispatch] p2p: у ${addr.slice(0, 10)}… нет привязанного ключа` +
+      ' — снимаю привязку задачи, чтобы её забрал опрос');
+    return releaseToPool('no_bound_key');
+  }
 
   /* Атомарный claim — до отправки, как и на WS. Иначе воркер мог бы
    * получить одну задачу и кадром, и опросом, и посчитать дважды. */
