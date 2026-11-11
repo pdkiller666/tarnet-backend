@@ -48,6 +48,11 @@ import {
   publicKeyFromSeed,
 } from '../worker-record.js'
 
+/* Прод-код разбора провайдеров. Импортируется, а не копируется: тест и
+ * мост обязаны идти одним путём, иначе дефект 2.28.1 (зелёный тест при
+ * сломанном проде) вернётся на первой же правке. */
+import { extractProviderIds } from '../discovery-client.js'
+
 const VERBOSE = process.argv.includes('--verbose')
 
 /** `--expect-peer 12D3Koo...` — проверять ИМЕННО этот peerId.
@@ -253,13 +258,37 @@ async function main() {
     await client.services.dht.routingTable.add(s1.peerId)
 
     const found = []
-    const events = await drain(client.services.dht.findProviders(CID.parse(cid)), (evt) => {
-      if (evt.type === EventTypes.PROVIDER && Array.isArray(evt.providers)) {
-        for (const p of evt.providers) found.push(p)
-      }
-    })
+    /* Разбор — ТОЛЬКО через extractProviderIds, то есть тот же код, что
+     * работает на проде. Раньше здесь был свой фильтр по evt.providers,
+     * и он оставался зелёным, пока прод отдавал "[object Object]":
+     * проверка смотрела не туда. Теперь двух путей разбора просто нет. */
+    const events = await drain(client.services.dht.findProviders(CID.parse(cid)))
+    const peerIds = extractProviderIds(events)
 
-    const peerIds = found.map((p) => p.id ? p.id.toString() : String(p))
+    /* Те же объекты PeerInfo нужны ниже, чтобы взять адреса провайдера.
+     * Достаём их из событий PROVIDER, но НЕ разбираем ими идентичность:
+     * идентичность уже дал extractProviderIds. */
+    for (const evt of events) {
+      if (evt?.name !== 'PROVIDER') continue
+      for (const p of evt.providers || []) found.push(p)
+    }
+
+    /* ---------- 4.0 ЛОВУШКА: [object Object] не должен проходить ----------
+     *
+     * ЭТО ПРОВЕРКА НА ОШИБКУ, А НЕ HAPPY PATH. Она воспроизводит ровно
+     * ту форму событий, на которой прод падал: DIAL_PEER без поля
+     * providers и PeerInfo-подобный объект без .id. Старый разбор брал
+     * само событие и давал "[object Object]" — то есть число провайдеров
+     * становилось 1 при пустой DHT. Если кто-то вернёт прежнюю логику,
+     * этот тест покраснеет, а не промолчит. */
+    const trap = extractProviderIds([
+      { name: 'DIAL_PEER', peer: { id: { toString: () => '12D3KooWtrappe' } } },
+      { name: 'PATH_ENDED', path: {} },
+      { name: 'PROVIDER', providers: [{ multiaddrs: [] }] },
+    ])
+    ok('4.0 ловушка: [object Object] и пустые PeerInfo не дают провайдеров',
+      trap.length === 0 && !trap.includes('[object Object]'),
+      { got: trap })
     ok('4.1 findProviders вернул события', events.length > 0, { events: events.length })
     ok('4.2 клиент нашёл воркера по CID', peerIds.includes(peerId),
       { found: peerIds.map((p) => p.slice(0, 12)), want: peerId.slice(0, 12) })

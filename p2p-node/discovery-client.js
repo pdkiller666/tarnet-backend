@@ -38,6 +38,48 @@ const RECORD_TIMEOUT_MS = Number(process.env.P2P_RECORD_TIMEOUT_MS || 5000)
  * никогда. Обрезаем осознанно и сообщаем об этом в ответе, а не молча. */
 const MAX_PROVIDERS = Number(process.env.P2P_MAX_PROVIDERS || 32)
 
+/**
+ * Из потока событий `dht.findProviders` достать peerId провайдеров.
+ *
+ * ПОЧЕМУ ОТДЕЛЬНАЯ ЭКСПОРТИРУЕМАЯ ФУНКЦИЯ. Раньше этот разбор жил
+ * внутри `findWorkers`, и тест вызывал `dht.findProviders` напрямую,
+ * разбирая `evt.providers` своими руками. Два пути разбора — тест и прод —
+ * разошлись, и тест остался зелёным, пока прод отдавал `[object Object]`.
+ * Одна функция, которую зовут оба, делает такое расхождение невозможным.
+ *
+ * ЧТО БЫЛО СЛОМАНО ДО 2.28.1. Разбор не смотрел на имя события:
+ * `Array.isArray(evt?.providers) ? evt.providers : [evt]`. В потоке
+ * `findProviders` есть DIAL_PEER, SEND_QUERY, PEER_RESPONSE и PATH_ENDED;
+ * у DIAL_PEER поля `providers` нет, поэтому в «провайдеры» попадало
+ * событие целиком. `String(evt)` давал "[object Object]", и ответ
+ * показывал `providers: 1` при пустой DHT — число выглядело
+ * доказательством, что записи есть.
+ *
+ * @param {object[]} events сырые события дренажа findProviders
+ * @returns {string[]} peerId в base58btc, без дублей, в порядке появления
+ */
+export function extractProviderIds(events) {
+  const seen = new Set()
+  const ids = []
+  for (const evt of Array.isArray(events) ? events : []) {
+    /* Только PROVIDER. PEER_RESPONSE тоже несёт providers[], но это
+     * промежуточные ответы узлов пути; kad-dht эмитит отдельное событие
+     * PROVIDER ровно для тех, кого нашёл, и дедуп уже сделан там. Брать
+     * оба источника значило бы считать одно и то же дважды. */
+    if (evt?.name !== 'PROVIDER') continue
+    for (const p of evt.providers || []) {
+      /* `p.id` — поле PeerInfo (`id: PeerId`). Свойства `p.peerId` в этой
+       * структуре нет, а `p.toString()` на объекте всегда даёт
+       * "[object Object]": обе ветки прежнего разбора были мертвы. */
+      const id = p?.id?.toString?.()
+      if (!id || typeof id !== 'string' || seen.has(id)) continue
+      seen.add(id)
+      ids.push(id)
+    }
+  }
+  return ids
+}
+
 /** Прочитать один кадр (JSON + \n) из libp2p-потока с таймаутом. */
 async function readOneFrame(stream, timeoutMs = RECORD_TIMEOUT_MS) {
   const readOnce = async () => {
@@ -105,23 +147,30 @@ export function createDiscovery({ node, networkId, log = () => {} }) {
      *
      * `providers` — провайдер-записи DHT, а не наши кэши: именно этот шаг
      * в runtime отсутствовал, из-за чего воркер публиковал «я умею X», а
-     * никто не спрашивал. */
+     * никто не спрашивал.
+     *
+     * ЧТО БЫЛО СЛОМАНО (2.28.1). Разбор не смотрел на ИМЯ события и брал
+     * само событие, если у него не было поля `providers`:
+     * `Array.isArray(evt.providers) ? evt.providers : [evt]`. Поток
+     * `findProviders` содержит DIAL_PEER, SEND_QUERY, PEER_RESPONSE и
+     * PATH_ENDED; у DIAL_PEER `providers` нет, поэтому в «провайдеры»
+     * попадало событие целиком, `String(evt)` давал "[object Object]", и
+     * `providers` в ответе становилось 1 при пустой DHT. Это не косметика:
+     * число провайдеров выглядело доказательством, что записи есть, и
+     * уводило диагностику в сеть мимо настоящей причины.
+     *
+     * Теперь разбираются ТОЛЬКО события `PROVIDER`, и peerId берётся из
+     * `p.id` — так называется поле в `PeerInfo` (kad-dht: `id: PeerId`,
+     * `multiaddrs: Multiaddr[]`). `p.peerId` в этой структуре нет вообще,
+     * а `p.toString()` на объекте всегда даёт "[object Object]" — обе
+     * ветки прежнего разбора не могли сработать ни при каких данных. */
     let providerIds = []
     try {
       const events = await drain(node.services.dht.findProviders(CID.parse(cid)))
-      const seen = new Set()
-      for (const evt of events) {
-        /* Событие несёт либо одного провайдера, либо массив. Обе формы
-         * допустимы в kad-dht, и падение на второй выглядело бы как
-         * «провайдеров нет» при непустом ответе. */
-        const list = Array.isArray(evt?.providers) ? evt.providers : [evt]
-        for (const p of list) {
-          const id = p?.peerId?.toString?.() || p?.id?.toString?.() || p?.toString?.()
-          if (!id || seen.has(id)) continue
-          seen.add(id)
-          providerIds.push(id)
-        }
-      }
+      /* Тот же разбор, что гоняет тест: см. extractProviderIds. Копия
+       * здесь разошлась бы с тестом на первой же правке — именно так
+       * дефект 2.28.1 и прожил до прода. */
+      providerIds = extractProviderIds(events)
     } catch (e) {
       return { ok: false, error: `FINDPROVIDERS_FAILED:${e.message}` }
     }
