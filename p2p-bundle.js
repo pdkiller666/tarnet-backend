@@ -49,6 +49,7 @@ const BUNDLED_FILES = [
   'peer-id-store.js',
   'public-addr.js',
   'task-protocol.js',
+  'webrtc-peer.js',
   'worker-record.js',
   'package.json',
   'package-lock.json',

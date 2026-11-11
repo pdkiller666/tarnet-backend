@@ -62,7 +62,7 @@ function readLocalWorkerAddress() {
 }
 
 function parseArgs(argv) {
-  const out = { url: DEFAULT_URL, window: 600, interval: 10, json: false, help: false, address: null, any: false };
+  const out = { url: DEFAULT_URL, window: 600, interval: 10, json: false, help: false, address: null, any: false, p2p: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--url') out.url = String(argv[++i] || '').trim();
@@ -70,6 +70,7 @@ function parseArgs(argv) {
     else if (a === '--interval') out.interval = Number(argv[++i]);
     else if (a === '--address') out.address = String(argv[++i] || '').trim();
     else if (a === '--any') out.any = true;
+    else if (a === '--p2p') out.p2p = true;
     else if (a === '--json') out.json = true;
     else if (a === '--help' || a === '-h') out.help = true;
     else if (!out.unknown) out.unknown = a;
@@ -104,6 +105,20 @@ async function snapshot(base) {
   const b = (p.body && p.body.bridge) || {};
   return {
     activeWorkers: Number(h.body && h.body.active_workers) || 0,
+    /* P2P-воркер — ОТДЕЛЬНЫЙ счётчик, а не второй способ посчитать то же
+     * (2.28.3). `active_workers` идёт по WS-реестру presence, а воркер,
+     * поднятый с `--test-p2p`, держит libp2p-канал и в WS-реестре может
+     * не появиться вовсе. Без этого поля проверка автозапуска после A3
+     * показала бы `workers=0` при живом P2P-воркере и назвала бы исправный
+     * автозапуск проваленным.
+     *
+     * `null` — «сервер не знает», `0` — «знает, что никого нет». Три
+     * состояния, а не два: склеить их значит соврать в отчёте. */
+    p2pWorkers: (h.body && typeof h.body.active_p2p_workers === 'number')
+      ? h.body.active_p2p_workers
+      : (h.body && h.body.active_p2p_workers === 0 ? 0 : null),
+    p2pRecords: Number(h.body && h.body.p2p_worker_records) || 0,
+    p2pTransportKnown: h.body ? h.body.p2p_transport_known !== false : null,
     llmMode: (h.body && h.body.llm_mode) || null,
     contacts: Number(b.connections) || 0,
     channels: Number((b.tasks && b.tasks.channels) || 0),
@@ -129,11 +144,12 @@ async function snapshot(base) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
-    console.log('check-autostart.js [--url URL] [--window 600] [--interval 10] [--address 0x…] [--any] [--json]');
+    console.log('check-autostart.js [--url URL] [--window 600] [--interval 10] [--address 0x…] [--any] [--p2p] [--json]');
     console.log('Ждёт active_workers>=1 И bridge.connections>=1 в пределах окна.');
     console.log('С адресом — дополнительно требует, чтобы ЭТОТ адрес был в worker_addresses:');
     console.log('С адресом (или если найден ~/.tarnet/worker.json) — ждёт ЭТОТ узел, а не любой.');
     console.log('--any отключает сверку по адресу (нужно, если сервер старше 2.24.0).');
+    console.log('--p2p считает по active_p2p_workers (воркер запущен с --test-p2p и в WS-реестре не виден).');
     process.exit(0);
   }
   if (args.unknown) bad(2, `неизвестный аргумент ${args.unknown}`);
@@ -229,12 +245,31 @@ async function main() {
        *   `[]` — поле есть, но никто не подключён;
        *   адрес в списке — наш узел среди авторизованных каналов. */
       const addressMatch = expected ? s.workerAddresses.includes(expected) : null;
-      const mine = expected ? (addressMatch === true && s.activeWorkers >= 1) : s.activeWorkers >= 1;
+      /* КРИТЕРИЙ ГОТОВНОСТИ РАЗНЫЙ ДЛЯ ДВУХ РЕЖИМОВ ВОРКЕРА (2.28.3).
+       *
+       * По умолчанию — `active_workers >= 1`: это WS-реестр presence, и он
+       * отвечает «сервер знает воркера и может слать ему задачу по WS».
+       * Оставить только его нельзя: воркер, поднятый с `--test-p2p`, держит
+       * libp2p-канал и в WS-реестр может не попасть вовсе — тогда исправный
+       * автозапуск выглядел бы проваленным.
+       *
+       * Поэтому `--p2p` переключает счётчик на `active_p2p_workers`.
+       * `null` в этом поле — «сервер не знает» (мост молчит), и это НЕ `0`:
+       * ноль значит «знает, что никого нет». Ни то, ни другое не готово, но
+       * в отчёте они названы по-разному: иначе владелец пойдёт чинить
+       * воркер при мёртвом мосте.
+       *
+       * `contacts >= 1` требуется в обоих режимах: без живого канала счётчик
+       * говорит о записи, а не о доставке. */
+      const workersCount = args.p2p ? s.p2pWorkers : s.activeWorkers;
+      const workersOk = typeof workersCount === 'number' && workersCount >= 1;
+      const mine = expected ? (addressMatch === true && workersOk) : workersOk;
       const ready = mine && s.contacts >= 1;
       const elapsed = Math.round((Date.now() - started) / 1000);
       if (!args.json) {
         console.log(
-          `[${String(elapsed).padStart(4)}с] workers=${s.activeWorkers} contacts=${s.contacts}` +
+          `[${String(elapsed).padStart(4)}с] workers=${s.activeWorkers}` +
+          ` p2p=${s.p2pWorkers === null ? '?' : s.p2pWorkers} contacts=${s.contacts}` +
           ` channels=${s.channels} framesIn=${s.framesIn}` +
           `${s.llmMode ? ` mode=${s.llmMode}` : ''}` +
           `${expected && s.hasAddressField ? ` addr=${addressMatch ? 'да' : 'нет'} mine=${mine ? 'да' : 'нет'}` : ''}` +

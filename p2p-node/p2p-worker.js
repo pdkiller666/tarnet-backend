@@ -46,6 +46,11 @@ import path from 'node:path'
  * (`Cannot read properties of undefined (reading 'bytes')`), причём
  * выглядит это как баг библиотеки, а не как наш. */
 import { CID } from 'multiformats/cid'
+/* WebRTC-приёмник (Этап 10). Импортируется статически намеренно: `werift` —
+ * чистый JS, и цена импорта — единицы миллисекунд. Динамический импорт тут
+ * дал бы только один эффект: ошибка установки `werift` всплыла бы поздно,
+ * уже внутри обработчика кадра, и выглядела бы как «сигналинг сломан». */
+import { answerOffer } from './webrtc-peer.js'
 
 const BOOTSTRAP_BASE = (
   process.env.TARNET_PUBLIC_URL || 'https://v1107336.hosted-by-vdsina.com'
@@ -389,6 +394,50 @@ async function handleTask(msg) {
     log(`задача ${msg.task.taskId}: ${out && out.ok ? 'выполнена' : 'отказ'}${out && out.error ? ` (${out.error})` : ''}`)
     return out
   }
+  /* СИГНАЛИНГ WEBRTC (Этап 10).
+   *
+   * ПОЧЕМУ ЭТОТ КАДР ЖИВЁТ ЗДЕСЬ, А НЕ В ОТДЕЛЬНОМ ПРОТОКОЛЕ.
+   * Отдельный libp2p-протокол потребовал бы нового `handle`, новой
+   * авторизации и нового способа достучаться до воркера, который слушает
+   * loopback на случайном порту. А этот канал уже открыт, уже проверен
+   * подписанным `hello` и уже носит произвольный `payload` в обе стороны.
+   * Лишний путь в прототипе — лишнее место для дефекта.
+   *
+   * ПОЧЕМУ В ОТВЕТЕ ОБЯЗАТЕЛЬНО `taskId`. Мост сопоставляет ответ с
+   * ожиданием по `taskId`; кадр без него попадает только в анонимную
+   * полосу, а она принимает ЛИШЬ `pong`. Первый заход дал ровно это:
+   * мост получал answer, не мог его никому отдать и писал «кадр без
+   * taskId и не pong (webrtc-offer) — сирота», а вызывающий получал
+   * TASK_TIMEOUT. Возвращаем id тем же полем, каким он пришёл.
+   *
+   * ЧЕГО ЗДЕСЬ НЕТ. Подписи `TaskGrant` и TURN: это транспортный
+   * прототип, а не приёмка работы. Обе вещи названы в
+   * `docs/STAGE-10-WEBRTC.md` как обязательные для боевого пути. */
+  if (msg && msg.action === 'webrtc-offer') {
+    const taskId = msg.taskId ? String(msg.taskId) : null
+    log('[webrtc] offer получен — собираю answer')
+    const res = await answerOffer(msg.offer, {
+      log: (m) => log(m),
+      /* Ответ на текст из DataChannel. Эхо с префиксом: тест должен
+       * видеть именно ответ воркера, а не своё же сообщение, вернувшееся
+       * по кругу — иначе проверка зеленеет на отсутствии связи. */
+      onMessage: (text) => `pong:${text}`
+    })
+    if (!res.ok) {
+      log(`[webrtc] offer отклонён: ${res.error}`)
+      return { ok: false, action: 'webrtc-offer', taskId, error: res.error }
+    }
+    log(`[webrtc] answer готов (${res.id}), ICE ${res.candidates_gathered ? 'собран' : 'неполный'}`)
+    return {
+      ok: true,
+      action: 'webrtc-offer',
+      taskId,
+      id: res.id,
+      answer: res.answer,
+      candidates_gathered: res.candidates_gathered
+    }
+  }
+
   /* Неизвестная задача — внятный отказ, а не тишина: молчание мост
    * истолкует как таймаут и будет искать проблему в сети, а не в имени. */
   return { ok: false, error: 'UNKNOWN_TASK', received: msg && msg.action }
