@@ -645,6 +645,39 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     hLlm.body.active_workers !== undefined && hLlm.body.pii_blocked_today !== undefined,
     { active_workers: hLlm.body.active_workers, pii_blocked_today: hLlm.body.pii_blocked_today });
 
+  /* ---------- 8.7b. active_p2p_workers: отличить «ноль» от «не знаю» ----------
+   *
+   * ЗАЧЕМ ЛОВУШКИ. Поле вводится ровно из-за лжи: /health отдавал
+   * `active_workers: 0` при живом P2P-воркере. Проверки ниже ловят три
+   * способа соврать заново:
+   *   1) поля нет вовсе — старый ответ;
+   *   2) мост молчит, а отдаётся 0 — «не знаю» выдано за «воркеров нет»;
+   *   3) /health и /worker/status разошлись — два экрана, одно состояние. */
+  ok('в /health есть active_p2p_workers',
+    Object.prototype.hasOwnProperty.call(hLlm.body, 'active_p2p_workers'),
+    hLlm.body.active_p2p_workers);
+  ok('active_p2p_workers — число или null, но не undefined',
+    hLlm.body.active_p2p_workers === null || typeof hLlm.body.active_p2p_workers === 'number',
+    { value: hLlm.body.active_p2p_workers, transport_known: hLlm.body.p2p_transport_known });
+  /* Главная ловушка. Если мост не ответил, счётчик ОБЯЗАН быть null:
+   * иначе мониторинг прочтёт «воркеров нет» там, где транспорт лежит,
+   * и будет искать вора в другом месте. Именно этот класс дефекта
+   * («проверка смотрит не туда») мы ловили весь день. */
+  ok('мост не ответил → счётчик null, а не 0 (не знать ≠ ноль)',
+    hLlm.body.p2p_transport_known !== false || hLlm.body.active_p2p_workers === null,
+    { known: hLlm.body.p2p_transport_known, p2p: hLlm.body.active_p2p_workers });
+  /* «worker» обязан быть чем-то подкреплён. Если WS-воркеров нет и P2P
+   * нет, режим worker — это ложь, откуда бы она ни взялась. */
+  ok('режим worker подкреплён хотя бы одним живым воркером',
+    hLlm.body.llm_mode !== 'worker'
+      || Number(hLlm.body.active_workers) > 0
+      || Number(hLlm.body.active_p2p_workers) > 0,
+    {
+      mode: hLlm.body.llm_mode,
+      ws: hLlm.body.active_workers,
+      p2p: hLlm.body.active_p2p_workers,
+    });
+
   const wStatus = await api('/worker/status');
   ok('/worker/status отвечает', wStatus.status === 200 && wStatus.body.mode !== undefined, wStatus.body);
   /* Без привязки ключа poll обязан ОТКАЗАТЬ, а не отдать пустую очередь:

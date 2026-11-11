@@ -365,11 +365,12 @@ websocket`, `listenHost: 127.0.0.1`, `announced_public: false`, список п�
 
 | Утверждение | Как проверить |
 |---|---|
-| Версия прода | `curl /health` → `buildVersion` = `version` из `package.json` (сейчас `2.26.10` и локально, и на проде); расхождение ловит `verify.sh` шаг 3.9 |
-| Тесты | `scripts/verify.sh` → 1326 ✅ / 0 ❌ |
-| Чеки и баланс | `curl /summary` → `receipts: 793`, `conservation.delta: 0` |
+| Версия прода | `curl /health` → `buildVersion` = `version` из `package.json` (сейчас `2.28.3`); расхождение ловит `verify.sh` шаг 3.9 |
+| Тесты | `scripts/verify.sh` → 1358+ ✅ / 0 ❌ |
+| Чеки и баланс | `curl /summary` → `receipts: 804`, `conservation.delta: 0` |
 | 18 моделей | `curl /models` → длина 18 |
 | Ставки Tier 6 | `curl /config` → `TIER6` |
+| Есть ли P2P-воркер | `curl /health` → `active_p2p_workers` (число или `null`, если мост молчит) |
 | NAT не проверен | `curl /p2p/status` → `worker_addresses: []` |
 | Всё совпадает | `scripts/verify.sh` → «ВСЁ ЗЕЛЁНОЕ» |
 

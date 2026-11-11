@@ -54,30 +54,68 @@ const dispatchGate = require('./dispatch-gate');
  * отказом. Не успели — возвращаем null: «не знаю» честнее, чем медленный
  * ответ, который будет прочитан как «сервер умер».
  *
- * ЗНАЧЕНИЕ:
- *   true  — есть живая запись с непустыми modelFamilies;
- *   false — мост ответил, но таких записей нет (установлен и молчит);
- *   null  — мост не ответил/не успел: состояние НЕИЗВЕСТНО. */
-let _capsCache = { at: 0, value: null };
-async function p2pCapsFact() {
+ * ЗНАЧЕНИЕ — ДВА НЕЗАВИСИМЫХ ФАКТА, снятых одним запросом в сокет:
+ *
+ *   channels — авторизованные живые каналы задач (`worker_addresses`).
+ *              Именно по ним диспетчер реально доставляет задачу
+ *              (`dispatchTaskOverP2p` → `p2pTaskChannels`).
+ *   records  — живые записи в DHT (`worker_records.live`, `expiresAt > now`).
+ *              Это «объявился в сети», а не «готов считать».
+ *
+ * ПОЧЕМУ ИХ НЕЛЬЗЯ СЛИТЬ. Счётчик по записям отвечает «объявлен ли воркер»,
+ * по каналам — «можно ли ему доставить прямо сейчас». Запись без канала дала
+ * бы ровно тот дефект, ради которого поле вводится, только в другую сторону:
+ * /health сказал бы «воркер жив», а задача не ушла бы никуда. Поэтому
+ * `active_p2p_workers` считается по КАНАЛАМ, а записи отдаются РЯДОМ —
+ * по паре видно «объявился, но не принимает».
+ *
+ * responded:false — это НЕ нули. Мост молчит или недоступен, и «воркеров
+ * нет» отличимо от «транспорт лежит» только так. Наружу уходят те же null. */
+let _p2pCache = { at: 0, value: null };
+async function p2pStatusFact() {
   const TTL_MS = 15000;
   const now = Date.now();
-  if (now - _capsCache.at < TTL_MS) return _capsCache.value;
+  if (now - _p2pCache.at < TTL_MS) return _p2pCache.value;
 
-  let value = null;
+  let value = {
+    responded: false, channels: null, records: null, capabilities: null, model_families: null,
+  };
   try {
     const r = await p2pBridge.send({ action: 'status' }, { timeoutMs: 300 });
     if (r && r.ok === true) {
-      /* Поле может отсутствовать у моста старой версии. Тогда именно null:
-       * «версия не отдаёт» — это не «не настроено». */
+      /* Поля могут отсутствовать у моста старой версии. Тогда именно null:
+       * «версия не отдаёт» — это не «ноль воркеров». */
+      const wa = Array.isArray(r.worker_addresses) ? r.worker_addresses : null;
       const wr = r.worker_records;
-      value = wr && typeof wr.with_capabilities === 'number' ? wr.with_capabilities > 0 : null;
+      value = {
+        responded: true,
+        channels: wa ? wa.length : null,
+        records: wr && typeof wr.live === 'number' ? wr.live : null,
+        capabilities: wr && typeof wr.with_capabilities === 'number' ? wr.with_capabilities : null,
+        model_families: wr && Array.isArray(wr.model_families) ? wr.model_families : null,
+      };
     }
-  } catch (_e) {
-    value = null;
-  }
-  _capsCache = { at: now, value };
+  } catch (_e) { /* responded:false — состояние НЕИЗВЕСТНО, а не «пусто» */ }
+  _p2pCache = { at: now, value };
   return value;
+}
+
+/* Четыре P2P-факта в одной форме для /health, /worker/status и /summary.
+ *
+ * ЗАЧЕМ ОТДЕЛЬНАЯ ФУНКЦИЯ. Три эндпоинта отвечают на один вопрос «есть ли
+ * кому считать по P2P». Если имена или семантика полей разойдутся хоть на
+ * одном, мониторинг и PWA увидят разное состояние одной системы — тот самый
+ * дефект «два пути», что стоил нам двух вечеров.
+ *
+ * `null` вместо `0`: мост не ответил — это «не знаю», а не «воркеров нет». */
+function p2pWorkersFields(p2p) {
+  const known = Boolean(p2p && p2p.responded);
+  return {
+    active_p2p_workers: known ? p2p.channels : null,
+    p2p_worker_records: known ? p2p.records : null,
+    p2p_model_families: known && Array.isArray(p2p.model_families) ? p2p.model_families : null,
+    p2p_transport_known: known,
+  };
 }
 /* 2.22.7: архив p2p-node для установщика. Модуль чистый (fs + zlib, без сети
  * и без БД), поэтому проверяется обычными юнит-тестами — архив можно собрать
@@ -2815,12 +2853,51 @@ function activeWorkerSnapshots(cutoff) {
   }));
 }
 
-function llmStatus() {
+function llmStatus(p2p) {
   const cutoff = Date.now() - WORKER_ACTIVE_WINDOW_MS;
   const snapshots = activeWorkerSnapshots(cutoff);
   const active = snapshots.length;
+
+  /* Режим остаётся в ОДНОМ месте (`describeMode`), иначе /health и
+   * /worker/status разойдутся — тот самый дефект «два пути разбора».
+   * P2P-факт лишь дополняет его, когда WS-воркеров нет. */
+  const base = LLM.describeMode({ activeWorkers: active, workers: snapshots });
+  const known = Boolean(p2p && p2p.responded);
+  const p2pChannels = known ? p2p.channels : null;
+  const p2pFamilies = known && Array.isArray(p2p.model_families) ? p2p.model_families : null;
+  /* Непустые семейства — единственное ДОКАЗАТЕЛЬСТВО, что P2P-воркер
+   * умеет считать. Канал несёт только `address`/`peerId`, модели в нём
+   * нет: объявить `worker` по одному факту открытого потока значило бы
+   * вернуть старый дефект «живой воркер без модели», только с другой
+   * стороны — теперь по P2P. */
+  const p2pHasModel = Array.isArray(p2pFamilies) && p2pFamilies.length > 0;
+  const p2pReady = p2pChannels !== null && p2pChannels > 0 && p2pHasModel;
+
+  let mode = base;
+  if (base.llm_mode !== 'worker' && p2pReady) {
+    mode = {
+      llm_mode: 'worker', external_provider: null,
+      active_workers: active, llm_mode_reason: null,
+    };
+  } else if (base.llm_mode !== 'worker' && p2pChannels !== null && p2pChannels > 0 && !p2pHasModel) {
+    /* Канал есть, модель не названа. Молчать нельзя — иначе «почему
+     * fallback при живом воркере» ищется в коде. Отдельная причина, а не
+     * `model_unverified`: она говорит про WS-воркера, а здесь транспорт
+     * другой и лечится он переменной `P2P_MODEL_FAMILIES` на стороне
+     * воркера. */
+    mode = { ...base, llm_mode_reason: 'p2p_model_unverified' };
+  }
+
   return {
-    ...LLM.describeMode({ activeWorkers: active, workers: snapshots }),
+    ...mode,
+    /* Та же форма, что у /summary: поля P2P определены в ОДНОМ месте
+     * (`p2pWorkersFields`). `active_p2p_workers` — сколько могут ПРИНЯТЬ
+     * задачу прямо сейчас (авторизованные живые каналы), а не записи DHT:
+     * доставка идёт каналом, и объявленный, но не принимающий воркер
+     * не должен выглядеть живым. `p2p_worker_records` — рядом, чтобы
+     * расхождение было видно: records > channels = «объявился, но не
+     * принимает». */
+    ...p2pWorkersFields(p2p),
     pii_blocked_today: LLM.piiBlockedToday(),
     /* Состояние PII-фильтра видно снаружи: включён ли ONNX, загрузилась ли
      * модель, какой порог. Иначе «почему заблокировало» превращается в гадание. */
@@ -3344,6 +3421,12 @@ app.get('/health', async (_req, res) => {
   let dbSizeBytes = null;
   try { dbSizeBytes = fs.statSync(DB_PATH).size; } catch (_e) { dbSizeBytes = null; }
 
+  /* Один замер моста на весь ответ. Раньше здесь был отдельный вызов ради
+   * `p2p_capabilities_configured`; теперь тот же снимок отдаёт ещё и
+   * `active_p2p_workers`. Второй запрос в сокет не добавил бы информации,
+   * только удвоил бы цену на самом частом эндпоинте. */
+  const p2pFact = await p2pStatusFact();
+
   res.json({
     status: 'ok',
     timestamp: Date.now(),
@@ -3382,11 +3465,13 @@ app.get('/health', async (_req, res) => {
      *
      * null — мост не ответил или не успел. Не false: «не знаю» и «точно не
      * настроено» ведут к разным действиям, и склеивать их значило бы гадать. */
-    p2p_capabilities_configured: await p2pCapsFact(),
+    p2p_capabilities_configured: p2pFact.responded
+      ? (p2pFact.capabilities === null ? null : p2pFact.capabilities > 0)
+      : null,
     /* Текущий режим LLM. Прозрачность вместо догадок: инвестор и агент
      * видят, работает ли настоящая модель или детерминированный fallback,
      * не читая логи. */
-    ...llmStatus(),
+    ...llmStatus(p2pFact),
     conservation: {
       gross: Number(gross.toFixed(6)),
       distributed: Number(distributed.toFixed(6)),
@@ -7243,7 +7328,7 @@ function treasuryAuditSnapshot() {
   };
 }
 
-app.get('/summary', (_req, res) => {
+app.get('/summary', async (_req, res) => {
   const t = ledger.totals();
   const gross = Number(t.feeGross) + Number(t.block);
   const distributed = Number(t.burn) + Number(t.treasury) + Number(t.royalty) + Number(t.reward);
@@ -7331,6 +7416,11 @@ app.get('/summary', (_req, res) => {
   res.json({
     receipts: Number(t.receipts),
     workers: get('SELECT COUNT(DISTINCT workerAddress) AS c FROM work_receipts').c,
+    /* Воркеры P2P — рядом с `workers`, и это не дубль, а другой факт.
+     * `workers` — сколько адресов УЖЕ отработали (история из work_receipts),
+     * `active_p2p_workers` — сколько МОГУТ принять задачу сейчас. Слить их
+     * значило бы показать мертвый узел живым или наоборот. */
+    ...p2pWorkersFields(await p2pStatusFact()),
     totalCwu: Number(Number(t.cwu).toFixed(6)),
     totalRewardTar: Number(Number(t.reward).toFixed(6)),
     totalFeeRewardTar: Number(Number(t.fee).toFixed(6)),
@@ -8704,11 +8794,17 @@ app.post('/worker/submit', (req, res) => {
 });
 
 /* Состояние очереди для наблюдаемости. */
-app.get('/worker/status', (_req, res) => {
+app.get('/worker/status', async (_req, res) => {
   const cutoff = Date.now() - WORKER_ACTIVE_WINDOW_MS;
   const pending = get(`SELECT COUNT(*) AS c FROM worker_tasks WHERE status = 'pending'`).c;
   const snapshots = activeWorkerSnapshots(cutoff);
-  const modeInfo = LLM.describeMode({ activeWorkers: snapshots.length, workers: snapshots });
+  /* Режим считается ТЕМ ЖЕ путём, что в /health (llmStatus), а не вторым
+   * вызовом `describeMode`. Раньше здесь был отдельный расчёт — и после
+   * появления P2P-ветки /worker/status начал бы отвечать `fallback` там,
+   * где /health уже говорит `worker`. Два соседних экрана показывали бы
+   * разное состояние одной системы: ровно тот дефект «два пути разбора»,
+   * который мы ловили весь день. */
+  const modeInfo = llmStatus(await p2pStatusFact());
   res.json({
     active_workers: snapshots.length,
     pending_tasks: Number(pending),
@@ -8716,6 +8812,11 @@ app.get('/worker/status', (_req, res) => {
     /* Причина режима видна снаружи: без неё «почему не worker» требует
      * чтения кода вместо одного запроса. */
     mode_reason: modeInfo.llm_mode_reason,
+    /* Те же два факта, что в /health: сколько P2P-воркеров готовы принять
+     * задачу и сколько записей видит DHT. Без них «почему не worker» при
+     * живом канале читалось бы только в одну сторону. */
+    active_p2p_workers: modeInfo.active_p2p_workers,
+    p2p_worker_records: modeInfo.p2p_worker_records,
     /* `installedModels` — то, что PWA использует как ЕДИНСТВЕННЫЙ источник
      * правды для селекта локальных моделей. Раньше его не было, и выбирать
      * приходилось из каталога сети — а он знает модели вообще, а не модели
