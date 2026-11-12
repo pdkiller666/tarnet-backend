@@ -2073,6 +2073,167 @@ function expireApprovalIfNeeded(row) {
   }
   return row;
 }
+
+/* ===== Агентский шлюз для Tier 6 (P0.3.2) =====
+ *
+ * ЗАЧЕМ ОТДЕЛЬНАЯ ФУНКЦИЯ. Ветка Tier 6 в /inference завершается своим
+ * `return` РАНЬШЕ общего агентского шлюза (тот стоит после выбора воркера).
+ * Из-за этого `agentId` в запросе с tier 6 не ограничивал ничего вообще.
+ * Проверено живьём, а не по чтению кода: один и тот же агент с лимитом
+ * 100 токенов получал `402 per_task_limit_exceeded` на tier base и
+ * `401 AUTH_MISSING_KEY` на tier 6 — то есть до лимита дело не доходило.
+ *
+ * ПОЧЕМУ НЕ СКОПИРОВАТЬ БЛОК. Копия разошлась бы с оригиналом на первой же
+ * правке лимитов, и Tier 6 снова стал бы дырой — молча, без красного теста.
+ *
+ * Возвращает `{ok:true, ctx}` либо `{ok:false, status, body}`: вызывающий
+ * сам решает, как ответить, и не получает права проигнорировать отказ.
+ */
+function agentGateForTier6({ body, clientAddress, maxTokens, prompt, actionId }) {
+  const agentIdRaw = typeof body.agentId === 'string' ? body.agentId.trim().toLowerCase() : '';
+  if (!agentIdRaw) return { ok: true, ctx: null };
+
+  if (!/^[0-9a-f]{64}$/.test(agentIdRaw)) {
+    return {
+      ok: false, status: 400,
+      body: { error: 'agentId must be 64 hex chars', agentId: agentIdRaw.slice(0, 16) + '…' },
+    };
+  }
+
+  const agentRow = get(`SELECT a.agentId, a.userId, a.status,
+                               w.maxPerTaskTokens, w.dailyLimitTokens,
+                               w.humanApprovalThresholdTokens
+                          FROM agent_registry a
+                          LEFT JOIN agent_wallets w ON w.agentId = a.agentId
+                         WHERE a.agentId = ?`, [agentIdRaw]);
+  if (!agentRow) {
+    return { ok: false, status: 404, body: { error: 'unknown_agent', agentId: agentIdRaw, hint: 'POST /agents' } };
+  }
+  if (agentRow.status !== 'active') {
+    return { ok: false, status: 403, body: { error: 'agent_not_active', status: agentRow.status, agentId: agentIdRaw } };
+  }
+  /* Та же причина отказа, что и на локальном пути: агент тратит бюджет
+   * СВОЕГО владельца. Tier 6 без этого сравнения списывал бы комиссию с
+   * любого присланного адреса, то есть оплата теряла бы владельца. */
+  if (!clientAddress || clientAddress !== agentRow.userId) {
+    return {
+      ok: false, status: 403,
+      body: {
+        error: 'agent_owner_mismatch',
+        note: 'agentId тратит бюджет своего владельца: clientAddress должен совпадать с userId агента',
+        agentId: agentIdRaw,
+        agentUserId: agentRow.userId,
+        clientAddress: clientAddress || null,
+      },
+    };
+  }
+
+  const promptHash = crypto.createHash('sha256').update(String(prompt ?? ''), 'utf8').digest('hex');
+  const approvalId = typeof body.approvalId === 'string' ? body.approvalId.trim() : '';
+  let usedApproval = null;
+  if (approvalId) {
+    const ap = expireApprovalIfNeeded(get('SELECT * FROM approvals WHERE approvalId = ?', [approvalId]));
+    if (!ap) return { ok: false, status: 404, body: { error: 'unknown_approvalId', approvalId } };
+    if (ap.agentId !== agentIdRaw) {
+      return { ok: false, status: 403, body: { error: 'approval_agent_mismatch', approvalId, agentId: ap.agentId } };
+    }
+    if (ap.status !== 'approved') {
+      return { ok: false, status: 409, body: { error: 'approval_not_granted', status: ap.status, approvalId } };
+    }
+    if (ap.payloadHash !== promptHash) {
+      return { ok: false, status: 409, body: { error: 'approval_payload_mismatch', note: 'одобрение выдано на другой промпт', approvalId } };
+    }
+    if (Number(ap.requestedTokens) !== maxTokens) {
+      return {
+        ok: false, status: 409,
+        body: { error: 'approval_amount_mismatch', approvedTokens: Number(ap.requestedTokens), requestedTokens: maxTokens, approvalId },
+      };
+    }
+    usedApproval = ap;
+  }
+
+  const limitsCheck = agentRuntime.checkTaskLimits({
+    wallet: agentRow,
+    maxTokens,
+    spentTokensToday: Number(agentSpendOf(agentIdRaw).spentTokens || 0),
+    heldTokens: agentHeldTokens(agentIdRaw),
+  });
+
+  if (!limitsCheck.ok) {
+    return {
+      ok: false,
+      status: limitsCheck.reason === 'invalid_max_tokens' ? 400 : 402,
+      body: {
+        error: limitsCheck.reason,
+        agentId: agentIdRaw,
+        requestedTokens: limitsCheck.requestedTokens,
+        limitTokens: limitsCheck.limitTokens,
+        projectedTokens: limitsCheck.projectedTokens,
+        note: limitsCheck.reason === 'daily_limit_exceeded'
+          ? 'дневной лимит агента исчерпан: сумма считается с учётом уже занятых задач'
+          : 'задача дороже лимита на одну задачу',
+        tier: 6,
+      },
+    };
+  }
+
+  if (limitsCheck.needsApproval && !usedApproval) {
+    const ap = createApproval({
+      agentId: agentIdRaw,
+      ownerAddress: agentRow.userId,
+      actionId,
+      payloadHash: promptHash,
+      requestedTokens: maxTokens,
+      projectedTar: limitsCheck.projectedTar,
+    });
+    /* 202, а не 402: ждём человека, а не пополнения. Ничего не списано. */
+    return {
+      ok: false, status: 202,
+      body: {
+        error: 'approval_required',
+        note: 'сумма выше порога подтверждения: подпишите запрос ключом владельца',
+        approvalId: ap.approvalId,
+        status: 'pending_approval',
+        agentId: agentIdRaw,
+        requestedTokens: maxTokens,
+        thresholdTokens: limitsCheck.thresholdTokens,
+        projectedTar: ap.projectedTar,
+        payloadHash: promptHash,
+        expiresAt: ap.expiresAt,
+        tier: 6,
+        endpoints: { read: 'GET /agents/approvals?userId=…', decide: 'POST /agents/approve' },
+      },
+    };
+  }
+
+  /* Одобрение одноразовое — и на этом пути тоже, иначе одну подпись можно
+   * предъявлять к каждой следующей задаче того же объёма. */
+  if (usedApproval) {
+    run(`UPDATE approvals SET status = 'expired', decidedAt = ?
+          WHERE approvalId = ? AND status = 'approved'`,
+      [new Date().toISOString(), usedApproval.approvalId]);
+  }
+
+  const reservation = reserveAgentTokens({
+    agentId: agentIdRaw,
+    actionId,
+    tokens: maxTokens,
+    tar: limitsCheck.projectedTar,
+  });
+
+  return {
+    ok: true,
+    ctx: {
+      agentId: agentIdRaw,
+      userId: agentRow.userId,
+      maxTokens,
+      actionId,
+      promptHash,
+      projectedTar: limitsCheck.projectedTar,
+      reservationId: reservation.created ? reservation.reservationId : null,
+    },
+  };
+}
 /* Реентерабельная транзакция.
  * Вложенный BEGIN в SQLite запрещён, а батч хочет одну транзакцию на пачку,
  * тогда как recordWork сам оборачивает запись. Счётчик глубины делает
@@ -9057,6 +9218,7 @@ async function runInference(req, res) {
         ? body.clientAddress
         : null;
 
+
       /* Проверка PII: порог 0.95 из конфига. Фильтр эвристический (0 МБ RAM),
        * но правило бинарное: нашлось совпадение — наружу не уходит. */
       const pii = LLM.piiCheck(prompt);
@@ -9103,6 +9265,63 @@ async function runInference(req, res) {
         });
       }
       sweepExpiredTier6Reserves();
+
+      /* ===== Агентский шлюз ДО любого сетевого вызова (P0.3.2) =====
+       *
+       * ПОЧЕМУ ЗДЕСЬ, А НЕ В ОБЩЕМ ШЛЮЗЕ. Общий агентский шлюз стоит ПОСЛЕ
+       * выбора воркера, а ветка Tier 6 завершается своим `return` раньше
+       * него. Значит без этой проверки `agentId` на tier 6 не ограничивал
+       * ничего: лимит на задачу, дневной лимит и порог HITL не применялись
+       * вовсе. Воспроизведено живьём: один и тот же агент с лимитом 100
+       * токенов получал `402 per_task_limit_exceeded` на tier base и
+       * `401 AUTH_MISSING_KEY` на tier 6.
+       *
+       * ПОЧЕМУ СВОЙ maxTokens. Общий `maxTokens` объявлен НИЖЕ по функции
+       * (после выбора воркера), и обращение к нему отсюда — TDZ-ошибка,
+       * падающая ровно на первом запросе с tier: 6. Тот же капкан, из-за
+       * которого `tier6Client` резолвится отдельной переменной. */
+      const t6MaxTokens = Math.trunc(Number(body.maxTokens ?? 512));
+      if (!Number.isFinite(t6MaxTokens) || t6MaxTokens <= 0) {
+        return res.status(400).json({ error: 'maxTokens must be a positive integer', got: body.maxTokens ?? null, tier: 6 });
+      }
+      if (t6MaxTokens > CONFIG.MAX_TOKENS_PER_TASK) {
+        return res.status(400).json({
+          error: 'max_tokens_exceeds_limit',
+          requestedTokens: t6MaxTokens,
+          maxAllowedTokens: CONFIG.MAX_TOKENS_PER_TASK,
+          hint: `один запрос не может превышать ${CONFIG.MAX_TOKENS_PER_TASK} токенов`,
+          tier: 6,
+        });
+      }
+
+      const t6ActionId = typeof body.actionId === 'string' && body.actionId.length
+        ? body.actionId
+        : 'inf_' + crypto.randomBytes(12).toString('hex');
+      const t6Gate = agentGateForTier6({
+        body,
+        clientAddress: tier6Client,
+        maxTokens: t6MaxTokens,
+        prompt,
+        actionId: t6ActionId,
+      });
+      if (!t6Gate.ok) return res.status(t6Gate.status).json(t6Gate.body);
+
+      /* Резерв токенов, взятый шлюзом, обязан быть снят на ЛЮБОМ выходе —
+       * и на отказе провайдера, и на успехе. Брошенный резерв навсегда
+       * съел бы дневной лимит агента, и он «закончился» бы, ничего не сделав. */
+      const t6AgentReservationId = t6Gate.ctx ? t6Gate.ctx.reservationId : null;
+      const releaseAgentHold = (worked) => {
+        if (!t6AgentReservationId) return;
+        try {
+          settleAgentReservation(t6AgentReservationId, {
+            agentId: t6Gate.ctx.agentId,
+            tokens: t6Gate.ctx.maxTokens,
+            tar: worked ? Number(t6Gate.ctx.projectedTar) || 0 : 0,
+            settled: Boolean(worked),
+            worked,
+          });
+        } catch (_e) { /* учёт не должен ломать ответ клиенту */ }
+      };
 
       /* Идемпотентность: ключ даёт клиент. Сервер не отличает ретрай от
        * нового намерения, если о ретрае не сказали, — поэтому без ключа
@@ -9213,6 +9432,7 @@ async function runInference(req, res) {
          * он просил именно внешнюю модель. Возвращаем без списаний. */
         if (e.code === 'PROVIDER_AUTH_FAILED' || e.code === 'AUTH_MISSING_KEY') {
           dropReserve('provider_auth_failed');
+          releaseAgentHold(false);
           return res.status(401).json({
             error: e.code,
             note: 'Проверьте ваш API-ключ провайдера',
@@ -9229,6 +9449,7 @@ async function runInference(req, res) {
         }
         if (e.code === 'PROVIDER_RATE_LIMIT') {
           dropReserve('provider_rate_limit');
+          releaseAgentHold(false);
           return res.status(429).json({
             error: 'PROVIDER_RATE_LIMIT',
             note: 'Лимит провайдера исчерпан. Повторите позже или используйте локальную модель.',
@@ -9241,6 +9462,7 @@ async function runInference(req, res) {
         if (e.code !== 'PROVIDER_TIMEOUT' && e.code !== 'PROVIDER_NETWORK' &&
             e.code !== 'PROVIDER_HTTP_ERROR' && e.code !== 'PROVIDER_EMPTY') {
           dropReserve('provider_error');
+          releaseAgentHold(false);
           return res.status(Number(e.status) || 502).json({
             error: e.code || 'PROVIDER_ERROR', note: e.message, provider, modelId, tier: 6,
           });
@@ -9252,6 +9474,11 @@ async function runInference(req, res) {
          * фолбэк: source будет worker, и клиент увидит, что модель была не
          * та, что он просил. */
         dropReserve('provider_unavailable');
+        /* Агентский резерв снимаем ПЕРЕД уходом на локальный путь: ниже
+         * сработает общий агентский шлюз, и он проверит лимиты заново.
+         * Оставленный резерв был бы посчитан в heldTokens дважды — агент
+         * получил бы daily_limit_exceeded на задачу, которая ещё не шла. */
+        releaseAgentHold(false);
         const localPick = pickWorker('base');
         if (!localPick) {
           return res.status(503).json({
@@ -9304,6 +9531,7 @@ async function runInference(req, res) {
           });
         } catch (e) {
           dropReserve('settle_failed');
+          releaseAgentHold(false);
           return res.status(409).json({
             error: 'RESERVE_NOT_SETTLEABLE',
             note: 'Резерв не удалось погасить — комиссия не списана, повтор безопасен.',
@@ -9376,6 +9604,8 @@ async function runInference(req, res) {
            * сжигания удваивало расход в любом расчёте вида SUM(to)−SUM(from). */
           if (burnTar > 0) recordBurn(burnTar, callId);
         });
+
+        releaseAgentHold(true);
 
         return res.status(200).json({
           source: 'external_api',

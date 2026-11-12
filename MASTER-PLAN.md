@@ -2,7 +2,7 @@
 
 **Версия:** 2.29.1
 **Дата:** 12.11.2026
-**Срез:** 808 чеков, **1296 проверок** (dpouw `1266 ✅ / 0 ❌` + `test-conversation.js` `30 ✅ / 0 ❌`);
+**Срез:** 808 чеков, **1302 проверки** (dpouw `1272 ✅ / 0 ❌` + `test-conversation.js` `30 ✅ / 0 ❌`);
 **A3 ЗАКРЫТ 11.11 20:0x** — `found: 1`, `active_p2p_workers: 1`,
 `llm_mode: worker`, воркер владельца найден через DHT (`qwen2.5-coder`), но с оговоркой:
 публичный адрес `45.144.49.113` — это VPN, а не домашний роутер, поэтому сценарий
@@ -263,7 +263,7 @@ WebRTC-прототип `werift`↔`werift` (`2.28.4`): DataChannel открыт
 | Burn | `0.191438 TAR` на адресе, `totalBurnedTar 0.188638` | `/summary`: `burnAddressBalanceTar` |
 | `active_workers` | **0** | `/health`: `active_workers: 0`, `active_p2p_workers: 0` |
 | `llm_mode` | `deterministic_fallback` | сети нет |
-| Тесты | **1266 ✅ / 0 ❌** (dpouw, RC=0) + **30 ✅ / 0 ❌** (`test-conversation.js`) = **1296** | прогон 12.11.2026, `node test-dpouw.js --test` |
+| Тесты | **1272 ✅ / 0 ❌** (dpouw, RC=0) + **30 ✅ / 0 ❌** (`test-conversation.js`) = **1302** | прогон 12.11.2026, `node test-dpouw.js --test` |
 | `delta` | **0** | `conservation`: `gross = distributed = 176.872557` |
 
 **Доли пересчитаны, а не перенесены.** С `804` -> `808` чеков эмиссия сдвинулась с
@@ -407,8 +407,8 @@ Claude считают «готово» по отсутствию платяще�
 ## 7. Итоговая формулировка
 
 > **Что построено:** работающий детерминированный леджер с invariant `delta === 0`,
-> живой P2P-транспорт на libp2p, Discovery через DHT и GossipSub, **1296** проверок
-> (1266 dpouw + 30 conversation), 6 E2E-наборов, **808** чеков, память диалога
+> живой P2P-транспорт на libp2p, Discovery через DHT и GossipSub, **1302** проверки
+> (1272 dpouw + 30 conversation), 6 E2E-наборов, **808** чеков, память диалога
 > (`messages[]` + `tarnet_memory_v1`). Это не прототип «на салфетке» — механика
 > согласована сама с собой и проверяется одной командой.
 >

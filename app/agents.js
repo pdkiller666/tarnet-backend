@@ -557,7 +557,13 @@
     status('Выполняю…');
 
     try {
-      const body = { agentId: currentAgentId, prompt, maxTokens };
+      /* clientAddress ОБЯЗАТЕЛЕН (P0.3.1). Без него сервер не знает, чей
+       * бюджет тратит агент, и создаёт НОВЫЙ кошелёк под этот вызов
+       * (server.js, ветка «2) Клиент»). Новый адрес не равен userId агента,
+       * поэтому проверка владельца отвечает 403 agent_owner_mismatch —
+       * дефект, воспроизведённый живьём: тот же запрос без поля даёт 403,
+       * с полем — 200. Сервер вёл себя верно, ошибка была в клиенте. */
+      const body = { agentId: currentAgentId, prompt, maxTokens, clientAddress: account.address };
       if (toolCalls.length) body.toolCalls = toolCalls;
       if (pendingRun && pendingRun.approvalId && pendingRun.prompt === prompt) {
         body.approvalId = pendingRun.approvalId;

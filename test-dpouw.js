@@ -3473,6 +3473,78 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
   ok('22.7 в разметке есть вкладка «Агенты»',
     indexHtml.includes('data-tab="agents"') && indexHtml.includes('id="hitlModal"'));
 
+  /* ---------- 22.8: clientAddress в агентском запуске (P0.3.1) ----------
+   *
+   * Дефект, который видел владелец: агент создаётся из UI, а запуск падает
+   * `403 agent_owner_mismatch`. Причина была НЕ на сервере: `app/agents.js`
+   * отправлял /inference без `clientAddress`, сервер честно генерировал
+   * новый кошелёк под вызов, и тот не совпадал с владельцем агента.
+   *
+   * Проверяем статикой по раздаваемому файлу: живой браузер в приёмке не
+   * участвует, и без этой проверки регрессия вернулась бы молча. */
+  ok('22.8 agents.js передаёт clientAddress в /inference',
+    /clientAddress\s*:\s*account\.address/.test(agentsJs),
+    'без поля сервер создаёт новый кошелёк и отвечает 403 agent_owner_mismatch');
+
+  /* ---------- 22.9: Tier 6 не обходит агентские лимиты (P0.3.2) ----------
+   *
+   * Ветка Tier 6 в /inference отвечала своим `return` РАНЬШЕ общего
+   * агентского шлюза, поэтому `agentId` на tier 6 не ограничивал ничего.
+   * Замер до правки: тот же агент с лимитом 100 токенов получал 402 на
+   * tier base и 401 AUTH_MISSING_KEY на tier 6 — то есть до лимита дело
+   * не доходило вовсе.
+   *
+   * Ключ провайдера фиктивный и ОБЯЗАТЕЛЕН в запросе: без него ответ 401
+   * приходит раньше шлюза, и проверка мерила бы отсутствие ключа, а не
+   * лимит. До сети дело не доходит — шлюз стоит перед вызовом. */
+  const p03Agent = await api('/agents', 'POST', {
+    userId: hitlOwnerAddr,
+    pubkey: Buffer.from(
+      crypto.generateKeyPairSync('ed25519').publicKey.export({ format: 'jwk' }).x,
+      'base64url').toString('hex'),
+    role: 'general',
+    allowedTools: ['calculator'],
+    maxPerTaskTokens: 100,
+    dailyLimitTokens: 1000,
+    humanApprovalThresholdTokens: 50,
+  });
+  ok('22.9 агент с жёстким лимитом создан',
+    p03Agent.status === 201, p03Agent.status);
+
+  const p03Local = await api('/inference', 'POST', {
+    prompt: 'дорогая локальная задача',
+    agentId: p03Agent.body?.agentId,
+    clientAddress: hitlOwnerAddr,
+    maxTokens: 6000,
+    tier: 'base',
+    workerAddress: wave4Worker,
+    actionId: runId('p03-local'),
+  });
+  ok('22.9 локальный путь: лимит агента применяется (402)',
+    p03Local.status === 402 && p03Local.body?.error === 'per_task_limit_exceeded',
+    { status: p03Local.status, error: p03Local.body?.error });
+
+  const p03Tier6 = await api('/inference', 'POST', {
+    prompt: 'дорогая внешняя задача',
+    agentId: p03Agent.body?.agentId,
+    clientAddress: hitlOwnerAddr,
+    maxTokens: 6000,
+    tier: 6,
+    modelId: 'openrouter/qwen3-coder',
+    actionId: runId('p03-tier6'),
+  }, { 'X-Provider-Key': 'sk-dummy-for-limit-test' });
+  ok('22.9 Tier 6: тот же лимит применяется (402, а не 401)',
+    p03Tier6.status === 402 && p03Tier6.body?.error === 'per_task_limit_exceeded',
+    { status: p03Tier6.status, error: p03Tier6.body?.error });
+
+  /* Ни один из двух отказов не должен был занять дневной лимит: отказ — это
+   * не выполненная работа, и брошенный резерв «съел» бы бюджет агента. */
+  const p03List = await api(`/agents?userId=${hitlOwnerAddr}`);
+  const p03Row = (p03List.body?.agents || []).find((a) => a.agentId === p03Agent.body?.agentId);
+  ok('22.9 отказы не израсходовали дневной лимит агента',
+    Number(p03Row?.spendToday?.spentTokens || 0) === 0,
+    p03Row?.spendToday);
+
   /* Вся серия не должна была сдвинуть деньги. */
   const cfFinal = (await api('/health')).body;
   ok('Волна 5 не сломала conservation (delta 0)',
@@ -4648,11 +4720,28 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
         foreign.status === 403 && foreign.body?.error === 'RECEIPT_FOREIGN',
         { status: foreign.status, error: foreign.body?.error });
 
-      /* --- Кейс 6: заявленные клиентом токены не влияют на кэшбэк -- */
-      const fakeTokens = await callT6(t6client, { tokens: 999999, maxTokens: 999999 });
+      /* --- Кейс 6: заявленные клиентом токены не влияют на кэшбэк ---
+       *
+       * Раздувается ИМЕННО `tokens` (сколько работы заявляет клиент), а
+       * `maxTokens` остаётся в пределах потолка сервера. Раньше здесь стояло
+       * `maxTokens: 999999`, и кейс проходил только потому, что ветка Tier 6
+       * потолок не проверяла вовсе. После P0.3.2 такой запрос законно
+       * получает 400 `max_tokens_exceeds_limit`, то есть тест мерил дыру, а
+       * не заявленный объём. Потолок проверяется отдельно — кейсом 6a. */
+      const fakeTokens = await callT6(t6client, { tokens: 999999 });
       ok('29.13 tokens:999999 не раздувает кэшбэк',
         Math.abs(Number(fakeTokens.body?.cashback_tar) - 0.0001) < 1e-12,
         fakeTokens.body?.cashback_tar);
+
+      /* --- Кейс 6a: потолок maxTokens действует и на Tier 6 ----------
+       * Тот же предел, что у базового пути: иначе резерв считается по
+       * произвольно большому числу и дневной бюджет агента блокируется
+       * одним запросом. */
+      const overCap = await callT6(t6client, { maxTokens: 999999 });
+      ok('29.13 Tier 6 отвергает maxTokens выше потолка (400)',
+        overCap.status === 400 && overCap.body?.error === 'max_tokens_exceeds_limit',
+        { status: overCap.status, error: overCap.body?.error,
+          maxAllowed: overCap.body?.maxAllowedTokens });
 
       /* --- Кейсы 7–9: отказ провайдера возвращает резерв -----------
        * Три разные причины, одно требование: деньги не должны остаться
