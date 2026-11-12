@@ -1437,6 +1437,11 @@ CREATE TABLE IF NOT EXISTS approvals (
     ['web_search', 'Веб-поиск', 'Поиск в интернете, возвращает сниппеты с источниками', 0.0005, null],
     ['python_executor', 'Python', 'Запуск кода на изолированном клиенте воркера', 0.00025, null],
     ['calculator', 'Калькулятор', 'Арифметика без выхода в сеть', 0.0, null],
+    /* P1.1a: второй безопасный инструмент. Цена ноль — это чтение своей же
+     * базы, а не работа воркера; брать за него деньги значило бы удорожать
+     * ответ на вопрос «сколько чеков», который сервер знает бесплатно. */
+    ['ledger_query', 'Запрос к леджеру',
+      'Read-only чтение /summary, /health, /epoch, /receipt/:id без выхода в сеть', 0.0, null],
   ];
   const stmt = db.prepare(`INSERT OR IGNORE INTO tool_registry
     (toolId, name, description, costPerCallTar, schema, isAvailable, createdAt)
@@ -10538,21 +10543,92 @@ async function runInference(req, res) {
    * реальные — их число и токены видны в ответе (agent.steps).
    */
   let agentTrace = null;
+  /* Реально исполненные в цикле вызовы. Отдельно от body.toolCalls: те —
+   * ДЕКЛАРАЦИЯ клиента, эти — ФАКТ исполнения. Списывать надо и то, и
+   * другое, но смешать их в одну переменную значило бы потерять разницу
+   * между «клиент заявил» и «сервер выполнил». */
+  let executedToolCalls = [];
   if (agentCtx) {
+    /* Источник данных для ledger_query. Функции, а не готовый снимок: снимок
+     * устарел бы между шагами, а чтение внутри шага видит то же состояние,
+     * что и ручки /summary, /health, /epoch. Ни одна ветка не пишет. */
+    const toolLedgerSource = {
+      summary: () => {
+        const t = ledger.totals();
+        return {
+          receipts: Number(t.receipts) || 0,
+          cwu: Number(t.cwu) || 0,
+          rewardTar: Number(t.rewardTar ?? t.reward) || 0,
+          feeGrossTar: Number(t.feeGross) || 0,
+          burnTar: Number(t.burn) || 0,
+          treasuryTar: Number(t.treasury) || 0,
+          royaltyTar: Number(t.royalty) || 0,
+        };
+      },
+      health: () => ({
+        status: 'ok',
+        buildVersion: BUILD_VERSION,
+        schemaVersion: SCHEMA_VERSION,
+        timestamp: Date.now(),
+      }),
+      epoch: (index) => {
+        const epoch = Number.isFinite(Number(index)) ? Number(index) : epochIndex();
+        const emissionTar = epochEmission(epoch);
+        const st = epochState(dbx, epoch, emissionTar);
+        return {
+          index: epoch,
+          emissionTar: Number(emissionTar.toFixed(6)),
+          releasedTar: releasedFor(epoch, emissionTar),
+          distributedTar: Number(st.distributedTar.toFixed(6)),
+        };
+      },
+      receipt: (id) => {
+        const r = ledger.getCumulativeReceipt(String(id));
+        return r ? { ...r, verified: ledger.verify(r).signatureValid } : { error: 'receipt_not_found', id };
+      },
+    };
+
     agentTrace = await agentRuntime.runAgent({
       agentId: agentCtx.agentId,
       prompt,
       maxTokens: agentCtx.maxTokens,
       infer: async (stepPrompt) => {
         const stepResult = await runTransport(stepPrompt);
+        const text = String(stepResult?.response ?? '');
+        /* Два источника вызовов, и оба настоящие: структурные toolCalls от
+         * воркера (если он их отдаст) и явный маркер в тексте. Свободный
+         * текст не разбираем — см. parseToolRequests. */
+        const requested = agentRuntime.parseToolRequests(text);
+        const structural = Array.isArray(stepResult?.toolCalls) ? stepResult.toolCalls : [];
         return {
-          response: stepResult?.response ?? '',
+          response: text,
           tokens: Math.max(1, Math.floor(Number(stepResult?.tokensGenerated) || 1)),
-          /* Инструменты объявляет воркер. Пока он их не порождает, массив
-           * пуст — и это правда, а не заглушка: выдуманный вызов списал бы
-           * деньги за работу, которой не было. */
-          toolCalls: Array.isArray(stepResult?.toolCalls) ? stepResult.toolCalls : [],
+          toolCalls: [...structural, ...requested],
         };
+      },
+      /* Политика проверяется здесь, ДО исполнения: то же правило, что и у
+       * декларации, иначе модель обошла бы allowlist, просто попросив
+       * инструмент в тексте. Отказ возвращается наблюдением, а не бросается
+       * наружу: цикл должен увидеть причину и продолжить без инструмента. */
+      onToolCall: async (call) => {
+        const catalog = all(`SELECT toolId, costPerCallTar, isAvailable FROM tool_registry`);
+        const agent = get('SELECT allowedTools FROM agent_registry WHERE agentId = ?', [agentCtx.agentId]);
+        const verdict = agentRuntime.checkToolCall({
+          toolId: call?.toolId,
+          allowedTools: parseJsonList(agent?.allowedTools),
+          tools: catalog,
+          callsSoFar: executedToolCalls.length,
+        });
+        if (!verdict.ok) {
+          return { ok: false, refused: true, ...verdict, note: 'вызов отклонён политикой, не исполнялся' };
+        }
+        const run = agentRuntime.runToolCall({
+          toolId: verdict.toolId,
+          args: call?.args,
+          ledgerSource: toolLedgerSource,
+        });
+        executedToolCalls.push(verdict);
+        return run;
       },
     });
 
@@ -10560,7 +10636,10 @@ async function runInference(req, res) {
      * промежуточные реплики нужны только как лог. */
     const lastStep = agentTrace.steps[agentTrace.steps.length - 1];
     if (lastStep) {
-      result = { ...result, response: lastStep.response };
+      /* Служебные маркеры `[[tool:...]]` вырезаются: пользователю незачем
+       * видеть протокол вызова. Вырезаются только Распознанные маркеры —
+       * кривой маркер останется видимым, чтобы ошибка не исчезла молча. */
+      result = { ...result, response: agentRuntime.stripToolRequests(lastStep.response) };
     } else {
       /* Цикл не сделал ни шага (нулевой бюджет или лимит итераций 0).
        * Без этой ветки `result` остался бы undefined, и следующий доступ
@@ -10705,6 +10784,28 @@ async function runInference(req, res) {
       }
     }
 
+    /* Фактически исполненные в цикле вызовы. Отдельный список, потому что это
+     * ДРУГОЙ факт, чем декларация клиента: `executedToolCalls` заполняется
+     * только тем, что сервер реально выполнил.
+     *
+     * ДВОЙНОГО СПИСАНИЯ НЕТ ПО ПОСТРОЕНИЮ. Считаем по инструменту максимум из
+     * двух чисел, а не сумму: клиент мог заявить `calculator` в теле и модель
+     * могла вызвать его же в цикле — это один и тот же вызов, и брать за него
+     * дважды значило бы штрафовать за честную декларацию. Если исполнено
+     * больше, чем заявлено, разница оплачивается: она не была в резерве. */
+    if (executedToolCalls.length) {
+      const declaredCount = new Map();
+      for (const c of toolCharges) declaredCount.set(c.toolId, (declaredCount.get(c.toolId) || 0) + 1);
+      const executedCount = new Map();
+      for (const c of executedToolCalls) executedCount.set(c.toolId, (executedCount.get(c.toolId) || 0) + 1);
+      for (const [toolId, execCount] of executedCount) {
+        const extra = Math.max(0, execCount - (declaredCount.get(toolId) || 0));
+        if (!extra) continue;
+        const verdict = executedToolCalls.find(v => v.toolId === toolId);
+        for (let k = 0; k < extra; k++) toolCharges.push(verdict);
+      }
+    }
+
     const actualTar = outcome.settled ? Number(outcome.settled.fee.gross) || 0 : 0;
     /* worked: провал качества (γ=0) значит «работы не было» — токены за него
      * лимит не отнимают. Всё остальное (чек выпущен ИЛИ работа накоплена в
@@ -10736,6 +10837,13 @@ async function runInference(req, res) {
         iteration: s.iteration,
         tokens: s.tokens,
         toolCalls: s.toolCalls.map((c) => c?.toolId ?? null),
+        /* Наблюдения — то, что вернули инструменты. Без них шаг читается как
+         * «вызвал и не получил», хотя результат был и повлиял на ответ. */
+        observations: (s.observations ?? []).map((o) => ({
+          toolId: o?.toolId ?? null,
+          ok: o?.result?.ok !== false,
+          reason: o?.result?.reason ?? null,
+        })),
         response: s.iteration === agentTrace.steps.length ? s.response : undefined,
       })),
       iterations: agentTrace?.iterations ?? 0,

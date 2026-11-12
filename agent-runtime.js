@@ -166,6 +166,286 @@ function toolCallsCost(calls) {
   return round(list.reduce((acc, c) => acc + (Number(c?.costTar) || 0), 0));
 }
 
+/* ===== P1.1a: исполнение инструментов =====
+ *
+ * ПОЧЕМУ БЕЗ eval И БЕЗ new Function. Выражение приходит из модели или из
+ * браузера, то есть из недоверенного источника. `eval` исполнил бы в процессе
+ * сервера всё, что там написано, — включая `require('fs')`. Поэтому здесь
+ * собственный токенизатор и рекурсивный спуск: грамматика маленькая и
+ * закрытая, всё, что в неё не входит, — отказ, а не «попробуем выполнить».
+ *
+ * ЧТО ПОДДЕРЖИВАЕТСЯ: + - * / ^, скобки, унарный минус, sqrt(x). Ровно то,
+ * что заявлено в директиве P1.1a. Ни переменных, ни вызовов, ни доступа к
+ * окружению: неизвестный идентификатор — ошибка, а не молчаливый undefined,
+ * иначе `process.exit(1)` превратился бы в 0.
+ *
+ * ГРАНИЦЫ. Длина выражения и глубина вложенности ограничены: `((((...` на
+ * мегабайт уронил бы сервер переполнением стека, а не отказом. */
+const CALC_MAX_EXPR = 512;
+const CALC_MAX_DEPTH = 32;
+
+function calcError(code, message, extra) {
+  return { ok: false, reason: code, message, ...(extra || {}) };
+}
+
+function calcTokenize(src) {
+  const tokens = [];
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') { i++; continue; }
+    if (ch >= '0' && ch <= '9' || ch === '.') {
+      const start = i;
+      let seenDot = false;
+      while (i < src.length && (src[i] >= '0' && src[i] <= '9' || src[i] === '.')) {
+        if (src[i] === '.') {
+          if (seenDot) return calcError('calc_bad_number', 'две точки в одном числе', { at: i });
+          seenDot = true;
+        }
+        i++;
+      }
+      const text = src.slice(start, i);
+      const value = Number(text);
+      if (!Number.isFinite(value)) return calcError('calc_bad_number', `не число: ${text}`, { at: start });
+      tokens.push({ t: 'num', v: value });
+      continue;
+    }
+    if (/[a-zA-Z_]/.test(ch)) {
+      const start = i;
+      while (i < src.length && /[a-zA-Z_0-9]/.test(src[i])) i++;
+      const name = src.slice(start, i);
+      if (name !== 'sqrt') {
+        return calcError('calc_unknown_name', `неизвестное имя: ${name}`, { at: start, allowed: ['sqrt'] });
+      }
+      tokens.push({ t: 'name', v: name });
+      continue;
+    }
+    if ('+-*/^()'.includes(ch)) { tokens.push({ t: ch }); i++; continue; }
+    return calcError('calc_bad_char', `недопустимый символ: ${ch}`, { at: i });
+  }
+  return { ok: true, tokens };
+}
+
+function calcParser(tokens) {
+  let pos = 0;
+  let depth = 0;
+
+  const peek = () => tokens[pos];
+  const take = (t) => {
+    const tok = tokens[pos];
+    if (!tok || tok.t !== t) return null;
+    pos++;
+    return tok;
+  };
+
+  function parseExpr() {
+    let left = parseTerm();
+    for (;;) {
+      const op = peek();
+      if (!op || (op.t !== '+' && op.t !== '-')) break;
+      pos++;
+      const right = parseTerm();
+      left = op.t === '+' ? left + right : left - right;
+    }
+    return left;
+  }
+
+  function parseTerm() {
+    let left = parsePower();
+    for (;;) {
+      const op = peek();
+      if (!op || (op.t !== '*' && op.t !== '/')) break;
+      pos++;
+      const right = parsePower();
+      if (op.t === '/' && right === 0) throw { code: 'calc_division_by_zero' };
+      left = op.t === '*' ? left * right : left / right;
+    }
+    return left;
+  }
+
+  /* Возведение в степень правоассоциативно: 2^3^2 = 2^(3^2) = 512, а не 64.
+   * Это не придирка: левая ассоциативность молча даёт другое число, и
+   * заметить это можно только сверкой. */
+  function parsePower() {
+    const base = parseUnary();
+    if (take('^')) {
+      const exp = parsePower();
+      return Math.pow(base, exp);
+    }
+    return base;
+  }
+
+  function parseUnary() {
+    if (take('-')) return -parseUnary();
+    if (take('+')) return parseUnary();
+    return parsePrimary();
+  }
+
+  function parsePrimary() {
+    const num = take('num');
+    if (num) return num.v;
+
+    const name = take('name');
+    if (name) {
+      depth++;
+      if (depth > CALC_MAX_DEPTH) throw { code: 'calc_too_deep' };
+      let arg;
+      if (take('(')) {
+        arg = parseExpr();
+        if (!take(')')) throw { code: 'calc_unclosed_paren' };
+      } else {
+        arg = parseUnary();
+      }
+      depth--;
+      if (arg < 0) throw { code: 'calc_sqrt_negative' };
+      return Math.sqrt(arg);
+    }
+
+    if (take('(')) {
+      depth++;
+      if (depth > CALC_MAX_DEPTH) throw { code: 'calc_too_deep' };
+      const v = parseExpr();
+      if (!take(')')) throw { code: 'calc_unclosed_paren' };
+      depth--;
+      return v;
+    }
+
+    const bad = peek();
+    throw { code: 'calc_unexpected', detail: bad ? bad.t : 'конец выражения' };
+  }
+
+  const value = parseExpr();
+  if (pos !== tokens.length) {
+    throw { code: 'calc_trailing_input', at: tokens[pos]?.t };
+  }
+  return value;
+}
+
+/* Убирает хвост двоичной плавающей арифметики (101475.20000000001), но не
+ * округляет по существу: 12 значащих цифр — это больше, чем осмысленно в
+ * деньгах и токенах, и меньше, чем шум double. */
+function calcNormalize(value) {
+  if (!Number.isFinite(value)) return value;
+  if (value === 0) return 0;
+  return Number(value.toPrecision(12));
+}
+
+function evaluateExpression(expression) {
+  const src = String(expression ?? '').trim();
+  if (!src) return calcError('calc_empty_expression', 'пустое выражение');
+  if (src.length > CALC_MAX_EXPR) {
+    return calcError('calc_expression_too_long', `выражение длиннее ${CALC_MAX_EXPR} символов`, { length: src.length });
+  }
+  const lexed = calcTokenize(src);
+  if (!lexed.ok) return lexed;
+  try {
+    const raw = calcParser(lexed.tokens);
+    if (!Number.isFinite(raw)) return calcError('calc_not_finite', 'результат не является конечным числом');
+    return { ok: true, expression: src, value: calcNormalize(raw) };
+  } catch (e) {
+    if (e && e.code) return calcError(e.code, e.code, e);
+    return calcError('calc_failed', e?.message || 'ошибка разбора');
+  }
+}
+
+/* `ledger_query` — второй безопасный инструмент. Read-only по построению:
+ * источника данных у него нет, кроме переданного `source`, и ни одна ветка
+ * не пишет. Даже если модель попросит «удали чек», запрос не найдёт ветки и
+ * вернёт отказ — писать здесь просто нечем.
+ *
+ * source — объект с функциями summary(), health(), epoch(), receipt(id).
+ * Так модуль остаётся без БД: сервер передаёт то же чтение, что отдаёт его
+ * собственные ручки, и второй реализации данных не появляется. */
+function ledgerQuery(args, source) {
+  const query = String(args?.query ?? '').trim().toLowerCase();
+  const allowed = ['summary', 'health', 'epoch', 'receipt'];
+  if (!query) return { ok: false, reason: 'ledger_query_required', allowed };
+  if (!allowed.includes(query)) {
+    return { ok: false, reason: 'ledger_query_unknown', got: query, allowed };
+  }
+  if (!source || typeof source !== 'object') {
+    return { ok: false, reason: 'ledger_source_unavailable', note: 'источник данных не передан' };
+  }
+  try {
+    if (query === 'summary') {
+      if (typeof source.summary !== 'function') return { ok: false, reason: 'ledger_source_incomplete', need: 'summary' };
+      return { ok: true, query, data: source.summary() };
+    }
+    if (query === 'health') {
+      if (typeof source.health !== 'function') return { ok: false, reason: 'ledger_source_incomplete', need: 'health' };
+      return { ok: true, query, data: source.health() };
+    }
+    if (query === 'epoch') {
+      if (typeof source.epoch !== 'function') return { ok: false, reason: 'ledger_source_incomplete', need: 'epoch' };
+      return { ok: true, query, data: source.epoch(args?.index) };
+    }
+    const id = String(args?.id ?? args?.worker ?? '').trim();
+    if (!id) return { ok: false, reason: 'ledger_query_id_required', query };
+    if (typeof source.receipt !== 'function') return { ok: false, reason: 'ledger_source_incomplete', need: 'receipt' };
+    return { ok: true, query, id, data: source.receipt(id) };
+  } catch (e) {
+    return { ok: false, reason: 'ledger_query_failed', message: e?.message || 'ошибка чтения' };
+  }
+}
+
+/* Один вход для исполнения любого разрешённого инструмента. Возвращает
+ * результат работы, а не вердикт политики: политику проверяет checkToolCall
+ * до вызова, и смешивать две проверки в одной функции значило бы позволить
+ * исполнить то, что политика отклонила. */
+function runToolCall({ toolId, args, ledgerSource } = {}) {
+  const id = String(toolId ?? '');
+  if (id === 'calculator') {
+    const expr = args?.expression ?? args?.expr ?? args?.input;
+    return { toolId: id, ...evaluateExpression(expr) };
+  }
+  if (id === 'ledger_query') {
+    return { toolId: id, ...ledgerQuery(args, ledgerSource) };
+  }
+  return { toolId: id, ok: false, reason: 'tool_not_implemented', note: 'инструмент заявлен, но исполнения нет' };
+}
+
+/* Запрос инструмента из ответа модели.
+ *
+ * ПОЧЕМУ МАРКЕР, А НЕ ФУНКЦИОНАЛЬНЫЙ ВЫЗОВ. Живой путь — Ollama `/api/chat`,
+ * а он в текущей конфигурации не отдаёт `tool_calls`: воркер получает текст.
+ * Разбирать свободный текст («посчитай 2+2») значило бы угадывать намерение
+ * и исполнять то, чего модель не просила. Поэтому протокол явный и узкий:
+ * `[[tool:calculator {"expression":"2+2"}]]`. Нет маркера — нет вызова.
+ *
+ * Нераспознанный маркер не глотается: он возвращается как отказ, и цикл
+ * видит причину. Иначе «модель попросила, сервер промолчал» выглядело бы
+ * как «модель не просила».
+ */
+const TOOL_MARKER_RE = /\[\[tool:([A-Za-z_][A-Za-z0-9_]*)\s*(\{[\s\S]*?\})?\s*\]\]/g;
+
+function parseToolRequests(text) {
+  const src = String(text ?? '');
+  const calls = [];
+  TOOL_MARKER_RE.lastIndex = 0;
+  let m;
+  while ((m = TOOL_MARKER_RE.exec(src)) !== null) {
+    const toolId = m[1];
+    let args = {};
+    if (m[2]) {
+      try {
+        args = JSON.parse(m[2]);
+      } catch (_e) {
+        calls.push({ toolId, args: null, parseError: 'tool_args_bad_json', raw: m[2] });
+        continue;
+      }
+    }
+    calls.push({ toolId, args });
+  }
+  return calls;
+}
+
+/* Текст ответа без маркеров: пользователю незачем видеть служебную разметку.
+ * Вырезаем только распознанные маркеры — если модель написала `[[tool:` с
+ * ошибкой, пусть это останется видимым, а не исчезнет молча. */
+function stripToolRequests(text) {
+  return String(text ?? '').replace(TOOL_MARKER_RE, '').replace(/[ \t]+\n/g, '\n').trim();
+}
+
 /* Цикл Think→Act→Observe.
  *
  * ПОЧЕМУ ЦИКЛ, А НЕ ОДИН ВЫЗОВ: агент по определению делает несколько шагов —
@@ -180,10 +460,13 @@ function toolCallsCost(calls) {
  *     останавливается с честной причиной, а не молча.
  *
  * infer(prompt, maxTokens) → { response, tokens, toolCalls? }
- *   toolCalls — заявленные воркером вызовы [{ toolId }]. Воркер их пока не
- *   порождает (исполнения инструментов на клиенте нет), поэтому на стенде
- *   цикл почти всегда завершается за одну итерацию. Это ограничение
- *   записано здесь, а не спрятано: иначе выглядело бы, что цепочки работают.
+ *   toolCalls — заявленные воркером вызовы [{ toolId, args }]. Политику
+ *   проверяет вызывающий ДО исполнения; здесь только порядок вызовов.
+ *
+ * onToolCall(call, ctx) → результат инструмента или null. Возвращённое
+ * кладётся в шаг как `observations` и уходит в следующий промпт блоком
+ * наблюдений: без этого модель вызывает инструмент и не видит ответа —
+ * цикл выглядит работающим, а решения по результату не принимает.
  */
 async function runAgent({
   agentId,
@@ -226,6 +509,10 @@ async function runAgent({
       response: step?.response ?? '',
       tokens,
       toolCalls: Array.isArray(step?.toolCalls) ? step.toolCalls : [],
+      /* Наблюдения заполняются НИЖЕ, после исполнения. Массив создаётся
+       * здесь, а не по месту вызова, чтобы у каждого шага форма была
+       * одинаковой: шаг без вызовов несёт `[]`, а не отсутствующее поле. */
+      observations: [],
     });
 
     const calls = Array.isArray(step?.toolCalls) ? step.toolCalls : [];
@@ -233,9 +520,29 @@ async function runAgent({
       stopReason = 'completed';
       break;
     }
+    /* Результат инструмента обязан дойти до следующего промпта: без этого
+     * модель вызывает calculator и не видит числа, то есть цикл формально
+     * работает, а решения по наблюдению не принимает. */
+    const current = steps[steps.length - 1];
     if (typeof onToolCall === 'function') {
       for (const call of calls) {
-        await onToolCall(call, { iteration: i + 1, remainingTokens: budget - spentTokens });
+        const observation = await onToolCall(call, { iteration: i + 1, remainingTokens: budget - spentTokens });
+        current.observations.push({
+          toolId: call?.toolId ?? null,
+          args: call?.args ?? null,
+          result: observation ?? null,
+        });
+      }
+    } else {
+      /* Исполнителя нет — это не «пустой результат», а отсутствие канала.
+       * Пишем причину, чтобы шаг нельзя было прочитать как «инструмент
+       * вызван и ничего не вернул». */
+      for (const call of calls) {
+        current.observations.push({
+          toolId: call?.toolId ?? null,
+          args: call?.args ?? null,
+          result: { ok: false, reason: 'tool_executor_missing' },
+        });
       }
     }
   }
@@ -260,12 +567,26 @@ function buildFollowUp(prompt, steps) {
   const observed = last?.toolCalls?.length
     ? `Вызвано инструментов: ${last.toolCalls.map(c => c.toolId).join(', ')}.`
     : '';
+  /* Наблюдения идут отдельным блоком, а не в строке «вызвано». Модель должна
+   * видеть РЕЗУЛЬТАТ вызова: без него второй шаг — это повторная догадка при
+   * том же знании, и цикл не может сойтись к ответу. */
+  const observations = Array.isArray(last?.observations) && last.observations.length
+    ? [
+      'Результаты инструментов:',
+      ...last.observations.map((o) => {
+        const r = o?.result;
+        const body = r && typeof r === 'object' ? JSON.stringify(r) : String(r);
+        return `  • ${o?.toolId}(${JSON.stringify(o?.args ?? null)}) → ${body}`;
+      }),
+    ].join('\n')
+    : '';
   return [
     prompt,
     '',
     `[шаг ${steps.length}] Твой предыдущий ответ:`,
     String(last?.response ?? ''),
     observed,
+    observations,
     '',
     'Продолжи, если задача не решена. Если решена — ответь без вызова инструментов.',
   ].join('\n');
@@ -280,6 +601,11 @@ module.exports = {
   toolCostTokens,
   checkToolCall,
   toolCallsCost,
+  evaluateExpression,
+  ledgerQuery,
+  runToolCall,
+  parseToolRequests,
+  stripToolRequests,
   runAgent,
   buildFollowUp,
 };

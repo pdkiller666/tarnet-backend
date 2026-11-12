@@ -2818,7 +2818,9 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
   ok('GET /tools отвечает 200', toolsRes.status === 200, toolsRes.status);
   const tools = toolsRes.body?.tools;
   ok('/tools отдаёт массив', Array.isArray(tools), typeof tools);
-  ok('/tools отдаёт ровно 3 инструмента', tools?.length === 3, tools?.length);
+  /* 4 после P1.1a: добавлен ledger_query. Число проверяется, чтобы каталог
+   * не разрастался молча — каждый новый инструмент должен быть осознанным. */
+  ok('/tools отдаёт ровно 4 инструмента', tools?.length === 4, tools?.length);
 
   const byId = new Map((tools ?? []).map(t => [t.toolId, t]));
   /* Цены после Волны 4: снижены в 20 раз, потому что писались из расчёта
@@ -2827,7 +2829,8 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
   ok('цены совпадают с директивой',
     byId.get('web_search')?.costPerCallTar === 0.0005
     && byId.get('python_executor')?.costPerCallTar === 0.00025
-    && byId.get('calculator')?.costPerCallTar === 0.0,
+    && byId.get('calculator')?.costPerCallTar === 0.0
+    && byId.get('ledger_query')?.costPerCallTar === 0.0,
     [...byId.values()].map(t => [t.toolId, t.costPerCallTar]));
 
   /* SQLite отдаёт 0/1. Если сервер не привёл тип, клиент получит число —
@@ -3049,6 +3052,88 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       { costTar: 0 }, { costTar: 0.00025 }, { costTar: 0.00025 },
     ]) === 0.0005,
     agentRuntime.toolCallsCost([{ costTar: 0 }, { costTar: 0.00025 }, { costTar: 0.00025 }]));
+
+  /* ---------- P1.1a: calculator ---------- */
+  /* Проверяем не «функция есть», а поведение: точность, приоритет операций,
+   * и главное — что недоверенное выражение НЕ исполняется как код. */
+  const calcOk = agentRuntime.evaluateExpression('(14592 * 83.45) / 12');
+  ok('calc: приоритет операций и скобки',
+    calcOk.ok === true && calcOk.value === 101475.2, calcOk);
+  ok('calc: степень правоассоциативна (2^3^2 = 512)',
+    agentRuntime.evaluateExpression('2^3^2').value === 512,
+    agentRuntime.evaluateExpression('2^3^2'));
+  ok('calc: унарный минус',
+    agentRuntime.evaluateExpression('-3 + 5').value === 2,
+    agentRuntime.evaluateExpression('-3 + 5'));
+  ok('calc: sqrt',
+    agentRuntime.evaluateExpression('sqrt(16)+1').value === 5,
+    agentRuntime.evaluateExpression('sqrt(16)+1'));
+  ok('calc: деление на ноль — отказ, а не Infinity',
+    agentRuntime.evaluateExpression('1/0').reason === 'calc_division_by_zero',
+    agentRuntime.evaluateExpression('1/0'));
+  /* Ключевая проверка безопасности: имя вне списка — отказ. Если бы здесь
+   * стоял eval, `process.exit(1)` завершил бы процесс сервера. */
+  ok('calc: произвольный идентификатор не исполняется',
+    agentRuntime.evaluateExpression('process.exit(1)').reason === 'calc_unknown_name',
+    agentRuntime.evaluateExpression('process.exit(1)'));
+  ok('calc: вызов неизвестной функции не исполняется',
+    agentRuntime.evaluateExpression('require("fs")').reason === 'calc_unknown_name',
+    agentRuntime.evaluateExpression('require("fs")'));
+  ok('calc: незакрытая скобка — отказ',
+    agentRuntime.evaluateExpression('(1+2').ok === false,
+    agentRuntime.evaluateExpression('(1+2'));
+  ok('calc: пустое выражение — отказ',
+    agentRuntime.evaluateExpression('   ').reason === 'calc_empty_expression',
+    agentRuntime.evaluateExpression('   '));
+  ok('calc: переполнение вложенности — отказ, а не падение стека',
+    agentRuntime.evaluateExpression('('.repeat(200) + '1' + ')'.repeat(200)).ok === false,
+    'глубина ограничена');
+
+  /* ---------- P1.1a: ledger_query ---------- */
+  /* Источник подставной: тест про контракт чтения, а не про БД. */
+  const fakeSource = {
+    summary: () => ({ receipts: 7 }),
+    health: () => ({ status: 'ok' }),
+    epoch: (i) => ({ index: i ?? 5 }),
+    receipt: (id) => ({ id, seq: 1 }),
+  };
+  ok('ledger_query: summary читает источник',
+    agentRuntime.ledgerQuery({ query: 'summary' }, fakeSource)?.data?.receipts === 7,
+    agentRuntime.ledgerQuery({ query: 'summary' }, fakeSource));
+  ok('ledger_query: epoch принимает index',
+    agentRuntime.ledgerQuery({ query: 'epoch', index: 9 }, fakeSource)?.data?.index === 9,
+    agentRuntime.ledgerQuery({ query: 'epoch', index: 9 }, fakeSource));
+  ok('ledger_query: receipt требует id',
+    agentRuntime.ledgerQuery({ query: 'receipt' }, fakeSource).reason === 'ledger_query_id_required',
+    agentRuntime.ledgerQuery({ query: 'receipt' }, fakeSource));
+  /* Write-запрос не находит ветки — писать в этом инструменте просто нечем. */
+  ok('ledger_query: мутация не проходит (белый список запросов)',
+    agentRuntime.ledgerQuery({ query: 'delete' }, fakeSource).reason === 'ledger_query_unknown',
+    agentRuntime.ledgerQuery({ query: 'delete' }, fakeSource));
+  ok('ledger_query: пустой запрос — отказ',
+    agentRuntime.ledgerQuery({}, fakeSource).reason === 'ledger_query_required');
+
+  /* ---------- P1.1a: исполнение по маркеру ---------- */
+  const parsed = agentRuntime.parseToolRequests(
+    'Считаю. [[tool:calculator {"expression":"2+2"}]] готово');
+  ok('маркер инструмента разбирается в вызов с аргументами',
+    parsed.length === 1 && parsed[0].toolId === 'calculator' && parsed[0].args?.expression === '2+2',
+    parsed);
+  ok('текст без маркера не порождает вызовов',
+    agentRuntime.parseToolRequests('просто ответ').length === 0);
+  ok('кривой JSON в маркере — видимая ошибка, а не тихий пропуск',
+    agentRuntime.parseToolRequests('[[tool:calculator {oops}]]')[0]?.parseError === 'tool_args_bad_json',
+    agentRuntime.parseToolRequests('[[tool:calculator {oops}]]'));
+  /* Пользователю не показывают служебную разметку. */
+  ok('служебный маркер вырезан из ответа клиенту',
+    agentRuntime.stripToolRequests('Считаю. [[tool:calculator {"expression":"2+2"}]] готово') === 'Считаю.  готово'
+    || agentRuntime.stripToolRequests('[[tool:calculator {"expression":"2+2"}]]').length === 0,
+    agentRuntime.stripToolRequests('Считаю. [[tool:calculator {"expression":"2+2"}]] готово'));
+  ok('runToolCall исполняет calculator',
+    agentRuntime.runToolCall({ toolId: 'calculator', args: { expression: '7*6' } })?.value === 42,
+    agentRuntime.runToolCall({ toolId: 'calculator', args: { expression: '7*6' } }));
+  ok('runToolCall на незаявленном инструменте — честный отказ',
+    agentRuntime.runToolCall({ toolId: 'python_executor' })?.reason === 'tool_not_implemented');
 
   /* ---------- Цикл Think→Act→Observe ---------- */
   /* Подставной infer вместо живой модели: тест про границы цикла, а не
