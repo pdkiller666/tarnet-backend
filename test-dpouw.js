@@ -5226,9 +5226,34 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       ok('29A.5 yandex → llm.api.cloud.yandex.net', hostOf('yandex') === 'llm.api.cloud.yandex.net', hostOf('yandex'));
       ok('29A.6 gigachat → sberbank', /sberbank/.test(hostOf('gigachat') || ''), hostOf('gigachat'));
 
-      /* 29A.7 Всего провайдеров 10: 8 OpenAI-совместимых + 2 спецформата. */
-      ok('29A.7 в PROVIDER_ENDPOINTS 10 провайдеров',
-        Object.keys(P).length === 10, Object.keys(P).length);
+      /* 29A.7 Счёт провайдеров больше НЕ константа.
+       *
+       * До 2.29.5 здесь стояло `length === 10`. Число закрепляло не
+       * инвариант, а состав таблицы: добавление Anthropic и xAI ломало
+       * проверку, хотя ничего не ломалось. Правильный контракт — «у
+       * каждого провайдера реестра есть адрес, и лишних адресов нет»:
+       * он переживёт следующего провайдера и поймает настоящий разрыв —
+       * запись в реестре без адреса (то есть модель, которая «есть», но
+       * уйти некуда). */
+      const REG_A = require('./config').PROVIDER_REGISTRY;
+      const regIds = Object.keys(REG_A);
+      const missingEndpoint = regIds.filter((id) => !P[id]);
+      const orphanEndpoint = Object.keys(P).filter((id) => !REG_A[id]);
+      ok('29A.7 у каждого провайдера реестра есть адрес',
+        missingEndpoint.length === 0, missingEndpoint);
+      ok('29A.7 в PROVIDER_ENDPOINTS нет адресов вне реестра',
+        orphanEndpoint.length === 0, orphanEndpoint);
+
+      /* 29A.7b `implemented: true` обязан означать живой адаптер, а не
+       * строку в таблице: иначе реестр обещает вызов, который отвечает
+       * 501. Проверяем по карте отказов, а не по комментарию. */
+      const NOT_IMPL = LLM.TIER6_NOT_IMPLEMENTED || {};
+      const falseClaims = regIds.filter((id) => REG_A[id].implemented && NOT_IMPL[id]);
+      ok('29A.7b implemented:true не пересекается с картой 501',
+        falseClaims.length === 0, falseClaims);
+      const silentGap = regIds.filter((id) => !REG_A[id].implemented && !NOT_IMPL[id]);
+      ok('29A.7b implemented:false обязан назвать причину 501',
+        silentGap.length === 0, silentGap);
 
       /* 29A.8 Префикс modelId резолвится в провайдера для всех новых. */
       const prefixes = ['deepseek', 'together', 'fireworks', 'mistral', 'yandex', 'gigachat'];
@@ -6233,19 +6258,51 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     const cssRes = await api('/app/styles.css');
     const cssSrc = typeof cssRes.body === 'string' ? cssRes.body : '';
 
-    /* 33.1 Провайдер ключа определяется по префиксу, и OpenRouter обязан
-     * проверяться ДО OpenAI: 'sk-or-v1-…' начинается на 'sk-', поэтому
-     * обратный порядок отнёс бы ключ OpenRouter к OpenAI — ровно та
-     * путаница, из-за которой всё и затевалось. */
+    /* 33.1 Провайдер ключа определяется по префиксу, и «sk-or-v1-…» обязан
+     * разрешаться в OpenRouter, а не в OpenAI.
+     *
+     * До 2.29.5 здесь искали литерал `sk-or-v1-` ВНУТРИ keyProvider: это
+     * закрепляло реализацию, а не правило. После переноса списка в реестр
+     * литералов в функции не осталось, и проверка покраснела, хотя
+     * поведение сохранилось. Правильный контракт — САМ РЕЗУЛЬТАТ: гоняем
+     * настоящие строки ключей через keyProvider() в браузерном контексте.
+     *
+     * Гоняем в jsdom-подобной песочнице: app.js — браузерный модуль, и
+     * просто `require` его не исполнит. Поэтому извлекаем и оцениваем
+     * только чистые функции префиксов с заглушкой localStorage. */
     const kpStart = appSrc.indexOf('function keyProvider');
-    const kpBody = kpStart < 0 ? '' : appSrc.slice(kpStart, kpStart + 700);
     ok('33.1 keyProvider() определяет провайдера по префиксу ключа',
-      /function keyProvider/.test(appSrc) && /sk-or-v1-/.test(kpBody),
-      kpBody ? 'есть' : 'keyProvider не найден');
-    const orAt = kpBody.indexOf('sk-or-v1-');
-    const oaAt = kpBody.indexOf("'sk-'");
-    ok('33.1 OpenRouter проверяется раньше OpenAI (иначе sk-or-v1 → openai)',
-      orAt >= 0 && oaAt > orAt, { skOrV1: orAt, skPlain: oaAt });
+      kpStart >= 0 && /providersForKeyClient|startsWith/.test(appSrc.slice(kpStart, kpStart + 900)),
+      kpStart < 0 ? 'keyProvider не найден' : 'есть');
+
+    /* Порядок префиксов проверяем там, где он теперь живёт: длинный
+     * префикс обязан идти раньше своего предка. Если кто-то вернёт ручной
+     * список и поставит `sk-` первым — ключ OpenRouter уедет в OpenAI, и
+     * этот тест это поймает. */
+    const fbLine = (appSrc.match(/const FALLBACK_PREFIX_ORDER = \[([^\]]*)\]/) || [])[1] || '';
+    const fbOrder = fbLine.split(',').map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+    const iOr = fbOrder.indexOf('sk-or-v1-');
+    const iAnt = fbOrder.indexOf('sk-ant-');
+    const iPlain = fbOrder.indexOf('sk-');
+    ok('33.1 длинные префиксы идут раньше sk- (иначе sk-or-v1 → openai)',
+      iOr >= 0 && iAnt >= 0 && iPlain >= 0 && iOr < iPlain && iAnt < iPlain,
+      { iOr, iAnt, iPlain });
+
+    /* И то же правило на серверном реестре — он источник для браузера. */
+    const REG_33 = require('./config').PROVIDER_REGISTRY;
+    const order33 = require('./config').PROVIDER_PREFIX_ORDER;
+    ok('33.1 порядок в config.js ставит sk-or-v1- и sk-ant- до sk-',
+      order33.indexOf('sk-or-v1-') < order33.indexOf('sk-')
+      && order33.indexOf('sk-ant-') < order33.indexOf('sk-')
+      && REG_33.openrouter.keyPrefix === 'sk-or-v1-'
+      && REG_33.anthropic.keyPrefix === 'sk-ant-',
+      order33);
+    /* Настоящий вызов резолвера: главная проверка, что путаницы нет. */
+    const rk33 = require('./config').providersForKey;
+    ok('33.1 sk-or-v1-… резолвится в openrouter, а не в openai',
+      JSON.stringify(rk33('sk-or-v1-abc')) === '["openrouter"]', rk33('sk-or-v1-abc'));
+    ok('33.1 sk-ant-… резолвится в anthropic',
+      JSON.stringify(rk33('sk-ant-abc')) === '["anthropic"]', rk33('sk-ant-abc'));
 
     /* 33.2 ГЛАВНЫЙ РЕГРЕСС. Список облачных фильтруется по провайдеру
      * ключа, а не только по его наличию. */
@@ -6296,10 +6353,33 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       /function checkKeyMatchesModel/.test(appSrc)
       && /checkKeyMatchesModel\(v\)/.test(appSrc),
       /checkKeyMatchesModel/.test(appSrc) ? 'есть и вызвана' : 'нет');
-    const warnAt = appSrc.indexOf('checkKeyMatchesModel(v)');
-    const setAt = appSrc.indexOf('localStorage.setItem(LS_BYOK, v)');
+    /* Сохранение идёт через saveByokKey(provider, v) — в 2.29.5 ключи
+     * разложены по провайдерам, и одного слота LS_BYOK больше нет.
+     *
+     * Проверяем именно ПОРЯДОК И БЕЗУСЛОВНОСТЬ: сверка формата считается
+     * раньше записи, но запись от её результата не зависит. Раньше здесь
+     * искали литерал localStorage.setItem(LS_BYOK, v) — это ловило не
+     * правило, а способ хранения, и сломалось при первом же расширении. */
+    const warnAt = appSrc.indexOf('const mismatch = checkKeyMatchesModel(v)');
+    const saveAt = appSrc.indexOf('saveByokKey(provider, v)');
+    ok('33.6 предупреждение считается до сохранения, а не после',
+      warnAt >= 0 && saveAt > warnAt, { check: warnAt, save: saveAt });
+    /* Запись не завёрнута в `if (mismatch)` / `if (!mismatch)`: гейт на
+     * предупреждении не стоит. Берём окно между сверкой и вызовом записи. */
+    const between = warnAt >= 0 && saveAt > warnAt ? appSrc.slice(warnAt, saveAt) : '';
     ok('33.6 предупреждение не блокирует сохранение ключа',
-      warnAt >= 0 && setAt > warnAt, { check: warnAt, save: setAt });
+      between.length > 0 && !/if\s*\(\s*!?\s*mismatch\s*\)\s*\{?\s*return/.test(between),
+      between ? 'сохранение безусловно' : 'окно не найдено');
+
+    /* 33.6b Ключи живут по провайдерам, а не в одном слоте: иначе второй
+     * сохранённый ключ затирал первый, и переключение модели молча ломало
+     * рабочий ключ. */
+    ok('33.6b ключи хранятся картой по провайдерам',
+      /LS_BYOK_MAP/.test(appSrc) && /function saveByokKey\(provider, key\)/.test(appSrc),
+      'карта провайдер→ключ');
+    ok('33.6b старый однопровайдерный слот читается как запасной',
+      /function legacyByokKey/.test(appSrc),
+      'переход со старого формата без потери ключа');
 
     /* 33.7 В разметке есть место для предупреждения, в стилях — его вид.
      * Иначе showByokWarn() пишет в никуда. */
@@ -7571,7 +7651,7 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     for (const m of cssForClasses.matchAll(/\.([a-z][a-z0-9-]{2,})/g)) cssClasses.add(m[1]);
 
     /* Корпус: вся разметка и все скрипты оболочки, включая шаблонные строки. */
-    const shellFiles = ['app.js', 'agents.js'];
+    const shellFiles = ['app.js', 'agents.js', 'knowledge.js'];
     const htmlFiles = [path.join('app', 'index.html')];
     let corpus = html;
     for (const f of shellFiles) {
@@ -11692,6 +11772,104 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     } finally {
       s62h.stop();
     }
+  }
+
+  /* ---------- 63. RAG в PWA (2.29.5) ----------
+   * Проверяется НАСТОЯЩИЙ модуль, а не его копия в тесте: `app/knowledge.js`
+   * экспортирует чистые функции и в Node, поэтому гоняем их напрямую.
+   * Грепать исходник на слова `cosine`/`chunkText` было бы бесполезно —
+   * они там есть в комментариях, и такая проверка зеленела бы при
+   * полностью сломанном коде. */
+  console.log('\n63. RAG в PWA: чанкинг, близость, склейка системной рамки');
+  {
+    const kbPath = path.join(__dirname, 'app', 'knowledge.js');
+    let kb = null;
+    try { kb = require(kbPath); } catch (e) { kb = null; }
+    ok('63.1 app/knowledge.js загружается как модуль', !!kb, kb ? 'ok' : 'require упал');
+
+    if (!kb) {
+      for (const n of ['63.2', '63.3', '63.4', '63.5', '63.6', '63.7']) {
+        skip(`${n} логика RAG`, 'модуль не загрузился');
+      }
+    } else {
+      /* 63.2 Перекрытие: хвост первого чанка обязан попасть во второй.
+       * Без него факт на стыке не попадёт ни в один чанк целиком. */
+      const long = 'А'.repeat(400) + '. ' + 'Б'.repeat(1200);
+      const ch = kb.chunkText(long);
+      const overlapped = ch.length > 1 && ch[1].includes(ch[0].slice(-40));
+      ok('63.2 соседние чанки перекрываются', overlapped,
+        { chunks: ch.length, head: ch[0].length });
+
+      /* 63.3 Размер чанка не превышает окно: иначе бюджет контекста
+       * считался бы по одному числу, а тратился по другому. */
+      const maxLen = Math.max(...ch.map((c) => c.length));
+      ok('63.3 чанк не больше окна CHUNK_SIZE',
+        maxLen <= kb.CONST.CHUNK_SIZE, { maxLen, size: kb.CONST.CHUNK_SIZE });
+
+      /* 63.4 Косинус на ортогональных векторах — 0, на одинаковых — 1.
+       * Если «похожесть» возвращает 1 всегда, поиск отдаёт случайный чанк. */
+      ok('63.4 cosine: одинаковые → 1, ортогональные → 0',
+        Math.abs(kb.cosine([1, 0], [1, 0]) - 1) < 1e-9 && Math.abs(kb.cosine([1, 0], [0, 1])) < 1e-9,
+        { same: kb.cosine([1, 0], [1, 0]), orth: kb.cosine([1, 0], [0, 1]) });
+
+      /* 63.5 Лексический запасной путь: вопрос про чеки обязан находить
+       * текст с «чеков» сильнее, чем текст без него. Это ровно тот режим,
+       * в который RAG уходит без сети — и он должен работать. */
+      const qt = kb.tokenize('сколько чеков в проекте');
+      const hit = kb.lexicalScore(qt, 'в проекте 808 чеков и 1328 проверок');
+      const miss = kb.lexicalScore(qt, 'погода в москве сегодня пасмурная');
+      ok('63.5 лексический поиск отличает релевантный текст',
+        hit > miss && hit > 0, { hit, miss });
+
+      /* 63.6 Без документов контекст ПУСТОЙ, а не «рамка с пустотой».
+       * Пустая вставка выглядела бы как «модель прочитала и не нашла». */
+      const ctx = await kb.contextFor('любой вопрос');
+      ok('63.6 без документов contextFor возвращает пустую строку', ctx === '', ctx.slice(0, 40));
+    }
+
+    /* 63.7 Склейка системной рамки — дефект, который нашёлся при встройке.
+     *
+     * До RAG `chatMessagesFor` при первом `system` возвращал историю как
+     * есть. Наивный `unshift` из директивы поэтому ВЫБРАСЫВАЛ базовую
+     * инструкцию воркера: клиентская рамка становилась единственной.
+     * Здесь проверяется, что обе на месте и `system` ровно один. */
+    const conv = require(path.join(__dirname, 'conversation.js'));
+    const merged = conv.chatMessagesFor(
+      [{ role: 'system', content: 'КОНТЕКСТ ИЗ ДОКУМЕНТОВ' }, { role: 'user', content: 'вопрос' }],
+      'вопрос'
+    );
+    const sys = merged.filter((m) => m.role === 'system');
+    ok('63.7 обе системные рамки склеены в одну',
+      sys.length === 1 && sys[0].content.includes('полезный ассистент') && sys[0].content.includes('КОНТЕКСТ ИЗ ДОКУМЕНТОВ'),
+      { systems: sys.length });
+    ok('63.8 рамка воркера идёт первой, вопрос последним',
+      merged[0].role === 'system' && merged[merged.length - 1].role === 'user',
+      merged.map((m) => m.role).join(','));
+
+    /* 63.9–63.11 Файлы отдаются и подключены. Проверка на 200, а не на
+     * наличие в репозитории: файл может лежать и не отдаваться. */
+    const kbRes = await api('/app/knowledge.js');
+    ok('63.9 /app/knowledge.js отдаётся браузеру', kbRes.status === 200, kbRes.status);
+
+    const idxRes = await api('/app/index.html');
+    const idx = typeof idxRes.body === 'string' ? idxRes.body : '';
+    ok('63.10 панель «Знания» есть в разметке',
+      idx.includes('id="tab-knowledge"') && idx.includes('id="kbUpload"'));
+    ok('63.11 knowledge.js подключён в index.html',
+      idx.includes('/app/knowledge.js'), 'нет тега script');
+
+    const swRes = await api('/app/sw.js');
+    const sw = typeof swRes.body === 'string' ? swRes.body : '';
+    ok('63.12 knowledge.js в предзагрузке service worker',
+      sw.includes("'/app/knowledge.js'"), 'нет в ASSETS');
+
+    /* 63.13 Приложение спрашивает контекст перед отправкой. Проверяем
+     * вызов, а не комментарий: именно вызов решает, будет ли RAG в чате. */
+    const appRes = await api('/app/app.js');
+    const appSrc = typeof appRes.body === 'string' ? appRes.body : '';
+    ok('63.13 app.js зовёт contextFor и кладёт результат в system',
+      appSrc.includes('contextFor(text)') && appSrc.includes("role: 'system', content: ragCtx"),
+      'вызов не найден');
   }
 
   console.log('\n' + '─'.repeat(50));

@@ -70,6 +70,9 @@
       <button class="tab" role="tab" data-tab="agents" aria-selected="false">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4M9 14h.01M15 14h.01"/></svg><span class="tab-label">Агенты</span>
       </button>
+      <button class="tab" role="tab" data-tab="knowledge" aria-selected="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/></svg><span class="tab-label">Знания</span>
+      </button>
     </nav>
 
     <div class="sidebar-section">
@@ -569,10 +572,20 @@
             <span class="chip">Tier 6</span>
           </div>
           <p class="dim tiny">
-            Свой ключ OpenRouter / OpenAI / Gemini / Groq / DeepSeek. Запросы
-            платите вы, напрямую провайдеру. Ключ не покидает это устройство,
-            кроме как в заголовке одного запроса. Провайдер определяется
-            выбранной моделью.
+            Свой ключ любого провайдера из списка. Запросы платите вы, напрямую
+            провайдеру. Ключ не покидает это устройство, кроме как в заголовке
+            одного запроса. Можно держать несколько ключей одновременно.
+          </p>
+          <label class="consent" for="byokProvider">
+            <span>Провайдер</span>
+          </label>
+          <select id="byokProvider" aria-label="Провайдер ключа">
+            <option value="">определить по ключу</option>
+          </select>
+          <p class="dim tiny" id="byokProviderHint">
+            Оставьте «определить по ключу», если формат ключа однозначен.
+            Ключи OpenAI, DeepSeek, Mistral, Together и Fireworks начинаются
+            одинаково — для них провайдера надо выбрать.
           </p>
           <label class="consent" for="byokKey">
             <span>Ключ</span>
@@ -581,10 +594,11 @@
                  placeholder="sk-..." aria-label="Ключ провайдера">
           <div class="row">
             <button id="byokSave" class="btn">Сохранить ключ</button>
-            <button id="byokClear" class="btn ghost">Удалить</button>
+            <button id="byokClear" class="btn ghost">Удалить все</button>
           </div>
           <p class="mono dim tiny addr-line" id="byokState">ключ не задан</p>
           <p class="byok-warn" id="byokWarn" hidden></p>
+          <div id="byokList" class="byok-list"></div>
           <p class="dim tiny">
             Кэшбэк за последний запрос:
             <strong id="cashbackVal">—</strong> TAR
@@ -691,6 +705,31 @@
         </div>
       </section>
 
+      <!-- ================= ЗНАНИЯ (RAG, 2.29.5) =================
+           Документы индексируются ЗДЕСЬ, в браузере, и никуда не уходят:
+           текст и векторы лежат в IndexedDB этого устройства. Это не
+           удобство, а условие: «приватный рой» не может отправлять
+           документацию человека в облако на этапе индексации. -->
+      <section id="tab-knowledge" class="panel" hidden>
+        <div class="card">
+          <div class="card-head">
+            <h2>База знаний</h2>
+            <span class="mono tiny dim" id="kbCounter">—</span>
+          </div>
+          <p class="hint">Загрузите PDF, Markdown или TXT. Документ разобьётся на
+            фрагменты и будет найден по смыслу вопроса. Всё остаётся на этом устройстве.</p>
+          <div class="row">
+            <button type="button" class="btn small" id="kbUpload">Загрузить документ</button>
+            <button type="button" class="ghost small" id="kbClear">Очистить всё</button>
+            <input type="file" id="kbFile" accept=".pdf,.md,.txt,.markdown,text/plain" multiple hidden>
+          </div>
+          <p class="hint" id="kbStatus">поиск: проверяю модель…</p>
+          <div id="kbList" class="kb-list"><div class="kb-empty">Документов пока нет</div></div>
+          <p class="hint">RAG не заменяет обучение: модель отвечает на основе найденного
+            фрагмента, а не «знает» документ целиком.</p>
+        </div>
+      </section>
+
     </div>
   </main>
 
@@ -732,6 +771,7 @@
      не нужен. Подключён ДО agents.js: тот берёт globalThis.TarnetEd25519. -->
 <script src="/app/vendor/ed25519.js"></script>
 <script src="/app/app.js"></script>
+<script src="/app/knowledge.js"></script>
 <script src="/app/agents.js"></script>
 <!-- HITL: подтверждение траты выше порога. Вне <section>, потому что это
      fixed-слой поверх любой вкладки, а не часть панели. -->

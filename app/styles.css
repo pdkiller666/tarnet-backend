@@ -452,6 +452,58 @@ select:focus-visible, textarea:focus-visible, input:focus-visible, button:focus-
   margin: 6px 0 0;
 }
 
+/* Список сохранённых ключей. Каждый — строка с провайдером, маской и
+ * удалением: человек должен видеть, СКОЛЬКО ключей лежит на устройстве,
+ * а не только последний. Маска вместо значения — ключ не попадает в DOM
+ * даже частично (см. byokMask). */
+.byok-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 0;
+}
+
+.byok-list:empty { display: none; }
+
+.byok-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  font-size: 12.5px;
+}
+
+.byok-item-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.byok-item-mask {
+  color: var(--muted-2);
+  font-size: 11.5px;
+}
+
+.byok-item-del {
+  flex: 0 0 auto;
+  border: 0;
+  background: none;
+  color: var(--muted-2);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+
+.byok-item-del:hover,
+.byok-item-del:focus { color: var(--danger); }
+
 /* Заголовки внутри ответа не должны выглядеть как заголовки страницы:
  * h1 модели — это акцент в реплике, а не название документа. */
 .msg.bot .bubble h1,
@@ -2087,6 +2139,54 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
  * поэтому закрывает планшеты и телефоны в любой ориентации, не задевая
  * мышь на ноутбуке. any-pointer: coarse — для гибридов с тачскрином,
  * где основным указателем числится мышь. */
+/* ---------- Знания (RAG, 2.29.5) ----------
+ * Список документов плоский, как и история чатов: групп и папок нет.
+ * Удаление — одна кнопка справа, потому что это единственное действие
+ * над документом, которое существует. */
+.kb-list {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.kb-empty {
+  padding: 18px 12px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  border: 1px dashed var(--border, rgba(127, 127, 127, 0.25));
+  border-radius: 10px;
+}
+.kb-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.18));
+  border-radius: 10px;
+  background: var(--panel-2, rgba(127, 127, 127, 0.06));
+}
+.kb-name {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kb-del {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+  background: transparent;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.kb-del:hover { color: var(--text, inherit); border-color: currentColor; }
+
 @media (pointer: coarse), (any-pointer: coarse) {
   .icon-btn { width: var(--tap); height: var(--tap); }
   .send-btn { width: var(--tap); height: var(--tap); }

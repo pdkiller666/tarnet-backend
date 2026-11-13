@@ -18,7 +18,10 @@ const { DatabaseSync } = require('node:sqlite');
 const crypto = require('crypto');
 const fs = require('fs');
 
-const { CONFIG, TIER6, FAUCET, TIER_WEIGHTS, normalizeTier, round } = require('./config');
+const {
+  CONFIG, TIER6, FAUCET, TIER_WEIGHTS, normalizeTier, round,
+  PROVIDER_REGISTRY,
+} = require('./config');
 const { classifyDomain, selectModel, selectSwarmModels } = require('./model-router');
 const { CWUCalculator, RewardEngine, verifyQuality, epochEmission, epochIndex, omega } = require('./economics');
 const { CumulativeLedger, receiptPayload, epochState, releasedFor, bumpEpoch } = require('./ledger');
@@ -3891,6 +3894,25 @@ app.get('/config', (_req, res) => {
     settlementIntervalSec: CONFIG.SETTLEMENT_INTERVAL_SEC,
     decimals: CONFIG.DECIMALS,
     minReceiptTokens: CONFIG.MIN_RECEIPT_TOKENS,
+    /* Реестр провайдеров (2.29.5). Отдаётся наружу, потому что PWA строит
+     * по нему экран «Провайдеры» и фильтр моделей. Держать копию списка в
+     * app.js значило бы иметь второй источник истины: новый провайдер
+     * появлялся бы на сервере и оставался невидимым в интерфейсе.
+     *
+     * Ключей здесь нет и быть не может — реестр описывает ФОРМАТ ключа
+     * (префикс), а не значение. Значение живёт только в браузере. */
+    providers: Object.keys(PROVIDER_REGISTRY).map((id) => {
+      const p = PROVIDER_REGISTRY[id];
+      return {
+        id,
+        title: p.title,
+        keyPrefix: p.keyPrefix,
+        format: p.format,
+        implemented: p.implemented,
+        signup: p.signup,
+        note: p.note,
+      };
+    }),
   });
 });
 

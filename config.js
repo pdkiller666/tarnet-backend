@@ -89,6 +89,153 @@ const FAUCET = {
   })(),
 };
 
+/* Реестр провайдеров (2.29.5, P0 «единое окно ко всему ИИ»).
+ *
+ * ПОЧЕМУ РЕЕСТР, А НЕ ТРИ СПИСКА. До этой сборки одни и те же провайдеры
+ * были перечислены в `llm-adapter.js` (адреса и заголовки), в `app/app.js`
+ * (подписи и префиксы для UI) и в каталоге `model_registry` в БД. Три
+ * источника разъезжались молча: новый провайдер появлялся в одном месте
+ * и становился невидимым в двух других. Здесь одна таблица фактов, а
+ * остальные места ВЫВОДЯТ данные из неё.
+ *
+ * ЧТО ЗНАЧИТ `implemented`.
+ *   true  — есть ветка вызова в `llm-adapter.js`, запрос дойдёт до сети.
+ *   false — адрес и формат ключа известны, но адаптера НЕТ: вызов отвечает
+ *           501 ДО сети. Так YandexGPT и GigaChat не выдают чужой ответ
+ *           за свой. Выдуманный адаптер хуже отсутствующего: он выглядит
+ *           работающим и врёт в ответе.
+ *
+ * `format` — форма протокола, а не бренд:
+ *   openai    — `/chat/completions`, Bearer, choices[0].message.content;
+ *   gemini    — `:generateContent`, x-goog-api-key, candidates[0]…;
+ *   anthropic — `/v1/messages`, x-api-key + anthropic-version, `content[]`.
+ * Три формата — три ветки кода; всё остальное параметризуется адресом.
+ *
+ * ПОРЯДОК ПРЕФИКСОВ ЗНАЧИМ. `sk-or-v1-` и `sk-ant-` начинаются на `sk-`.
+ * Если сверять с `sk-` раньше — ключ OpenRouter и Anthropic уедет в OpenAI
+ * и получит 401. Поэтому порядок здесь — часть контракта, и его проверяет
+ * гейт, а не только комментарий. */
+const PROVIDER_REGISTRY = {
+  openrouter: {
+    title: 'OpenRouter', keyPrefix: 'sk-or-v1-', format: 'openai', implemented: true,
+    endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+    signup: 'https://openrouter.ai/keys',
+    note: 'Сотни моделей одним ключом, есть бесплатные',
+  },
+  openai: {
+    title: 'OpenAI', keyPrefix: 'sk-', format: 'openai', implemented: true,
+    endpoint: 'https://api.openai.com/v1/chat/completions',
+    signup: 'https://platform.openai.com/api-keys',
+    note: 'GPT-4o и совместимые; ключ начинается на sk-',
+  },
+  anthropic: {
+    title: 'Anthropic', keyPrefix: 'sk-ant-', format: 'anthropic', implemented: true,
+    endpoint: 'https://api.anthropic.com/v1/messages',
+    signup: 'https://console.anthropic.com/settings/keys',
+    note: 'Claude; свой протокол /v1/messages',
+  },
+  gemini: {
+    title: 'Google Gemini', keyPrefix: 'AIza', format: 'gemini', implemented: true,
+    endpoint: 'https://generativelanguage.googleapis.com/v1beta/models',
+    signup: 'https://aistudio.google.com/apikey',
+    note: 'Есть бесплатный уровень',
+  },
+  xai: {
+    title: 'xAI (Grok)', keyPrefix: 'xai-', format: 'openai', implemented: true,
+    endpoint: 'https://api.x.ai/v1/chat/completions',
+    signup: 'https://console.x.ai',
+    note: 'Grok; протокол OpenAI-совместимый',
+  },
+  deepseek: {
+    title: 'DeepSeek', keyPrefix: 'sk-', format: 'openai', implemented: true,
+    endpoint: 'https://api.deepseek.com/v1/chat/completions',
+    signup: 'https://platform.deepseek.com/api_keys',
+    note: 'Дёшево; ключ тоже на sk- — от OpenAI неотличим по префиксу',
+  },
+  mistral: {
+    title: 'Mistral', keyPrefix: 'sk-', format: 'openai', implemented: true,
+    endpoint: 'https://api.mistral.ai/v1/chat/completions',
+    signup: 'https://console.mistral.ai/api-keys',
+    note: 'Европейский провайдер, OpenAI-совместимый',
+  },
+  groq: {
+    title: 'Groq', keyPrefix: 'gsk_', format: 'openai', implemented: true,
+    endpoint: 'https://api.groq.com/openai/v1/chat/completions',
+    signup: 'https://console.groq.com/keys',
+    note: 'Быстрый инференс открытых моделей',
+  },
+  together: {
+    title: 'Together AI', keyPrefix: 'sk-', format: 'openai', implemented: true,
+    endpoint: 'https://api.together.xyz/v1/chat/completions',
+    signup: 'https://api.together.ai/settings/api-keys',
+    note: 'Открытые модели, OpenAI-совместимый',
+  },
+  fireworks: {
+    title: 'Fireworks AI', keyPrefix: 'sk-', format: 'openai', implemented: true,
+    endpoint: 'https://api.fireworks.ai/inference/v1/chat/completions',
+    signup: 'https://fireworks.ai/account/api-keys',
+    note: 'Открытые модели, OpenAI-совместимый',
+  },
+  qwen: {
+    title: 'Alibaba Qwen', keyPrefix: 'sk-', format: 'openai', implemented: false,
+    endpoint: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions',
+    signup: 'https://dashscope.console.aliyun.com/apiKey',
+    note: 'Адаптер [SPEC Phase 2.5]: адрес известен, ветки вызова нет',
+  },
+  yandex: {
+    title: 'YandexGPT', keyPrefix: '', format: 'yandex', implemented: false,
+    endpoint: 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion',
+    signup: 'https://console.yandex.cloud',
+    note: 'Адаптер [SPEC Phase 2.5]: свой конверт modelUri + completionOptions',
+  },
+  gigachat: {
+    title: 'GigaChat', keyPrefix: '', format: 'gigachat', implemented: false,
+    endpoint: 'https://gigachat.devices.sberbank.ru/api/v1/chat/completions',
+    signup: 'https://developers.sber.ru/portal/products/gigachat',
+    note: 'Адаптер [SPEC Phase 2.5]: OAuth-обмен client_secret на access_token',
+  },
+};
+
+/* Порядок проверки префиксов. Отдельный массив, а не перебор объекта:
+ * порядок ключей в объекте формально не гарантирован, а здесь он —
+ * часть контракта (см. комментарий выше про sk-or-v1- и sk-ant-).
+ *
+ * Составлен так, чтобы более длинный префикс всегда шёл раньше своего
+ * префикса-предка. Проверяется гейтом на реальных значениях. */
+const PROVIDER_PREFIX_ORDER = [
+  'sk-or-v1-',  /* до sk- */
+  'sk-ant-',    /* до sk- */
+  'xai-',
+  'gsk_',
+  'AIza',
+  'sk-',        /* последний: самый широкий */
+];
+
+/* Провайдер по ключу.
+ *
+ * НЕОДНОЗНАЧНОСТЬ — НЕ ОШИБКА, А ФАКТ. Ключи OpenAI, DeepSeek, Mistral,
+ * Together, Fireworks все начинаются на `sk-`, и по префиксу их не
+ * различить. Возвращаем СПИСОК: такой ключ разрешает модели всех, кто
+ * делит этот префикс. Скрыть половину рабочих моделей значило бы сломать
+ * каталог ради красивой однозначности; угадать одного — гарантировать
+ * 401 остальным.
+ *
+ * Пустой список = «не определили»: провайдера с таким префиксом нет в
+ * реестре. Это не повод отказывать в сохранении: у провайдера может
+ * появиться новый формат, а отказ на незнакомый ключ сделал бы новинку
+ * недоступной навсегда. */
+function providersForKey(raw) {
+  const key = String(raw == null ? '' : raw).trim();
+  if (!key) return [];
+  for (const prefix of PROVIDER_PREFIX_ORDER) {
+    if (!key.startsWith(prefix)) continue;
+    const hit = Object.keys(PROVIDER_REGISTRY)
+      .filter((id) => PROVIDER_REGISTRY[id].keyPrefix === prefix && PROVIDER_REGISTRY[id].implemented);
+    if (hit.length) return hit;
+  }
+  return [];
+}
+
 const CONFIG = {
   /* Требовать РЕАЛЬНУЮ оплату до начисления воркеру (2.24.0).
    *
@@ -295,4 +442,7 @@ function round(value, decimals = CONFIG.DECIMALS) {
   return Math.round((Number(value) + Number.EPSILON) * f) / f;
 }
 
-module.exports = { CONFIG, TIER6, FAUCET, TIER_WEIGHTS, normalizeTier, round };
+module.exports = {
+  CONFIG, TIER6, FAUCET, TIER_WEIGHTS, normalizeTier, round,
+  PROVIDER_REGISTRY, PROVIDER_PREFIX_ORDER, providersForKey,
+};

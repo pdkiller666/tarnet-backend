@@ -109,13 +109,16 @@
  * ввода и кнопку, которой на сервере уже нельзя воспользоваться. Человек
  * введёт адрес, получит отказ и решит, что сломана привязка, а не то, что он
  * смотрит старую оболочку. */
-const CACHE = 'tarnet-app-v40';
+const CACHE = 'tarnet-app-v42';
 
 const ASSETS = [
   '/app/',
   '/app/index.html',
   '/app/styles.css',
   '/app/app.js',
+  /* RAG (2.29.5). Без предзагрузки вкладка «Знания» в офлайне была бы
+   * пустой кнопкой: модуль грузится отдельным файлом, а не из app.js. */
+  '/app/knowledge.js',
   '/app/agents.js',
   '/app/icon.svg',
   '/app/manifest.webmanifest',

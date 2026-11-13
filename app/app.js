@@ -371,6 +371,16 @@ document.querySelectorAll('.tab').forEach((tab) => {
      * agents.js. Прячем здесь, а событием ниже сообщаем, что пора грузить
      * данные — иначе вкладка открывалась бы пустой до первого клика. */
     if ($('tab-agents')) $('tab-agents').hidden = name !== 'agents';
+    /* Панель «Знания» (2.29.5). Модуль RAG объявлен после app.js, поэтому
+     * здесь только показываем/прячем; содержимое рисует сам knowledge.js
+     * при своём init(). Проверка на наличие — чтобы отсутствие файла не
+     * ломало переключение всех остальных вкладок. */
+    if ($('tab-knowledge')) $('tab-knowledge').hidden = name !== 'knowledge';
+    if (name === 'knowledge') {
+      const kb = window.TarNetKnowledge;
+      if (kb && typeof kb.renderList === 'function') kb.renderList();
+      refreshKbCounter();
+    }
     if (name === 'devices') { refreshBalance(); refreshFaucet(); refreshCrossCompute(); refreshEarn(true); }
     document.dispatchEvent(new CustomEvent('tarnet:tab', { detail: name }));
   });
@@ -640,6 +650,29 @@ $('workerHowto').addEventListener('click', () => {
 });
 
 /* ---------- Адаптеры ---------- */
+/* Реестр провайдеров с сервера (2.29.5).
+ *
+ * Загружается отдельным запросом, а не приходит с /models: /config статичен
+ * и кэшируется, а /models зависит от воркеров и меняется часто. Слить их
+ * значило бы перезапрашивать статичный реестр при каждом обновлении
+ * каталога.
+ *
+ * Ошибка сети НЕ фатальна: списки остаются пустыми, работает встроенный
+ * минимум префиксов, а экран настроек открывается. Падать из-за косметики
+ * (подписи в выпадающем списке) нельзя — ключ сохраняется и без реестра. */
+async function loadProviderRegistry() {
+  try {
+    const cfg = await call('/config');
+    const list = Array.isArray(cfg && cfg.providers) ? cfg.providers : [];
+    if (!list.length) return;
+    PROVIDER_REGISTRY_CACHE = list;
+    PROVIDER_BY_ID = new Map(list.map((p) => [p.id, p]));
+    renderProviderSelect();
+  } catch (_e) {
+    /* остаёмся на встроенном минимуме префиксов */
+  }
+}
+
 async function loadAdapters() {
   const sel = $('adapter');
   try {
@@ -814,7 +847,11 @@ async function loadModels() {
   const sel = $('model');
   if (!sel) return;
   const prev = sel.value;
-  const hasKey = Boolean(byokKey());
+  /* Наличие ХОТЬ ОДНОГО ключа, а не ключа выбранной модели: на первом
+   * открытии модель ещё не выбрана, selectedProviderId() = null, и
+   * Boolean(byokKey()) дал бы false при сохранённом ключе — облачные
+   * модели не появились бы вовсе, и человек решил бы, что ключ не принят. */
+  const hasKey = hasAnyByok();
   try {
     const data = await call('/models');
     const all = (data && Array.isArray(data.models) ? data.models : []);
@@ -1660,7 +1697,31 @@ async function sendPrompt(prompt, opts = {}) {
      * Последний ход обязан совпасть с `prompt` — сервер именно это и
      * сверяет, и не совпадение это отказ, а не подгонка молча. */
     const history = await messagesForInference(text);
-    if (history.length > 1) body.messages = history;
+
+    /* RAG (2.29.5): контекст из загруженных документов.
+     *
+     * ПОЧЕМУ ЗДЕСЬ, А НЕ ВНУТРИ messagesForInference. Та функция отвечает
+     * за историю диалога и её контракт с сервером (последний ход = `prompt`);
+     * искать документы внутри неё значило бы, что всякий вызов истории
+     * (например, отрисовка) тянет эмбеддинги.
+     *
+     * ПОЧЕМУ ЧЕРЕЗ `system`. Контекст — рамка, а не реплика человека:
+     * положить его в `user` значило бы соврать модели о том, кто это сказал,
+     * и сломать сверку PROMPT_MESSAGES_MISMATCH (последний user ≠ prompt).
+     *
+     * ИСКЛЮЧЕНИЕ ДЛЯ ПЕРВОГО ВОПРОСА. Без истории body.messages не шлётся
+     * (лишнее поле = лишний повод для расхождения), но с контекстом
+     * отправить его ОБЯЗАТЕЛЬНО: иначе RAG молча не работал бы ровно
+     * в самом частом случае — первый вопрос по загруженному документу. */
+    let ragCtx = '';
+    const kb = window.TarNetKnowledge;
+    if (kb && typeof kb.contextFor === 'function') {
+      try { ragCtx = await kb.contextFor(text); } catch (_e) { ragCtx = ''; }
+    }
+    const withCtx = ragCtx
+      ? [{ role: 'system', content: ragCtx }, ...history]
+      : history;
+    if (withCtx.length > 1 || ragCtx) body.messages = withCtx;
     /* modelId шлём только если выбрана конкретная модель: пустое значение
      * означает «базовая», и тогда сервер берёт BASE_MODEL сам. */
     const modelId = $('model')?.value;
@@ -2116,49 +2177,151 @@ async function claimFaucet() {
  */
 const LS_BYOK = 'tarnet.byok.key';
 const LS_CASHBACK = 'tarnet.byok.cashback';
+/* Ключи по провайдерам (2.29.5). Один человек держит ключ OpenRouter и
+ * ключ Anthropic одновременно — раньше второй затирал первый, и переключение
+ * модели молча ломало рабочий ключ. Теперь хранилище — объект
+ * {providerId: key}, а LS_BYOK остаётся только для чтения старого формата:
+ * удалять его при обновлении значило бы стирать ключ у всех, кто уже вошёл. */
+const LS_BYOK_MAP = 'tarnet.byok.keys';
 
-function byokKey() {
+/* Реестр из /config. Пустой, пока не загрузился, — все хелперы ниже обязаны
+ * работать и в этом состоянии: экран настроек доступен до сети. */
+let PROVIDER_REGISTRY_CACHE = [];
+let PROVIDER_BY_ID = new Map();
+
+function registryList() { return PROVIDER_REGISTRY_CACHE; }
+function registryGet(id) { return PROVIDER_BY_ID.get(id) || null; }
+
+function byokMap() {
   try {
-    /* trim(): вставка из буфера часто тащит перевод строки или пробел.
-     * Провайдер ответил бы 401 на «правильный» ключ, и причина была бы
-     * невидима — поэтому чистим при чтении, а не при сохранении. */
-    return String(localStorage.getItem(LS_BYOK) || '').trim();
-  } catch (_e) { return ''; }
+    const raw = localStorage.getItem(LS_BYOK_MAP);
+    const obj = raw ? JSON.parse(raw) : null;
+    /* Битый JSON не должен ронять весь экран настроек: читаем как «ключей
+     * нет» и даём человеку сохранить заново. */
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch (_e) { return {}; }
+}
+
+function writeByokMap(obj) {
+  try { localStorage.setItem(LS_BYOK_MAP, JSON.stringify(obj)); return true; }
+  catch (_e) { return false; }
+}
+
+/* Старый однопровайдерный ключ. Только чтение: при первом сохранении он
+ * переезжает в карту под своим провайдером. */
+function legacyByokKey() {
+  try { return String(localStorage.getItem(LS_BYOK) || '').trim(); }
+  catch (_e) { return ''; }
+}
+
+/* Провайдер выбранной модели. `MODEL_INFO` заполняется из /models, поэтому
+ * до загрузки каталога ответ — null, и это нормально: тогда ключ берётся
+ * как «любой сохранённый». */
+function selectedProviderId() {
+  const sel = document.getElementById('model');
+  const id = sel ? sel.value : '';
+  if (!id) return null;
+  const info = MODEL_INFO.get(id);
+  return info && info.provider ? info.provider : null;
+}
+
+/* Ключ конкретного провайдера. trim() при чтении: вставка из буфера тащит
+ * перевод строки, и провайдер ответил бы 401 на «правильный» ключ.
+ *
+ * Без аргумента возвращает ключ ТОЙ модели, что выбрана сейчас, — это
+ * сохраняет прежний контракт `byokKey()` для отправки запроса. Если модель
+ * не выбрана или у её провайдера ключа нет, отдаём любой сохранённый: так
+ * экран «ключ задан» не врёт, пока человек не выбрал облачную модель. */
+function byokKey(providerId) {
+  const map = byokMap();
+  if (providerId) {
+    const v = map[providerId];
+    if (v) return String(v).trim();
+    const legacy = legacyByokKey();
+    if (legacy && providersForKeyClient(legacy).includes(providerId)) return legacy;
+    return '';
+  }
+  const sel = selectedProviderId();
+  if (sel) {
+    const own = byokKey(sel);
+    if (own) return own;
+  }
+  const first = Object.keys(map).find((id) => String(map[id] || '').trim());
+  if (first) return String(map[first]).trim();
+  return legacyByokKey();
+}
+
+/* Есть ли ключ хотя бы у одного провайдера. Отдельная функция, потому что
+ * `Boolean(byokKey())` до загрузки каталога даёт false даже при сохранённом
+ * ключе: selectedProviderId() ещё null, а карта непустая. */
+function hasAnyByok() {
+  const map = byokMap();
+  if (Object.keys(map).some((id) => String(map[id] || '').trim())) return true;
+  return Boolean(legacyByokKey());
+}
+
+/* Провайдеры, которым годится этот ключ. Логика зеркалит `providersForKey`
+ * из config.js, но живёт в браузере, потому что ключ не уходит на сервер.
+ * Список префиксов идёт от реестра (/config), а не из литералов: новый
+ * провайдер, добавленный на сервере, сразу начинает распознаваться здесь.
+ *
+ * Пока реестр не загрузился, работает встроенный минимум — иначе при старте
+ * без сети (service worker) сохранённый ключ считался бы нераспознанным. */
+const FALLBACK_PREFIX_ORDER = ['sk-or-v1-', 'sk-ant-', 'xai-', 'gsk_', 'AIza', 'sk-'];
+
+function providersForKeyClient(raw) {
+  const key = String(raw == null ? '' : raw).trim();
+  if (!key) return [];
+  const list = registryList();
+  const pairs = list.length
+    ? list.map((p) => ({ id: p.id, prefix: p.keyPrefix, implemented: p.implemented }))
+    /* Без реестра id не нужны вызывающему: он сверяет только пустоту. */
+    : FALLBACK_PREFIX_ORDER.map((prefix) => ({ id: prefix, prefix, implemented: true }));
+  const order = list.length
+    ? Array.from(new Set(pairs.map((p) => p.prefix).filter(Boolean)))
+      .sort((a, b) => b.length - a.length)
+    : FALLBACK_PREFIX_ORDER;
+  for (const prefix of order) {
+    if (!key.startsWith(prefix)) continue;
+    const hit = pairs.filter((p) => p.prefix === prefix && p.implemented).map((p) => p.id);
+    if (hit.length) return hit;
+  }
+  return [];
 }
 
 /* Провайдер по префиксу ключа. Список моделей фильтруется по нему, чтобы
  * человек с ключом OpenRouter не выбирал gpt-4o и не получал 401.
  *
- * Порядок проверок важен: 'sk-or-v1-' начинается на 'sk-', поэтому
- * OpenRouter проверяется ДО OpenAI. Обратный порядок отнёс бы ключ
- * OpenRouter к OpenAI — ровно та путаница, из-за которой всё и затевалось.
+ * Порядок проверок теперь берётся из реестра и сортируется по длине
+ * префикса: 'sk-or-v1-' и 'sk-ant-' длиннее 'sk-', поэтому проверяются
+ * раньше. Обратный порядок отнёс бы ключ OpenRouter к OpenAI — ровно та
+ * путаница, из-за которой всё и затевалось.
  *
- * null означает «формат неизвестен», и это не ошибка: у провайдера может
- * появиться новый префикс. Такой ключ не прячет облачные модели — угадывать
- * за пользователя нельзя, а 401 теперь приходит с причиной в details. */
+ * 'ambiguous' означает «префикс делят несколько провайдеров» (sk- у OpenAI,
+ * DeepSeek, Mistral, Together, Fireworks). null означает «формат неизвестен»,
+ * и это не ошибка: у провайдера может появиться новый префикс. Такой ключ
+ * не прячет облачные модели — угадывать за пользователя нельзя. */
 function keyProvider() {
   const k = byokKey();
   if (!k) return null;
-  if (k.startsWith('sk-or-v1-')) return 'openrouter';
-  if (k.startsWith('gsk_')) return 'groq';
-  if (k.startsWith('AIza')) return 'gemini';
-  /* Ключи OpenAI и DeepSeek начинаются одинаково — на `sk-`. Отличить их по
-   * префиксу невозможно, и угадывать нельзя: ошибка либо скрыла бы рабочие
-   * модели, либо показала заведомо нерабочие. Поэтому для `sk-` возвращается
-   * метка неопределённости, а не конкретный провайдер. */
-  if (k.startsWith('sk-')) return 'ambiguous';
+  const hit = providersForKeyClient(k);
+  if (hit.length === 1) return hit[0];
+  if (hit.length > 1) return 'ambiguous';
   return null;
 }
 
 /* Какие провайдеры совместимы с сохранённым ключом. Возвращает массив:
- * для неоднозначного `sk-` их два, для остальных — один. Пустой массив
+ * для неоднозначного `sk-` их пять, для остальных — один. Пустой массив
  * означает «провайдера по ключу не определить» — тогда показываем всех,
- * и пусть решает сам провайдер. */
+ * и пусть решает сам провайдер.
+ *
+ * Раньше здесь был жёсткий ['openai','deepseek']: ключ Mistral или Together
+ * тоже начинается на sk-, и такой человек не видел НИ ОДНОЙ своей модели,
+ * хотя ключ рабочий. Теперь список выводится из реестра. */
 function keyProviders() {
-  const p = keyProvider();
-  if (!p) return [];
-  if (p === 'ambiguous') return ['openai', 'deepseek'];
-  return [p];
+  const k = byokKey();
+  if (!k) return [];
+  return providersForKeyClient(k);
 }
 
 const PROVIDER_TITLE = {
@@ -2167,6 +2330,9 @@ const PROVIDER_TITLE = {
   groq: 'Groq',
   gemini: 'Google Gemini',
   deepseek: 'DeepSeek',
+  anthropic: 'Anthropic',
+  xai: 'xAI (Grok)',
+  qwen: 'Alibaba Qwen',
   together: 'Together',
   fireworks: 'Fireworks',
   mistral: 'Mistral',
@@ -2181,10 +2347,14 @@ const PROVIDER_TITLE = {
  * гадать, почему её нет. */
 const CLOUD_GROUPS = [
   { label: 'Облачные — DeepSeek', providers: ['deepseek'] },
-  { label: 'Облачные — OpenRouter / Groq / Gemini / OpenAI',
-    providers: ['openrouter', 'groq', 'gemini', 'openai'] },
+  { label: 'Облачные — Anthropic / OpenAI / xAI',
+    providers: ['anthropic', 'openai', 'xai'] },
+  { label: 'Облачные — OpenRouter / Groq / Gemini',
+    providers: ['openrouter', 'groq', 'gemini'] },
   { label: 'Облачные — Агрегаторы (Together / Fireworks / Mistral)',
     providers: ['together', 'fireworks', 'mistral'] },
+  { label: 'Облачные — Qwen (адаптер в разработке) — 501',
+    providers: ['qwen'] },
   { label: 'Облачные — Российские (YandexGPT / GigaChat) — 501',
     providers: ['yandex', 'gigachat'] },
 ];
@@ -2200,16 +2370,113 @@ function byokMask(k) {
 function renderByokState() {
   const k = byokKey();
   const st = $('byokState');
-  if (st) st.textContent = byokMask(k);
+  const map = byokMap();
+  const ids = Object.keys(map).filter((id) => String(map[id] || '').trim());
+  const legacy = legacyByokKey();
+  /* Верхняя строка описывает ОБЩЕЕ состояние: сколько ключей на устройстве.
+   * Раньше она показывала маску одного ключа, и при двух сохранённых
+   * человек видел только последний — «ключ сохранён» при трёх ключах
+   * вводит в заблуждение ровно тогда, когда ключ нужен другой. */
+  if (st) {
+    if (ids.length === 1 && !legacy) st.textContent = byokMask(map[ids[0]]);
+    else if (ids.length || legacy) {
+      st.textContent = `ключей на устройстве: ${ids.length + (legacy ? 1 : 0)}`;
+    } else st.textContent = 'ключ не задан';
+  }
   const input = $('byokKey');
   /* Поле остаётся пустым даже при сохранённом ключе: иначе ключ лежал бы
    * в DOM и попал бы в любой снимок страницы. */
   if (input && k) input.placeholder = 'ключ сохранён — введите новый, чтобы заменить';
+  else if (input) input.placeholder = 'sk-...';
   const cb = $('cashbackVal');
   if (cb) {
     const v = Number(localStorage.getItem(LS_CASHBACK) || 0);
     cb.textContent = v > 0 ? fmt(v) : '—';
   }
+  renderByokList(ids, legacy);
+  renderProviderSelect();
+}
+
+/* Список сохранённых ключей: провайдер, маска, удаление только этого.
+ *
+ * Значение ключа в DOM не попадает: строка собирается из byokMask, а сама
+ * маска — это первые 4 и последние 4 символа. Полный ключ остаётся в
+ * localStorage и уходит только заголовком запроса. */
+function renderByokList(ids, legacy) {
+  const box = $('byokList');
+  if (!box) return;
+  box.textContent = '';
+  const entries = ids.map((id) => ({ id, title: PROVIDER_TITLE[id] || (registryGet(id)?.title) || id, key: map_key(id) }));
+  if (legacy) {
+    const owners = providersForKeyClient(legacy);
+    entries.push({
+      id: owners.length === 1 ? owners[0] : 'legacy',
+      title: owners.length === 1
+        ? `${PROVIDER_TITLE[owners[0]] || owners[0]} (старый слот)`
+        : 'старый слот — провайдер не определён',
+      key: legacy,
+    });
+  }
+  for (const e of entries) {
+    const row = document.createElement('div');
+    row.className = 'byok-item';
+    const name = document.createElement('span');
+    name.className = 'byok-item-name';
+    name.textContent = e.title;
+    const mask = document.createElement('span');
+    mask.className = 'byok-item-mask mono';
+    mask.textContent = byokMask(e.key);
+    const del = document.createElement('button');
+    del.className = 'byok-item-del';
+    del.type = 'button';
+    del.title = 'Удалить этот ключ';
+    del.setAttribute('aria-label', `Удалить ключ ${e.title}`);
+    del.textContent = '×';
+    del.addEventListener('click', () => {
+      if (e.id === 'legacy') {
+        try { localStorage.removeItem(LS_BYOK); } catch (_e) { /* пусто */ }
+      } else {
+        removeByokKey(e.id);
+      }
+      renderByokState();
+      loadModels();
+    });
+    row.append(name, mask, del);
+    box.appendChild(row);
+  }
+}
+
+function map_key(id) {
+  const v = byokMap()[id];
+  return v ? String(v).trim() : '';
+}
+
+/* Выпадающий список провайдеров. Строится из реестра /config, поэтому
+ * провайдеры, которых нет в этой сборке адаптера, видны и помечены.
+ *
+ * Первая опция — «определить по ключу»: это путь по умолчанию, потому что
+ * для девяти провайдеров из тринадцати формат ключа однозначен и вопрос
+ * лишний. */
+function renderProviderSelect() {
+  const sel = $('byokProvider');
+  if (!sel) return;
+  const list = registryList();
+  if (!list.length) return;   /* реестр не загружен — не трогаем текущее */
+  const prev = sel.value;
+  sel.textContent = '';
+  const auto = document.createElement('option');
+  auto.value = '';
+  auto.textContent = 'определить по ключу';
+  sel.appendChild(auto);
+  for (const p of list) {
+    const o = document.createElement('option');
+    o.value = p.id;
+    /* Пометка «адаптер в разработке» нужна ДО сохранения ключа: иначе
+     * человек вставляет рабочий ключ Qwen, ждёт ответа и получает 501. */
+    o.textContent = p.implemented ? p.title : `${p.title} — адаптер в разработке (501)`;
+    sel.appendChild(o);
+  }
+  if (prev) sel.value = prev;
 }
 
 function addCashback(tar) {
@@ -2292,6 +2559,52 @@ function showByokWarn(text) {
   }
 }
 
+/* Куда сохранять ключ.
+ *
+ * ПОЧЕМУ НЕ СПРАШИВАЕМ ВСЕГДА. У ключа OpenRouter, Anthropic, xAI, Groq и
+ * Gemini формат уникален — провайдер определяется по префиксу без человека.
+ * Спрашивать там, где ответ уже известен, значит добавлять шаг, на котором
+ * ошибаются. Вопрос возникает ровно в одном случае: префикс `sk-` делят
+ * пять провайдеров, и по ключу их не различить.
+ *
+ * Тогда решает выбранная модель: если её провайдер в списке кандидатов —
+ * это он. Иначе берём явный выбор из выпадающего списка, и только если его
+ * нет — первого кандидата. Догадка не блокирует сохранение: ключ всё равно
+ * уезжает под каким-то провайдером, и его можно переложить, не перепечатывая. */
+function resolveSaveProvider(key, explicitId) {
+  const candidates = providersForKeyClient(key);
+  if (explicitId) return { provider: explicitId, candidates, guessed: false };
+  if (candidates.length === 1) return { provider: candidates[0], candidates, guessed: false };
+  const selProv = selectedProviderId();
+  if (selProv && candidates.includes(selProv)) {
+    return { provider: selProv, candidates, guessed: false };
+  }
+  if (candidates.length > 1) return { provider: candidates[0], candidates, guessed: true };
+  /* Формат неизвестен. Кладём под выбранную модель, а если и её нет — под
+   * 'unknown': ключ не должен потеряться из-за того, что человек ещё не
+   * выбрал модель. Отправить его сможет та модель, чей провайдер совпадёт
+   * позже. */
+  return { provider: selProv || 'unknown', candidates, guessed: true };
+}
+
+function saveByokKey(provider, key) {
+  const map = byokMap();
+  map[provider] = key;
+  if (!writeByokMap(map)) return false;
+  /* Старый однопровайдерный слот чистим только после успешной записи карты:
+   * иначе при отказе localStorage ключ исчез бы из обоих мест. */
+  try { localStorage.removeItem(LS_BYOK); } catch (_e) { /* нечего чистить */ }
+  return true;
+}
+
+function removeByokKey(provider) {
+  const map = byokMap();
+  delete map[provider];
+  writeByokMap(map);
+  try { if (legacyByokKey() && providersForKeyClient(legacyByokKey()).includes(provider)) localStorage.removeItem(LS_BYOK); }
+  catch (_e) { /* нечего чистить */ }
+}
+
 $('byokSave')?.addEventListener('click', () => {
   const v = String($('byokKey')?.value || '').trim();
   if (!v) {
@@ -2302,20 +2615,31 @@ $('byokSave')?.addEventListener('click', () => {
    * человек вправе поменять модель после, и терять вставленный ключ из-за
    * догадки о его формате нельзя. */
   const mismatch = checkKeyMatchesModel(v);
-  try { localStorage.setItem(LS_BYOK, v); } catch (_e) {
+  const explicit = String($('byokProvider')?.value || '').trim();
+  const { provider, guessed } = resolveSaveProvider(v, explicit);
+  if (!saveByokKey(provider, v)) {
     $('byokState').textContent = 'браузер не дал сохранить ключ';
     return;
   }
   if ($('byokKey')) $('byokKey').value = '';
   renderByokState();
-  showByokWarn(mismatch);
+  /* Догадку показываем явно: молча приписать ключ OpenAI, когда это
+   * DeepSeek, значит дать человеку понять это только по 401. */
+  showByokWarn(mismatch || (guessed && provider !== 'unknown'
+    ? `Ключ сохранён под провайдером ${PROVIDER_TITLE[provider] || provider} — `
+      + 'по его формату провайдера не определить. Если это не он, выберите '
+      + 'провайдера в списке и сохраните ключ снова.'
+    : ''));
   /* Список моделей зависит от наличия ключа: облачные появляются сразу
    * после сохранения, без перезагрузки страницы. */
   loadModels();
 });
 
 $('byokClear')?.addEventListener('click', () => {
+  /* Удаляем ВСЕ ключи и кэшбэк — это кнопка «убрать с этого устройства».
+   * Точечное удаление одного провайдера есть в списке ниже. */
   try {
+    localStorage.removeItem(LS_BYOK_MAP);
     localStorage.removeItem(LS_BYOK);
     localStorage.removeItem(LS_CASHBACK);
   } catch (_e) { /* нечего чистить */ }
@@ -3017,6 +3341,24 @@ function bindBento(root) {
  * показываем «пока пусто»; если тред есть, но в нём нет сообщений —
  * он не попадает в список вовсе (иначе после каждого «Новый диалог»
  * в истории висели бы пустые записи). */
+/* Счётчик документов в шапке «Знаний» (2.29.5).
+ * Считает по IndexedDB, а не по DOM: список рисует knowledge.js, и
+ * выводить число из чужих элементов значило бы зависеть от её разметки. */
+async function refreshKbCounter() {
+  const el = $('kbCounter');
+  if (!el) return;
+  const kb = window.TarNetKnowledge;
+  if (!kb || typeof kb.stats !== 'function') { el.textContent = '—'; return; }
+  try {
+    const s = await kb.stats();
+    el.textContent = s.documents
+      ? `${s.documents} док · ${s.chunks} фрагм`
+      : 'пусто';
+  } catch (_e) {
+    el.textContent = '—';
+  }
+}
+
 async function renderHistoryList() {
   const box = $('chatHistory');
   if (!box) return;
@@ -3558,6 +3900,17 @@ syncP2P();
   }
   renderWorkerHelp();
   startBannerPolling();
+  /* Реестр провайдеров — ДО loadModels, и это единственное место, где
+   * последовательность важнее скорости.
+   *
+   * loadModels фильтрует облачные модели по списку провайдеров, а этот
+   * список строится из реестра. Если реестр ещё пуст, отрабатывает
+   * встроенный минимум префиксов, и вместо id провайдеров возвращаются
+   * сами префиксы (`sk-`, `AIza`) — фильтр не совпадёт ни с одной моделью,
+   * и облачный каталог окажется пустым при рабочем ключе.
+   *
+   * Цена — один лишний round-trip на старте к статичному /config. */
+  await loadProviderRegistry();
   /* Модели и адаптеры грузим параллельно: это два независимых запроса,
    * а последовательное ожидание добавляло к старту лишний round-trip. */
   await Promise.all([loadAdapters(), loadModels()]);

@@ -164,6 +164,14 @@ const PROVIDER_ENDPOINTS = {
   groq: 'https://api.groq.com/openai/v1/chat/completions',
   openai: 'https://api.openai.com/v1/chat/completions',
   gemini: 'https://generativelanguage.googleapis.com/v1beta/models',
+  /* Anthropic — свой протокол, а не OpenAI-совместимый: адрес `/v1/messages`,
+   * ключ в `x-api-key` (не Bearer), обязательный `anthropic-version`,
+   * ответ в `content[]`. Отдельная ветка ниже, а не общий конверт: подогнать
+   * его под OpenAI значило бы соврать про формат и получить 400 от API. */
+  anthropic: 'https://api.anthropic.com/v1/messages',
+  /* xAI заявляет OpenAI-совместимый протокол, поэтому идёт общей веткой —
+   * отличается только адресом. Отдельный код был бы копией fetch-обёртки. */
+  xai: 'https://api.x.ai/v1/chat/completions',
   /* OpenAI-совместимые: тело запроса и форма ответа те же, что у Groq и
    * OpenRouter, поэтому идут в общую ветку ниже без отдельного кода.
    * Отдельная функция на каждого провайдера была бы копией одной и той же
@@ -172,6 +180,9 @@ const PROVIDER_ENDPOINTS = {
   together: 'https://api.together.xyz/v1/chat/completions',
   fireworks: 'https://api.fireworks.ai/inference/v1/chat/completions',
   mistral: 'https://api.mistral.ai/v1/chat/completions',
+  /* Qwen: адрес известен, ветки вызова нет (implemented: false в реестре
+   * config.js) — 501 ниже, до сети. */
+  qwen: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions',
   /* НЕ OpenAI-совместимые: у Yandex свой конверт (modelUri + completionOptions),
    * у GigaChat — OAuth-токен и поле `messages` с другим ответом. Адреса
    * записаны для документации; вызов до сети не доходит — 501 ниже. */
@@ -188,6 +199,8 @@ const PROVIDER_ENDPOINTS = {
  * Текст намеренно содержит «[SPEC Phase 2.5]» — тот же маркер, что у FIAT
  * и BYOK-оплаты, чтобы обещание нельзя было принять за работающую функцию. */
 const TIER6_NOT_IMPLEMENTED = {
+  qwen: 'Alibaba Qwen: адаптер [SPEC Phase 2.5]. Адрес DashScope известен, '
+    + 'но ветка вызова не написана — ответа от Qwen в этой сборке нет.',
   yandex: 'YandexGPT: адаптер [SPEC Phase 2.5]. Формат запроса не OpenAI-совместим '
     + '(modelUri + completionOptions), iam-токен и folderId не поддерживаются.',
   gigachat: 'GigaChat: адаптер [SPEC Phase 2.5]. Нужен OAuth-обмен client_secret '
@@ -229,10 +242,13 @@ function providerForModel(modelId) {
   if (prefix === 'groq') return 'groq';
   if (prefix === 'openai') return 'openai';
   if (prefix === 'google' || prefix === 'gemini') return 'gemini';
+  if (prefix === 'anthropic' || prefix === 'claude') return 'anthropic';
+  if (prefix === 'xai' || prefix === 'x-ai' || prefix === 'grok') return 'xai';
   if (prefix === 'deepseek') return 'deepseek';
   if (prefix === 'together') return 'together';
   if (prefix === 'fireworks') return 'fireworks';
   if (prefix === 'mistral') return 'mistral';
+  if (prefix === 'qwen') return 'qwen';
   if (prefix === 'yandex') return 'yandex';
   if (prefix === 'gigachat') return 'gigachat';
   /* Голый префикс `deepseek-` НЕ маппится намеренно: в каталоге уже есть
@@ -260,6 +276,12 @@ const KEY_PREFIX = {
   groq: 'gsk_',
   gemini: 'AIza',
   deepseek: 'sk-',
+  anthropic: 'sk-ant-',
+  xai: 'xai-',
+  together: 'sk-',
+  fireworks: 'sk-',
+  mistral: 'sk-',
+  qwen: 'sk-',
 };
 
 const PROVIDER_TITLE = {
@@ -268,6 +290,9 @@ const PROVIDER_TITLE = {
   groq: 'Groq',
   gemini: 'Google Gemini',
   deepseek: 'DeepSeek',
+  anthropic: 'Anthropic',
+  xai: 'xAI (Grok)',
+  qwen: 'Alibaba Qwen',
   together: 'Together AI',
   fireworks: 'Fireworks AI',
   mistral: 'Mistral AI',
@@ -313,8 +338,12 @@ async function callExternalProvider({ provider, modelId, prompt, maxTokens = 512
   }
 
   /* Убираем внутренний префикс роутера: 'openrouter/qwen3-coder' → 'qwen3-coder'. */
+  /* Порядок альтернатив здесь не значим (анкоринг `^` + один слэш), но
+   * список обязан покрывать ВСЕ провайдеры `providerForModel`: пропуск
+   * оставлял в теле запроса внутренний префикс (`anthropic/claude-…`),
+   * и провайдер отвечал 404 на несуществующую модель. */
   const cleanModel = String(modelId || '').replace(
-    /^(openrouter|groq|openai|google|gemini|deepseek|together|fireworks|mistral|yandex|gigachat)\//, '');
+    /^(openrouter|groq|openai|google|gemini|anthropic|claude|xai|x-ai|grok|deepseek|together|fireworks|mistral|qwen|yandex|gigachat)\//, '');
   const signal = AbortSignal.timeout(TIER6_TIMEOUT_MS);
 
   /* Адрес резолвится ДО try: отказ guard'а на не-loopback — это осознанный
@@ -336,6 +365,33 @@ async function callExternalProvider({ provider, modelId, prompt, maxTokens = 512
         body: JSON.stringify({
           contents: [{ parts: [{ text: String(prompt) }] }],
           generationConfig: { maxOutputTokens: maxTokens, temperature: 0.2 },
+        }),
+      });
+    } else if (prov === 'anthropic') {
+      /* Свой протокол: ключ в `x-api-key` (НЕ Bearer), обязательный
+       * `anthropic-version`, максимум токенов в `max_tokens` обязателен,
+       * системная инструкция — отдельным полем `system`, а не сообщением.
+       *
+       * Почему `system` отдельно: Anthropic отвергает `role: "system"` в
+       * `messages` с 400. Этот путь вызывается без истории (одна строка
+       * промпта), поэтому системного поля здесь нет вовсе — модель получает
+       * только вопрос. Появится история — сюда придёт отдельное поле.
+       *
+       * Версия 2023-06-01 закреплена намеренно: без неё API отвечает 400,
+       * а `latest` не существует как значение. */
+      res = await fetch(endpoint, {
+        method: 'POST',
+        signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': key,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: cleanModel || 'claude-3-5-haiku-latest',
+          max_tokens: maxTokens,
+          temperature: 0.2,
+          messages: [{ role: 'user', content: String(prompt) }],
         }),
       });
     } else {
@@ -389,16 +445,25 @@ async function callExternalProvider({ provider, modelId, prompt, maxTokens = 512
   }
 
   const data = await res.json().catch(() => ({}));
+  /* Три формы ответа — три ветки. Anthropic отдаёт `content[]` массивом
+   * блоков, и текст лежит в первом блоке с `type: "text"`; брать `[0].text`
+   * вслепую нельзя — первым может оказаться блок `tool_use` без текста. */
   const text = prov === 'gemini'
     ? (data?.candidates?.[0]?.content?.parts?.[0]?.text || '')
-    : (data?.choices?.[0]?.message?.content || '');
+    : prov === 'anthropic'
+      ? ((data?.content || []).filter((b) => b && b.type === 'text').map((b) => b.text || '').join('') || '')
+      : (data?.choices?.[0]?.message?.content || '');
   if (typeof text !== 'string' || !text.length) {
     throw tier6Error(`Provider ${prov} вернул пустой ответ`, { status: 502, code: 'PROVIDER_EMPTY' });
   }
 
   const usageTokens = prov === 'gemini'
     ? Number(data?.usageMetadata?.totalTokenCount || 0)
-    : Number(data?.usage?.total_tokens || 0);
+    : prov === 'anthropic'
+      /* Anthropic разделяет input/output и НЕ отдаёт total. Складываем сами:
+       * иначе оплата считалась бы по половине факта. */
+      ? Number(data?.usage?.input_tokens || 0) + Number(data?.usage?.output_tokens || 0)
+      : Number(data?.usage?.total_tokens || 0);
 
   return {
     provider: prov,
@@ -557,6 +622,10 @@ module.exports = {
   TIER6_MIN_CONFIDENCE,
   TIER6_TIMEOUT_MS,
   PROVIDER_ENDPOINTS,
+  /* Карта отказов нужна приёмке: без неё нельзя проверить, что
+   * `implemented: true` в реестре config.js означает живой адаптер, а
+   * `false` — названную причину 501, а не молчаливую дыру. */
+  TIER6_NOT_IMPLEMENTED,
   endpointFor,
   providerForModel,
   callExternalProvider,
