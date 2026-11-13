@@ -393,7 +393,7 @@ websocket`, `listenHost: 127.0.0.1`, `announced_public: false`, список п�
 
 | Утверждение | Как проверить |
 |---|---|
-| Версия прода | `curl /health` → `buildVersion` = `version` из `package.json` (сейчас `2.29.3`); расхождение ловит `verify.sh` шаг 3.9. Локальный код — `2.29.4`, в проде ещё `2.29.3` |
+| Версия прода | `curl /health` → `buildVersion` = `version` из `package.json` (сейчас `2.29.4`); расхождение ловит `verify.sh` шаг 3.9 |
 | Тесты | `scripts/verify.sh` → 1328 ✅ / 0 ❌ (1298 dpouw + 30 conversation) |
 | Чеки и баланс | `curl /summary` → `receipts: 808`, `conservation.delta: 0` |
 | 18 моделей | `curl /models` → длина 18 |
