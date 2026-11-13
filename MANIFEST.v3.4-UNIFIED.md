@@ -4357,7 +4357,7 @@ max_tokens_exceeds_limit` — то есть тест мерил дыру, а н�
 
 | Проверка | Результат |
 |---|---|
-| GitHub HEAD = локальный = VPS | `44023be` = `44023be` = `44023be2a` |
+| GitHub HEAD = локальный = VPS | `cc5d0d1` = `cc5d0d1` = `cc5d0d13a` (код `44023be` + документы) |
 | sha256 файлов | **169/169** |
 | Тесты на сервере | 1293 + 25 + 15 + 15 + 10 + 12 + 10 + 9 ✅ / 0 ❌ |
 | Сервисы | `tarnet`, `p2p-bridge`, `tarnet-seed2`, `litestream-tarnet` — active |
