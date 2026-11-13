@@ -166,6 +166,135 @@ function toolCallsCost(calls) {
   return round(list.reduce((acc, c) => acc + (Number(c?.costTar) || 0), 0));
 }
 
+/* ===== P1.1b: схемы инструментов для модели =====
+ *
+ * ЗАЧЕМ. До 2.29.4 инструменты исполнялись, но просил их тест: воркер
+ * отправлял в Ollama только `messages`, и модель физически не могла
+ * породить `tool_calls` — поля `tools` в запросе не было. Схемы ниже —
+ * то, что уезжает в теле запроса, чтобы модель знала о существовании
+ * инструментов и о форме аргументов.
+ *
+ * ПОЧЕМУ ФОРМАТ OpenAI-совместимый. Ollama `/api/chat` принимает именно
+ * его (`tools: [{type:'function', function:{...}}]`), и тот же формат
+ * понимают облачные бэкенды. Одна форма на три бэкенда — один тест.
+ *
+ * ЧЕГО ЗДЕСЬ НЕТ. Описаний `web_search` и `python_executor`: они лежат в
+ * каталоге с ценой, но исполнения у них нет (`tool_not_implemented`).
+ * Объявить модели инструмент, который откажет, — значит научить её
+ * просить заведомо нерабочее. Схема уезжает только для тех, что реально
+ * исполняются и разрешены агенту. */
+const TOOL_SCHEMAS = [
+  {
+    type: 'function',
+    function: {
+      name: 'calculator',
+      description: 'Считает арифметическое выражение: + - * / ^, скобки, sqrt(x). '
+        + 'Возвращает точное число. Используй для любых вычислений вместо счёта в уме.',
+      parameters: {
+        type: 'object',
+        properties: {
+          expression: {
+            type: 'string',
+            description: 'Выражение, например "(14592 * 83.45) / 12"',
+          },
+        },
+        required: ['expression'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ledger_query',
+      description: 'Read-only чтение состояния TarNet. query=summary — чеки и суммы, '
+        + 'query=health — версия сборки, query=epoch — номер и эмиссия эпохи, '
+        + 'query=receipt — конкретный чек. Ничего не меняет.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', enum: ['summary', 'health', 'epoch', 'receipt'] },
+          index: { type: 'number', description: 'Номер эпохи для query=epoch' },
+          id: { type: 'string', description: 'Идентификатор чека для query=receipt' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+];
+
+/* Схемы только для разрешённых инструментов.
+ *
+ * Пустой allowlist — пустой массив, а не «все»: агент без политики не должен
+ * получать инструменты по умолчанию. Отказ политики приходит раньше, но
+ * объявлять модели запрещённое — отдельная ошибка, и она дешевле ловится
+ * здесь, чем в логе отказов. */
+function toolSchemasFor(allowedTools) {
+  const allow = Array.isArray(allowedTools) ? allowedTools : [];
+  if (!allow.length) return [];
+  return TOOL_SCHEMAS.filter(t => allow.includes(t.function.name));
+}
+
+/* Привести `message.tool_calls` от бэкенда к нашему виду `[{toolId, args}]`.
+ *
+ * ТРИ ФОРМЫ, И ВСЕ ВСТРЕЧАЮТСЯ:
+ *   1. Ollama — `{function: {name, arguments}}`, arguments — ОБЪЕКТ;
+ *   2. OpenAI-совместимые — то же, но arguments — СТРОКА с JSON;
+ *   3. наш внутренний — сразу `{toolId, args}` (его шлют тесты и старый путь).
+ *
+ * Битая строка аргументов не глотается: вызов возвращается с `parseError`,
+ * и цикл видит отказ. Иначе «модель попросила, а сервер промолчал» было бы
+ * неотличимо от «модель не просила».
+ *
+ * Пустые имена отбрасываются: `name: ""` — это не вызов, а мусор в ответе. */
+function normalizeToolCalls(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const fn = item.function && typeof item.function === 'object' ? item.function : null;
+    const toolId = String((fn ? fn.name : (item.toolId || item.name)) || '').trim();
+    if (!toolId) continue;
+    let args = fn ? fn.arguments : item.args;
+    if (typeof args === 'string') {
+      const src = args.trim();
+      if (!src) {
+        args = {};
+      } else {
+        try {
+          args = JSON.parse(src);
+        } catch (_e) {
+          out.push({ toolId, args: null, parseError: 'tool_args_bad_json', raw: src.slice(0, 200) });
+          continue;
+        }
+      }
+    }
+    if (args !== null && typeof args !== 'object') args = { value: args };
+    out.push({ toolId, args: args || {} });
+  }
+  return out;
+}
+
+/* Таймаут на один вызов инструмента.
+ *
+ * ПОЧЕМУ PROMISE.race, А НЕ ФЛАГ ПОСЛЕ ВЫЗОВА. Инструменты сейчас
+ * синхронные, но исполняться они могут и удалённо (python_executor на
+ * воркере). Проверка «сколько заняло» после возврата назвала бы
+ * медленный вызов медленным, но не спасла бы цикл от ожидания.
+ *
+ * Отмена не убивает работу — она возвращает управление циклу. Это честно
+ * названо в результате: `timed_out: true`, а не «ок». */
+function withTimeout(promise, ms, toolId) {
+  const limit = Number(ms) > 0 ? Number(ms) : 5000;
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({
+      toolId, ok: false, reason: 'tool_timeout', timed_out: true, timeoutMs: limit,
+    }), limit);
+  });
+  return Promise.race([Promise.resolve(promise), timeout])
+    .finally(() => { if (timer) clearTimeout(timer); });
+}
+
 /* ===== P1.1a: исполнение инструментов =====
  *
  * ПОЧЕМУ БЕЗ eval И БЕЗ new Function. Выражение приходит из модели или из
@@ -476,6 +605,7 @@ async function runAgent({
   maxIterations = CONFIG.AGENT_MAX_ITERATIONS,
   timeoutMs = 120000,
   onToolCall = null,
+  maxToolCalls = CONFIG.AGENT_MAX_TOOL_CALLS_PER_RUN,
 }) {
   if (typeof infer !== 'function') {
     throw new Error('runAgent requires an infer function');
@@ -483,9 +613,11 @@ async function runAgent({
   if (!agentId) throw new Error('runAgent requires agentId');
 
   const budget = Number(maxTokens) > 0 ? Number(maxTokens) : 512;
+  const callCap = Number(maxToolCalls) > 0 ? Math.trunc(Number(maxToolCalls)) : 3;
   const startedAt = Date.now();
   const steps = [];
   let spentTokens = 0;
+  let totalCalls = 0;
   let stopReason = 'iteration_limit';
 
   for (let i = 0; i < maxIterations; i++) {
@@ -520,12 +652,32 @@ async function runAgent({
       stopReason = 'completed';
       break;
     }
+    /* Потолок ВЫЗОВОВ ОТ МОДЕЛИ (P1.1b). Отдельно от лимита задачи:
+     * клиентская декларация — решение человека, эта — догадка 1.5B-модели,
+     * которая на длинной цепочке просит инструмент по несуществующему
+     * результату предыдущего. Урезаем, а не обрываем без объяснения:
+     * лишние вызовы остаются в шаге с причиной, чтобы в отчёте было видно
+     * «модель просила больше, чем ей разрешено».
+     *
+     * Учёт ДО исполнения: проверка после вызова уже потратила бы время
+     * воркера и токены на бесполезный вызов. */
+    const room = Math.max(0, callCap - totalCalls);
+    const accepted = calls.slice(0, room);
+    const dropped = calls.slice(room);
+    const current = steps[steps.length - 1];
+    for (const call of dropped) {
+      current.observations.push({
+        toolId: call?.toolId ?? null,
+        args: call?.args ?? null,
+        result: { ok: false, reason: 'tool_call_limit', limit: callCap, note: 'сверх потолка вызовов от модели — не исполнялся' },
+      });
+    }
+    totalCalls += accepted.length;
     /* Результат инструмента обязан дойти до следующего промпта: без этого
      * модель вызывает calculator и не видит числа, то есть цикл формально
      * работает, а решения по наблюдению не принимает. */
-    const current = steps[steps.length - 1];
     if (typeof onToolCall === 'function') {
-      for (const call of calls) {
+      for (const call of accepted) {
         const observation = await onToolCall(call, { iteration: i + 1, remainingTokens: budget - spentTokens });
         current.observations.push({
           toolId: call?.toolId ?? null,
@@ -537,13 +689,19 @@ async function runAgent({
       /* Исполнителя нет — это не «пустой результат», а отсутствие канала.
        * Пишем причину, чтобы шаг нельзя было прочитать как «инструмент
        * вызван и ничего не вернул». */
-      for (const call of calls) {
+      for (const call of accepted) {
         current.observations.push({
           toolId: call?.toolId ?? null,
           args: call?.args ?? null,
           result: { ok: false, reason: 'tool_executor_missing' },
         });
       }
+    }
+    /* Потолок исчерпан — следующий шаг модели не нужен: она попросит ещё,
+     * а исполнять будет нечего. Завершаем с честной причиной. */
+    if (totalCalls >= callCap) {
+      stopReason = 'tool_call_limit';
+      break;
     }
   }
 
@@ -554,6 +712,8 @@ async function runAgent({
     spentTokens,
     iterations: steps.length,
     stopReason,
+    toolCallLimit: callCap,
+    toolCallsUsed: totalCalls,
     steps,
     elapsedMs: Date.now() - startedAt,
   };
@@ -601,6 +761,10 @@ module.exports = {
   toolCostTokens,
   checkToolCall,
   toolCallsCost,
+  TOOL_SCHEMAS,
+  toolSchemasFor,
+  normalizeToolCalls,
+  withTimeout,
   evaluateExpression,
   ledgerQuery,
   runToolCall,

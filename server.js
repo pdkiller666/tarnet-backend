@@ -755,6 +755,20 @@ ensureColumn('worker_tasks', 'maxTokens', 'maxTokens INTEGER');
 ensureColumn('worker_tasks', 'promptHash', 'promptHash TEXT');
 ensureColumn('worker_tasks', 'promptHashVerified', 'promptHashVerified INTEGER');
 
+/* ===== P1.1b: вызовы инструментов от модели =====
+ *
+ * ЗАЧЕМ ОТДЕЛЬНАЯ КОЛОНКА, А НЕ ПОЛЕ В ОТВЕТЕ. Вызовы нужны ДВУМ
+ * читателям и в разное время: сервер читает их сразу при выдаче задачи
+ * в цикл агента, а `verify.sh`/аудит — потом, когда ключа сессии уже
+ * нет в памяти. Положить их в `response` значило бы смешать текст
+ * ответа с протоколом вызова: ответ шифруется, а вызовы — служебные
+ * метаданные, из которых промпта не восстановить.
+ *
+ * NULL — задача старше механизма или модель не просила инструментов.
+ * Пустой массив и NULL различаются намеренно: NULL значит «не было
+ * канала», `[]` — «канал был, вызовов не было». */
+ensureColumn('worker_tasks', 'toolCallsJson', 'toolCallsJson TEXT');
+
 /* ===== Миграция: source при эмуляции (2.26.7) =====
  *
  * До 2.26.7 при фолбэке менялся только `emulated`, а `source` оставался
@@ -1386,6 +1400,36 @@ CREATE TABLE IF NOT EXISTS agent_spend (
   toolCalls INTEGER NOT NULL DEFAULT 0 CHECK (toolCalls >= 0),
   PRIMARY KEY (agentId, day)
 );
+
+/* ===== P1.1b: аудит вызовов инструментов =====
+ *
+ * ЗАЧЕМ ОТДЕЛЬНАЯ ТАБЛИЦА, А НЕ СЧЁТЧИК В agent_spend. Счётчик отвечает
+ * на «сколько», но не на «что именно и с каким исходом». Вопросы, которые
+ * задаются на разборе («почему агент не посчитал», «сколько раз отказала
+ * политика», «какой инструмент тормозит») требуют построчного следа.
+ *
+ * ЗАЧЕМ source. 'model' — вызов породила модель; 'policy' — отказ до
+ * исполнения. Смешав их в одну кучу, нельзя отличить «модель не умеет»
+ * (важный вывод P1.1b) от «модель умеет, но ей запретили настройки».
+ *
+ * ЧЕГО ЗДЕСЬ НЕТ: текста промпта. Аргументы хранятся — без них нельзя
+ * доказать, ЧТО было посчитано, — но текст ответа модели в эту таблицу
+ * не попадает. */
+CREATE TABLE IF NOT EXISTS agent_tool_calls (
+  callId TEXT PRIMARY KEY,
+  agentId TEXT NOT NULL,
+  actionId TEXT,
+  toolId TEXT,
+  argsJson TEXT,
+  ok INTEGER NOT NULL DEFAULT 0 CHECK (ok IN (0, 1)),
+  reason TEXT,
+  costTar REAL NOT NULL DEFAULT 0 CHECK (costTar >= 0),
+  tookMs INTEGER,
+  source TEXT NOT NULL DEFAULT 'model' CHECK (source IN ('model', 'declared', 'policy')),
+  createdAt TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_agent ON agent_tool_calls (agentId, createdAt);
+CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_action ON agent_tool_calls (actionId);
 
 /* Резерв под незавершённую задачу.
  * Зачем: между постановкой задачи и выпуском чека проходит время, и без
@@ -2041,6 +2085,38 @@ function recordToolSpend({ agentId, calls, tar }) {
          toolCalls = toolCalls + excluded.toolCalls`,
     [agentId, day, round(Number(tar) || 0), Math.max(0, Math.round(Number(calls) || 0))]);
   return agentSpendOf(agentId, day);
+}
+
+/* Строчный след одного вызова инструмента (P1.1b).
+ *
+ * ПОЧЕМУ НЕ БРОСАЕТ ПРИ ОШИБКЕ. Аудит — свидетельство, а не условие
+ * работы: если запись не легла, ответ инструмента уже получен, и терять
+ * его из-за сломанной телеметрии значило бы менять результат ради лога.
+ * Отказ записи печатается в лог, но не выходит наружу.
+ *
+ * `argsJson` обрезается до 2000 символов: калькулятор ограничен 512, а
+ * ledger_query — короткими полями, так что всё больше — уже аномалия,
+ * и хранить её целиком незачем. */
+function recordAgentToolCall({
+  agentId, actionId = null, toolId = null, args = null,
+  ok = false, reason = null, costTar = 0, tookMs = null, source = 'model',
+}) {
+  try {
+    const argsJson = args === null || args === undefined ? null : JSON.stringify(args).slice(0, 2000);
+    run(`INSERT INTO agent_tool_calls
+           (callId, agentId, actionId, toolId, argsJson, ok, reason, costTar, tookMs, source, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ['atc_' + crypto.randomBytes(8).toString('hex'), String(agentId), actionId,
+        toolId === null ? null : String(toolId).slice(0, 64), argsJson,
+        ok ? 1 : 0, reason === null ? null : String(reason).slice(0, 120),
+        round(Number(costTar) || 0),
+        Number.isFinite(Number(tookMs)) ? Math.max(0, Math.round(Number(tookMs))) : null,
+        ['model', 'declared', 'policy'].includes(source) ? source : 'model',
+        new Date().toISOString()]);
+  } catch (e) {
+    console.log(`[audit] вызов ${toolId} не записан: ${e.message}`);
+  }
+  return null;
 }
 
 /* Каноническая строка, которую подписывает ВЛАДЕЛЕЦ.
@@ -5214,6 +5290,25 @@ function parseJsonList(v) {
   }
 }
 
+/* Разбор вызовов инструментов из строки задачи (P1.1b).
+ *
+ * ПОЧЕМУ НЕ parseJsonList РЯДОМ. Тот скрывает разницу между «поля не было»
+ * и «было пусто»: для allowTools это нормально (пустой allowlist = запрет),
+ * а для вызовов — нет. NULL должен остаться null: цикл по нему понимает,
+ * что канал молчал, и не путает это с ответом «просил и ничего не нашлось».
+ *
+ * Битый JSON — тоже null, а не []: строка, которую нельзя разобрать, — это
+ * не утверждение «вызовов не было». */
+function parseToolCallsJson(v) {
+  if (v === null || v === undefined || v === '') return null;
+  try {
+    const p = JSON.parse(v);
+    return Array.isArray(p) ? p : null;
+  } catch (_e) {
+    return null;
+  }
+}
+
 const AGENT_ROLES = new Set(['coder', 'researcher', 'general']);
 
 app.post('/agents', (req, res) => {
@@ -8022,7 +8117,7 @@ async function dispatchTaskOverP2p({
   return { attempted: true, delivered: true, executed: true, accepted: out.status === 200 };
 }
 
-function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxTokens = null, excludeWsAddr = null, forceWsAddr = null, onEnqueued = null, messages = null, canonicalPrompt = null }) {
+function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxTokens = null, excludeWsAddr = null, forceWsAddr = null, onEnqueued = null, messages = null, canonicalPrompt = null, tools = null }) {
   const taskId = 'wt_' + crypto.randomBytes(12).toString('hex');
   const now = Date.now();
   const sessionKey = crypto.randomBytes(32);
@@ -8065,6 +8160,13 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
     ...(typeof canonicalPrompt === 'string' && Array.isArray(messages) && messages.length
       ? { messages }
       : {}),
+    /* P1.1b: схемы инструментов для модели. Едут ВНУТРИ зашифрованного
+     * тела — как и промпт: набор разрешённых агенту инструментов говорит
+     * о его правах, и открытым текстом в кадре это лишняя утечка.
+     *
+     * Пустой массив не отправляем: воркер тогда не добавляет `tools` в
+     * запрос к Ollama, и поведение остаётся байт-в-байт прежним. */
+    ...(Array.isArray(tools) && tools.length ? { tools } : {}),
     maxTokens: Number(maxTokens) > 0 ? Math.trunc(Number(maxTokens)) : CONFIG.MAX_TOKENS_PER_TASK,
   });
   /* Тот же потолок кладём в строку: на приёме результата его надо СВЕРИТЬ с
@@ -8252,6 +8354,10 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
            * задачи начали бы валить spot-check на пустом месте. */
           promptHashVerified: row.promptHashVerified === null || row.promptHashVerified === undefined
             ? null : Number(row.promptHashVerified) === 1,
+          /* P1.1b: вызовы, которые породила САМА модель. Пустой массив —
+           * честный ответ «модель ничего не просила», а не отсутствие
+           * поля: цикл должен отличать «нет вызовов» от «канал не умеет». */
+          toolCalls: parseToolCallsJson(row.toolCallsJson),
         });
       }
       if (row.status === 'failed') return reject(new Error('worker reported failure'));
@@ -8859,16 +8965,34 @@ function ingestWorkerResult(body) {
    * инструкции. */
   const declaredErrorDetail = typeof body.errorDetail === 'string' && body.errorDetail.length
     ? body.errorDetail.slice(0, 200) : null;
+  /* P1.1b: вызовы инструментов, которые прислал воркер.
+   *
+   * ПОЧЕМУ ПРИНИМАЕМ, А НЕ ПРОВЕРЯЕМ ЗДЕСЬ. Проверка политики и исполнение
+   * живут в цикле агента, где есть каталог, allowlist и счётчик вызовов.
+   * Здесь только сохранение: приём результата не должен знать про политику,
+   * иначе одна и та же проверка заведётся в двух местах и разойдётся.
+   *
+   * `normalizeToolCalls` терпит три формы (Ollama / OpenAI / своя), но
+   * сохраняет только имя и аргументы: id и индексы от провайдера нам не
+   * нужны, а в БД они — мусор, который потом никто не прочтёт.
+   *
+   * Пустой массив — валидное значение: «канал был, вызовов не было».
+   * Отсутствие поля — null: старый воркер, который про tools не знает. */
+  const declaredToolCalls = Array.isArray(body.toolCalls)
+    ? agentRuntime.normalizeToolCalls(body.toolCalls).map(c => ({ toolId: c.toolId, args: c.args ?? null, ...(c.parseError ? { parseError: c.parseError } : {}) }))
+    : null;
   /* encryptedPayload стирается сразу по получении результата: задача
    * завершена, хранить шифротекст больше не для чего. */
   run(
     `UPDATE worker_tasks SET status = 'done', response = ?, tokensGenerated = ?,
        usageJson = ?, model = ?, source = ?, error = ?, errorDetail = ?, finishedAt = ?, encryptedPayload = NULL,
-       promptHashVerified = ?
+       promptHashVerified = ?, toolCallsJson = ?
      WHERE taskId = ?`,
     [storedResponse, tokens, JSON.stringify(body.usage || null), body.model, declaredSource,
       declaredError, declaredErrorDetail, Date.now(),
-      promptHashVerified === null ? null : (promptHashVerified ? 1 : 0), taskId],
+      promptHashVerified === null ? null : (promptHashVerified ? 1 : 0),
+      declaredToolCalls === null ? null : JSON.stringify(declaredToolCalls),
+      taskId],
   );
   /* Ключ НЕ удаляем здесь: его ещё нужен читателю, чтобы расшифровать ответ
    * при выдаче клиенту. Удаление — в enqueueWorkerTask после расшифровки. */
@@ -9994,6 +10118,16 @@ async function runInference(req, res) {
         [clientAddress, reserveTarHeld, new Date().toISOString()]);
     }
 
+    /* P1.1b: схемы инструментов — то, что уедет в теле задачи.
+     *
+     * Считаются ЗДЕСЬ, а не в цикле, потому что источник один: allowlist
+     * агента. Считать в цикле значило бы ходить в БД на каждом шаге за
+     * тем, что не меняется внутри задачи.
+     *
+     * Пустой массив — законное значение: агент без allowedTools получает
+     * запрос без `tools`, и воркер не добавляет поле в Ollama. */
+    const agentTools = agentRuntime.toolSchemasFor(
+      parseJsonList(get('SELECT allowedTools FROM agent_registry WHERE agentId = ?', [agentIdRaw])?.allowedTools));
     agentCtx = {
       agentId: agentIdRaw,
       userId: agentRow.userId,
@@ -10002,6 +10136,7 @@ async function runInference(req, res) {
       promptHash,
       usedApproval: usedApproval ? usedApproval.approvalId : null,
       limits: limitsCheck.limits,
+      tools: agentTools,
     };
   }
 
@@ -10197,6 +10332,10 @@ async function runInference(req, res) {
             prompt,
             messages: history,
             canonicalPrompt,
+            /* P1.1b: схемы инструментов едут в каждую руку роя отдельно:
+             * обе руки — один агент, и одна без `tools` дала бы ответ,
+             * собранный без инструментов, а другая — с ними. */
+            tools: agentCtx ? agentCtx.tools : null,
             model: modelForArm || fallbackModel,
             tier,
             workerAddress: addr,
@@ -10357,6 +10496,11 @@ async function runInference(req, res) {
                * /inference отдавал null при уже состоявшейся сверке. */
               promptHashVerified: w.promptHashVerified === undefined ? null : w.promptHashVerified,
               tokensGenerated: Math.max(1, Math.floor(Number(w.tokensGenerated) || 1)),
+              /* P1.1b: вызовы от модели едут из результата задачи в объект
+               * шага. Без этой строки цепочка рвётся здесь: воркер прислал
+               * `tool_calls`, сервер сохранил их в БД, а цикл увидел пусто и
+               * остановился как «модель ничего не просила». */
+              toolCalls: Array.isArray(w.toolCalls) ? w.toolCalls : [],
               emulated: false,
               workerTaskId: w.taskId,
             };
@@ -10449,6 +10593,7 @@ async function runInference(req, res) {
         prompt,
         messages: history,
         canonicalPrompt,
+        tools: agentCtx ? agentCtx.tools : null,
         model: modelId || body.model || null, tier, workerAddress, maxTokens,
       });
       result = {
@@ -10461,6 +10606,8 @@ async function runInference(req, res) {
          * recordWork и до ответа клиенту. */
         promptHashVerified: w.promptHashVerified === undefined ? null : w.promptHashVerified,
         tokensGenerated: Math.max(1, Math.floor(Number(w.tokensGenerated) || 1)),
+        /* P1.1b: вызовы от модели — тот же перенос, что и в ветке роя. */
+        toolCalls: Array.isArray(w.toolCalls) ? w.toolCalls : [],
         emulated: false,
         workerTaskId: w.taskId,
       };
@@ -10599,7 +10746,12 @@ async function runInference(req, res) {
          * воркера (если он их отдаст) и явный маркер в тексте. Свободный
          * текст не разбираем — см. parseToolRequests. */
         const requested = agentRuntime.parseToolRequests(text);
-        const structural = Array.isArray(stepResult?.toolCalls) ? stepResult.toolCalls : [];
+        /* P1.1b: структурные вызовы от модели. Приходят в двух формах —
+         * Ollama (`{function:{name, arguments}}`) и наша (`{toolId, args}`),
+         * плюс `arguments` строкой у OpenAI-совместимых. Нормализация одна
+         * на все три — та же функция, что у приёма результата, иначе воркер
+         * и сервер понимали бы форму по-разному. */
+        const structural = agentRuntime.normalizeToolCalls(stepResult?.toolCalls);
         return {
           response: text,
           tokens: Math.max(1, Math.floor(Number(stepResult?.tokensGenerated) || 1)),
@@ -10620,15 +10772,49 @@ async function runInference(req, res) {
           callsSoFar: executedToolCalls.length,
         });
         if (!verdict.ok) {
+          recordAgentToolCall({
+            agentId: agentCtx.agentId,
+            actionId: agentCtx.actionId,
+            toolId: call?.toolId ?? null,
+            args: call?.args ?? null,
+            ok: false,
+            reason: verdict.reason,
+            costTar: 0,
+            source: 'policy',
+          });
           return { ok: false, refused: true, ...verdict, note: 'вызов отклонён политикой, не исполнялся' };
         }
-        const run = agentRuntime.runToolCall({
+        /* Таймаут на вызов (P1.1b). Инструменты сейчас синхронные, но
+         * python_executor будет удалённым; ограничение ставится ДО того,
+         * как он появится, иначе первая же медленная реализация повесит
+         * цикл на неопределённое время. */
+        const startedCall = Date.now();
+        const callResult = await agentRuntime.withTimeout(
+          agentRuntime.runToolCall({
+            toolId: verdict.toolId,
+            args: call?.args,
+            ledgerSource: toolLedgerSource,
+          }),
+          CONFIG.AGENT_TOOL_TIMEOUT_MS,
+          verdict.toolId,
+        );
+        const tookMs = Date.now() - startedCall;
+        /* Аудит — ДО возврата: если цикл упадёт сразу после вызова,
+         * след вызова должен остаться. Пишется и отказ, и успех: иначе
+         * нельзя ответить на «почему агент ничего не сделал». */
+        recordAgentToolCall({
+          agentId: agentCtx.agentId,
+          actionId: agentCtx.actionId,
           toolId: verdict.toolId,
-          args: call?.args,
-          ledgerSource: toolLedgerSource,
+          args: call?.args ?? null,
+          ok: callResult?.ok !== false,
+          reason: callResult?.reason ?? null,
+          costTar: verdict.costTar,
+          tookMs,
+          source: 'model',
         });
         executedToolCalls.push(verdict);
-        return run;
+        return callResult;
       },
     });
 

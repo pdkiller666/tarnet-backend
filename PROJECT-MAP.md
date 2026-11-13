@@ -4,7 +4,13 @@
 а не «что работает» (это `MANIFEST.v3.4-UNIFIED.md`) и не «как мы сюда пришли»
 (это `PROJECT-HISTORY.md`).
 
-**Сверено с кодом:** 2026-11-13 05:4x MSK, на проде и локально `2.29.3`, гейт **1293 ✅ / 0 ❌** +
+**Сверено с кодом:** 2026-11-13 11:5x MSK, локально `2.29.4` (прод — `2.29.3`), гейт **1298 ✅ / 0 ❌** +
+`test-conversation.js` **30 ✅ / 0 ❌** — `2.29.4` (P1.1b) не добавляет файлов, а расширяет существующие:
+`agent-runtime.js` (`TOOL_SCHEMAS`, `toolSchemasFor`, `normalizeToolCalls`, `withTimeout`,
+потолок `maxToolCalls` в `runAgent`), `config.js` (`AGENT_MAX_TOOL_CALLS_PER_RUN`,
+`AGENT_TOOL_TIMEOUT_MS`), `server.js` (колонка `worker_tasks.toolCallsJson`, таблица
+`agent_tool_calls`, `recordAgentToolCall`, `parseToolCallsJson`), `worker-demo.js`
+(`tools` в теле Ollama/облака, `toolCalls` в `payload` результата). Предыдущая сверка 2026-11-13 05:4x MSK, на проде и локально `2.29.3`, гейт **1293 ✅ / 0 ❌** +
 `test-conversation.js` **30 ✅ / 0 ❌** — `2.29.3` (P1.1a) не добавляет файлов, а наполняет
 существующий `agent-runtime.js`: `evaluateExpression`, `ledgerQuery`, `runToolCall` —
 инструменты реально исполняются (каталог 3 → 4, §Б.79). Предыдущая сверка 2026-11-11 21:5x MSK, локально `2.29.1`, гейт **1272 ✅ / 0 ❌** +
@@ -141,7 +147,7 @@
 
 | Файл | Строк | Проверок | Что покрывает |
 | :--- | --: | --: | :--- |
-| `test-dpouw.js` | 11647 | **1293** | Основная приёмка: экономика, леджер, чеки, API, Private Swarm, корреляция ответов (51.12–51.14), сверка адреса автозапуска (59.1–59.4b), `--test-p2p` и диагностика зависимостей (53.7–53.10) |
+| `test-dpouw.js` | 11716 | **1298** | Основная приёмка: экономика, леджер, чеки, API, Private Swarm, корреляция ответов (51.12–51.14), сверка адреса автозапуска (59.1–59.4b), `--test-p2p` и диагностика зависимостей (53.7–53.10) |
 | `test-mesh.js` | 459 | **25** | Onion, mesh, многоузловой путь |
 | `proof-treasury-gate.js` | 199 | **15** | Казна и гейт. С 2.24.1 фикстура проходит гейт оплаты: отдельный плательщик через `POST /faucet/claim`, `clientAddress` в теле `/work`. Две проверки фикстуры (faucet выдал, баланс > 0) + 13 исходных |
 | `proof-agent-key.js` | 352 | 57 | Ключ агента: `exportKey` → `InvalidAccessError` |

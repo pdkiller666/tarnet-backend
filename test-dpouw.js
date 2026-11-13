@@ -3158,6 +3158,10 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     prompt: 'всегда вызывает инструмент',
     maxTokens: 1000,
     maxIterations: 3,
+    /* Потолок вызовов снят нарочно: тест про ИТЕРАЦИИ, а не про вызовы.
+     * Иначе сработает tool_call_limit раньше (P1.1b) и проверка
+     * перестанет проверять то, ради чего написана. */
+    maxToolCalls: 100,
     infer: async () => {
       loopCalls++;
       return { response: 'ещё шаг', tokens: 10, toolCalls: [{ toolId: 'calculator' }] };
@@ -3166,6 +3170,71 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
   ok('цикл упирается в maxIterations, а не крутится вечно',
     loopCalls === 3 && looped.stopReason === 'iteration_limit',
     { calls: loopCalls, stop: looped.stopReason });
+
+  /* ===== P1.1b: потолок вызовов от модели =====
+   *
+   * ЗАЧЕМ ОТДЕЛЬНО ОТ ИТЕРАЦИЙ. До 2.29.4 цикл ограничивался только
+   * числом шагов. Модель, которая просит инструмент на каждом шаге,
+   * упиралась в 10 шагов и тратила 10 вызовов — а директива требует три.
+   * Это ДРУГОЙ предохранитель, и проверять его надо отдельно: тест на
+   * итерации прошёл бы и без него. */
+  let cappedCalls = 0;
+  const capped = await agentRuntime.runAgent({
+    agentId: 'a'.repeat(64),
+    prompt: 'просит инструмент всегда',
+    maxTokens: 100000,
+    maxIterations: 10,
+    maxToolCalls: 3,
+    infer: async () => {
+      cappedCalls++;
+      return { response: 'шаг', tokens: 1, toolCalls: [{ toolId: 'calculator' }] };
+    },
+  });
+  ok('P1.1b потолок вызовов от модели = 3 по умолчанию',
+    agentRuntime.runAgent && require('./config').CONFIG.AGENT_MAX_TOOL_CALLS_PER_RUN === 3,
+    require('./config').CONFIG.AGENT_MAX_TOOL_CALLS_PER_RUN);
+  ok('P1.1b цикл останавливается на tool_call_limit, не на 10 шагах',
+    capped.stopReason === 'tool_call_limit' && capped.toolCallsUsed === 3 && cappedCalls === 3,
+    { stop: capped.stopReason, used: capped.toolCallsUsed, inferCalls: cappedCalls });
+
+  /* Вызовы сверх потолка не пропадают молча: они приходят наблюдением
+   * с причиной. Иначе «модель просила 5, исполнилось 3» выглядело бы
+   * как «модель просила 3». */
+  let manyCalls = 0;
+  const overflow = await agentRuntime.runAgent({
+    agentId: 'a'.repeat(64),
+    prompt: 'просит 5 за раз',
+    maxTokens: 100000,
+    maxIterations: 5,
+    maxToolCalls: 3,
+    infer: async () => {
+      manyCalls++;
+      return {
+        response: 'шаг', tokens: 1,
+        toolCalls: Array.from({ length: 5 }, () => ({ toolId: 'calculator', args: { expression: '1+1' } })),
+      };
+    },
+    onToolCall: async () => ({ ok: true, value: 2 }),
+  });
+  const overObs = overflow.steps[0].observations;
+  ok('P1.1b лишние вызовы помечены tool_call_limit, а не выброшены',
+    overObs.length === 5 && overObs.filter(o => o.result?.reason === 'tool_call_limit').length === 2,
+    overObs.map(o => o.result?.reason || 'executed'));
+
+  /* Таймаут — отдельный предохранитель, и проверять его надо на живой
+   * задержке: подмена часов показала бы, что код читает переменную, а не
+   * что он реально перестаёт ждать. */
+  const slowStart = Date.now();
+  const slow = await agentRuntime.withTimeout(
+    new Promise(resolve => setTimeout(() => resolve({ ok: true, value: 42 }), 200)),
+    50, 'calculator');
+  const slowMs = Date.now() - slowStart;
+  ok('P1.1b медленный инструмент отсекается таймаутом',
+    slow.ok === false && slow.reason === 'tool_timeout' && slowMs < 180,
+    { reason: slow.reason, tookMs: slowMs });
+  const fast = await agentRuntime.withTimeout(Promise.resolve({ ok: true, value: 7 }), 5000, 'calculator');
+  ok('P1.1b быстрый инструмент возвращает результат, а не таймаут',
+    fast.ok === true && fast.value === 7, fast);
 
   /* ---------- Резерв и conservation через HTTP ---------- */
   const wave4OwnerEntropy = idCrypto.randomBytes(32).toString('hex');

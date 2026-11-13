@@ -356,7 +356,7 @@ async function fetchAbortable(url, opts, signal, timeoutMs = 120000) {
   }
 }
 
-async function askOllama(prompt, requestedModel, maxTokens = null, signal = null, history = null) {
+async function askOllama(prompt, requestedModel, maxTokens = null, signal = null, history = null, tools = null) {
   /* Модель из задачи имеет приоритет над OLLAMA_MODEL: клиент выбрал её в
    * каталоге, и подменять её своей значило бы врать в ответе. */
   const model = await resolveOllamaModel(requestedModel);
@@ -371,6 +371,13 @@ async function askOllama(prompt, requestedModel, maxTokens = null, signal = null
       model,
       stream: false,
       messages: chat,
+      /* P1.1b: схемы инструментов. До 2.29.4 этого поля не было, и модель
+       * физически не могла породить `tool_calls` — просил инструмент тест
+       * маркером в тексте, а не модель. Поле добавляется только когда
+       * сервер прислал непустой набор: воркер без инструментов обязан
+       * слать байт-в-байт прежнее тело, иначе старые модели начнут
+       * получать шаблон с `tools` и менять поведение без спроса. */
+      ...(Array.isArray(tools) && tools.length ? { tools } : {}),
       /* num_predict — потолок генерации у Ollama. Без него модель пишет,
        * пока не упрётся в свой контекст: воркер тратит время, сервер держит
        * чужой запрос, а клиент просил коротко. Значение пришло из
@@ -398,7 +405,15 @@ async function askOllama(prompt, requestedModel, maxTokens = null, signal = null
   }
   const j = await res.json();
   const response = j.message?.content || j.response || '';
-  if (!response.trim()) throw new Error('ollama вернул пустой ответ');
+  /* P1.1b: модель попросила инструменты.
+   *
+   * ПОЧЕМУ ЭТО НЕ ОШИБКА, ХОТЯ ТЕКСТА НЕТ. У модели с tool_calls `content`
+   * часто пуст: она не отвечает, а просит вызвать функцию. Проверка
+   * «пустой ответ» ниже сработала бы раньше и превратила бы законный
+   * запрос в сбой — пришлось бы отвечать по второму кругу за те же деньги.
+   * Поэтому вызовы проверяются ДО текста. */
+  const rawToolCalls = Array.isArray(j.message?.tool_calls) ? j.message.tool_calls : [];
+  if (!response.trim() && !rawToolCalls.length) throw new Error('ollama вернул пустой ответ');
 
   /* Токены берём из счётчиков Ollama, если он их дал: это точнее оценки
    * по длине символов, а именно от них зависит начисление.
@@ -411,6 +426,10 @@ async function askOllama(prompt, requestedModel, maxTokens = null, signal = null
   const completion_tokens = j.eval_count || Math.ceil(response.length / 4);
   return {
     response, source: 'ollama', model,
+    /* Вызовы уезжают в сыром виде провайдера: нормализация — на сервере,
+     * где одна форма на три бэкенда. Воркер не должен знать про наши
+     * `toolId` — иначе его сборка и сервер разойдутся в формате. */
+    ...(rawToolCalls.length ? { toolCalls: rawToolCalls } : {}),
     usage: { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
   };
 }
@@ -421,7 +440,7 @@ async function askOllama(prompt, requestedModel, maxTokens = null, signal = null
  * (`qwen2.5-coder-7b`) провайдеру не принадлежит, и отправка его в облако
  * дала бы 404 «model not found» вместо ответа. В таком случае честно
  * считаем дефолтом и объявляем в ответе именно то, что запустили. */
-async function askCloud(prompt, requestedModel, maxTokens = null, signal = null, history = null) {
+async function askCloud(prompt, requestedModel, maxTokens = null, signal = null, history = null, tools = null) {
   const conf = GROQ_KEY
     ? { url: 'https://api.groq.com/openai/v1/chat/completions', key: GROQ_KEY,
         model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', name: 'groq', prefix: 'groq/' }
@@ -449,13 +468,19 @@ async function askCloud(prompt, requestedModel, maxTokens = null, signal = null,
     body: JSON.stringify({
       model,
       messages: chat,
+      ...(Array.isArray(tools) && tools.length ? { tools } : {}),
       ...(maxTokens ? { max_tokens: maxTokens } : {}),
     }),
   }, signal);
   if (!res.ok) throw new Error(`${conf.name} HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`);
   const j = await res.json();
-  const response = j.choices?.[0]?.message?.content || '';
-  if (!response.trim()) throw new Error(`${conf.name} вернул пустой ответ`);
+  const choice = j.choices?.[0]?.message || {};
+  const response = choice.content || '';
+  /* P1.1b: у OpenAI-совместимых бэкендов вызовы лежат в `tool_calls`, а
+   * текст тогда обычно пуст. Та же причина, что и у Ollama: проверка
+   * пустоты ниже сработала бы раньше и убила бы законный запрос. */
+  const rawToolCalls = Array.isArray(choice.tool_calls) ? choice.tool_calls : [];
+  if (!response.trim() && !rawToolCalls.length) throw new Error(`${conf.name} вернул пустой ответ`);
 
   const u = j.usage || {};
   const prompt_tokens = u.prompt_tokens
@@ -465,6 +490,7 @@ async function askCloud(prompt, requestedModel, maxTokens = null, signal = null,
     /* Объявляем РЕАЛЬНО запущенную модель: если провайдер ответил не тем
      * именем, что просили, отчёт обязан это показать, а не повторить запрос. */
     response, source: conf.name, model,
+    ...(rawToolCalls.length ? { toolCalls: rawToolCalls } : {}),
     usage: { prompt_tokens, completion_tokens, total_tokens: u.total_tokens || prompt_tokens + completion_tokens },
   };
 }
@@ -552,11 +578,11 @@ function ollamaErrorCode(e) {
   return 'OLLAMA_ERROR';
 }
 
-async function generate(prompt, requestedModel, maxTokens = null, signal = null, history = null) {
+async function generate(prompt, requestedModel, maxTokens = null, signal = null, history = null, tools = null) {
   let ollamaErr = null;
   if (Date.now() >= ollamaDeadUntil) {
     try {
-      return await askOllama(prompt, requestedModel, maxTokens, signal, history);
+      return await askOllama(prompt, requestedModel, maxTokens, signal, history, tools);
     } catch (e) {
       /* Отмена — не поломка бэкенда: не записывать её в паузу Ollama и не
        * переходить на облако по «ошибке». Иначе CANCEL ухудшал бы следующий
@@ -583,7 +609,7 @@ async function generate(prompt, requestedModel, maxTokens = null, signal = null,
   }
   if (GROQ_KEY || OPENROUTER_KEY) {
     try {
-      return await askCloud(prompt, requestedModel, maxTokens, signal, history);
+      return await askCloud(prompt, requestedModel, maxTokens, signal, history, tools);
     } catch (e) {
       log(`облачный API не ответил (${e.message})`);
     }
@@ -824,6 +850,10 @@ async function runTask(task, via = 'http') {
    * `{prompt}`, и тогда контекст — один текущий вопрос, как было всегда. */
   let history = null;
   let taskMaxTokens = null;
+  /* P1.1b: схемы инструментов из зашифрованного тела задачи. null — сервер
+   * их не прислал (старая версия или у агента нет allowedTools), и тогда
+   * воркер шлёт в Ollama точно то же тело, что и раньше. */
+  let taskTools = null;
   /* Отмена, пришедшая до старта: задачу не начинаем. Ответа не будет —
    * сервер её уже снял в `cancelled`, и присылать туда 409 бессмысленно. */
   if (task && task.taskId && taskCancelledBefore.has(task.taskId)) {
@@ -873,6 +903,19 @@ async function runTask(task, via = 'http') {
         )
         : null;
       if (history && !history.length) history = null;
+      /* Схемы инструментов (P1.1b). Валидируем форму, а не только тип:
+       * битая схема заставит Ollama ответить 400 на весь запрос, и
+       * человек увидит сбой модели вместо причины. Отбрасываем молча
+       * незаконное и называем число в логе — молчание здесь стоило бы
+       * дороже, чем одна строка. */
+      if (Array.isArray(parsed.tools) && parsed.tools.length) {
+        const valid = parsed.tools.filter(t => t && typeof t === 'object'
+          && t.type === 'function' && t.function && typeof t.function.name === 'string');
+        if (valid.length !== parsed.tools.length) {
+          log(`задача ${task.taskId}: отброшено ${parsed.tools.length - valid.length} схем инструментов — не та форма`);
+        }
+        taskTools = valid.length ? valid : null;
+      }
       const mt = Number(parsed.maxTokens);
       taskMaxTokens = Number.isFinite(mt) && mt > 0 ? Math.trunc(mt) : null;
     } else {
@@ -897,7 +940,7 @@ async function runTask(task, via = 'http') {
   const pulse = setInterval(heartbeat, 7000);
   let gen;
   try {
-    gen = await generate(prompt, task.model || null, taskMaxTokens, abortCtrl.signal, history);
+    gen = await generate(prompt, task.model || null, taskMaxTokens, abortCtrl.signal, history, taskTools);
   } catch (e) {
     /* Отмена: это не ошибка воркера и не повод для ERROR-кадра — сервер
      * отменил задачу сам. Возвращаем причину, чтобы onWsTask просто
@@ -933,9 +976,22 @@ async function runTask(task, via = 'http') {
     /* Ответ шифруется ключом сессии, когда он есть. Ключ пришёл по TLS и
      * живёт только в памяти — на диск не попадает. Хеш промпта — рядом,
      * открытым: он не раскрывает текст, но доказывает, что считали именно его. */
-    payload: sessionKeyB64
-      ? { encryptedResponse: encryptResult(gen.response, sessionKeyB64), promptHash }
-      : { response: gen.response, promptHash },
+    payload: {
+      ...(sessionKeyB64
+        ? { encryptedResponse: encryptResult(gen.response, sessionKeyB64), promptHash }
+        : { response: gen.response, promptHash }),
+      /* P1.1b: вызовы инструментов от модели.
+       *
+       * ПОЧЕМУ ВНУТРИ payload, А НЕ РЯДОМ С НИМ. Оба пути отправки
+       * (WS-кадр и POST /worker/submit) собираются как `...out.payload`.
+       * Положив поле рядом, я бы не получил ошибки — оно бы просто
+       * не доехало, и цикл увидел бы «модель ничего не просила». Проверять
+       * это надо тестом на форме кадра, а не глазами.
+       *
+       * ЧЕСТНО О ЦЕНЕ. Аргументы могут повторять кусок вопроса, поэтому
+       * сервер стирает колонку сразу после чтения её циклом. */
+      ...(Array.isArray(gen.toolCalls) && gen.toolCalls.length ? { toolCalls: gen.toolCalls } : {}),
+    },
   };
 }
 
