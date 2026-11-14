@@ -12058,6 +12058,36 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       wrtcMod.CONST.MAX_SDP_CHARS === 100000 &&
       /OFFER_TOO_LARGE/.test(srvSrcForSdp),
       { client: wrtcMod.CONST.MAX_SDP_CHARS });
+
+    /* 63.20–63.22 — артефакты ручной проверки Этапа 10 (`2.29.11`).
+     * Без них `check-webrtc.js` и инструкция остались бы «написали», а
+     * не «есть и не противоречит коду». */
+    const fs63 = require('fs');
+    const cwPath = path.join(__dirname, 'scripts', 'check-webrtc.js');
+    let cwSrc = '';
+    try { cwSrc = fs63.readFileSync(cwPath, 'utf8'); } catch (e) { cwSrc = ''; }
+    ok('63.20 scripts/check-webrtc.js есть и знает контракт отказов',
+      cwSrc.length > 1000 && /NO_OFFER/.test(cwSrc) && /BAD_ADDRESS/.test(cwSrc),
+      cwSrc ? `${cwSrc.length} байт` : 'файла нет');
+
+    /* Своя ошибка, которую скрипт уже поймал один раз: `/health` отвечает
+     * `{status:"ok"}`, а не `{ok:true}`. Проверка на `ok:true` давала
+     * ложно красный на живом сервере. Здесь — замок от возврата. */
+    ok('63.21 check-webrtc читает /health по полю status, а не ok',
+      /health\.json\.status\s*===\s*'ok'/.test(cwSrc),
+      'Guard от повторения своей ошибки');
+
+    const btPath = path.join(__dirname, 'docs', 'WEBRTC-BROWSER-TEST.md');
+    let btSrc = '';
+    try { btSrc = fs63.readFileSync(btPath, 'utf8'); } catch (e) { btSrc = ''; }
+    /* Инструкция обязана называть РЕАЛЬНЫЕ имена, иначе она уводит:
+     * поле записи — `workerAddress` (не `address`), откат — FALLBACK_LOG. */
+    ok('63.22 WEBRTC-BROWSER-TEST называет реальное поле workerAddress',
+      btSrc.length > 1000 &&
+      /workerAddress/.test(btSrc) &&
+      /TarNetWebRTC/.test(btSrc) &&
+      /FALLBACK_LOG|WebRTC failed, using WS relay/.test(btSrc),
+      btSrc ? `${btSrc.length} байт` : 'файла нет');
   }
 
   console.log('\n' + '─'.repeat(50));

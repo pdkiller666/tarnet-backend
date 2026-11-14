@@ -105,10 +105,10 @@ sudo ./scripts/bootstrap.sh --domain=tarnet.example.com \
 
 ```
 [11] проверка
-     ✅ локально /health 200, buildVersion 2.28.4
+     ✅ локально /health 200, buildVersion <совпадает с package.json>
      ✅ снаружи https://tarnet.example.com/health → 200
 
-{"ok":true,"domain":"tarnet.example.com","commit":"6559b67...","buildVersion":"2.28.4",
+{"ok":true,"domain":"tarnet.example.com","commit":"<SHA этого коммита>","buildVersion":"<из /health>",
  "health_local":"200","health_external":"200"}
 ```
 
