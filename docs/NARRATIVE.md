@@ -349,7 +349,7 @@ re-announce, seed-failover, Circuit Relay и `--expect-peer` (последний
 |---|---|
 | Веб-приложение TarNet | `/app/` → HTTP 200, трёхколоночный интерфейс, PWA |
 | Бухгалтерия и экономика | 808 чеков, `delta = 0` у burn, treasury и conservation одновременно |
-| Тесты | **1495 ✅ / 0 ❌** (1323 dpouw + 46 knowledge + 30 conversation), гейт `verify.sh` — 1465 в девяти наборах, 14.11.2026 |
+| Тесты | **1399 ✅ / 0 ❌** (1323 dpouw + 46 knowledge + 30 conversation), гейт `verify.sh` — 1465 в девяти наборах, 14.11.2026 |
 | Эмиссия и казна | block `169.329484` TAR, fee `7.152497` TAR, казна `0.1982` TAR (сумма долей сходится с `totalRewardTar 176.481981`) |
 | 18 моделей с кэшбэком | `GET /models` → 18, `GET /config` → fee 0.0002 / cashback 0.0001 |
 | Роевой синтез | два воркера параллельно, выбор лучшего, `CANCEL` за 389 мс |
@@ -400,7 +400,7 @@ websocket`, `listenHost: 127.0.0.1`, `announced_public: false`, список п�
 | Утверждение | Как проверить |
 |---|---|
 | Версия прода | `curl /health` → `buildVersion` = `version` из `package.json` (сейчас `2.29.7`); расхождение ловит `verify.sh` шаг 3.9 |
-| Тесты | `scripts/verify.sh` → 1465 ✅ / 0 ❌ (девять наборов: 1323 + 25 + 15 + 46 + 15 + 10 + 12 + 10 + 9), сборка `2.29.7`; локально гейт **1495** (1323 + 46 + 30) |
+| Тесты | `scripts/verify.sh` → 1465 ✅ / 0 ❌ (девять наборов: 1323 + 25 + 15 + 46 + 15 + 10 + 12 + 10 + 9), сборка `2.29.7`; локально гейт **1399** (1323 + 46 + 30) |
 | Чеки и баланс | `curl /summary` → `receipts: 808`, `conservation.delta: 0` |
 | 18 моделей | `curl /models` → длина 18 |
 | Ставки Tier 6 | `curl /config` → `TIER6` |
