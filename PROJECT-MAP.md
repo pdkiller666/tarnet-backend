@@ -4,7 +4,7 @@
 а не «что работает» (это `MANIFEST.v3.4-UNIFIED.md`) и не «как мы сюда пришли»
 (это `PROJECT-HISTORY.md`).
 
-**Сверено с кодом:** 2026-11-14 05:3x MSK, на проде и локально `2.29.6` (`curl /health` → `buildVersion: 2.29.6`, VPS HEAD = GitHub = локально `20b81dd`), гейт **1323 ✅ / 0 ❌** +
+**Сверено с кодом:** 2026-11-14 05:3x MSK, на проде и локально `2.29.6` (`curl /health` → `buildVersion: 2.29.6`, VPS = GitHub = локальная копия), гейт **1323 ✅ / 0 ❌** +
 `test-conversation.js` **30 ✅ / 0 ❌** = **1353** — `2.29.6` (P1.1c) не добавляет файлов: правка внесена
 в `agent-runtime.js` (вызов `onToolCall` в цикле `runAgent` обёрнут в `try/catch`, ошибка
 возвращается наблюдением `tool_executor_threw`) и в `test-dpouw.js` (серия P1.1c, 3 проверки).
