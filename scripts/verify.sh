@@ -496,6 +496,29 @@ else
   no "версия прода" "прод $BUILD_LIVE != package.json $BUILD_PKG — раскатай или поправь номер"
 fi
 
+# ---------- 3.10 версия в шапках документов = package.json ----------
+# ПОЧЕМУ ОТДЕЛЬНАЯ ПРОВЕРКА. Шаг 3.9 сверяет \`/health\` с \`package.json\` — то есть
+# ловит расхождение КОДА и ПРОДА. Но версию в шапках \`MASTER-PLAN.md\` и
+# \`MANIFEST.v3.4-UNIFIED.md\` пишет рука, и она протухает молча: 14.11.2026 код был
+# \`2.29.11\`, прод отдавал \`2.29.11\`, а шапки говорили \`2.29.8\` и \`2.29.7\`. Оба шага
+# 3.9 при этом были зелёными — гейт проверял не то, что врало. Инвестор читает
+# шапку, а не \`/health\`.
+#
+# Разбор терпит markdown-обвязку: в документах номер стоит как \`**Версия:** 2.29.11\`
+# или \`**Сборка живого стенда:** \`2.29.11\`\`, поэтому снимаются и звёздочки, и
+# обратные кавычки. Без этого проверка краснела бы на верных документах — а
+# гейт, который врёт в обе стороны, отключают.
+MP_VER=$(grep -m1 'Версия:' MASTER-PLAN.md 2>/dev/null | sed 's/.*Версия:[* ]*//' | tr -d '`' | awk '{print $1}')
+MF_VER=$(grep -m1 'Сборка живого стенда:' MANIFEST.v3.4-UNIFIED.md 2>/dev/null | sed 's/.*Сборка живого стенда:[* ]*//' | tr -d '`' | awk '{print $1}')
+BUILD_PKG_HEAD=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1)
+if [ -z "$MP_VER" ] || [ -z "$MF_VER" ]; then
+  no "версия в шапках" "не разобрал шапку: MASTER-PLAN='$MP_VER', MANIFEST='$MF_VER'"
+elif [ "$MP_VER" = "$BUILD_PKG_HEAD" ] && [ "$MF_VER" = "$BUILD_PKG_HEAD" ]; then
+  ok "версия в шапках" "$BUILD_PKG_HEAD = package.json (оба документа)"
+else
+  no "версия в шапках" "package.json=$BUILD_PKG_HEAD, MASTER-PLAN=$MP_VER, MANIFEST=$MF_VER"
+fi
+
 H_PUB=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/health")
 [ "$H_PUB" = "200" ] && ok "/health снаружи" "HTTP 200" || no "/health снаружи" "HTTP $H_PUB"
 

@@ -427,8 +427,9 @@ websocket`, `listenHost: 127.0.0.1`, `announced_public: false`, список п�
 
 | Утверждение | Как проверить |
 |---|---|
-| Версия прода | `curl /health` → `buildVersion` = `version` из `package.json` (сейчас `2.29.8`); расхождение ловит `verify.sh` шаг 3.9 |
-| Тесты | `scripts/verify.sh` → 1465 ✅ / 0 ❌ (девять наборов: 1323 + 25 + 15 + 46 + 15 + 10 + 12 + 10 + 9), сборка `2.29.8`; локально гейт **1399** (1323 + 46 + 30) |
+| Версия прода | `curl /health` → `buildVersion` = `version` из `package.json` (сейчас `2.29.12`); расхождение ловит `verify.sh` шаг 3.9 |
+| Тесты | `scripts/verify.sh` → 1465 ✅ / 0 ❌ (девять наборов), сборка `2.29.12`; локальный гейт **1420** (`1344` dpouw + `46` knowledge + `30` conversation) |
+| Версия в шапках | `grep -m1 'Версия:' MASTER-PLAN.md`, `grep -m1 'Сборка живого стенда:' MANIFEST.v3.4-UNIFIED.md` = `package.json`; ручная версия в шапке протухала молча (14.11: код `2.29.11`, шапки `2.29.8`/`2.29.7`), теперь расхождение ловит `verify.sh` шаг 3.10 |
 | Чеки и баланс | `curl /summary` → `receipts: 808`, `conservation.delta: 0` |
 | 18 моделей | `curl /models` → длина 18 |
 | Ставки Tier 6 | `curl /config` → `TIER6` |
