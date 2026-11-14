@@ -3511,7 +3511,7 @@ const RATE_LIMITS = {
  * четвёртой реплике человек получал 429 «лимит 10 в минуту» при живом
  * балансе и своём ключе провайдера. */
 const RATE_READ_PATH =
-  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|models|p2p\/status|p2p\/bootstrap|worker\/status|agents(\/approvals)?|tools)$/;
+  /^\/(health|summary|ledger|nodes|adapters|balances|settlements|epoch|config|providers|models|p2p\/status|p2p\/bootstrap|worker\/status|agents(\/approvals)?|tools)$/;
 /* `/id/<pubkey>/balance` — чтение, а не запись: клиент опрашивает баланс так же
  * часто, как /balance/<addr>. Без этой ветки он упирался бы в 10/мин. */
 /* `/consent/<userId>` — тоже чтение: PWA читает согласие один раз при
@@ -3864,6 +3864,31 @@ app.get('/health', async (_req, res) => {
   });
 });
 
+/* Публичный реестр провайдеров — ОДНА функция на два маршрута.
+ *
+ * `/providers` (2.29.9) и `/config.providers` отдают байт-в-байт одно и то
+ * же, потому что собираются здесь. Копия сериализатора в двух местах — это
+ * ровно тот дубликат, который протухает первым: новый провайдер появится в
+ * реестре, `/config` его покажет, а `/providers` останется старым, и PWA
+ * будет зависеть от того, какой адрес она спросила.
+ *
+ * Ключей здесь нет и быть не может: реестр описывает ФОРМАТ ключа (префикс),
+ * а не значение. Значение живёт только в браузере. */
+function publicProviders() {
+  return Object.keys(PROVIDER_REGISTRY).map((id) => {
+    const p = PROVIDER_REGISTRY[id];
+    return {
+      id,
+      title: p.title,
+      keyPrefix: p.keyPrefix,
+      format: p.format,
+      implemented: p.implemented,
+      signup: p.signup,
+      note: p.note,
+    };
+  });
+}
+
 /* --- Config / формулы (для клиента и аудита) --- */
 app.get('/config', (_req, res) => {
   res.json({
@@ -3901,19 +3926,19 @@ app.get('/config', (_req, res) => {
      *
      * Ключей здесь нет и быть не может — реестр описывает ФОРМАТ ключа
      * (префикс), а не значение. Значение живёт только в браузере. */
-    providers: Object.keys(PROVIDER_REGISTRY).map((id) => {
-      const p = PROVIDER_REGISTRY[id];
-      return {
-        id,
-        title: p.title,
-        keyPrefix: p.keyPrefix,
-        format: p.format,
-        implemented: p.implemented,
-        signup: p.signup,
-        note: p.note,
-      };
-    }),
+    providers: publicProviders(),
   });
+});
+
+/* `/providers` — реестр отдельным адресом (2.29.9).
+ *
+ * Зачем он есть, если то же самое лежит в `/config.providers`: адрес
+ * называется так, как его ищут. Человек, пишущий интеграцию, не обязан
+ * знать, что реестр спрятан внутри конфига. Обе точки читают один
+ * сериализатор выше, поэтому расхождения между ними невозможны по
+ * построению, а не по обещанию. */
+app.get('/providers', (_req, res) => {
+  res.json({ providers: publicProviders() });
 });
 
 /* --- Epoch --- */

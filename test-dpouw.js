@@ -6454,6 +6454,44 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     const cacheV33 = (swSrc33.match(/const CACHE = 'tarnet-app-v(\d+)'/) || [])[1];
     ok('33.8 кэш не ниже v12 (фильтр по провайдеру дойдёт до клиента)',
       Number(cacheV33) >= 12, cacheV33);
+
+    /* 33.9 `GET /providers` — реестр отдельным адресом (2.29.9).
+     *
+     * Проверяется не только код 200, а ГЛАВНОЕ — что этот адрес и
+     * `/config.providers` не разъедутся. Две точки, собранные двумя
+     * разными кусками кода, расходятся молча: новый провайдер попадает в
+     * одну и исчезает из другой. Поэтому сравниваем ответы целиком. */
+    const pRes = await api('/providers');
+    ok('33.9 GET /providers отвечает 200', pRes.status === 200, pRes.status);
+    const pList = Array.isArray(pRes.body?.providers) ? pRes.body.providers : [];
+    const regIds33 = Object.keys(require('./config').PROVIDER_REGISTRY);
+    ok('33.9 /providers отдаёт весь реестр',
+      pList.length === regIds33.length, { got: pList.length, want: regIds33.length });
+
+    /* Ключей в ответе нет: реестр описывает формат, а не значение. Если
+     * здесь появится поле key/secret — это утечка по недосмотру. */
+    const leaked = pList.filter((p) => 'key' in p || 'secret' in p || 'apiKey' in p);
+    ok('33.9 в /providers нет полей с ключами', leaked.length === 0, leaked.map((p) => p.id));
+
+    const cfgRes = await api('/config');
+    const cfgProvs = Array.isArray(cfgRes.body?.providers) ? cfgRes.body.providers : [];
+    ok('33.9 /providers и /config.providers — один и тот же список',
+      JSON.stringify(pList) === JSON.stringify(cfgProvs),
+      { providers: pList.length, config: cfgProvs.length });
+
+    /* Флаг implemented обязан совпадать с картой 501: иначе PWA покажет
+     * «подключён» там, где вызов гарантированно вернёт 501. */
+    const NOT_IMPL_33 = require('./llm-adapter').TIER6_NOT_IMPLEMENTED || {};
+    const wrongFlag = pList.filter((p) => Boolean(p.implemented) === Boolean(NOT_IMPL_33[p.id]));
+    ok('33.9 implemented в /providers не врёт про 501',
+      wrongFlag.length === 0, wrongFlag.map((p) => p.id));
+
+    /* `/providers` — чтение: браузер дёргает его на старте вместе с
+     * `/config`. Класс strict (10/мин) съел бы половину бюджета чата. */
+    const srvSrc33 = require('fs').readFileSync('./server.js', 'utf8');
+    const readRe33 = (srvSrc33.match(/const RATE_READ_PATH =\s*\n?\s*\/(.+)\/;/) || [])[1] || '';
+    ok('33.9 /providers отнесён к классу read, а не strict',
+      /providers/.test(readRe33), readRe33.slice(0, 90));
   }
 
   /* ===== 34. Tier 6: платит ТОЛЬКО сам клиент (2.19.2) =====

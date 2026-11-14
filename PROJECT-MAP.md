@@ -241,14 +241,14 @@ SQLite, `/var/lib/tarnet` на проде. **45 таблиц** (проверен
 
 ---
 
-## 10. API — 70 маршрутов (38 GET, 30 POST, 2 DELETE)
+## 10. API — 71 маршрут (39 GET, 30 POST, 2 DELETE)
 
 Разбивка по назначению (полный контракт — `docs/NETWORK-CONTRACT-v1.md`):
 
 - **Работа:** `POST /work`, `POST /worker/submit`, `GET /worker/poll`, `GET /receipt/:worker`
 - **Инференс:** `POST /inference`, `POST /inference/onion`, `GET /models`
 - **Узлы:** `GET /nodes`, `POST /node`, `GET /p2p/status`
-- **Экономика:** `GET /health`, `GET /summary`, `GET /config`, `GET /epoch`, `GET /ledger`, `GET /balances`
+- **Экономика:** `GET /health`, `GET /summary`, `GET /config`, `GET /providers`, `GET /epoch`, `GET /ledger`, `GET /balances`
 - **Кошелёк:** `POST /faucet/claim`
 - **Tier 6:** `POST /tier6/*`
 - **Устройства:** `/devices/link*`, `/devices/links/:owner`
@@ -257,6 +257,13 @@ SQLite, `/var/lib/tarnet` на проде. **45 таблиц** (проверен
 **Правило Code-First:** маршрут существует = он есть в `server.js`. Отсутствие в
 `docs/NETWORK-CONTRACT-v1.md` — дефект документа, а не признак отсутствия кода
 (так было с `CANCEL` и `swarm`: в коде есть, в контракте не было).
+
+**`GET /providers` (2.29.9).** Отдаёт публичный реестр провайдеров — тот же, что лежит в
+`/config.providers`, и **собранный той же функцией** `publicProviders()` в `server.js`. Две
+точки, собранные разным кодом, расходятся молча; здесь расхождение невозможно по построению.
+Ключей в ответе нет: реестр описывает формат ключа (префикс), а не значение — значение живёт
+только в браузере. Класс лимита — `read`, иначе PWA на старте (реестр + `/config`) съедала бы
+половину бюджета `strict` (10/мин).
 
 ---
 
