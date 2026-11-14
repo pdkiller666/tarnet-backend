@@ -3221,6 +3221,51 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     overObs.length === 5 && overObs.filter(o => o.result?.reason === 'tool_call_limit').length === 2,
     overObs.map(o => o.result?.reason || 'executed'));
 
+  /* ===== P1.1c: ошибка инструмента — наблюдение, а не смерть цикла =====
+   *
+   * ДЕФЕКТ, КОТОРЫЙ ЭТО ЛОВИТ. До 2.29.6 исключение внутри onToolCall
+   * выходило из runAgent наружу: прогон умирал целиком и не возвращал
+   * НИ ОДНОГО шага — ни ответа модели, ни уже собранных наблюдений, хотя
+   * токены были потрачены. Замерено пробой до правки: reject вместо
+   * результата. Проверка держит именно ПРОДОЛЖЕНИЕ цикла, а не текст
+   * ошибки: тест на текст прошёл бы и при падении, если бы причина
+   * совпала случайно. */
+  let throwInferCalls = 0;
+  let throwRejected = null;
+  let thrown = null;
+  try {
+    thrown = await agentRuntime.runAgent({
+      agentId: 'a'.repeat(64),
+      prompt: 'инструмент бросает',
+      maxTokens: 100000,
+      maxIterations: 3,
+      maxToolCalls: 2,
+      infer: async () => {
+        throwInferCalls++;
+        /* Инструмент просится ОДИН раз — проверка про продолжение
+         * после ошибки, а не про потолок вызовов. Модель, просящая
+         * инструмент на каждом шаге, упёрлась бы в tool_call_limit
+         * и тест не отличил бы это от смерти цикла. */
+        return throwInferCalls > 1
+          ? { response: 'готово', tokens: 1, toolCalls: [] }
+          : { response: 'шаг', tokens: 1, toolCalls: [{ toolId: 'calculator', args: { expression: '2+2' } }] };
+      },
+      onToolCall: async () => { throw new Error('boom из инструмента'); },
+    });
+  } catch (e) {
+    throwRejected = e?.message || String(e);
+  }
+  ok('P1.1c исключение в инструменте не убивает прогон',
+    throwRejected === null && thrown !== null,
+    { rejected: throwRejected });
+  const throwObs = thrown?.steps?.[0]?.observations?.[0];
+  ok('P1.1c ошибка инструмента вернулась наблюдением с причиной',
+    throwObs?.result?.ok === false && throwObs?.result?.reason === 'tool_executor_threw',
+    throwObs?.result);
+  ok('P1.1c цикл продолжился после ошибки инструмента',
+    thrown?.stopReason === 'completed' && throwInferCalls === 2,
+    { stop: thrown?.stopReason, inferCalls: throwInferCalls });
+
   /* Таймаут — отдельный предохранитель, и проверять его надо на живой
    * задержке: подмена часов показала бы, что код читает переменную, а не
    * что он реально перестаёт ждать. */

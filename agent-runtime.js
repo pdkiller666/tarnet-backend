@@ -678,7 +678,29 @@ async function runAgent({
      * работает, а решения по наблюдению не принимает. */
     if (typeof onToolCall === 'function') {
       for (const call of accepted) {
-        const observation = await onToolCall(call, { iteration: i + 1, remainingTokens: budget - spentTokens });
+        /* Исполнитель обязан возвращать результат, а не бросать.
+         *
+         * ДЕФЕКТ, КОТОРЫЙ ЭТО ЛОВИТ. До 2.29.6 исключение внутри onToolCall
+         * выходило из runAgent наружу: прогон умирал целиком, и наружу не
+         * возвращалось НИ ОДНОГО шага — ни ответа модели, ни уже полученных
+         * наблюдений. Замерено пробой: `onToolCall: async () => { throw ... }`
+         * давал reject всей функции, а не наблюдение с ошибкой. То есть одна
+         * сломанная реализация инструмента обнуляла работу цикла, хотя
+         * остальные инструменты были исправны, а токены уже потрачены.
+         *
+         * Ошибка инструмента — это наблюдение, а не повод останавливать
+         * цикл: модель должна увидеть причину и продолжить без него. */
+        let observation;
+        try {
+          observation = await onToolCall(call, { iteration: i + 1, remainingTokens: budget - spentTokens });
+        } catch (e) {
+          observation = {
+            ok: false,
+            reason: 'tool_executor_threw',
+            message: e?.message ? String(e.message) : String(e),
+            note: 'исполнитель инструмента бросил исключение — ошибка возвращена как наблюдение',
+          };
+        }
         current.observations.push({
           toolId: call?.toolId ?? null,
           args: call?.args ?? null,

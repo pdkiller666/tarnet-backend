@@ -4,7 +4,11 @@
 а не «что работает» (это `MANIFEST.v3.4-UNIFIED.md`) и не «как мы сюда пришли»
 (это `PROJECT-HISTORY.md`).
 
-**Сверено с кодом:** 2026-11-13 11:5x MSK, локально `2.29.4` (прод — `2.29.3`), гейт **1298 ✅ / 0 ❌** +
+**Сверено с кодом:** 2026-11-14 05:3x MSK, локально `2.29.6` (прод — `2.29.5`), гейт **1323 ✅ / 0 ❌** +
+`test-conversation.js` **30 ✅ / 0 ❌** = **1353** — `2.29.6` (P1.1c) не добавляет файлов: правка внесена
+в `agent-runtime.js` (вызов `onToolCall` в цикле `runAgent` обёрнут в `try/catch`, ошибка
+возвращается наблюдением `tool_executor_threw`) и в `test-dpouw.js` (серия P1.1c, 3 проверки).
+Предыдущая сверка 2026-11-13 11:5x MSK, локально `2.29.4` (прод — `2.29.3`), гейт **1298 ✅ / 0 ❌** +
 `test-conversation.js` **30 ✅ / 0 ❌** — `2.29.4` (P1.1b) не добавляет файлов, а расширяет существующие:
 `agent-runtime.js` (`TOOL_SCHEMAS`, `toolSchemasFor`, `normalizeToolCalls`, `withTimeout`,
 потолок `maxToolCalls` в `runAgent`), `config.js` (`AGENT_MAX_TOOL_CALLS_PER_RUN`,
