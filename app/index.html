@@ -772,6 +772,11 @@
 <script src="/app/vendor/ed25519.js"></script>
 <script src="/app/app.js"></script>
 <script src="/app/knowledge.js"></script>
+<!-- WebRTC-клиент (2.29.10, Этап 10). Отдельным файлом, а не внутри
+     app.js: транспорт меняется чаще и не должен тянуть за собой весь
+     интерфейс. Подключён ПОСЛЕ app.js, поэтому app.js видит его только
+     через `window.TarNetWebRTC` в момент вызова, а не при загрузке. -->
+<script src="/app/webrtc-client.js"></script>
 <script src="/app/agents.js"></script>
 <!-- HITL: подтверждение траты выше порога. Вне <section>, потому что это
      fixed-слой поверх любой вкладки, а не часть панели. -->

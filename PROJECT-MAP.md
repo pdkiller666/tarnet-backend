@@ -241,13 +241,14 @@ SQLite, `/var/lib/tarnet` на проде. **45 таблиц** (проверен
 
 ---
 
-## 10. API — 71 маршрут (39 GET, 30 POST, 2 DELETE)
+## 10. API — 73 маршрута (40 GET, 31 POST, 2 DELETE)
 
 Разбивка по назначению (полный контракт — `docs/NETWORK-CONTRACT-v1.md`):
 
 - **Работа:** `POST /work`, `POST /worker/submit`, `GET /worker/poll`, `GET /receipt/:worker`
 - **Инференс:** `POST /inference`, `POST /inference/onion`, `GET /models`
-- **Узлы:** `GET /nodes`, `POST /node`, `GET /p2p/status`
+- **Узлы:** `GET /nodes`, `POST /node`, `GET /p2p/status`, `GET /p2p/discover`
+- **Транспорт:** `POST /p2p/signal`
 - **Экономика:** `GET /health`, `GET /summary`, `GET /config`, `GET /providers`, `GET /epoch`, `GET /ledger`, `GET /balances`
 - **Кошелёк:** `POST /faucet/claim`
 - **Tier 6:** `POST /tier6/*`
@@ -257,6 +258,18 @@ SQLite, `/var/lib/tarnet` на проде. **45 таблиц** (проверен
 **Правило Code-First:** маршрут существует = он есть в `server.js`. Отсутствие в
 `docs/NETWORK-CONTRACT-v1.md` — дефект документа, а не признак отсутствия кода
 (так было с `CANCEL` и `swarm`: в коде есть, в контракте не было).
+
+**`POST /p2p/signal` (2.29.10, Этап 10).** Принимает offer браузера, находит воркера
+через DHT, отдаёт его `answer`. Тело — `{workerAddress?|targetPeerId?, offer:{type,sdp}}`;
+адрес нормализуется в нижний регистр и проверяется `/^0x[a-f0-9]{40}$/`, SDP больше
+`100000` байт отвергается `413 OFFER_TOO_LARGE`. Ошибки разведены по коду: `400` —
+неверный запрос, `502` — воркер не ответил, `503` — мост недоступен. Класс лимита —
+`signal` (60/мин), отдельно от `strict`: сигналинг идёт при каждом подключении, и в
+бюджете 10/мин второе соединение уже упиралось бы в отказ.
+
+**Что этот маршрут НЕ делает.** Он не передаёт задачи: после открытия DataChannel
+трафик идёт напрямую, минуя сервер. Сервер видит SDP (адреса и кодеки), но не
+содержимое задач. И он не проверен в браузере — в контейнере гейта браузера нет.
 
 **`GET /providers` (2.29.9).** Отдаёт публичный реестр провайдеров — тот же, что лежит в
 `/config.providers`, и **собранный той же функцией** `publicProviders()` в `server.js`. Две

@@ -6492,6 +6492,51 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     const readRe33 = (srvSrc33.match(/const RATE_READ_PATH =\s*\n?\s*\/(.+)\/;/) || [])[1] || '';
     ok('33.9 /providers отнесён к классу read, а не strict',
       /providers/.test(readRe33), readRe33.slice(0, 90));
+
+    /* 33.10 `POST /p2p/signal` — сигналинг WebRTC (2.29.10, Этап 10).
+     *
+     * Проверяются ОТКАЗЫ, а не успех: успех требует живого канала до
+     * воркера (`active_workers: 0`), и делать вид, что он есть, значило бы
+     * повторить болезнь `SKIP → green`. Зато форма запроса и класс лимита
+     * проверяются целиком — именно там ошибка стоит дорого: неверная
+     * валидация пропустит мусор к воркеру, а класс `strict` съест бюджет
+     * платного чата. */
+    const sigNoOffer = await api('/p2p/signal', 'POST', { workerAddress: '0x' + '1'.repeat(40) });
+    ok('33.10 /p2p/signal без offer — 400 NO_OFFER',
+      sigNoOffer.status === 400 && sigNoOffer.body?.error === 'NO_OFFER',
+      { status: sigNoOffer.status, error: sigNoOffer.body?.error });
+
+    const sigNoTarget = await api('/p2p/signal', 'POST', {
+      offer: { type: 'offer', sdp: 'v=0' },
+    });
+    ok('33.10 /p2p/signal без адресата — 400 NO_TARGET',
+      sigNoTarget.status === 400 && sigNoTarget.body?.error === 'NO_TARGET',
+      { status: sigNoTarget.status, error: sigNoTarget.body?.error });
+
+    const sigBadAddr = await api('/p2p/signal', 'POST', {
+      workerAddress: 'не-адрес',
+      offer: { type: 'offer', sdp: 'v=0' },
+    });
+    ok('33.10 /p2p/signal на мусорный адрес — 400 BAD_ADDRESS',
+      sigBadAddr.status === 400 && sigBadAddr.body?.error === 'BAD_ADDRESS',
+      { status: sigBadAddr.status, error: sigBadAddr.body?.error });
+
+    /* SDP сверх порога отсекается ДО моста: иначе заведомо негодный кадр
+     * занимал бы канал задач, на котором висят настоящие задачи. */
+    const sigHuge = await api('/p2p/signal', 'POST', {
+      workerAddress: '0x' + '2'.repeat(40),
+      offer: { type: 'offer', sdp: 'x'.repeat(100001) },
+    });
+    ok('33.10 /p2p/signal с гигантским sdp — 413 OFFER_TOO_LARGE',
+      sigHuge.status === 413 && sigHuge.body?.error === 'OFFER_TOO_LARGE',
+      { status: sigHuge.status, error: sigHuge.body?.error });
+
+    /* Свой класс лимита, а не `strict`: сигналинг не платный, но частый. */
+    ok('33.10 /p2p/signal имеет класс signal, а не strict',
+      /if \(req\.path === '\/p2p\/signal'\) return 'signal'/.test(srvSrc33),
+      'нет ветки rateClass');
+    ok('33.10 класс signal объявлен в RATE_LIMITS',
+      /signal: \{ max:/.test(srvSrc33), 'нет записи signal');
   }
 
   /* ===== 34. Tier 6: платит ТОЛЬКО сам клиент (2.19.2) =====
@@ -11966,6 +12011,53 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     ok('63.13 app.js зовёт contextFor и кладёт результат в system',
       appSrc.includes('contextFor(text)') && appSrc.includes("role: 'system', content: ragCtx"),
       'вызов не найден');
+
+    /* 63.14–63.19 WebRTC-клиент (2.29.10, Этап 10).
+     *
+     * ЧЕГО ЭТИ ПРОВЕРКИ НЕ ДОКАЗЫВАЮТ: живого соединения. В контейнере
+     * гейта браузера нет (`No supported browser found`), и делать вид,
+     * что канал проверен, значило бы повторить болезнь `SKIP → green`.
+     * Проверяется то, что можно проверить без браузера: файл отдаётся,
+     * подключён, в предзагрузке, экспорты на месте, откат называется
+     * явной строкой, SDP сверяется с пределом сервера. */
+    const wrtcRes = await api('/app/webrtc-client.js');
+    ok('63.14 /app/webrtc-client.js отдаётся браузеру', wrtcRes.status === 200, wrtcRes.status);
+
+    const wrtcSrc = typeof wrtcRes.body === 'string' ? wrtcRes.body : '';
+    ok('63.15 webrtc-client.js подключён в index.html',
+      idx.includes('/app/webrtc-client.js'), 'нет тега script');
+    ok('63.16 webrtc-client.js в предзагрузке service worker',
+      sw.includes("'/app/webrtc-client.js'"), 'нет в ASSETS');
+
+    /* Молчаливый откат запрещён: если WebRTC не поднялся, это обязано
+     * быть видно в консоли отдельной строкой. Проверяется литерал, а не
+     * комментарий — строка должна уйти в `console.warn`. */
+    ok('63.17 откат на WS назван явной строкой и уходит в лог',
+      wrtcSrc.includes('[transport] WebRTC failed, using WS relay') &&
+      wrtcSrc.includes('console.warn'),
+      'нет строки отката или она не логируется');
+
+    /* Разбор в Node (не в браузере) ловит опечатку в имени экспорта,
+     * из-за которой `window.TarNetWebRTC` оказался бы без метода. */
+    const wrtcMod = require('./app/webrtc-client.js');
+    ok('63.18 webrtc-client экспортирует connect/discover/isSupported',
+      typeof wrtcMod.connect === 'function' &&
+      typeof wrtcMod.discover === 'function' &&
+      typeof wrtcMod.isSupported === 'function',
+      Object.keys(wrtcMod).join(','));
+
+    /* Предел SDP в двух местах (клиент и сервер) обязан совпадать: если
+     * клиент разрешит больше, сервер отклонит offer с 413, и причина
+     * будет выглядеть как «воркер не ответил».
+     *
+     * `srvSrc33` здесь НЕЛЬЗЯ: он объявлен в блоке 33 и в этой области
+     * видимости не существует. Своё чтение — не дублирование, а граница
+     * блоков; при первом прогоне эта строка дала бы ReferenceError. */
+    const srvSrcForSdp = require('fs').readFileSync('./server.js', 'utf8');
+    ok('63.19 предел SDP у клиента совпадает с серверным',
+      wrtcMod.CONST.MAX_SDP_CHARS === 100000 &&
+      /OFFER_TOO_LARGE/.test(srvSrcForSdp),
+      { client: wrtcMod.CONST.MAX_SDP_CHARS });
   }
 
   console.log('\n' + '─'.repeat(50));

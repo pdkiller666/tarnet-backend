@@ -3495,6 +3495,13 @@ const RATE_LIMITS = {
   worker: { max: RATE_LIMIT_WORKER_MAX, label: 'опрос воркера' },
   chat: { max: RATE_LIMIT_CHAT_MAX, label: 'синхронизация чата' },
   strict: { max: RATE_LIMIT_MAX, label: 'запись' },
+  /* Сигналинг WebRTC — не чтение и не платная запись: одно соединение =
+   * один offer/answer. Без своего класса он падал бы в `strict` (10/мин),
+   * то есть делил бы бюджет с платным `/inference`, и неудачная попытка
+   * WebRTC съедала бы половину бюджета чата — ровно та ошибка, что была
+   * у `/models` и `/providers`. 60/мин: хватает на переподключения, но
+   * поток мусора всё равно упирается. */
+  signal: { max: Number(process.env.RATE_LIMIT_SIGNAL_MAX || 60), label: 'сигналинг WebRTC' },
 };
 
 /* Пути, которые UI опрашивает постоянно. Статика вроде console.html идёт
@@ -3527,6 +3534,11 @@ const RATE_READ_UI = /^\/($|index\.html$|app$|app\/|ui(\/|$))/;
 
 function rateClass(req) {
   if (req.path === '/worker/poll') return 'worker';
+  /* Сигнал WebRTC — свой класс, а не `strict`: он не платный и не читает
+   * метрики, зато случается на каждое соединение. Проверка идёт до
+   * метода по той же причине, что у `/chat/sync`: эндпоинт есть только
+   * как POST, но класс ему нужен всё равно. */
+  if (req.path === '/p2p/signal') return 'signal';
   /* /chat/sync — POST, поэтому без этой ветки попадал в strict. Проверка
    * идёт до метода: эндпоинт есть только как POST, GET на него отдаёт 404,
    * но класс ему нужен всё равно.
@@ -7276,6 +7288,135 @@ app.get('/p2p/discover', async (req, res) => {
     cached: Array.isArray(r.cached) ? r.cached : [],
     cid: r.cid || null,
     elapsed_ms: r.elapsed_ms ?? null,
+  });
+});
+
+/* --- Stage 10: сигналинг WebRTC через мост (POST /p2p/signal) ---
+ * Тело: { workerAddress? | targetPeerId?, offer: { type, sdp } } → { answer }
+ *
+ * ЗАЧЕМ ЭТОТ АДРЕС. В Stage 10 PWA соединяется с воркером напрямую
+ * (`RTCPeerConnection`), и обмен offer/answer — единственное, что ещё
+ * требует посредника: до открытия канала стороны друг друга не знают.
+ * Сам путь уже доказан в 2.28.4 (`scripts/webrtc-test.js`): кадр
+ * `webrtc-offer` едет тем же мостом в воркер, воркер отвечает `answer`.
+ * Поэтому здесь **тонкий фасад над доказанным путём**, а не второй
+ * механизм: своей очереди не заводит, состояния не хранит, payload не
+ * подменяет.
+ *
+ * ЧЕГО ОН НЕ ДЕЛАЕТ (и обещать нельзя). Не проверяет подпись `TaskGrant`
+ * и не держит TURN — обе вещи названы в `docs/STAGE-10-WEBRTC.md` как
+ * обязательные для боевого пути. Ответ `ok: true` здесь значит «answer
+ * получен», а не «транспорт готов».
+ */
+app.post('/p2p/signal', async (req, res) => {
+  const body = req.body || {};
+  const offer = body.offer;
+  const wantAddress = body.workerAddress ? String(body.workerAddress).toLowerCase() : null;
+  const wantPeer = body.targetPeerId ? String(body.targetPeerId) : null;
+
+  if (!offer || typeof offer !== 'object' || !offer.sdp || !offer.type) {
+    return res.status(400).json({
+      ok: false,
+      error: 'NO_OFFER',
+      detail: 'нужен offer: { type, sdp } — без него воркеру нечего принимать',
+    });
+  }
+  /* Размер SDP ограничен явно. `express.json` держит 10 МБ — это про
+   * загрузку файлов, а не про сигналинг; offer такого размера означает
+   * неверный запрос, и пропускать его к воркеру значило бы тратить
+   * канал на заведомо негодный кадр. */
+  if (String(offer.sdp).length > 100000) {
+    return res.status(413).json({
+      ok: false,
+      error: 'OFFER_TOO_LARGE',
+      detail: `sdp ${String(offer.sdp).length} байт, предел 100000`,
+    });
+  }
+  if (!wantAddress && !wantPeer) {
+    return res.status(400).json({
+      ok: false,
+      error: 'NO_TARGET',
+      detail: 'укажите workerAddress (0x…) или targetPeerId — иначе сигнал некуда слать',
+    });
+  }
+
+  /* Мост находит адресата по адресу: `peerId` в канал задач не едет.
+   * Поэтому пира разворачиваем в адрес через `channels`, а не угадываем:
+   * «нашёл по DHT» и «можно доставить» — разные факты, и второй надо
+   * подтвердить, иначе PWA будет ждать answer у пира без канала. */
+  let address = wantAddress;
+  if (!address && wantPeer) {
+    const ch = await p2pBridge.send({ action: 'channels' }, { timeoutMs: 1500 });
+    const list = (ch && Array.isArray(ch.channels)) ? ch.channels : [];
+    const hit = list.find((c) => String(c.peerId) === wantPeer);
+    if (!hit) {
+      return res.status(404).json({
+        ok: false,
+        error: 'PEER_NO_CHANNEL',
+        targetPeerId: wantPeer,
+        detail: 'пир известен, но канал задач не открыт — offer доставить некому',
+        channels: list.length,
+      });
+    }
+    address = String(hit.address).toLowerCase();
+  }
+  if (!/^0x[a-f0-9]{40}$/.test(String(address))) {
+    return res.status(400).json({
+      ok: false,
+      error: 'BAD_ADDRESS',
+      detail: `ожидался адрес 0x + 40 hex, получено: ${String(address).slice(0, 48)}`,
+    });
+  }
+
+  /* `taskId` обязателен: мост сопоставляет ответ с ожиданием только по
+   * нему, а анонимную полосу принимает лишь `pong`. */
+  const taskId = `webrtc-${crypto.randomBytes(6).toString('hex')}`;
+  const reply = await p2pBridge.task(
+    { action: 'webrtc-offer', taskId, offer: { type: String(offer.type), sdp: String(offer.sdp) } },
+    { timeoutMs: 15000, address },
+  );
+
+  if (!reply || reply.ok !== true) {
+    const err = (reply && reply.error) || 'BRIDGE_UNREACHABLE';
+    /* 503 — состояние инфраструктуры (мост молчит или канала нет),
+     * 502 — воркер ответил отказом. Смешивать их значило бы искать
+     * причину в воркере, когда не поднят мост. */
+    const infra = err === 'NO_TASK_CHANNEL' || err === 'BRIDGE_UNREACHABLE' || err === 'P2P_BRIDGE_UNAVAILABLE';
+    return res.status(infra ? 503 : 502).json({
+      ok: false,
+      error: err,
+      taskId,
+      address,
+      detail: infra
+        ? 'канал задач не открыт или мост не отвечает — WebRTC сейчас не поднять'
+        : 'воркер не принял offer',
+    });
+  }
+
+  const inner = reply.result;
+  if (!inner || inner.ok !== true || !inner.answer || !inner.answer.sdp) {
+    return res.status(502).json({
+      ok: false,
+      error: (inner && inner.error) || 'NO_ANSWER',
+      taskId,
+      address,
+      detail: 'воркер ответил, но answer в ответе нет',
+    });
+  }
+
+  return res.json({
+    ok: true,
+    action: 'signal',
+    taskId,
+    address,
+    peerId: wantPeer || null,
+    answer: { type: inner.answer.type, sdp: inner.answer.sdp },
+    /* Неполный ICE — не отказ, но и не «готово»: без `complete` часть
+     * кандидатов не собрана, и соединение может не встать. Пусть клиент
+     * видит это флагом, а не узнаёт по таймауту. */
+    candidatesGathered: Boolean(inner.candidates_gathered),
+    via: reply.via || 'p2p',
+    elapsedMs: reply.rtt_ms ?? null,
   });
 });
 
