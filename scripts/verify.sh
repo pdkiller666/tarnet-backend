@@ -96,6 +96,47 @@ run_suite() {
   fi
 }
 
+# ---------- проверка многоходовой памяти модели ----------
+#
+# ПОЧЕМУ ОТДЕЛЬНАЯ ФУНКЦИЯ, А НЕ `run_suite`. `check-multi-turn.js` имеет
+# четыре исхода, и только один из них — провал:
+#
+#   0 — модель помнит имя (зелено);
+#   1 — модель НЕ помнит при живом воркере (настоящий провал);
+#   3 — живого воркера нет, проверять нечего;
+#   4 — сеть/сервер недоступны.
+#
+# `run_suite` считает любой непустой rc провалом, поэтому исход 3 дал бы
+# красный гейт на машине, где воркер просто не запущен, — а это нормальное
+# состояние и на VPS, и в CI. `skip` в FAIL не идёт, но печатается всегда,
+# чтобы «зелено» нельзя было получить тишиной: строка «проверка не сделана,
+# воркера нет» честнее, чем отсутствие строки.
+check_multi_turn() {
+  if [ "${TARNET_SKIP_TESTS:-0}" = "1" ]; then
+    return
+  fi
+  local log="/tmp/tarnet-verify-multiturn.log" rcfile="/tmp/tarnet-verify-multiturn.rc"
+  rm -f "$rcfile"
+  setsid nohup sh -c "node scripts/check-multi-turn.js >'$log' 2>&1; echo \$? >'$rcfile'" >/dev/null 2>&1 &
+  local waited=0
+  while [ ! -s "$rcfile" ] && [ "$waited" -lt 120 ]; do
+    sleep 5; waited=$((waited+5))
+  done
+  if [ ! -s "$rcfile" ]; then
+    no "multi-turn" "нет завершения за 120с — смотри $log"
+    return
+  fi
+  local rc
+  rc=$(cat "$rcfile" 2>/dev/null)
+  case "$rc" in
+    0) ok "multi-turn" "модель помнит имя через два хода (зелено)" ;;
+    3) skip "multi-turn" "воркера нет (active_workers: 0) — память не проверена, это НЕ провал модели" ;;
+    4) no "multi-turn" "сервер недоступен (exit 4) — смотри $log" ;;
+    1) no "multi-turn" "модель НЕ помнит имя при живом воркере (exit 1) — дефект воркера, смотри $log" ;;
+    *) no "multi-turn" "неожиданный исход exit $rc — смотри $log" ;;
+  esac
+}
+
 verify_tests() {
   if [ "${TARNET_SKIP_TESTS:-0}" = "1" ]; then
     # Осознанный пропуск печатается, чтобы «зелено» нельзя было получить тишиной.
@@ -105,6 +146,21 @@ verify_tests() {
   run_suite "dpouw" "${TARNET_TEST_TIMEOUT_DPOUW:-900}" "node test-dpouw.js --test" dpouw
   run_suite "mesh" "${TARNET_TEST_TIMEOUT_MESH:-300}" "node test-mesh.js" mesh
   run_suite "treasury" "${TARNET_TEST_TIMEOUT_TREASURY:-300}" "node proof-treasury-gate.js" treasury
+  # RAG в PWA (`app/knowledge.js`) — набор добавлен в 2.29.7.
+  #
+  # ПОЧЕМУ ОТДЕЛЬНЫЙ НАБОР, А НЕ ЧАСТЬ `dpouw`. Модуль живёт в браузере и
+  # проверяется через настоящий IndexedDB (`fake-indexeddb`), то есть в
+  # окружении, которого у `test-dpouw` нет. Сложить их значило бы либо
+  # тащить браузерную зависимость в серверный набор, либо не проверять RAG
+  # вовсе — а до 2.29.7 его не проверяло ничто.
+  run_suite "knowledge" "${TARNET_TEST_TIMEOUT_KNOWLEDGE:-180}" "node test-knowledge.js" knowledge
+
+  # Многоходовая память модели (2.29.7). `test-conversation.js` доказывает,
+  # что история ДОЕЗЖАЕТ до воркера; здесь проверяется СЛЕДСТВИЕ — что модель,
+  # прочитав её, отвечает так, будто помнит. Транспорт может быть исправен,
+  # а ответ — нет. Без воркера исход 3 = `skip`, а не провал: см. комментарий
+  # у `check_multi_turn`.
+  check_multi_turn
 
   # p2p E2E (2.26.0, Блок 6.3) — ОБЯЗАТЕЛЬНЫЙ ГЕЙТ.
   #
