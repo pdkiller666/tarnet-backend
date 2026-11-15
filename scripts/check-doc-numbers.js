@@ -15,10 +15,19 @@
  * ЧТО СВЕРЯЕТСЯ
  *   1. Версия в шапке `MASTER-PLAN.md`  = `package.json` (шаг 3.10).
  *   2. Версия в шапке `MANIFEST…md`      = `package.json` (шаг 3.10).
- *   3. Версия в шапке `NARRATIVE.md`     = `package.json` (шаг 3.10, новое).
- *   4. «локальный гейт N» в MASTER-PLAN  = dpouw + knowledge + conversation.
- *   5. «N проверок в verify.sh» и список слагаемых = фактические счёта наборов.
- *   6. Те же два числа в таблице NARRATIVE.
+ *   3. Версия в шапке `NARRATIVE.md`     = `package.json` (шаг 3.10).
+ *   4. Версия в H1 `README.md`           = `package.json` (шаг 3.10, с 2.29.14).
+ *   5. Версия в шапке `PROJECT-MAP.md`   = `package.json` (шаг 3.10, с 2.29.14).
+ *   6. «локальный гейт N» в MASTER-PLAN  = dpouw + knowledge + conversation.
+ *   7. «N проверок в verify.sh» и список слагаемых = фактические счёта наборов.
+ *   8. Те же два числа в таблице NARRATIVE.
+ *   9. Таблица §2 `MASTER-PLAN`: гейт и весь `verify.sh` = счёта наборов.
+ *  10. §4 `MANIFEST`: итог в прозе и цепочка слагаемых = счёта наборов.
+ *
+ * ПОЧЕМУ README И PROJECT-MAP (2.29.14). Шаг 3.10 сверял три документа, а
+ * `README.md` — первый файл, который открывает новый человек, — отставал на 25
+ * версий (`2.22.13` при коде `2.29.13`) и оставался зелёным. Документ вне гейта
+ * протухает молча; расширение списка — лечение причины, а не симптома.
  *
  * ПОЧЕМУ НЕЛЬЗЯ СРАВНИВАТЬ ТОЛЬКО СУММУ. Сумма сходится и тогда, когда один
  * набор вырос, а другой упал (1344+46+30 = 1420 = 1399+46+30−55). Поэтому
@@ -49,6 +58,12 @@ function parseArgs(argv) {
     else if (a === '--json') out.json = true;
     else if (a === '--help') out.help = true;
   }
+  /* `TARNET_SKIP_TESTS=1` — это «наборы не прогонялись». `verify.sh` выставляет
+   * её при пропуске тестов и ЖДЁТ честного «не проверено». Без этой ветки
+   * разбор читал бы уцелевшие счётчики из `/tmp` с прошлого прогона и печатал
+   * «совпало» по числам, которых в этом прогоне никто не получал, — зелёный
+   * вердикт из чужих данных. Поэтому переменная = `--no-counts`. */
+  if (String(process.env.TARNET_SKIP_TESTS || '') === '1') out.noCounts = true;
   return out;
 }
 
@@ -164,6 +179,74 @@ function parseManifestVer(text) {
   return firstVersionAfter(text, String.raw`Сборка живого стенда:`);
 }
 
+/* Версия в H1 README: «# TarNet / Synapse — dPoUW backend (`2.29.14`)».
+ * Только строка-заголовок: в теле README версий много (примеры ответов,
+ * история), и первое совпадение по файлу вернуло бы не шапку. */
+function parseReadmeVer(text) {
+  if (!text) return null;
+  const line = text.split('\n').find((l) => /^#\s/.test(l) && /TarNet/.test(l)) || null;
+  if (!line) return null;
+  const m = line.match(/\(`?(\d+\.\d+\.\d+)`?\)/);
+  return m ? cleanVer(m[1]) : null;
+}
+
+/* Версия в шапке PROJECT-MAP: «**Сверено с кодом:** 2026-11-15 MSK, локально и
+ * на проде `2.29.14` (…)». Якорь — «на проде», а не первое число строки: в той
+ * же строке дальше идут исторические версии, и «первое совпадение» вернуло бы
+ * `2.22.13` из примера дрейфа. */
+function parseProjectMapVer(text) {
+  if (!text) return null;
+  const line = text.split('\n').find((l) => l.includes('Сверено с кодом:')) || '';
+  const m = line.match(/на проде\s*`?(\d+\.\d+\.\d+)/);
+  return m ? cleanVer(m[1]) : null;
+}
+
+/* Таблица §2 MASTER-PLAN: «| Тесты | … = **1420** локальный гейт; весь
+ * `verify.sh` — **1516** в десяти наборах | …». Возвращает оба числа, чтобы §2
+ * не мог разойтись с шапкой §1 молча. */
+function parseMasterPlanStatus(text) {
+  const out = { localGate: null, total: null };
+  if (!text) return out;
+  const line = text.split('\n').find((l) => /^\|\s*Тесты\s*\|/.test(l) && /verify\.sh/.test(l)) || '';
+  if (!line) return out;
+  const lg = line.match(/=\s*\*{0,2}(\d+)\*{0,2}\s*локальный гейт/);
+  if (lg) out.localGate = Number(lg[1]);
+  const tot = line.match(/verify\.sh`?\s*—\s*\*{0,2}(\d+)\*{0,2}/);
+  if (tot) out.total = Number(tot[1]);
+  return out;
+}
+
+/* §4 MANIFEST: «… прогоном `bash scripts/verify.sh` (**1516 проверок в десяти
+ * наборах, 0 провалов**: dpouw `1344` + mesh `25` + … )».
+ * Слагаемые берутся ТОЛЬКО после «dpouw»: до него в строке стоит
+ * `localhost:3001`, и «все числа в бэктиках» дали бы лишний 3001. */
+function parseManifestCore(text) {
+  const out = { total: null, addends: null };
+  if (!text) return out;
+  /* Ищем ВНУТРИ §4, а не по всему файлу: та же фраза стоит и в шапке
+   * («гейт `scripts/verify.sh` — **1516 проверок в десяти наборах, 0 ❌**»),
+   * и первое совпадение по файлу вернуло бы шапку — разбор читал бы не тот
+   * раздел и молча сверял бы одно и то же место дважды. */
+  const lines = text.split('\n');
+  const start = lines.findIndex((l) => /^##\s*4\./.test(l));
+  const scope = start >= 0 ? lines.slice(start) : lines;
+  const line = scope.find((l) => /проверок в десяти наборах/.test(l) && /Проверяется запросами|прогоном/.test(l))
+    || scope.find((l) => /проверок в десяти наборах/.test(l)) || '';
+  if (!line) return out;
+  const tot = line.match(/\*{0,2}(\d+)\s+проверок в десяти наборах/);
+  if (tot) out.total = Number(tot[1]);
+  const from = line.indexOf('dpouw');
+  if (from >= 0) {
+    const tail = line.slice(from);
+    const re = /`(\d+)`/g;
+    const nums = [];
+    let m2;
+    while ((m2 = re.exec(tail)) !== null) nums.push(Number(m2[1]));
+    if (nums.length >= 3) out.addends = nums;
+  }
+  return out;
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -174,6 +257,8 @@ function main() {
   const mpPath = path.join(args.docsDir, 'MASTER-PLAN.md');
   const mfPath = path.join(args.docsDir, 'MANIFEST.v3.4-UNIFIED.md');
   const narPath = path.join(args.docsDir, 'docs', 'NARRATIVE.md');
+  const readmePath = path.join(args.docsDir, 'README.md');
+  const mapPath = path.join(args.docsDir, 'PROJECT-MAP.md');
   const pkgPath = path.join(args.docsDir, 'package.json');
 
   const mpText = readText(mpPath);
@@ -184,7 +269,12 @@ function main() {
 
   const mp = parseMasterPlan(mpText);
   const nar = parseNarrative(narText);
-  const mfVer = parseManifestVer(readText(mfPath));
+  const mfText = readText(mfPath);
+  const mfVer = parseManifestVer(mfText);
+  const readmeVer = parseReadmeVer(readText(readmePath));
+  const mapVer = parseProjectMapVer(readText(mapPath));
+  const mpStatus = parseMasterPlanStatus(mpText);
+  const mfCore = parseManifestCore(mfText);
 
   const counts = {};
   for (const s of SUITES) counts[s.key] = args.noCounts ? null : readCount(args.countsDir, s.tag);
@@ -200,7 +290,9 @@ function main() {
     if (mp.version !== pkgVer) bad.push(`MASTER-PLAN=${mp.version || '—'}`);
     if (mfVer !== pkgVer) bad.push(`MANIFEST=${mfVer || '—'}`);
     if (nar.version !== pkgVer) bad.push(`NARRATIVE=${nar.version || '—'}`);
-    if (bad.length === 0) add('OK', 'версия в шапках', `${pkgVer} = package.json (три документа)`);
+    if (readmeVer !== pkgVer) bad.push(`README=${readmeVer || '—'}`);
+    if (mapVer !== pkgVer) bad.push(`PROJECT-MAP=${mapVer || '—'}`);
+    if (bad.length === 0) add('OK', 'версия в шапках', `${pkgVer} = package.json (пять документов)`);
     else add('NO', 'версия в шапках', `package.json=${pkgVer}, ${bad.join(', ')}`);
   }
 
@@ -245,8 +337,39 @@ function main() {
     else add('NO', 'число проверок (все наборы)', problems.join('; '));
   }
 
+  /* --- 9. Таблица §2 MASTER-PLAN --- */
+  if (args.noCounts || !allKnown) {
+    add('SKIP', 'число проверок (§2 MASTER-PLAN)', 'нет счёта набора — таблица §2 не проверена');
+  } else if (mpStatus.total === null || mpStatus.localGate === null) {
+    add('NO', 'число проверок (§2 MASTER-PLAN)',
+      `не разобрал таблицу §2: гейт=${mpStatus.localGate ?? '—'}, всего=${mpStatus.total ?? '—'}`);
+  } else {
+    const p2 = [];
+    if (mpStatus.total !== allActual) p2.push(`§2 итог ${mpStatus.total} != ${allActual}`);
+    if (mpStatus.localGate !== lgActual) p2.push(`§2 локальный гейт ${mpStatus.localGate} != ${lgActual}`);
+    if (p2.length === 0) add('OK', 'число проверок (§2 MASTER-PLAN)', `${allActual} и гейт ${lgActual} совпадают с §1`);
+    else add('NO', 'число проверок (§2 MASTER-PLAN)', p2.join('; '));
+  }
+
+  /* --- 10. §4 MANIFEST: проза + слагаемые --- */
+  if (args.noCounts || !allKnown) {
+    add('SKIP', 'число проверок (§4 MANIFEST)', 'нет счёта набора — §4 не проверен');
+  } else {
+    const p4 = [];
+    if (mfCore.total === null) p4.push('не разобрал итог §4');
+    else if (mfCore.total !== allActual) p4.push(`§4 итог ${mfCore.total} != ${allActual}`);
+    if (mfCore.addends === null) p4.push('не разобрал слагаемые §4');
+    else {
+      const docSorted = [...mfCore.addends].sort((a, b) => a - b).join(',');
+      const actSorted = SUITES.map((k) => counts[k.key]).sort((a, b) => a - b).join(',');
+      if (docSorted !== actSorted) p4.push(`§4 состав расходится: в документе ${docSorted}, факт ${actSorted}`);
+    }
+    if (p4.length === 0) add('OK', 'число проверок (§4 MANIFEST)', `${allActual} и набор слагаемых совпадают`);
+    else add('NO', 'число проверок (§4 MANIFEST)', p4.join('; '));
+  }
+
   if (args.json) {
-    console.log(JSON.stringify({ pkgVer, mp, nar, mfVer, counts, rows }, null, 2));
+    console.log(JSON.stringify({ pkgVer, mp, nar, mfVer, readmeVer, mapVer, mpStatus, mfCore, counts, rows }, null, 2));
   } else {
     for (const r of rows) console.log(`${r.status}\t${r.label}\t${r.detail}`);
   }
@@ -255,4 +378,4 @@ function main() {
 }
 
 if (require.main === module) process.exit(main());
-module.exports = { parseMasterPlan, parseNarrative, parseManifestVer, cleanVer, SUITES, LOCAL_GATE };
+module.exports = { parseMasterPlan, parseNarrative, parseManifestVer, parseReadmeVer, parseProjectMapVer, parseMasterPlanStatus, parseManifestCore, cleanVer, SUITES, LOCAL_GATE };

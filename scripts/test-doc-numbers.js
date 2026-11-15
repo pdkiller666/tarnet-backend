@@ -21,6 +21,17 @@
  *      прогона не было — сверять нечего, и это не зелёный вердикт.
  *   8. markdown-обвязка (`**2.29.13**`, `` `2.29.13` ``) разбирается: иначе
  *      гейт краснел бы на верных документах.
+ *   9. Версия в H1 `README.md` (с 2.29.14): именно то, что протухло на 25
+ *      версий и осталось зелёным.
+ *  10. Версия в шапке `PROJECT-MAP.md` (с 2.29.14).
+ *  11. Числа в таблице §2 `MASTER-PLAN` расходятся с §1 → exit 1.
+ *  12. Числа в §4 `MANIFEST` (проза + слагаемые) → exit 1.
+ *  13. §4 читается ВНУТРИ раздела: та же фраза есть в шапке, и «первое
+ *      совпадение по файлу» сверяло бы шапку дважды.
+ *  14. §2 и §4 красят по отдельности: верный §1 не спасает протухшее тело.
+ *
+ * Всего 16 проверок: пункты 5, 12, 13 разложены на пары (сумма/состав),
+ * потому что «число не то» и «набор не тот» — разные дефекты.
  *
  * Запуск: node test-doc-numbers.js
  * rc: 0 — все пункты прошли, 1 — есть провал, 2 — не смог подготовить песочницу.
@@ -58,19 +69,38 @@ const LOCAL = COUNTS.dpouw + COUNTS.knowledge + COUNTS.conversation; // 1420
 
 /* Собирает песочницу: документы с ПАРАМЕТРАМИ, чтобы один шаблон покрывал
  * и зелёный, и каждый красный случай. */
-function sandbox({ ver = VER, mpVer = ver, mfVer = ver, narVer = ver, total = TOTAL, addends = null, local = LOCAL, narLocal = local, mpEmpty = false } = {}) {
+function sandbox({ ver = VER, mpVer = ver, mfVer = ver, narVer = ver, readmeVer = ver, mapVer = ver,
+  total = TOTAL, addends = null, local = LOCAL, narLocal = local, mpEmpty = false,
+  mpSec2 = null, mfCore = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-docnum-'));
   const counts = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-counts-'));
   fs.mkdirSync(path.join(dir, 'docs'), { recursive: true });
 
   const chain = (addends || [COUNTS.dpouw, COUNTS.mesh, COUNTS.treasury, COUNTS.knowledge, COUNTS.conversation, COUNTS.p2pdiscovery, COUNTS.p2pgossip, COUNTS.p2pseed, COUNTS.p2prelay, COUNTS.p2preannounce]).join(' + ');
 
+  const s2 = mpSec2 || { total, local };
   fs.writeFileSync(path.join(dir, 'MASTER-PLAN.md'),
     `# MASTER-PLAN\n\n**Версия:** ${mpEmpty ? '' : mpVer}\n\n` +
-    `**Срез:** 808 чеков, **${total} проверок в \`verify.sh\`** (десять наборов **${chain} ✅ / 0 ❌**), плюс локальный гейт **${local}** (dpouw \`${COUNTS.dpouw}\` + knowledge \`${COUNTS.knowledge}\` + conversation \`${COUNTS.conversation}\`);\n`);
+    `**Срез:** 808 чеков, **${total} проверок в \`verify.sh\`** (десять наборов **${chain} ✅ / 0 ❌**), плюс локальный гейт **${local}** (dpouw \`${COUNTS.dpouw}\` + knowledge \`${COUNTS.knowledge}\` + conversation \`${COUNTS.conversation}\`);\n\n` +
+    `## 2. Текущий статус\n\n` +
+    `| Тесты | **${COUNTS.dpouw} ✅ / 0 ❌** (dpouw) + **${COUNTS.knowledge} ✅ / 0 ❌** (knowledge) + **${COUNTS.conversation} ✅ / 0 ❌** (conversation) = **${s2.local}** локальный гейт; весь \`verify.sh\` — **${s2.total}** в десяти наборах | прогон |\n`);
 
+  const core = mfCore || { total, chain: [COUNTS.dpouw, COUNTS.mesh, COUNTS.treasury, COUNTS.knowledge, COUNTS.conversation, COUNTS.p2pdiscovery, COUNTS.p2pgossip, COUNTS.p2pseed, COUNTS.p2prelay, COUNTS.p2preannounce] };
+  /* Имя набора СНАЧАЛА, число в бэктиках потом — ровно как в живом §4
+   * («dpouw `1344` + mesh `25`»). Разбор режет строку от слова `dpouw`, чтобы
+   * не поймать `localhost:3001`; при обратном порядке первое число срезалось
+   * бы вместе с префиксом, и тест краснел бы на верном документе. */
+  const coreChain = (core.chain || []).map((n, i) => `${['dpouw','mesh','treasury','knowledge','conversation','discovery','gossip','failover','relay','reannounce'][i] || 'x'} \`${n}\``).join(' + ');
   fs.writeFileSync(path.join(dir, 'MANIFEST.v3.4-UNIFIED.md'),
-    `# MANIFEST\n\n**Дата:** 14 ноября 2026 | **Сборка живого стенда:** \`${mfVer}\` (схема — 2.1.0-dpouw)\n`);
+    `# MANIFEST\n\n**Дата:** 14 ноября 2026 | **Сборка живого стенда:** \`${mfVer}\` (схема — 2.1.0-dpouw)\n\n` +
+    `## 4. ДЕЙСТВУЮЩЕЕ ЯДРО ФАЗЫ 1 (\`${mfVer}\`)\n\n` +
+    `Проверяется запросами к \`localhost:3001\` и прогоном \`bash scripts/verify.sh\` (**${core.total} проверок в десяти наборах, 0 провалов**: ${coreChain}), снимок 14.11.2026.\n`);
+
+  fs.writeFileSync(path.join(dir, 'README.md'),
+    `# TarNet / Synapse — dPoUW backend (\`${readmeVer}\`)\n\nДемонстрационный стенд экономики.\n`);
+
+  fs.writeFileSync(path.join(dir, 'PROJECT-MAP.md'),
+    `# PROJECT-MAP\n\n**Сверено с кодом:** 2026-11-14 MSK, локально и на проде \`${mapVer}\` (\`verify.sh\` → **${total}** в десяти наборах).\n`);
 
   fs.writeFileSync(path.join(dir, 'docs', 'NARRATIVE.md'),
     `# NARRATIVE\n\n**Версия среза:** ${narVer} (локально и на проде) · **Дата:** 14.11.2026\n\n` +
@@ -108,6 +138,28 @@ function check(name, { expectRc, sandboxArgs, grep }) {
 }
 
 console.log('test-doc-numbers — проверка scripts/check-doc-numbers.js');
+/* 15. `TARNET_SKIP_TESTS=1` — это «наборы не прогонялись», и разбор обязан
+ *     ответить SKIP, а не «совпало» по уцелевшим счётчикам прошлого прогона.
+ *     `verify.sh` выставляет эту переменную при пропуске тестов; без её чтения
+ *     гейт печатал бы зелёный вердикт из данных, которых в этом прогоне не было. */
+{
+  const { dir, counts } = sandbox({});
+  let rc = null, out = '';
+  try {
+    out = execFileSync(process.execPath, [CHECKER, '--docs-dir', dir, '--counts-dir', counts],
+      { encoding: 'utf8', env: { ...process.env, TARNET_SKIP_TESTS: '1' } });
+    rc = 0;
+  } catch (e) {
+    rc = e.status === undefined ? 1 : e.status;
+    out = String(e.stdout || '') + String(e.stderr || '');
+  }
+  const allSkip = /^SKIP\t/gm.test(out) && !/^OK\tчисло проверок/gm.test(out);
+  if (rc === 0 && allSkip) ok('TARNET_SKIP_TESTS=1 → SKIP, не OK', 'числа не сверялись и это видно');
+  else no('TARNET_SKIP_TESTS=1 → SKIP, не OK', `exit ${rc}, allSkip=${allSkip}\n${out}`);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(counts, { recursive: true, force: true });
+}
+
 console.log('──────────────────────────────────────────────────');
 
 /* 1. Зелёный baseline. */
@@ -169,8 +221,12 @@ check('пустая шапка MASTER-PLAN → exit 1', {
  *    обязаны быть зелёными, иначе гейт отключат. */
 {
   const { dir, counts } = sandbox({});
-  fs.writeFileSync(path.join(dir, 'MANIFEST.v3.4-UNIFIED.md'),
-    `# MANIFEST\n\n**Дата:** 14.11.2026 | **Сборка живого стенда:** **\`${VER}\`**\n`);
+  /* Переписываем ТОЛЬКО шапку в «жирной» обвязке, тело §4 оставляем: §4 —
+   * самостоятельная проверка (пункт 12), и документ без него обязан краснеть.
+   * Тест здесь про обвязку, поэтому §4 должен остаться валидным. */
+  const mf = fs.readFileSync(path.join(dir, 'MANIFEST.v3.4-UNIFIED.md'), 'utf8')
+    .replace(`**Сборка живого стенда:** \`${VER}\``, `**Сборка живого стенда:** **\`${VER}\`**`);
+  fs.writeFileSync(path.join(dir, 'MANIFEST.v3.4-UNIFIED.md'), mf);
   const res = run(['--docs-dir', dir, '--counts-dir', counts]);
   if (res.rc === 0) ok('markdown-обвязка разбирается', '`**2.29.13**` → зелено');
   else no('markdown-обвязка разбирается', `exit ${res.rc}\n${res.out}`);
@@ -189,6 +245,63 @@ check('пустая шапка MASTER-PLAN → exit 1', {
   const hasSkip = /^SKIP\tчисло проверок \(все наборы\)/m.test(res.out);
   if (hasSkip && /нет счёта набора: .*relay/.test(res.out)) ok('нет счёта набора → SKIP с именем набора', 'relay назван');
   else no('нет счёта набора → SKIP с именем набора', `SKIP=${hasSkip}\n${res.out}`);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(counts, { recursive: true, force: true });
+}
+
+/* 10. Протухшая версия в README — ровно та дыра, из-за которой 2.29.14 и
+ *     появился: `2.22.13` при коде `2.29.13`, и гейт был зелёным 25 версий. */
+check('README 2.22.13 → exit 1, назван README', {
+  expectRc: 1, sandboxArgs: { readmeVer: '2.22.13' }, grep: /README=2\.22\.13/,
+});
+
+/* 11. Протухшая версия в PROJECT-MAP. */
+check('PROJECT-MAP 2.29.12 → exit 1, назван PROJECT-MAP', {
+  expectRc: 1, sandboxArgs: { mapVer: '2.29.12' }, grep: /PROJECT-MAP=2\.29\.12/,
+});
+
+/* 12. Таблица §2 MASTER-PLAN разошлась с шапкой §1. Это отдельный пункт:
+ *     §1 может быть верным, а §2 — нет, и именно так `1302` жил в §7 при
+ *     верной шапке. Сверять только шапку значило бы не видеть тело. */
+check('§2 MASTER-PLAN 1302 → exit 1', {
+  expectRc: 1, sandboxArgs: { mpSec2: { total: 1302, local: LOCAL } }, grep: /§2 итог 1302 != 1516/,
+});
+check('§2 MASTER-PLAN гейт 1247 → exit 1', {
+  expectRc: 1, sandboxArgs: { mpSec2: { total: TOTAL, local: 1247 } }, grep: /§2 локальный гейт 1247 != 1420/,
+});
+
+/* 13. §4 MANIFEST: итог и состав слагаемых. Два разных провала — «число не то»
+ *     и «набор не тот»: подмена одного набора другим при верной сумме. */
+check('§4 MANIFEST итог 1247 → exit 1', {
+  expectRc: 1, sandboxArgs: { mfCore: { total: 1247, chain: [COUNTS.dpouw, COUNTS.mesh, COUNTS.treasury, COUNTS.knowledge, COUNTS.conversation, COUNTS.p2pdiscovery, COUNTS.p2pgossip, COUNTS.p2pseed, COUNTS.p2prelay, COUNTS.p2preannounce] } },
+  grep: /§4 итог 1247 != 1516/,
+});
+{
+  const wrong = [1300, 44, COUNTS.mesh, COUNTS.treasury, COUNTS.knowledge, COUNTS.conversation, COUNTS.p2pdiscovery, COUNTS.p2pgossip, COUNTS.p2pseed, COUNTS.p2prelay, COUNTS.p2preannounce];
+  const sum = wrong.reduce((a, b) => a + b, 0);
+  if (sum !== TOTAL) no('§4 верная сумма, неверный состав — песочница собрана неверно', `сумма ${sum} != ${TOTAL}`);
+  else check('§4 верная сумма, неверный состав → exit 1', {
+    expectRc: 1, sandboxArgs: { mfCore: { total: TOTAL, chain: wrong } }, grep: /§4 состав расходится/,
+  });
+}
+
+/* 14. §4 читается ВНУТРИ раздела, а не по первой фразе файла. В шапке та же
+ *     фраза «проверок в десяти наборах» — и разбор, искавший по всему файлу,
+ *     сверял бы шапку дважды, оставляя тело §4 непроверенным молча. Ломаем
+ *     ТОЛЬКО §4 и требуем красноты: шапка при этом верная. */
+{
+  const { dir, counts } = sandbox({});
+  const mf = fs.readFileSync(path.join(dir, 'MANIFEST.v3.4-UNIFIED.md'), 'utf8');
+  const broken = mf.replace(/\*\*1516 проверок в десяти наборах, 0 провалов\*\*/,
+                            '**1247 проверок в десяти наборах, 0 провалов**');
+  if (broken === mf) {
+    no('§4 ломается отдельно от шапки — подстановка не сработала', 'шаблон §4 не найден');
+  } else {
+    fs.writeFileSync(path.join(dir, 'MANIFEST.v3.4-UNIFIED.md'), broken);
+    const res = run(['--docs-dir', dir, '--counts-dir', counts]);
+    if (res.rc === 1 && /§4 итог 1247 != 1516/.test(res.out)) ok('§4 читается внутри раздела', 'шапка верная, §4 сломан → красный');
+    else no('§4 читается внутри раздела', `exit ${res.rc}\n${res.out.split('\n').filter(Boolean).map((l) => `       ${l}`).join('\n')}`);
+  }
   fs.rmSync(dir, { recursive: true, force: true });
   fs.rmSync(counts, { recursive: true, force: true });
 }
