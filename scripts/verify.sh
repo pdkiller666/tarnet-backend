@@ -653,6 +653,43 @@ else
   fi
 fi
 
+# ---------- 3.14 статическая проверка WebRTC-клиента (2.29.18) ----------
+# ПОЧЕМУ СТАТИЧЕСКАЯ, А НЕ ЖИВАЯ. Живой прогон `scripts/webrtc-test.js`
+# поднимает мост и воркер (~20 с) — в каждый коммит это дорого, поэтому он
+# в slow-gate (`TARNET_SLOW_TESTS=1`). Но между релизами клиент может тихо
+# выпасть из сборки: файл лежит, а `<script>` убрали, или `sw.js` его не
+# кэширует, или экспорт переименован. Тогда `window.TarNetWebRTC` перестаёт
+# существовать, и узнаётся это только в браузере владельца — то есть поздно.
+# Три условия проверяются отдельно: файл, подключение, экспорт. Одно без
+# другого не работает: подключённый файл без экспорта — пустая страница,
+# экспорт без кэша — работает до первого перезахода в PWA.
+WEBRTC_CLIENT=app/webrtc-client.js
+if [ ! -f "$WEBRTC_CLIENT" ]; then
+  no "WebRTC-клиент" "$WEBRTC_CLIENT отсутствует — PWA не может поднять DataChannel"
+else
+  WR_BAD=""
+  grep -q 'webrtc-client\.js' app/index.html || WR_BAD="$WR_BAD не-в-index.html"
+  grep -q 'webrtc-client\.js' app/sw.js || WR_BAD="$WR_BAD не-в-кэше-sw.js"
+  grep -q 'window\.TarNetWebRTC' "$WEBRTC_CLIENT" || WR_BAD="$WR_BAD нет-экспорта-window.TarNetWebRTC"
+  if [ -z "$WR_BAD" ]; then
+    ok "WebRTC-клиент" "index.html + кэш sw.js + экспорт window.TarNetWebRTC"
+  else
+    no "WebRTC-клиент" "$WR_BAD"
+  fi
+fi
+
+# Живой прототип воркер↔клиент — только по явному запросу релизного прогона.
+if [ "${TARNET_SLOW_TESTS:-0}" = "1" ]; then
+  if node scripts/webrtc-test.js >/tmp/tarnet-webrtc.out 2>&1; then
+    ok "WebRTC живьём" "$(grep -c '✅' /tmp/tarnet-webrtc.out)/5, DataChannel открыт"
+  else
+    WR_RC=$?
+    no "WebRTC живьём" "rc $WR_RC — детали /tmp/tarnet-webrtc.out"
+  fi
+else
+  skip "WebRTC живьём" "TARNET_SLOW_TESTS=1 — прогон поднимает мост ~20 с"
+fi
+
 H_PUB=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/health")
 [ "$H_PUB" = "200" ] && ok "/health снаружи" "HTTP 200" || no "/health снаружи" "HTTP $H_PUB"
 
@@ -753,6 +790,12 @@ WS_ROOT="$(cd "$REPO_DIR/.." && pwd)"
 # перенесён в archive/docs-history/, и симлинк на него стал битым. Это ровно
 # третий случай того же дефекта с другой стороны: список проверял ссылку,
 # которой больше нет. Список и корень правятся одним коммитом с переносом.
+# 15.11.2026 (2.29.18): `AUDIT-REALITY.md` перенесён в archive/docs-history/ вместе
+# с `REALITY-CHECK-v3` и `PRE-NAT-STATUS`. Здесь выбор другой, чем у PROJECT-MEMORY:
+# симлинк НЕ убран, а перенаправлен на новый путь. Причина — документ остаётся
+# единственным аудитом «что обещали vs что имеем» на раннем срезе (`2.17.0`), и
+# вход в него из корня полезнее, чем минус одна строка в списке. Гейт проверяет
+# `[ -L ] && [ -f ]`, поэтому перенаправленная ссылка зелёная, а битая — нет.
 DOC_LINKS="MANIFEST.v3.4-UNIFIED.md PROJECT-HISTORY.md PROJECT-MAP.md ROADMAP.md MASTER-PLAN.md NARRATIVE.md ONE-PAGER.md PITCH-DECK.md DEMO-SCRIPT.md EMAIL-TEMPLATE.md AUDIT-REALITY.md INVESTOR-CHECKLIST.md"
 if [ -d "$WS_ROOT" ]; then
   LINKS_BAD=""
