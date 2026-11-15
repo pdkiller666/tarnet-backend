@@ -202,7 +202,7 @@ root@195.63.131.172 true` обязан пройти без пароля.
 2. Удалять `done`-сессии, чьё содержимое целиком дублируется родителем (259 штук,
    **31,7 МБ**) — потерь ноль. Перед удалением прогонять
    `scripts/extract-session-summary.js`. Сводка по сессиям больше не живёт отдельным
-   файлом: `docs/PROJECT-MEMORY.md` перенесён в `archive/docs-history/` 15.11.2026,
+   файлом: `PROJECT-MEMORY.md` (лежал в `docs/`) перенесён в `archive/docs-history/` 15.11.2026,
    и суть сессий теперь идёт прямо в `PROJECT-HISTORY.md` и `memory/`.
 3. `~/.npm/_cacache` — уже чистили, дал +241 МБ.
 4. `doctor --session-sqlite compact` — **почти бесполезен** при здоровом `freelist`;

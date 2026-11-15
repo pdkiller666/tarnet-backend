@@ -68,7 +68,7 @@ const TOTAL = Object.values(COUNTS).reduce((a, b) => a + b, 0); // 1516
 const LOCAL = COUNTS.dpouw + COUNTS.knowledge + COUNTS.conversation; // 1420
 /* Фактическое число файлов в коммите — то же, что `verify.sh` передаёт в
  * `--file-count`. Песочница пишет его в шапки, поэтому baseline зелёный. */
-const FACT_FILES = 186;
+const FACT_FILES = 187;
 
 /* Собирает песочницу: документы с ПАРАМЕТРАМИ, чтобы один шаблон покрывал
  * и зелёный, и каждый красный случай. */
@@ -124,7 +124,14 @@ function sandbox({ ver = VER, mpVer = ver, mfVer = ver, narVer = ver, readmeVer 
 
 function run(args) {
   try {
-    const out = execFileSync(process.execPath, [CHECKER, ...args], { encoding: 'utf8' });
+    /* `TARNET_SKIP_TESTS` НЕ наследуется (2.29.17). Проверки ниже гоняют разбор на
+     * подставных файлах, где счётчики наборов существуют намеренно: при
+     * унаследованном `TARNET_SKIP_TESTS=1` разбор честно отвечает SKIP, тест ждёт
+     * OK и падает. Гейт с пропуском тестов печатал `12 ✅ / 9 ❌` — ложную
+     * красноту, из-за которой `TARNET_SKIP_TESTS=1` переставал быть быстрым
+     * режимом. Переменная выставляется ТОЛЬКО в кейсе 15, где она и проверяется. */
+    const out = execFileSync(process.execPath, [CHECKER, ...args],
+      { encoding: 'utf8', env: { ...process.env, TARNET_SKIP_TESTS: '0' } });
     return { rc: 0, out };
   } catch (e) {
     return { rc: e.status === undefined ? 1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
