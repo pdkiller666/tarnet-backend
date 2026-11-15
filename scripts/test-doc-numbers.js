@@ -66,22 +66,30 @@ const COUNTS = {
 };
 const TOTAL = Object.values(COUNTS).reduce((a, b) => a + b, 0); // 1516
 const LOCAL = COUNTS.dpouw + COUNTS.knowledge + COUNTS.conversation; // 1420
+/* Фактическое число файлов в коммите — то же, что `verify.sh` передаёт в
+ * `--file-count`. Песочница пишет его в шапки, поэтому baseline зелёный. */
+const FACT_FILES = 183;
 
 /* Собирает песочницу: документы с ПАРАМЕТРАМИ, чтобы один шаблон покрывал
  * и зелёный, и каждый красный случай. */
 function sandbox({ ver = VER, mpVer = ver, mfVer = ver, narVer = ver, readmeVer = ver, mapVer = ver,
   total = TOTAL, addends = null, local = LOCAL, narLocal = local, mpEmpty = false,
-  mpSec2 = null, mfCore = null } = {}) {
+  mpSec2 = null, mfCore = null, shaTotal = null, shaMatch = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-docnum-'));
   const counts = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-counts-'));
   fs.mkdirSync(path.join(dir, 'docs'), { recursive: true });
 
   const chain = (addends || [COUNTS.dpouw, COUNTS.mesh, COUNTS.treasury, COUNTS.knowledge, COUNTS.conversation, COUNTS.p2pdiscovery, COUNTS.p2pgossip, COUNTS.p2pseed, COUNTS.p2prelay, COUNTS.p2preannounce]).join(' + ');
 
+  /* Число файлов в шапке. По умолчанию — FACT_FILES, ровно то, что `verify.sh`
+     передаёт в `--file-count`, поэтому baseline зелёный. `shaTotal`/`shaMatch`
+     позволяют сломать шапку не в том месте (числитель ≠ знаменателю). */
+  const shaN = shaTotal === null ? FACT_FILES : shaTotal;
+  const shaPair = `${shaMatch === null ? shaN : shaMatch}/${shaN}`;
   const s2 = mpSec2 || { total, local };
   fs.writeFileSync(path.join(dir, 'MASTER-PLAN.md'),
     `# MASTER-PLAN\n\n**Версия:** ${mpEmpty ? '' : mpVer}\n\n` +
-    `**Срез:** 808 чеков, **${total} проверок в \`verify.sh\`** (десять наборов **${chain} ✅ / 0 ❌**), плюс локальный гейт **${local}** (dpouw \`${COUNTS.dpouw}\` + knowledge \`${COUNTS.knowledge}\` + conversation \`${COUNTS.conversation}\`);\n\n` +
+    `**Срез:** 808 чеков, **${total} проверок в \`verify.sh\`** (десять наборов **${chain} ✅ / 0 ❌**), плюс локальный гейт **${local}** (dpouw \`${COUNTS.dpouw}\` + knowledge \`${COUNTS.knowledge}\` + conversation \`${COUNTS.conversation}\`); sha256 **${shaPair}**;\n\n` +
     `## 2. Текущий статус\n\n` +
     `| Тесты | **${COUNTS.dpouw} ✅ / 0 ❌** (dpouw) + **${COUNTS.knowledge} ✅ / 0 ❌** (knowledge) + **${COUNTS.conversation} ✅ / 0 ❌** (conversation) = **${s2.local}** локальный гейт; весь \`verify.sh\` — **${s2.total}** в десяти наборах | прогон |\n`);
 
@@ -92,7 +100,7 @@ function sandbox({ ver = VER, mpVer = ver, mfVer = ver, narVer = ver, readmeVer 
    * бы вместе с префиксом, и тест краснел бы на верном документе. */
   const coreChain = (core.chain || []).map((n, i) => `${['dpouw','mesh','treasury','knowledge','conversation','discovery','gossip','failover','relay','reannounce'][i] || 'x'} \`${n}\``).join(' + ');
   fs.writeFileSync(path.join(dir, 'MANIFEST.v3.4-UNIFIED.md'),
-    `# MANIFEST\n\n**Дата:** 14 ноября 2026 | **Сборка живого стенда:** \`${mfVer}\` (схема — 2.1.0-dpouw)\n\n` +
+    `# MANIFEST\n\n**Дата:** 14 ноября 2026 | **Сборка живого стенда:** \`${mfVer}\` (схема — 2.1.0-dpouw); sha256 **${shaPair}**\n\n` +
     `## 4. ДЕЙСТВУЮЩЕЕ ЯДРО ФАЗЫ 1 (\`${mfVer}\`)\n\n` +
     `Проверяется запросами к \`localhost:3001\` и прогоном \`bash scripts/verify.sh\` (**${core.total} проверок в десяти наборах, 0 провалов**: ${coreChain}), снимок 14.11.2026.\n`);
 
@@ -125,7 +133,7 @@ function run(args) {
 
 function check(name, { expectRc, sandboxArgs, grep }) {
   const { dir, counts } = sandbox(sandboxArgs || {});
-  const res = run(['--docs-dir', dir, '--counts-dir', counts]);
+  const res = run(['--docs-dir', dir, '--counts-dir', counts, '--file-count', String(FACT_FILES)]);
   const okRc = res.rc === expectRc;
   const okGrep = grep ? grep.test(res.out) : true;
   if (okRc && okGrep) {
@@ -302,6 +310,33 @@ check('§4 MANIFEST итог 1247 → exit 1', {
     if (res.rc === 1 && /§4 итог 1247 != 1516/.test(res.out)) ok('§4 читается внутри раздела', 'шапка верная, §4 сломан → красный');
     else no('§4 читается внутри раздела', `exit ${res.rc}\n${res.out.split('\n').filter(Boolean).map((l) => `       ${l}`).join('\n')}`);
   }
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(counts, { recursive: true, force: true });
+}
+
+/* 18. Число файлов в шапке (sha256 N/N) — ровно тот дефект, который 2.29.15
+ *     и лечит: 15.11.2026 документы говорили `179/179`, а гейт на том же
+ *     коммите насчитал `183/183`, потому что четыре новых файла въехали в тот
+ *     же коммит, что и число. Ни один шаг этого не видел. */
+check('sha256 179/179 при 183 файлах → exit 1, назван MASTER-PLAN', {
+  expectRc: 1, sandboxArgs: { shaTotal: 179 }, grep: /MASTER-PLAN=179/,
+});
+
+/* 19. Числитель ≠ знаменателю: `176/179` — не «почти верно», а другая пара
+ *     чисел. Сравнение только по знаменателю пропустило бы эту строку. */
+check('sha256 176/179 → exit 1, назван числитель', {
+  expectRc: 1, sandboxArgs: { shaTotal: 179, shaMatch: 176 }, grep: /числитель ≠ знаменателю/,
+});
+
+/* 20. Без `--file-count` — SKIP, а не «совпало»: сверять число файлов не с чем,
+ *     и молчаливый зелёный вердикт здесь стоил бы ровно того же, что и раньше. */
+{
+  const { dir, counts } = sandbox({});
+  const res = run(['--docs-dir', dir, '--counts-dir', counts]);
+  const hasSkip = /^SKIP\tsha256 файлов в шапках/m.test(res.out);
+  const hasOk = /^OK\tsha256 файлов в шапках/m.test(res.out);
+  if (res.rc === 0 && hasSkip && !hasOk) ok('без --file-count → SKIP, не OK', 'число файлов не сверялось и это видно');
+  else no('без --file-count → SKIP, не OK', `exit ${res.rc}, SKIP=${hasSkip}, OK=${hasOk}\n${res.out}`);
   fs.rmSync(dir, { recursive: true, force: true });
   fs.rmSync(counts, { recursive: true, force: true });
 }

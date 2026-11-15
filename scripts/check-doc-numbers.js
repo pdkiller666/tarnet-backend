@@ -40,6 +40,7 @@
  *   2 — не разобрал документ (это тоже провал: пустая шапка ≠ верная шапка).
  *
  * Запуск: node scripts/check-doc-numbers.js [--docs-dir DIR] [--counts-dir DIR]
+ *                                           [--file-count N]
  *                                           [--no-counts] [--json]
  */
 
@@ -49,12 +50,20 @@ const path = require('path');
 const ROOT = path.resolve(__dirname, '..');
 
 function parseArgs(argv) {
-  const out = { docsDir: ROOT, countsDir: '/tmp', noCounts: false, json: false };
+  const out = { docsDir: ROOT, countsDir: '/tmp', noCounts: false, json: false, fileCount: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--docs-dir') out.docsDir = path.resolve(String(argv[++i] || ''));
     else if (a === '--counts-dir') out.countsDir = String(argv[++i] || '/tmp');
     else if (a === '--no-counts') out.noCounts = true;
+    /* Фактическое число файлов в коммите. Передаёт `verify.sh` из
+       `git ls-tree -r --name-only HEAD | wc -l` — тем же счётом, которым
+       потом сверяет байты. `null` = не передали, и тогда проверка честно
+       говорит «не проверено», а не «совпало». */
+    else if (a === '--file-count') {
+      const n = Number(String(argv[++i] || '').trim());
+      out.fileCount = Number.isFinite(n) && n > 0 ? n : null;
+    }
     else if (a === '--json') out.json = true;
     else if (a === '--help') out.help = true;
   }
@@ -216,6 +225,29 @@ function parseMasterPlanStatus(text) {
   return out;
 }
 
+/* sha256 N/N в шапке документа: «sha256 **179/179** — столько файлов в коммите».
+ *
+ * ПОЧЕМУ ЭТО ОТДЕЛЬНАЯ ПРОВЕРКА (2.29.15). Число файлов в коммите — факт,
+ * который меняется от ЛЮБОГО `git add`, в том числе от коммита, который сам
+ * это число записывает. 15.11.2026 ровно так и вышло: документы сказали
+ * `179/179`, а гейт на том же коммите насчитал `183/183` — четыре новых файла
+ * (`AUDIT`, `PROJECT-EVOLUTION`, `PRE-FLIGHT-RECON`, `archive/README`) въехали
+ * в тот же коммит, что и число. Ни один шаг гейта этого не видел.
+ *
+ * Смотрим только ШАПКУ (`limitLines`): в теле документов `sha256` встречается
+ * в исторических записях (`76/76`, `169/169`), и разбор по всему файлу вернул
+ * бы первую из них — то есть сверял бы историю с сегодняшним деревом. */
+function parseShaClaim(text, limitLines) {
+  const out = { match: null, total: null };
+  if (!text) return out;
+  const lines = text.split('\n').slice(0, limitLines || 10);
+  for (const line of lines) {
+    const m = line.match(/sha256[*`\s]*(\d+)\s*\/\s*(\d+)/i);
+    if (m) return { match: Number(m[1]), total: Number(m[2]) };
+  }
+  return out;
+}
+
 /* §4 MANIFEST: «… прогоном `bash scripts/verify.sh` (**1516 проверок в десяти
  * наборах, 0 провалов**: dpouw `1344` + mesh `25` + … )».
  * Слагаемые берутся ТОЛЬКО после «dpouw»: до него в строке стоит
@@ -250,7 +282,7 @@ function parseManifestCore(text) {
 function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
-    console.log('check-doc-numbers.js [--docs-dir DIR] [--counts-dir DIR] [--no-counts] [--json]');
+    console.log('check-doc-numbers.js [--docs-dir DIR] [--counts-dir DIR] [--file-count N] [--no-counts] [--json]');
     return 0;
   }
 
@@ -275,6 +307,10 @@ function main() {
   const mapVer = parseProjectMapVer(readText(mapPath));
   const mpStatus = parseMasterPlanStatus(mpText);
   const mfCore = parseManifestCore(mfText);
+  /* Шапки для сверки числа файлов: MASTER-PLAN (строка «Срез») и MANIFEST
+     (строка «Сборка живого стенда»). Обе — в первых десяти строках. */
+  const shaMp = parseShaClaim(mpText, 10);
+  const shaMf = parseShaClaim(mfText, 10);
 
   const counts = {};
   for (const s of SUITES) counts[s.key] = args.noCounts ? null : readCount(args.countsDir, s.tag);
@@ -294,6 +330,23 @@ function main() {
     if (mapVer !== pkgVer) bad.push(`PROJECT-MAP=${mapVer || '—'}`);
     if (bad.length === 0) add('OK', 'версия в шапках', `${pkgVer} = package.json (пять документов)`);
     else add('NO', 'версия в шапках', `package.json=${pkgVer}, ${bad.join(', ')}`);
+  }
+
+  /* --- 3.12. Число файлов в коммите (sha256 N/N) --- */
+  if (args.fileCount === null) {
+    add('SKIP', 'sha256 файлов в шапках', 'не передан --file-count — число файлов не проверено');
+  } else {
+    const bad = [];
+    for (const [name, sha] of [['MASTER-PLAN', shaMp], ['MANIFEST', shaMf]]) {
+      if (sha.total === null) bad.push(`${name}: не разобрал sha256 N/N`);
+      /* Числитель проверяется ПЕРВЫМ: `176/179` — это другая пара чисел, а не
+         «почти верная». Обратный порядок скрывал этот дефект за расхождением
+         знаменателя, и тест поймал это раньше гейта. */
+      else if (sha.match !== sha.total) bad.push(`${name}=${sha.match}/${sha.total} (числитель ≠ знаменателю)`);
+      else if (sha.total !== args.fileCount) bad.push(`${name}=${sha.total}`);
+    }
+    if (bad.length === 0) add('OK', 'sha256 файлов в шапках', `${args.fileCount}/${args.fileCount} = файлов в коммите`);
+    else add('NO', 'sha256 файлов в шапках', `файлов в коммите ${args.fileCount}, ${bad.join(', ')}`);
   }
 
   /* --- 4. Локальный гейт: dpouw + knowledge + conversation --- */
@@ -378,4 +431,4 @@ function main() {
 }
 
 if (require.main === module) process.exit(main());
-module.exports = { parseMasterPlan, parseNarrative, parseManifestVer, parseReadmeVer, parseProjectMapVer, parseMasterPlanStatus, parseManifestCore, cleanVer, SUITES, LOCAL_GATE };
+module.exports = { parseMasterPlan, parseNarrative, parseManifestVer, parseReadmeVer, parseProjectMapVer, parseMasterPlanStatus, parseManifestCore, parseShaClaim, cleanVer, SUITES, LOCAL_GATE };
