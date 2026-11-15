@@ -68,13 +68,13 @@ const TOTAL = Object.values(COUNTS).reduce((a, b) => a + b, 0); // 1516
 const LOCAL = COUNTS.dpouw + COUNTS.knowledge + COUNTS.conversation; // 1420
 /* Фактическое число файлов в коммите — то же, что `verify.sh` передаёт в
  * `--file-count`. Песочница пишет его в шапки, поэтому baseline зелёный. */
-const FACT_FILES = 183;
+const FACT_FILES = 186;
 
 /* Собирает песочницу: документы с ПАРАМЕТРАМИ, чтобы один шаблон покрывал
  * и зелёный, и каждый красный случай. */
 function sandbox({ ver = VER, mpVer = ver, mfVer = ver, narVer = ver, readmeVer = ver, mapVer = ver,
   total = TOTAL, addends = null, local = LOCAL, narLocal = local, mpEmpty = false,
-  mpSec2 = null, mfCore = null, shaTotal = null, shaMatch = null } = {}) {
+  mpSec2 = null, mfCore = null, shaTotal = null, shaMatch = null, mapShaPair = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-docnum-'));
   const counts = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-counts-'));
   fs.mkdirSync(path.join(dir, 'docs'), { recursive: true });
@@ -108,7 +108,7 @@ function sandbox({ ver = VER, mpVer = ver, mfVer = ver, narVer = ver, readmeVer 
     `# TarNet / Synapse — dPoUW backend (\`${readmeVer}\`)\n\nДемонстрационный стенд экономики.\n`);
 
   fs.writeFileSync(path.join(dir, 'PROJECT-MAP.md'),
-    `# PROJECT-MAP\n\n**Сверено с кодом:** 2026-11-14 MSK, локально и на проде \`${mapVer}\` (\`verify.sh\` → **${total}** в десяти наборах).\n`);
+    `# PROJECT-MAP\n\n**Сверено с кодом:** 2026-11-14 MSK, локально и на проде \`${mapVer}\` (\`verify.sh\` → **${total}** в десяти наборах; sha256 **${mapShaPair || shaPair}**).\n`);
 
   fs.writeFileSync(path.join(dir, 'docs', 'NARRATIVE.md'),
     `# NARRATIVE\n\n**Версия среза:** ${narVer} (локально и на проде) · **Дата:** 14.11.2026\n\n` +
@@ -328,7 +328,16 @@ check('sha256 176/179 → exit 1, назван числитель', {
   expectRc: 1, sandboxArgs: { shaTotal: 179, shaMatch: 176 }, grep: /числитель ≠ знаменателю/,
 });
 
-/* 20. Без `--file-count` — SKIP, а не «совпало»: сверять число файлов не с чем,
+/* 20a. PROJECT-MAP тоже обязан проверяться (2.29.16). До этого шаг 3.12 сверял
+ *      ДВА документа из ТРЁХ, где число написано рукой, и `PROJECT-MAP.md` можно
+ *      было забыть обновить при зелёном гейте — та же дыра, что `README.md` до
+ *      2.29.14. Тест держит именно третье имя в списке, а не «проверка работает»:
+ *      при откате списка к двум документам эта строка краснеет. */
+check('sha256 в PROJECT-MAP неверный → exit 1, назван PROJECT-MAP', {
+  expectRc: 1, sandboxArgs: { mapShaPair: '183/183', shaTotal: FACT_FILES }, grep: /PROJECT-MAP=183/,
+});
+
+/* 20b. Без `--file-count` — SKIP, а не «совпало»: сверять число файлов не с чем,
  *     и молчаливый зелёный вердикт здесь стоил бы ровно того же, что и раньше. */
 {
   const { dir, counts } = sandbox({});

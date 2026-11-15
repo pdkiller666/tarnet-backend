@@ -303,14 +303,25 @@ function main() {
   const nar = parseNarrative(narText);
   const mfText = readText(mfPath);
   const mfVer = parseManifestVer(mfText);
+  const mapText = readText(mapPath);
   const readmeVer = parseReadmeVer(readText(readmePath));
-  const mapVer = parseProjectMapVer(readText(mapPath));
+  const mapVer = parseProjectMapVer(mapText);
   const mpStatus = parseMasterPlanStatus(mpText);
   const mfCore = parseManifestCore(mfText);
-  /* Шапки для сверки числа файлов: MASTER-PLAN (строка «Срез») и MANIFEST
-     (строка «Сборка живого стенда»). Обе — в первых десяти строках. */
+  /* Шапки для сверки числа файлов: MASTER-PLAN (строка «Срез»), MANIFEST
+     (строка «Сборка живого стенда») и PROJECT-MAP (строка «Сверено с кодом»).
+     Все три — в первых десяти строках.
+
+     ПОЧЕМУ PROJECT-MAP ДОБАВЛЕН (2.29.16). До этого шаг 3.12 сверял ДВА
+     документа из ТРЁХ, где это число написано рукой. `PROJECT-MAP.md` заявлял
+     `sha256 183/183` и не проверялся вообще — то есть его можно было забыть
+     обновить, и гейт остался бы зелёным. Ровно та же дыра, что `README.md` до
+     2.29.14: документ с числом в шапке, которого нет в списке проверяемых.
+     Список документов, а не их количество — потому что «два из трёх» и было
+     дефектом. */
   const shaMp = parseShaClaim(mpText, 10);
   const shaMf = parseShaClaim(mfText, 10);
+  const shaMap = parseShaClaim(mapText, 10);
 
   const counts = {};
   for (const s of SUITES) counts[s.key] = args.noCounts ? null : readCount(args.countsDir, s.tag);
@@ -337,7 +348,7 @@ function main() {
     add('SKIP', 'sha256 файлов в шапках', 'не передан --file-count — число файлов не проверено');
   } else {
     const bad = [];
-    for (const [name, sha] of [['MASTER-PLAN', shaMp], ['MANIFEST', shaMf]]) {
+    for (const [name, sha] of [['MASTER-PLAN', shaMp], ['MANIFEST', shaMf], ['PROJECT-MAP', shaMap]]) {
       if (sha.total === null) bad.push(`${name}: не разобрал sha256 N/N`);
       /* Числитель проверяется ПЕРВЫМ: `176/179` — это другая пара чисел, а не
          «почти верная». Обратный порядок скрывал этот дефект за расхождением
