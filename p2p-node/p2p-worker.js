@@ -51,6 +51,8 @@ import { CID } from 'multiformats/cid'
  * дал бы только один эффект: ошибка установки `werift` всплыла бы поздно,
  * уже внутри обработчика кадра, и выглядела бы как «сигналинг сломан». */
 import { answerOffer } from './webrtc-peer.js'
+import { createTaskHandler } from './task-handler.js'
+import { NonceStore } from './task-grant.js'
 
 const BOOTSTRAP_BASE = (
   process.env.TARNET_PUBLIC_URL || 'https://v1107336.hosted-by-vdsina.com'
@@ -268,6 +270,56 @@ const EXEC_FILE = path.join(os.homedir(), '.tarnet', 'p2p-exec.json')
 let execCache = { mtimeMs: -1, port: null, token: null }
 let execWarned = false
 
+/* Обработчик кадра DataChannel — один на процесс (2.29.20).
+ *
+ * ПОЧЕМУ ОДИН, А НЕ НОВЫЙ НА КАЖДОЕ СОЕДИНЕНИЕ. Внутри живёт счётчик
+ * занятости (`inFlight`), и второй экземпляр означал бы два независимых
+ * счётчика: воркер считал бы «очередь свободна» дважды и пускал бы две
+ * задачи на одну CPU. NonceStore тоже должен быть один, иначе повтор
+ * nonce внутри одного соединения не ловился бы вообще.
+ *
+ * ПОЧЕМУ ЛЕНИВО. Ключ воркера появляется на диске после WS-рукопожатия
+ * (другой процесс), а `handleTask` может быть вызван раньше. Собираем
+ * при первом кадре, когда ключ уже есть или его заведомо не будет. */
+let taskHandler = null
+let taskHandlerSeed = null
+let taskHandlerAddress = null
+
+async function getTaskHandler() {
+  /* Ключ нужен для подписи чека и кадра ошибки. Без него обработчик всё
+   * равно полезен (проверка гранта не требует ключа ВОРКЕРА — в гранте
+   * ключ клиента), но чек уйдёт неподписанным, и это надо знать в логе. */
+  if (!taskHandlerSeed) {
+    const ident = await waitForWorkerIdentity({ timeoutMs: KEY_WAIT_MS })
+    if (!ident.error && ident.seed) {
+      taskHandlerSeed = Buffer.from(ident.seed)
+      taskHandlerAddress = ident.address
+    } else {
+      log(`TaskGrant: ключ воркера не найден (${ident.error || 'нет seed'}) — чек и ошибки пойдут без подписи`)
+    }
+  }
+  if (taskHandler) return taskHandler
+  taskHandler = createTaskHandler({
+    store: nonceStore,
+    models: fetchModelsFromExecutor,
+    execute: async (t) => proxyToLocalExecutor({
+      taskId: t.taskId,
+      prompt: t.prompt,
+      model: t.model,
+      maxTokens: t.maxTokens
+    }),
+    seed: taskHandlerSeed,
+    workerAddress: taskHandlerAddress,
+    log: (m) => log(m)
+  })
+  return taskHandler
+}
+
+/* Память nonce — одна на процесс. Путь рядом с `peer-id.bin` и
+ * `worker.json`, переопределяется `P2P_NONCE_STORE` (см. `task-grant.js`:
+ * класть файл в `p2p-node/` нельзя — он уехал бы в архив установщика). */
+const nonceStore = new NonceStore()
+
 function loadExecDescriptor() {
   let st
   try { st = fs.statSync(EXEC_FILE) } catch (_e) {
@@ -329,6 +381,44 @@ async function proxyToLocalExecutor(task) {
   } catch (e) {
     if (ctrl.signal.aborted) return { ok: false, error: 'EXEC_TIMEOUT', timeout_ms: EXEC_TIMEOUT_MS }
     return { ok: false, error: 'EXEC_UNREACHABLE', detail: e.message }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * Спросить у локального исполнителя модели с дайджестами (2.29.20).
+ *
+ * ЗАЧЕМ ЧЕРЕЗ ПРОКСИ. Дайджест знает только процесс, который читает
+ * `/api/tags` у Ollama. Здесь его нет и не должно быть: `p2p-node/` —
+ * отдельный npm-пакет, и второй источник правды о том, что установлено,
+ * разошёлся бы с первым на первой переустановке модели.
+ *
+ * ПУСТОЙ СПИСОК — НЕ НОЛЬ МОДЕЛЕЙ. Отсутствие исполнителя или ошибка
+ * отдают `[]`, и тогда грант получает `E_MODEL / hash_unknown`. Это
+ * честнее, чем пропустить задачу «на веру»: пропуск превратил бы защиту
+ * в её отсутствие.
+ */
+async function fetchModelsFromExecutor() {
+  const d = loadExecDescriptor()
+  if (!d) return []
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 5000)
+  try {
+    const res = await fetch(`http://127.0.0.1:${d.port}/p2p/models`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${d.token}` },
+      signal: ctrl.signal
+    })
+    const body = await res.json().catch(() => null)
+    if (res.status === 401) {
+      execCache = { mtimeMs: -1, port: null, token: null }
+      return []
+    }
+    if (!body || body.ok !== true || !Array.isArray(body.models)) return []
+    return body.models
+  } catch (_e) {
+    return []
   } finally {
     clearTimeout(timer)
   }
@@ -410,18 +500,34 @@ async function handleTask(msg) {
    * taskId и не pong (webrtc-offer) — сирота», а вызывающий получал
    * TASK_TIMEOUT. Возвращаем id тем же полем, каким он пришёл.
    *
-   * ЧЕГО ЗДЕСЬ НЕТ. Подписи `TaskGrant` и TURN: это транспортный
-   * прототип, а не приёмка работы. Обе вещи названы в
-   * `docs/STAGE-10-WEBRTC.md` как обязательные для боевого пути. */
+   * ЧЕГО ЗДЕСЬ НЕТ. TURN: это транспортный прототип, а не приёмка
+   * работы. TURN — отдельная спека, потому что он добавляет сервер, то
+   * есть ровно ту центральную точку, которую Этап 10 убирает.
+   *
+   * С 2.29.20 здесь есть `TaskGrant`: кадр `{type:'task'}` проверяется
+   * и уходит на исполнение. Грант — авторизация права на задачу
+   * (Этап 10), а НЕ верификация вычислений (Этап 12). Смешать их
+   * значило бы объявить Этап 12 закрытым документом. */
   if (msg && msg.action === 'webrtc-offer') {
     const taskId = msg.taskId ? String(msg.taskId) : null
     log('[webrtc] offer получен — собираю answer')
     const res = await answerOffer(msg.offer, {
       log: (m) => log(m),
-      /* Ответ на текст из DataChannel. Эхо с префиксом: тест должен
-       * видеть именно ответ воркера, а не своё же сообщение, вернувшееся
-       * по кругу — иначе проверка зеленеет на отсутствии связи. */
-      onMessage: (text) => `pong:${text}`
+      /* Ответ на текст из DataChannel.
+       *
+       * ПЛОСКИЙ ТЕКСТ ОСТАЁТСЯ ЭХОМ, и это не забывчивость.
+       * `webrtc-test.js` шлёт в канал `ping-<ts>` — не JSON — и ждёт
+       * ровно `pong:<text>`. Если бы обработчик отвечал JSON'ом на всё,
+       * зелёный тест покраснел бы на неизменённом коде. Поэтому решение
+       * принимает `task-handler.js`: не-JSON и `{type:'ping'}` — эхо,
+       * `{type:'task'}` — грант, всё остальное — `E_MODEL`.
+       *
+       * СОБИРАЕМ ЛЕНИВО: ключ воркера появляется на диске после
+       * WS-рукопожатия другого процесса. */
+      onMessage: async (text) => {
+        const handler = await getTaskHandler()
+        return handler(text)
+      }
     })
     if (!res.ok) {
       log(`[webrtc] offer отклонён: ${res.error}`)

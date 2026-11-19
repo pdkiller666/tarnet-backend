@@ -12090,6 +12090,222 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       btSrc ? `${btSrc.length} байт` : 'файла нет');
   }
 
+  /* ===== 64. TaskGrant: право на задачу до исполнения (2.29.20) =====
+   *
+   * ПОЧЕМУ ЭТОТ БЛОК В ГЛАВНОМ НАБОРЕ, А НЕ РЯДОМ С МОДУЛЕМ.
+   * `task-grant.js` и `task-handler.js` — единственные файлы, которые
+   * решают, пускать ли чужую задачу на CPU воркера. Непокрытый отказ
+   * здесь — это воркер, который молча принимает подделку или молча
+   * отказывает честному клиенту. Оба исхода видны только на живой
+   * машине, то есть поздно.
+   *
+   * ПОЧЕМУ НА КАЖДЫЙ КОД ОТДЕЛЬНЫЙ СЛУЧАЙ. Шесть кодов названы в
+   * `docs/TASK-GRANT-SPEC.md`. Проверка «вернулся хоть какой-то отказ»
+   * зеленела бы и тогда, когда ВСЕ условия сваливаются в `E_SIG`: клиент
+   * не отличил бы «мне не разрешили» от «я подписал неверно». Поэтому
+   * каждое поле портится точечно, и проверяется именно ожидаемый код.
+   *
+   * ЭХО ПЛОСКОГО ТЕКСТА ПРОВЕРЯЕТСЯ ЗДЕСЬ ЖЕ (§64.9): `webrtc-test.js`
+   * шлёт `ping-<ts>` не-JSON'ом и ждёт ровно `pong:<text>`. Если бы
+   * обработчик начал отвечать JSON'ом на всё, зелёный тест Этапа 10
+   * покраснел бы на неизменённом коде — этот пункт замок от возврата.
+   */
+  section('64. TaskGrant: шесть отказов, подписанный чек, эхо сохранено');
+  {
+    const nodeCrypto = require('crypto');
+    const tg = await import('./p2p-node/task-grant.js');
+    const th = await import('./p2p-node/task-handler.js');
+
+    const mkKey = () => {
+      const seed = nodeCrypto.randomBytes(32);
+      const priv = nodeCrypto.createPrivateKey({
+        key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]),
+        format: 'der', type: 'pkcs8'
+      });
+      const spki = nodeCrypto.createPublicKey(priv).export({ format: 'der', type: 'spki' });
+      return { seed, priv, pub: spki.subarray(spki.length - 32) };
+    };
+
+    const client = mkKey();
+    const worker = mkKey();
+    const clientAddr = tg.addressFromPublicKey(client.pub);
+    const workerAddr = tg.addressFromPublicKey(worker.pub);
+    const DIGEST = 'a'.repeat(64);
+    const MODEL = 'qwen2.5-coder:1.5b';
+    /* Два РАЗНЫХ контракта, и путать их нельзя: `createTaskHandler`
+     * принимает ФУНКЦИЮ `models()` (она же отдаёт список по кадру
+     * `type:'models'`), а `verifyGrant` — уже ГОТОВЫЙ массив. Первый
+     * прогон блока дал шесть провалов `not_installed` ровно потому, что
+     * функция ушла туда, где ждали массив. */
+    const models = async () => [{ name: MODEL, digest: 'sha256:' + DIGEST }];
+    const installed = await models();
+
+    const nsPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-tg64-')), 'ns.json');
+    const store = new tg.NonceStore({ file: nsPath });
+
+    const mkGrant = (over = {}) => {
+      const g = {
+        version: tg.GRANT_VERSION,
+        taskId: '0x' + nodeCrypto.randomBytes(16).toString('hex'),
+        modelId: MODEL,
+        modelHash: 'sha256:' + DIGEST,
+        maxTokens: 256,
+        clientAddress: clientAddr,
+        clientPubkey: client.pub.toString('hex'),
+        epoch: 10,
+        timestamp: Date.now(),
+        nonce: '0x' + nodeCrypto.randomBytes(8).toString('hex'),
+        ...over
+      };
+      g.signature = tg.signGrant(g, client.priv);
+      return g;
+    };
+
+    const good = mkGrant();
+    const v = tg.verifyGrant(good, { store, models: installed });
+    ok('64.1 валидный грант принят: taskId и адрес клиента',
+      v.ok === true && v.taskId === good.taskId && v.clientAddress === clientAddr,
+      v.ok ? v.taskId : v);
+
+    /* Подпись последняя и самая дорогая — но именно она отличает
+     * намерение от права. Портим байт, а не поле: поле поймал бы п. 3. */
+    const sigBad = mkGrant();
+    sigBad.signature = Buffer.from(nodeCrypto.randomBytes(64)).toString('base64');
+    const vSig = tg.verifyGrant(sigBad, { store, models: installed });
+    ok('64.2 битая подпись → E_SIG/bad_signature',
+      vSig.ok === false && vSig.code === 'E_SIG' && vSig.reason === 'bad_signature',
+      vSig.code + '/' + vSig.reason);
+
+    /* Повтор того же гранта — не «вторая задача», а попытка списать
+     * работу дважды одним правом. Nonce запоминается только после
+     * успешной проверки. */
+    const replay = mkGrant();
+    const vFirst = tg.verifyGrant(replay, { store, models: installed });
+    if (vFirst.ok) store.record(vFirst.clientAddress, replay.nonce, vFirst.epoch);
+    const vSecond = tg.verifyGrant(replay, { store, models: installed });
+    ok('64.3 повтор nonce → E_REPLAY/nonce_reused',
+      vFirst.ok === true && vSecond.ok === false &&
+      vSecond.code === 'E_REPLAY' && vSecond.reason === 'nonce_reused',
+      vSecond.code + '/' + vSecond.reason);
+
+    /* Откат epoch. Воркер не пересчитывает epoch (это дело сервера), но
+     * монотонность держит: иначе повтор с меньшим epoch прошёл бы после
+     * перезапуска и сброса кольца nonce. */
+    const older = mkGrant({ epoch: 5 });
+    const vOld = tg.verifyGrant(older, { store, models: installed });
+    ok('64.4 epoch меньше принятого → E_REPLAY/epoch_regressed',
+      vOld.ok === false && vOld.code === 'E_REPLAY' && vOld.reason === 'epoch_regressed',
+      vOld.code + '/' + vOld.reason);
+
+    const stale = mkGrant({ timestamp: Date.now() - tg.GRANT_MAX_SKEW_MS - 60000 });
+    const vStale = tg.verifyGrant(stale, { store, models: installed });
+    ok('64.5 просроченный грант → E_WINDOW',
+      vStale.ok === false && vStale.code === 'E_WINDOW',
+      vStale.code + '/' + vStale.reason);
+
+    /* Модель: две разные причины, и обе — E_MODEL, но с разным reason.
+     * Клиент по reason понимает, идти ли `type:'models'` за дайджестом. */
+    const notInst = mkGrant({ modelId: 'нет-такой:1b' });
+    const vNotInst = tg.verifyGrant(notInst, { store, models: installed });
+    ok('64.6 модели нет у воркера → E_MODEL/not_installed',
+      vNotInst.ok === false && vNotInst.code === 'E_MODEL' && vNotInst.reason === 'not_installed',
+      vNotInst.code + '/' + vNotInst.reason);
+
+    const wrongHash = mkGrant({ modelHash: 'sha256:' + 'b'.repeat(64) });
+    const vHash = tg.verifyGrant(wrongHash, { store, models: installed });
+    ok('64.7 дайджест не совпал → E_MODEL/hash_mismatch',
+      vHash.ok === false && vHash.code === 'E_MODEL' && vHash.reason === 'hash_mismatch',
+      vHash.code + '/' + vHash.reason);
+
+    const tooMany = mkGrant({ maxTokens: tg.DEFAULT_MAX_TOKENS_PER_TASK + 1 });
+    const vTok = tg.verifyGrant(tooMany, { store, models: installed });
+    ok('64.8 больше потолка → E_TOKENS/above_limit',
+      vTok.ok === false && vTok.code === 'E_TOKENS' && vTok.reason === 'above_limit',
+      vTok.code + '/' + vTok.reason);
+
+    /* ---------- обработчик кадра ---------- */
+    const handler = th.createTaskHandler({
+      store,
+      models,
+      execute: async (t) => ({ ok: true, payload: { response: 'эхо:' + t.prompt } }),
+      seed: worker.seed,
+      workerAddress: workerAddr
+    });
+
+    const flat = await handler('ping-1700000000000');
+    ok('64.9 плоский текст остался эхом pong:',
+      flat === 'pong:ping-1700000000000', flat);
+
+    const taskFrame = JSON.parse(await handler(JSON.stringify({ type: 'task', grant: mkGrant(), prompt: 'привет' })));
+    /* `assuranceLevel: self_reported` — не украшение. Чек воркера — его
+     * ЗАЯВЛЕНИЕ, а не запись леджера: `spot_checked` начнётся со Stage 11,
+     * `committee_verified` — со Stage 12. Написать их раньше значило бы
+     * выдать непроверенное за проверенное. */
+    ok('64.10 кадр задачи → result с чеком self_reported',
+      taskFrame.type === 'result' &&
+      taskFrame.text === 'эхо:привет' &&
+      taskFrame.receipt.assuranceLevel === 'self_reported' &&
+      taskFrame.receipt.cwu === 0 && taskFrame.receipt.feeRewardUnits === 0,
+      { type: taskFrame.type, text: taskFrame.text, level: taskFrame.receipt && taskFrame.receipt.assuranceLevel });
+
+    let receiptOk = false;
+    try {
+      /* Снимаем `signature` копированием, а не `undefined`-полем: JCS
+       * выбрасывает `undefined`, и оба пути дают один объект — но полагаться
+       * на это в проверке подписи значит проверять не то, что подписывали. */
+      const { signature: _drop, ...receiptBody } = taskFrame.receipt;
+      receiptOk = nodeCrypto.verify(
+        null,
+        Buffer.from(require('./jcs.js').stringify(receiptBody), 'utf8'),
+        tg.ed25519PublicKeyFromRaw(worker.pub),
+        Buffer.from(taskFrame.receipt.signature, 'base64')
+      );
+    } catch (_e) { receiptOk = false; }
+    ok('64.11 чек подписан ключом воркера и проверяется',
+      receiptOk === true, taskFrame.receipt.signature ? 'подпись есть' : 'подписи нет');
+
+    /* Отказ обязан быть подписан: иначе чужой узел мог бы отвечать
+     * `E_BUSY` от имени воркера и тихо забирать трафик. */
+    const badFrame = JSON.parse(await handler(JSON.stringify({ type: 'task', grant: sigBad, prompt: 'x' })));
+    let errSigned = false;
+    try {
+      const { signature: _drop2, ...errBody } = badFrame;
+      errSigned = nodeCrypto.verify(
+        null,
+        Buffer.from(require('./jcs.js').stringify(errBody), 'utf8'),
+        tg.ed25519PublicKeyFromRaw(worker.pub),
+        Buffer.from(badFrame.signature, 'base64')
+      );
+    } catch (_e) { errSigned = false; }
+    ok('64.12 отказ E_SIG подписан воркером',
+      badFrame.type === 'error' && badFrame.code === 'E_SIG' && errSigned === true,
+      { code: badFrame.code, signed: errSigned });
+
+    /* Занятость. Проверяется конкуренцией, а не подделкой счётчика:
+     * `maxQueue:1` и незавершённая первая задача — это и есть то
+     * состояние, в котором воркер обязан ответить `E_BUSY`. */
+    let release = null;
+    const busyStore = new tg.NonceStore({ file: path.join(os.tmpdir(), `tarnet-tg64-busy-${Date.now()}.json`) });
+    const busyHandler = th.createTaskHandler({
+      store: busyStore,
+      models,
+      execute: () => new Promise((r) => { release = r; }),
+      seed: worker.seed,
+      workerAddress: workerAddr,
+      maxQueue: 1
+    });
+    const bg = mkGrant();
+    const pBg = busyHandler(JSON.stringify({ type: 'task', grant: bg, prompt: 'медленно' }));
+    await new Promise((r) => setTimeout(r, 60));
+    const busy = JSON.parse(await busyHandler(JSON.stringify({ type: 'task', grant: mkGrant(), prompt: 'ещё' })));
+    ok('64.13 очередь занята → E_BUSY',
+      busy.type === 'error' && busy.code === 'E_BUSY', busy.code + '/' + busy.reason);
+    if (release) release({ ok: true, payload: { response: 'готово' } });
+    await pBg.catch(() => {});
+
+    fs.rmSync(path.dirname(nsPath), { recursive: true, force: true });
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

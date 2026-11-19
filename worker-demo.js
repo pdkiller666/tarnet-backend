@@ -82,7 +82,14 @@ function normalizeModelName(s) {
  * моделей нет» — разные вещи. Пустой массив без флага заставил бы PWA
  * писать «нет моделей» человеку, у которого не запущен Ollama. */
 const OLLAMA_TAGS_TTL_MS = 15000;
-let ollamaTagsCache = { models: [], at: 0, online: false };
+/* Помимо имён держим `digests` — имя модели → `sha256:…`. Нужно
+ * `TaskGrant` (2.29.20): грант несёт `modelHash`, и воркер обязан сверить
+ * его с тем, что РЕАЛЬНО лежит на диске. Без дайджеста проверка
+ * вырождается в сверку одного имени, то есть не защищает от подмены
+ * «под видом запрошенной». `ollamaTags()` продолжает отдавать только
+ * имена: её читают отчёт воркера и PWA, и менять её форму значило бы
+ * сломать трёх потребителей ради одного нового. */
+let ollamaTagsCache = { models: [], digests: {}, at: 0, online: false };
 
 async function ollamaTags({ maxAgeMs = OLLAMA_TAGS_TTL_MS } = {}) {
   if (Date.now() - ollamaTagsCache.at < maxAgeMs) return ollamaTagsCache.models;
@@ -90,15 +97,48 @@ async function ollamaTags({ maxAgeMs = OLLAMA_TAGS_TTL_MS } = {}) {
     const res = await fetch(`${OLLAMA}/api/tags`, { signal: AbortSignal.timeout(3000) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const j = await res.json();
-    const models = (Array.isArray(j.models) ? j.models : [])
-      .map((m) => m && m.name).filter(Boolean);
-    ollamaTagsCache = { models, at: Date.now(), online: true };
+    const raw = Array.isArray(j.models) ? j.models : [];
+    const models = raw.map((m) => m && m.name).filter(Boolean);
+    /* `digest` у Ollama есть в ответе `/api/tags`, но до 2.29.20 код его не
+     * брал: транспорту он был не нужен. Модель без дайджеста не выдумываем
+     * и не подставляем имя — отсутствие остаётся отсутствием, и грант на
+     * неё получит `E_MODEL / hash_unknown`, а не пропуск «на веру». */
+    const digests = {};
+    for (const m of raw) {
+      if (m && typeof m.name === 'string' && typeof m.digest === 'string' && m.digest) {
+        digests[m.name] = m.digest.startsWith('sha256:') ? m.digest : `sha256:${m.digest}`;
+      }
+    }
+    ollamaTagsCache = { models, digests, at: Date.now(), online: true };
     return models;
   } catch (_e) {
     /* Недоступность не кэшируем навсегда: следующий пульс проверит снова. */
-    ollamaTagsCache = { models: [], at: Date.now(), online: false };
+    ollamaTagsCache = { models: [], digests: {}, at: Date.now(), online: false };
     return [];
   }
+}
+
+/**
+ * Установленные модели с дайджестами — ровно та форма, которую ждёт
+ * `verifyGrant({ models })`.
+ *
+ * ПОЧЕМУ ОТДЕЛЬНАЯ ФУНКЦИЯ, А НЕ ПОЛЕ В `ollamaTags`. Возврат `ollamaTags`
+ * — массив строк, и его читают `workerModelReport` и PWA. Смена формы
+ * сломала бы отчёт о воркере молча: он перестал бы показывать модели, а
+ * выглядело бы это как «Ollama пропала». Форма входа проверки гранта —
+ * отдельный контракт, и он живёт отдельной функцией.
+ *
+ * @returns {Promise<Array<{name:string, digest:string}>>} пустой массив,
+ *          если Ollama недоступна — тогда грант получит `hash_unknown`.
+ */
+async function ollamaModelsWithDigest() {
+  await ollamaTags();
+  const out = [];
+  for (const name of ollamaTagsCache.models) {
+    const digest = ollamaTagsCache.digests[name];
+    if (typeof digest === 'string' && digest) out.push({ name, digest });
+  }
+  return out;
 }
 
 /* Отчёт для сервера: что реально установлено на ЭТОМ ПК и жива ли Ollama.
@@ -1669,7 +1709,7 @@ function startP2pExecutor() {
   if (p2pExecServer) return p2pExecServer;
   const token = nodeCrypto.randomBytes(32).toString('hex');
 
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
     const reply = (code, obj) => {
       try {
         res.writeHead(code, { 'content-type': 'application/json' });
@@ -1677,11 +1717,34 @@ function startP2pExecutor() {
       } catch (_e) { /* клиент уже отвалился */ }
     };
 
-    if (req.method !== 'POST' || (req.url !== '/p2p/execute' && req.url !== '/p2p/cancel')) {
+    if (req.method !== 'POST' || (req.url !== '/p2p/execute' && req.url !== '/p2p/cancel' && req.url !== '/p2p/models')) {
       return reply(404, { ok: false, error: 'NOT_FOUND' });
     }
     if (String(req.headers.authorization || '') !== `Bearer ${token}`) {
       return reply(401, { ok: false, error: 'BAD_TOKEN' });
+    }
+
+    /* Список моделей с дайджестами (2.29.20).
+     *
+     * ЗАЧЕМ ЧЕРЕЗ ЭТОТ ЖЕ ВХОД. Дайджест знает только этот процесс: он
+     * читает `/api/tags` у Ollama. `p2p-node` — отдельный npm-пакет без
+     * доступа к `worker-demo.js`, и дублировать там запрос к Ollama
+     * значило бы завести второй источник правды о том, что установлено.
+     *
+     * ОТВЕТ БЕЗ ПРОМПТА И БЕЗ КЛЮЧЕЙ — только имя и digest. Тот же токен,
+     * что у `/p2p/execute`: это тот же круг доверия (локальный процесс
+     * воркера), и отдельный токен ничего бы не защитил.
+     *
+     * ТЕЛО НЕ ЧИТАЕМ. Запрос без тела, и `return` уходит сразу: вешать
+     * `on('end')` ради пустого POST значило бы держать сокет открытым до
+     * таймаута, если вызывающий не закроет поток. */
+    if (req.url === '/p2p/models') {
+      try {
+        const models = await ollamaModelsWithDigest();
+        return reply(200, { ok: true, models });
+      } catch (e) {
+        return reply(200, { ok: false, error: 'MODELS_UNAVAILABLE', detail: e.message });
+      }
     }
 
     let raw = '';
