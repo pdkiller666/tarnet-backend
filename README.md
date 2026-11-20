@@ -1,4 +1,4 @@
-# TarNet / Synapse — dPoUW backend (`2.29.20`)
+# TarNet / Synapse — dPoUW backend (`2.29.21`)
 
 Демонстрационный стенд экономики **Deterministic Proof-of-Useful-Work**.
 Каждая подтверждённая единица работы даёт точное, заранее вычислимое
@@ -243,7 +243,7 @@ omega, share, adapterId, actionId, timestamp, prevSignature, signature
 ## Проверка
 
 ```bash
-# приёмка: 1357 проверок dpouw; весь гейт — bash scripts/verify.sh (1529 в 10 наборах)
+# приёмка: 1367 проверок dpouw; весь гейт — bash scripts/verify.sh (1539 в 10 наборах)
 # --test сам поднимает изолированный сервер на свободном порту
 # и временной БД (TARNET_DB=$(mktemp)); запущенный стенд не нужен
 node test-dpouw.js --test

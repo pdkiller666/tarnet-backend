@@ -12306,6 +12306,78 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     fs.rmSync(path.dirname(nsPath), { recursive: true, force: true });
   }
 
+  /* ---------- 65. stage10-test.bat: инварианты Windows-скрипта ---------- */
+  /* ЗАЧЕМ ЭТОТ БЛОК. `scripts/stage10-test.bat` — единственный вход для
+   * проверки Этапа 10 на машине владельца, и запускается он НЕ здесь: ни один
+   * Linux-тест его не исполняет. Файл в репозитории, который никто не
+   * проверяет, протухает молча.
+   *
+   * ЧТО ИМЕННО ПРОВЕРЯЕТСЯ И ПОЧЕМУ ИМЕННО ЭТО. Три свойства ломают скрипт
+   * ЦЕЛИКОМ, а по отдельности выглядят безобидно:
+   *
+   *  • CRLF и чистый ASCII. `cmd.exe` читает `
+` как конец команды только
+   *    вместе с `\r`. Файл с голыми `\n` (типичный результат `git config`
+   *    без `core.autocrlf` или редактирования в Linux-редакторе) даёт ошибки
+   *    вида «`goto` was unexpected at this time» — и человек читает это как
+   *    «скрипт сломан», а не «файл сохранён не в том формате». Не-ASCII байты
+   *    (тире, кавычки-ёлочки) ломаются ещё вернее: в консоли Windows они
+   *    превращаются в мусор, а в метке `goto` — в несуществующую метку.
+   *
+   *  • Обе ветки режима. `%~1` сравнивается с `--post-reboot`; опечатка в
+   *    литерале отправляет `--post-reboot` в ветку ДО перезагрузки, и скрипт
+   *    бодро печатает инструкции вместо проверок. Выглядит как работа.
+   *
+   *  • Коды возврата логируются как ДАННЫЕ. Проверка несостоявшегося
+   *    автозапуска ОБЯЗАНА вернуть ненулевой код (1/3), и `if errorlevel`-
+   *    обработка, падающая на этом, превратила бы штатный результат в
+   *    «скрипт упал». Поэтому в файле должны остаться имена переменных
+   *    `AUTOSTART_RC` и `WEBRTC_RC`: по ним видно, что код сохранён, а не
+   *    проглочен.
+   *
+   * ЭТО НЕ ЗАМЕНА ЖИВОГО ПРОГОНА на Windows. Блок доказывает, что файл
+   * пригоден к запуску и не потерял структуру при правках; что он делает на
+   * машине владельца — доказывает только `stage10-test.log` оттуда. */
+  section('65. stage10-test.bat: формат для cmd.exe и обе ветки режима');
+  {
+    const batPath = path.join(__dirname, 'scripts', 'stage10-test.bat');
+    let buf = null;
+    try { buf = fs.readFileSync(batPath); } catch { /* ниже красное, не падение */ }
+    ok('65.1 файл существует и читается', buf !== null, batPath);
+
+    if (buf) {
+      const latin = buf.toString('latin1');
+      const crlf = (latin.match(/\r\n/g) || []).length;
+      /* Голый `\n` ИЩЕТСЯ ЧЕРЕЗ LOOKBEHIND: `\r\n` тоже содержит `\n`, и
+       * наивный счёт дал бы «все строки голые» на правильном файле. */
+      const bareLf = (latin.match(/(?<!\r)\n/g) || []).length;
+      const nonAscii = [...buf].filter((b) => b > 127).length;
+
+      ok('65.2 все переводы строк — CRLF (иначе cmd.exe ломает разбор)',
+        crlf > 0 && bareLf === 0, { crlf, bareLf });
+      ok('65.3 файл — чистый ASCII (кириллица в .bat ломает метки и вывод)',
+        nonAscii === 0, { nonAscii });
+
+      const text = latin;
+      ok('65.4 ветка --post-reboot распознаётся по %~1',
+        /%~1/.test(text) && /--post-reboot/.test(text),
+        { hasArgRef: /%~1/.test(text) });
+      ok('65.5 есть метка POST_REBOOT и переход на неё',
+        /goto\s+POST_REBOOT/i.test(text) && /:POST_REBOOT/.test(text));
+      ok('65.6 порядок вызовов: автозапуск, затем webrtc',
+        text.indexOf('check-autostart.js') > 0 &&
+        text.indexOf('check-webrtc.js') > text.indexOf('check-autostart.js'));
+      ok('65.7 коды возврата сохраняются в переменные, а не проглатываются',
+        /AUTOSTART_RC/.test(text) && /WEBRTC_RC/.test(text));
+      ok('65.8 окно ожидания и интервал переданы автозапуску',
+        /--window\s+\d+/.test(text) && /--interval\s+\d+/.test(text));
+      ok('65.9 жёсткая перезагрузка страницы названа (Ctrl+Shift+R)',
+        /Ctrl\+Shift\+R/i.test(text));
+      ok('65.10 лог пишется в файл stage10-test.log',
+        /stage10-test\.log/.test(text));
+    }
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {
