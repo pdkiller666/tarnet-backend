@@ -366,9 +366,18 @@ node scripts/swarm-critic-solo.js --models anthropic/claude-haiku-5.5 \
 ```
 
 Флаги: `--models`, `--baseline`, `--limit`, `--out`, `--timeout`.
+`swarm-critique.js`: `--in`, `--out`, `--limit`, `--timeout`, `--regen`,
+`--critic`, `--judge`, `--judge-select`, `--max-tokens`.
+`swarm-critic-solo.js`: `--model`/`--models`, `--out`, `--limit`, `--max-tokens`.
+
+⚠️ `--max-tokens` обязателен для reasoning-моделей (`deepseek-v4.1-flash`):
+иначе весь бюджет уходит в `reasoning_tokens`, приходит `content: null` с
+`finish_reason: length` и судья выглядит «не ответившим».
+
 Требует `OPENROUTER_API_KEY`. Результат — JSON с полем `summary.verdict`
 (`MOAT-CANDIDATE` при `winRatePct >= 20`, иначе `NO-MOAT`) и сырыми ответами
-всех моделей в `rows[].models[].content` для разбора.
+всех моделей в `rows[].models[].content` для разбора; `summary.judgeMode`
+(`solve` | `select`) фиксирует, решал судья сам или выбирал из готовых.
 
 ---
 
