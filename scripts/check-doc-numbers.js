@@ -18,11 +18,13 @@
  *   3. Версия в шапке `NARRATIVE.md`     = `package.json` (шаг 3.10).
  *   4. Версия в H1 `README.md`           = `package.json` (шаг 3.10, с 2.29.14).
  *   5. Версия в шапке `PROJECT-MAP.md`   = `package.json` (шаг 3.10, с 2.29.14).
- *   6. «локальный гейт N» в MASTER-PLAN  = dpouw + knowledge + conversation.
- *   7. «N проверок в verify.sh» и список слагаемых = фактические счёта наборов.
- *   8. Те же два числа в таблице NARRATIVE.
- *   9. Таблица §2 `MASTER-PLAN`: гейт и весь `verify.sh` = счёта наборов.
- *  10. §4 `MANIFEST`: итог в прозе и цепочка слагаемых = счёта наборов.
+ *   6. Версия в шапке `ROADMAP.md`       = `package.json` (шаг 3.10, с 2.29.26).
+ *   7. «локальный гейт N» в MASTER-PLAN  = dpouw + knowledge + conversation.
+ *   8. «N проверок в verify.sh» и список слагаемых = фактические счёта наборов.
+ *   9. Те же два числа в таблице NARRATIVE.
+ *  10. Таблица §2 `MASTER-PLAN`: гейт и весь `verify.sh` = счёта наборов.
+ *  11. §4 `MANIFEST`: итог в прозе и цепочка слагаемых = счёта наборов.
+ *  12. §0 `ROADMAP`: итог, локальный гейт и слагаемые = счёта наборов.
  *
  * ПОЧЕМУ README И PROJECT-MAP (2.29.14). Шаг 3.10 сверял три документа, а
  * `README.md` — первый файл, который открывает новый человек, — отставал на 25
@@ -210,6 +212,52 @@ function parseProjectMapVer(text) {
   return m ? cleanVer(m[1]) : null;
 }
 
+/* Версия в шапке ROADMAP: «**Последняя сверка:** 2026-11-21 MSK, локально и на
+ * проде `2.29.25` (…)». Якорь — «на проде», как у PROJECT-MAP: в той же строке
+ * дальше идут исторические версии, и первое число строки — дата, а не версия.
+ *
+ * ПОЧЕМУ ROADMAP ДОБАВЛЕН (2.29.26). Приёмка директивы `94bd749-fix` показала
+ * ровно тот дефект, который 2.29.14–2.29.16 уже лечили для других документов:
+ * `ROADMAP.md` держал в шапке `2.29.19` / 1516 / 188, стенд был `2.29.25` /
+ * 1568 / 195, и гейт оставался зелёным, потому что `ROADMAP` не был в списке.
+ * Документ вне списка протухает молча. */
+function parseRoadmapVer(text) {
+  if (!text) return null;
+  const line = text.split('\n').find((l) => l.includes('Последняя сверка:')) || '';
+  const m = line.match(/на проде\s*`?(\d+\.\d+\.\d+)/);
+  return m ? cleanVer(m[1]) : null;
+}
+
+/* §0 ROADMAP, строка «Приёмка»: «| Приёмка | **1568 ✅ / 0 ❌** | 21.11.2026,
+ * `bash scripts/verify.sh`, десять наборов: dpouw **1396**, mesh **25**, … —
+ * **1472**.» Возвращает итог, локальный гейт и слагаемые.
+ *
+ * Слагаемые берутся ТОЛЬКО после «десять наборов:»: в начале строки стоит дата
+ * `21.11.2026`, и «все числа строки» вернули бы её куски.
+ * Итог и гейт — отдельными якорями, чтобы «1568» и «1472» нельзя было перепутать
+ * местами: гейт всегда стоит после «Локальный гейт». */
+function parseRoadmapCounts(text) {
+  const out = { total: null, localGate: null, addends: null };
+  if (!text) return out;
+  const line = text.split('\n').find((l) => /^\|\s*Приёмка\s*\|/.test(l)) || '';
+  if (!line) return out;
+  const tot = line.match(/\*\*(\d+)\s*✅/);
+  if (tot) out.total = Number(tot[1]);
+  const lg = line.match(/Локальный гейт[^—]*—\s*\*{0,2}(\d+)/);
+  if (lg) out.localGate = Number(lg[1]);
+  const at = line.indexOf('десять наборов:');
+  if (at >= 0) {
+    /* Отрезок — от «десять наборов:» до «Локальный гейт»: после гейта стоит его
+       число (1472), и «все цифры до конца строки» подмешали бы его в слагаемые. */
+    let tail = line.slice(at);
+    const lgAt = tail.indexOf('Локальный гейт');
+    if (lgAt >= 0) tail = tail.slice(0, lgAt);
+    const nums = (tail.match(/\d+/g) || []).map(Number);
+    if (nums.length >= 3) out.addends = nums;
+  }
+  return out;
+}
+
 /* Таблица §2 MASTER-PLAN: «| Тесты | … = **1420** локальный гейт; весь
  * `verify.sh` — **1516** в десяти наборах | …». Возвращает оба числа, чтобы §2
  * не мог разойтись с шапкой §1 молча. */
@@ -291,6 +339,7 @@ function main() {
   const narPath = path.join(args.docsDir, 'docs', 'NARRATIVE.md');
   const readmePath = path.join(args.docsDir, 'README.md');
   const mapPath = path.join(args.docsDir, 'PROJECT-MAP.md');
+  const roadPath = path.join(args.docsDir, 'ROADMAP.md');
   const pkgPath = path.join(args.docsDir, 'package.json');
 
   const mpText = readText(mpPath);
@@ -306,6 +355,9 @@ function main() {
   const mapText = readText(mapPath);
   const readmeVer = parseReadmeVer(readText(readmePath));
   const mapVer = parseProjectMapVer(mapText);
+  const roadText = readText(roadPath);
+  const roadVer = parseRoadmapVer(roadText);
+  const road = parseRoadmapCounts(roadText);
   const mpStatus = parseMasterPlanStatus(mpText);
   const mfCore = parseManifestCore(mfText);
   /* Шапки для сверки числа файлов: MASTER-PLAN (строка «Срез»), MANIFEST
@@ -322,6 +374,9 @@ function main() {
   const shaMp = parseShaClaim(mpText, 10);
   const shaMf = parseShaClaim(mfText, 10);
   const shaMap = parseShaClaim(mapText, 10);
+  /* ROADMAP держит sha256 на одиннадцатой строке (шапка «Последняя сверка»),
+     а не в первых десяти, как три документа выше, поэтому предел 12. */
+  const shaRoad = parseShaClaim(roadText, 12);
 
   const counts = {};
   for (const s of SUITES) counts[s.key] = args.noCounts ? null : readCount(args.countsDir, s.tag);
@@ -339,7 +394,8 @@ function main() {
     if (nar.version !== pkgVer) bad.push(`NARRATIVE=${nar.version || '—'}`);
     if (readmeVer !== pkgVer) bad.push(`README=${readmeVer || '—'}`);
     if (mapVer !== pkgVer) bad.push(`PROJECT-MAP=${mapVer || '—'}`);
-    if (bad.length === 0) add('OK', 'версия в шапках', `${pkgVer} = package.json (пять документов)`);
+    if (roadVer !== pkgVer) bad.push(`ROADMAP=${roadVer || '—'}`);
+    if (bad.length === 0) add('OK', 'версия в шапках', `${pkgVer} = package.json (шесть документов)`);
     else add('NO', 'версия в шапках', `package.json=${pkgVer}, ${bad.join(', ')}`);
   }
 
@@ -348,7 +404,7 @@ function main() {
     add('SKIP', 'sha256 файлов в шапках', 'не передан --file-count — число файлов не проверено');
   } else {
     const bad = [];
-    for (const [name, sha] of [['MASTER-PLAN', shaMp], ['MANIFEST', shaMf], ['PROJECT-MAP', shaMap]]) {
+    for (const [name, sha] of [['MASTER-PLAN', shaMp], ['MANIFEST', shaMf], ['PROJECT-MAP', shaMap], ['ROADMAP', shaRoad]]) {
       if (sha.total === null) bad.push(`${name}: не разобрал sha256 N/N`);
       /* Числитель проверяется ПЕРВЫМ: `176/179` — это другая пара чисел, а не
          «почти верная». Обратный порядок скрывал этот дефект за расхождением
@@ -432,8 +488,28 @@ function main() {
     else add('NO', 'число проверок (§4 MANIFEST)', p4.join('; '));
   }
 
+  /* --- 11. §0 ROADMAP: итог, гейт и слагаемые --- */
+  if (args.noCounts || !allKnown) {
+    add('SKIP', 'число проверок (§0 ROADMAP)', 'нет счёта набора — §0 ROADMAP не проверен');
+  } else if (road.total === null || road.localGate === null) {
+    add('NO', 'число проверок (§0 ROADMAP)',
+      `не разобрал §0 ROADMAP: итог=${road.total ?? '—'}, гейт=${road.localGate ?? '—'}`);
+  } else {
+    const p0 = [];
+    if (road.total !== allActual) p0.push(`§0 итог ${road.total} != ${allActual}`);
+    if (road.localGate !== lgActual) p0.push(`§0 локальный гейт ${road.localGate} != ${lgActual}`);
+    if (road.addends === null) p0.push('не разобрал слагаемые §0');
+    else {
+      const docSorted = [...road.addends].sort((a, b) => a - b).join(',');
+      const actSorted = SUITES.map((k) => counts[k.key]).sort((a, b) => a - b).join(',');
+      if (docSorted !== actSorted) p0.push(`§0 состав расходится: в документе ${docSorted}, факт ${actSorted}`);
+    }
+    if (p0.length === 0) add('OK', 'число проверок (§0 ROADMAP)', `${allActual}, гейт ${lgActual} и набор слагаемых совпадают`);
+    else add('NO', 'число проверок (§0 ROADMAP)', p0.join('; '));
+  }
+
   if (args.json) {
-    console.log(JSON.stringify({ pkgVer, mp, nar, mfVer, readmeVer, mapVer, mpStatus, mfCore, counts, rows }, null, 2));
+    console.log(JSON.stringify({ pkgVer, mp, nar, mfVer, readmeVer, mapVer, roadVer, road, mpStatus, mfCore, counts, rows }, null, 2));
   } else {
     for (const r of rows) console.log(`${r.status}\t${r.label}\t${r.detail}`);
   }
@@ -442,4 +518,4 @@ function main() {
 }
 
 if (require.main === module) process.exit(main());
-module.exports = { parseMasterPlan, parseNarrative, parseManifestVer, parseReadmeVer, parseProjectMapVer, parseMasterPlanStatus, parseManifestCore, parseShaClaim, cleanVer, SUITES, LOCAL_GATE };
+module.exports = { parseMasterPlan, parseNarrative, parseManifestVer, parseReadmeVer, parseProjectMapVer, parseRoadmapVer, parseRoadmapCounts, parseMasterPlanStatus, parseManifestCore, parseShaClaim, cleanVer, SUITES, LOCAL_GATE };

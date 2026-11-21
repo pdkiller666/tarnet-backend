@@ -74,7 +74,8 @@ const FACT_FILES = 187;
  * и зелёный, и каждый красный случай. */
 function sandbox({ ver = VER, mpVer = ver, mfVer = ver, narVer = ver, readmeVer = ver, mapVer = ver,
   total = TOTAL, addends = null, local = LOCAL, narLocal = local, mpEmpty = false,
-  mpSec2 = null, mfCore = null, shaTotal = null, shaMatch = null, mapShaPair = null } = {}) {
+  mpSec2 = null, mfCore = null, shaTotal = null, shaMatch = null, mapShaPair = null,
+  roadVer = ver, roadTotal = total, roadLocal = local, roadShaPair = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-docnum-'));
   const counts = fs.mkdtempSync(path.join(os.tmpdir(), 'tarnet-counts-'));
   fs.mkdirSync(path.join(dir, 'docs'), { recursive: true });
@@ -109,6 +110,12 @@ function sandbox({ ver = VER, mpVer = ver, mfVer = ver, narVer = ver, readmeVer 
 
   fs.writeFileSync(path.join(dir, 'PROJECT-MAP.md'),
     `# PROJECT-MAP\n\n**Сверено с кодом:** 2026-11-14 MSK, локально и на проде \`${mapVer}\` (\`verify.sh\` → **${total}** в десяти наборах; sha256 **${mapShaPair || shaPair}**).\n`);
+
+  /* ROADMAP: шапка «Последняя сверка» на ОДИННАДЦАТОЙ строке (sha256 читается
+     с пределом 12) и §0, строка «Приёмка». Оба места сверяются так же, как
+     остальные документы, — иначе `ROADMAP` снова протухнет молча. */
+  fs.writeFileSync(path.join(dir, 'ROADMAP.md'),
+    `# ROADMAP — план развития TarNet / Synapse\n\n**Назначение.** Что делать дальше.\n\n**Составлено:** 2026-11-05.\n**Последняя сверка:** 2026-11-21 MSK, локально и на проде \`${roadVer}\` (\`bash scripts/verify.sh\` — **${roadTotal} ✅ / 0 ❌** в десяти наборах, sha256 **${roadShaPair || shaPair}**);\n\n## 0. Где проект сейчас — без округлений\n\n| Факт | Значение | Что это значит |\n| :--- | :--- | :--- |\n| Приёмка | **${roadTotal} ✅ / 0 ❌** | 21.11.2026, \`bash scripts/verify.sh\`, десять наборов: dpouw **${COUNTS.dpouw}**, mesh **${COUNTS.mesh}**, treasury **${COUNTS.treasury}**, knowledge **${COUNTS.knowledge}**, conversation **${COUNTS.conversation}**, discovery **${COUNTS.p2pdiscovery}**, gossip **${COUNTS.p2pgossip}**, seed-failover **${COUNTS.p2pseed}**, relay **${COUNTS.p2prelay}**, reannounce **${COUNTS.p2preannounce}**. Локальный гейт (dpouw + knowledge + conversation) — **${roadLocal}**. |\n`);
 
   fs.writeFileSync(path.join(dir, 'docs', 'NARRATIVE.md'),
     `# NARRATIVE\n\n**Версия среза:** ${narVer} (локально и на проде) · **Дата:** 14.11.2026\n\n` +
@@ -273,6 +280,27 @@ check('README 2.22.13 → exit 1, назван README', {
 /* 11. Протухшая версия в PROJECT-MAP. */
 check('PROJECT-MAP 2.29.12 → exit 1, назван PROJECT-MAP', {
   expectRc: 1, sandboxArgs: { mapVer: '2.29.12' }, grep: /PROJECT-MAP=2\.29\.12/,
+});
+
+/* 21. Протухшая версия в ROADMAP — ровно дефект, который директива `94bd749-fix`
+ *     и закрывает: шапка говорила `2.29.19` при стенде `2.29.25`, гейт зелёный,
+ *     потому что документа не было в списке. */
+check('ROADMAP 2.29.19 → exit 1, назван ROADMAP', {
+  expectRc: 1, sandboxArgs: { roadVer: '2.29.19' }, grep: /ROADMAP=2\.29\.19/,
+});
+
+/* 22. §0 ROADMAP: итог и гейт сверяются отдельно от шапки — тело может
+ *     протухнуть при верной шапке. */
+check('§0 ROADMAP итог 1516 → 1400 → exit 1', {
+  expectRc: 1, sandboxArgs: { roadTotal: 1400, roadLocal: LOCAL }, grep: /§0 итог 1400 != 1516/,
+});
+check('§0 ROADMAP гейт 1420 → 1399 → exit 1', {
+  expectRc: 1, sandboxArgs: { roadLocal: 1399 }, grep: /§0 локальный гейт 1399 != 1420/,
+});
+
+/* 23. sha256 в ROADMAP — отдельная пара чисел, как у трёх других документов. */
+check('sha256 в ROADMAP неверный → exit 1, назван ROADMAP', {
+  expectRc: 1, sandboxArgs: { roadShaPair: '188/188', shaTotal: FACT_FILES }, grep: /ROADMAP=188/,
 });
 
 /* 12. Таблица §2 MASTER-PLAN разошлась с шапкой §1. Это отдельный пункт:
