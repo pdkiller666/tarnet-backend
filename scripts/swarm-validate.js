@@ -174,7 +174,13 @@ function runCases(answer, fnName, cases) {
 /* Вызов модели                                                       */
 /* ------------------------------------------------------------------ */
 
-async function ask(model, prompt) {
+/* `maxTokens` вынесен параметром, потому что часть моделей — reasoning.
+ * 2026-11-21: `deepseek-v4.1-flash` на промпте критика сжёг ВСЕ 300 токенов в
+ * `reasoning_tokens`, вернул `content: null` и `finish_reason: length`. Снаружи
+ * это выглядело как «критик не ответил», хотя он думал весь лимит. Поэтому
+ * лимит для критика выше, а пустой контент при `length` помечается отдельно. */
+async function ask(model, prompt, opts = {}) {
+  const maxTokens = Number(opts.maxTokens) || 700;
   const started = Date.now();
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
@@ -189,7 +195,7 @@ async function ask(model, prompt) {
           { role: 'system', content: 'Отвечай предельно кратко, ровно то, что просят. Без пояснений, если не просят.' },
           { role: 'user', content: prompt },
         ],
-        max_tokens: 700,
+        max_tokens: maxTokens,
         temperature: 0,
       }),
     });
@@ -200,8 +206,16 @@ async function ask(model, prompt) {
     if (!res.ok || !json) {
       return { ok: false, status: res.status, error: (json && json.error && json.error.message) || text.slice(0, 200), ms, content: '', cost: 0 };
     }
-    const content = (json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content) || '';
-    return { ok: true, status: res.status, ms, content, cost: Number(json.usage && json.usage.cost) || 0 };
+    const choice = (json.choices && json.choices[0]) || {};
+    const content = (choice.message && choice.message.content) || '';
+    const reasoning = Number((json.usage && json.usage.completion_tokens_details && json.usage.completion_tokens_details.reasoning_tokens) || 0);
+    const finish = choice.finish_reason || null;
+    /* Пустой контент при `length` — не «модель промолчала», а исчерпанный
+     * бюджет рассуждений. Разные причины — разные выводы, поэтому различаем. */
+    if (!content && finish === 'length') {
+      return { ok: false, status: res.status, error: `reasoning_overflow: ${reasoning} токенов рассуждения, контента нет (max_tokens=${maxTokens})`, ms, content: '', cost: Number(json.usage && json.usage.cost) || 0, reasoning, finish };
+    }
+    return { ok: true, status: res.status, ms, content, cost: Number(json.usage && json.usage.cost) || 0, reasoning, finish };
   } catch (e) {
     return { ok: false, status: 0, error: e.name === 'AbortError' ? `timeout ${TIMEOUT_MS}ms` : e.message, ms: Date.now() - started, content: '', cost: 0 };
   } finally {
@@ -291,4 +305,12 @@ async function main() {
   console.log(`результат: ${OUT}`);
 }
 
-main().catch((e) => { console.error('непредвиденная ошибка:', e && e.stack || e); process.exit(1); });
+/* Модуль, а не только CLI: `swarm-critique.js` берёт отсюда TASKS и ask().
+ * Копировать задачи в Critique нельзя — два списка оракулов разойдутся, и
+ * сравнение «Selection vs Critique» станет сравнением двух разных стендов.
+ * Поэтому main() запускается ТОЛЬКО при прямом вызове файла. */
+if (require.main === module) {
+  main().catch((e) => { console.error('непредвиденная ошибка:', e && e.stack || e); process.exit(1); });
+}
+
+module.exports = { TASKS, ask, runCases, extractCode, near, YES_NO, MODELS, BASELINE, OUT };
