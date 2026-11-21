@@ -60,6 +60,12 @@ async function bindWorker(addr) {
   const sig = crypto.sign(null, Buffer.from(`TARNET_WORKER_POLL:${k}:${ts}`, 'utf8'), kp.privateKey).toString('base64');
   return api('/worker/handshake', 'POST', { pubkey: rawPubHex(kp), timestamp: ts, signature: sig, claimedAddress: k });
 }
+/* Ключ плательщика. С 2.29.25 `clientAddress` без подписи — 401
+ * CLIENT_SIGNATURE_REQUIRED (B.1): сервер больше не даёт списывать чужие
+ * деньги, полагаясь на одно имя адреса. Тест платит по-настоящему, значит
+ * обязан подписывать по-настоящему — фикстура, не шлюз. */
+let clientPair = null;
+
 async function signedWork(addr, { tokens, tier, actionId, clientAddress }) {
   const k = String(addr).toLowerCase();
   const kp = workerKeyFor(k);
@@ -72,9 +78,15 @@ async function signedWork(addr, { tokens, tier, actionId, clientAddress }) {
   const sig = crypto.sign(null, Buffer.from(payload, 'utf8'), kp.privateKey).toString('base64');
   const body = { workerAddress: k, tokens, tier, actionId, worker_ts: ts, worker_signature: sig };
   /* Плательщик обязателен с 2.24.0: `/work` без `clientAddress` отвечает
-   * 400 CLIENT_REQUIRED до аудита казны, и тест гейта не доходит до цели.
-   * Фикстуру чиним здесь, а не ослаблением шлюза. */
-  if (clientAddress) body.clientAddress = String(clientAddress).toLowerCase();
+   * 400 CLIENT_REQUIRED до аудита казны, и тест гейта не доходит до цели. */
+  if (clientAddress) {
+    const c = String(clientAddress).toLowerCase();
+    body.clientAddress = c;
+    /* Канонический payload подписи клиента (server.js, clientSignPayload):
+     * clientAddress:workerAddress:tokens:tier:actionId */
+    const canonical = [c, k, String(Number(tokens)), String(tier ?? 'base'), String(actionId ?? '')].join(':');
+    body.client_signature = crypto.sign(null, Buffer.from(canonical, 'utf8'), clientPair.privateKey).toString('base64');
+  }
   return api('/work', 'POST', body);
 }
 
@@ -131,8 +143,16 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
     /* Плательщик — отдельный кошелёк, пополненный Faucet'ом. Гейт 2.24.0
      * требует реального списания, поэтому «просто тестовый вызов» больше
      * не существует: у клиента должны быть деньги на комиссию. 0.01 TAR
-     * от Faucet покрывает несколько вызовов по ~0.001 TAR gross. */
-    const client = '0x' + 'c'.repeat(40);
+     * от Faucet покрывает несколько вызовов по ~0.001 TAR gross.
+     *
+     * Адрес выводится сервером из присланного публичного ключа (2.26.7):
+     * приватный ключ по HTTP не отдаётся, поэтому пара генерируется здесь. */
+    clientPair = crypto.generateKeyPairSync('ed25519');
+    const wallet = await api('/wallet', 'POST', {
+      publicKeyPem: clientPair.publicKey.export({ type: 'spki', format: 'pem' }),
+    });
+    const client = wallet.body?.address;
+    if (!client) throw new Error(`кошелёк плательщика не создан: ${JSON.stringify(wallet.body)}`);
 
     console.log('=== 0) узел и базовая работа ===');
     const reg = await api('/node', 'POST', { address: worker, stake: 1, reputation: 1 });
