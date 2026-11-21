@@ -67,6 +67,7 @@ class CumulativeLedger {
     burnTar, treasuryTar, royaltyTar,
     epoch, omega = 0, share = 0, adapterId = null, actionId = null,
     batchedFrom = null, adapterDeletedAt = null, demo = false, synthetic = false,
+    grantTaskId = null,
   }) {
     if (!workerAddress) throw new Error('workerAddress is required');
     const prev = this.lastFor(workerAddress);
@@ -119,8 +120,8 @@ class CumulativeLedger {
           adapterId, actionId, timestamp, prevSignature, signature, signatureAlg, createdAt,
           batchedFrom, adapterDeletedAt,
           workerSeq, prevReceiptHash, cumulativeCwu, cumulativeTar, receiptHash, payloadVersion,
-          demo, synthetic)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          demo, synthetic, grantTaskId)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [seq, workerAddress, round(cwu), tier,
         round(feeGrossTar), round(feeRewardTar), round(blockRewardTar), round(rewardTar),
         round(burnTar), round(treasuryTar), round(royaltyTar), cumulativeTotal,
@@ -130,7 +131,8 @@ class CumulativeLedger {
         batchedFrom && batchedFrom.length ? JSON.stringify(batchedFrom) : null,
         adapterDeletedAt,
         workerSeq, prevReceiptHash, cumulativeCwu, cumulativeTar, receiptHash, 2,
-        demo ? 1 : 0, (demo || synthetic) ? 1 : 0],
+        demo ? 1 : 0, (demo || synthetic) ? 1 : 0,
+        grantTaskId || null],
     );
 
     return this.get(seq);
@@ -161,6 +163,10 @@ class CumulativeLedger {
       share: Number(r.share),
       adapterId: r.adapterId,
       actionId: r.actionId,
+      /* Ссылка на грант, по которому выполнена работа (2.29.25). Вне
+       * подписываемого payload: подпись подтверждает суммы и цепочку, а
+       * привязка к праву — отдельный факт, восстановимый сверкой с грантом. */
+      grantTaskId: r.grantTaskId || null,
       timestamp: r.timestamp,
       prevSignature: r.prevSignature || '',
       signature: r.signature,

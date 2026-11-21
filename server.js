@@ -1735,6 +1735,9 @@ ensureColumn('work_receipts', 'cumulativeCwu', 'cumulativeCwu REAL');
 ensureColumn('work_receipts', 'cumulativeTar', 'cumulativeTar REAL');
 ensureColumn('work_receipts', 'receiptHash', 'receiptHash TEXT');
 ensureColumn('work_receipts', 'payloadVersion', 'payloadVersion INTEGER DEFAULT 1');
+/* Привязка чека к праву (2.29.25): grant.taskId, если работа выполнена по
+ * гранту. Nullable: обычная работа без гранта — законный путь. */
+ensureColumn('work_receipts', 'grantTaskId', 'grantTaskId TEXT');
 /* synthetic — чек создан синтетикой, а не реальным воркером (2.29.24).
  *
  * Поле нужно /summary: сумма всех чеков уже сейчас включает записи
@@ -2741,7 +2744,7 @@ function lookupActionId(id) {
 /* ===== Ядро начисления =====
  * Единственный путь, которым в системе появляются токены. Никаких условий
  * «если повезло»: при γ=1 начисление всегда, при γ=0 — никогда. */
-function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, response, actionId, flush = false, demo = false, paymentMode = null, promptHashVerified = null, allowUnpaid = false, synthetic = false }) {
+function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, response, actionId, flush = false, demo = false, paymentMode = null, promptHashVerified = null, allowUnpaid = false, synthetic = false, grantTaskId = null }) {
   const t = normalizeTier(tier);
   if (!t) {
     const err = new Error(`tier must be one of ${TIERS.join('|')}`);
@@ -2763,6 +2766,17 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
     err.code = 'SELF_DEALING';
     throw err;
   }
+  /* Ссылка на грант — либо её нет, либо это id задачи в формате контракта
+   * `0x` + 32 hex. Мусор в поле хуже пустого значения: аудит решил бы, что
+   * чек привязан к праву, которого не существует. */
+  if (grantTaskId !== null && grantTaskId !== undefined && grantTaskId !== '') {
+    if (typeof grantTaskId !== 'string' || !/^0x[0-9a-f]{32}$/i.test(grantTaskId)) {
+      const err = new Error('grantTaskId must look like 0x + 32 hex chars');
+      err.code = 'BAD_GRANT_TASK_ID';
+      throw err;
+    }
+  }
+
   const node = get('SELECT address, stake, reputation, isTeeAttested FROM nodes WHERE address = ?', [workerAddress]);
   if (!node) {
     const err = new Error('Unknown worker node — register it via POST /node first');
@@ -3064,6 +3078,7 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
       share: settled.block.share,
       adapterId: adapterId || BASE_MODEL,
       actionId: id,
+      grantTaskId,
       batchedFrom,
       adapterDeletedAt: adapter ? adapter.deletedAt : null,
       demo,
@@ -5878,6 +5893,23 @@ app.get('/ledger', (req, res) => {
                 FROM ledger_txs ORDER BY id DESC LIMIT ?`, [limit]));
 });
 
+/* Кому положен bootstrap stake (2.29.25).
+ *
+ * Бесплатный stake — не «мелочь для удобства»: он даёт routingWeight > 0,
+ * место в пуле выдачи и право на block reward. Пока вход бесплатен, атака
+ * тоже бесплатна. Поэтому до конца закрытого пилота bootstrap выдаётся
+ * только адресам из белого списка.
+ *
+ * `*` (все) намеренно разрешён только при выключенном гейте оплаты: это
+ * стенд, где денег нет вовсе. На проде `TARNET_REQUIRE_PAYMENT` включён,
+ * и wildcard не срабатывает даже при опечатке в env. */
+function pilotBootstrapEligible(address) {
+  const list = Array.isArray(CONFIG.PILOT_WHITELIST) ? CONFIG.PILOT_WHITELIST : [];
+  if (!list.length) return false;
+  if (list.includes('*')) return CONFIG.REQUIRE_PAYMENT === false;
+  return list.includes(String(address).toLowerCase());
+}
+
 /* --- Node --- */
 app.post('/node', (req, res) => {
   /* isTeeAttested в теле НЕ читается намеренно. Флаг TEE — утверждение о
@@ -5984,12 +6016,17 @@ app.post('/node', (req, res) => {
   const existing = get(
     'SELECT stake, reputation, rsaPublicKeyPem, tier, publicUrl FROM nodes WHERE address = ?',
     [address]);
+  /* Bootstrap — привилегия белого списка (2.29.25). Вне списка новый узел
+   * получает 0/0: он виден в реестре, но не получает веса, не попадает в
+   * выдачу и не может печатать награду. Существующий узел сохраняет своё
+   * значение: уже выданное не отзывается этой правкой. */
+  const bootstrapAllowed = pilotBootstrapEligible(address);
   const finalStake = existing && Number(existing.stake) > 0
     ? Number(existing.stake)
-    : CONFIG.BOOTSTRAP_STAKE;
+    : (bootstrapAllowed ? CONFIG.BOOTSTRAP_STAKE : 0);
   const finalReputation = existing && Number(existing.reputation) > 0
     ? Number(existing.reputation)
-    : CONFIG.BOOTSTRAP_REPUTATION;
+    : (bootstrapAllowed ? CONFIG.BOOTSTRAP_REPUTATION : 0);
   const rw = routingWeight(finalStake, finalReputation);
   /* INSERT OR REPLACE затирает строку целиком. Поле, не переданное в этом
    * запросе, не должно терять ранее сохранённое значение: клиент может
@@ -6027,6 +6064,7 @@ app.post('/node', (req, res) => {
        ON CONFLICT(address) DO UPDATE SET stakedTar = excluded.stakedTar, updatedAt = excluded.updatedAt`,
     [address, finalStake, new Date().toISOString()]);
   res.json({ address, stake: finalStake, reputation: finalReputation,
+    bootstrapGranted: bootstrapAllowed,
     isTeeAttested: teeFlag === 1, routingWeight: rw, tier: finalTier,
     validatorEligible: ['expert', 'heavy'].includes(finalTier),
     onionCapable: Boolean(pubKey),
@@ -6640,6 +6678,38 @@ function handleWork(req, res) {
     });
   }
 
+  /* Подпись клиента — обязательна, если назван плательщик (2.29.25).
+   *
+   * До этой правки подпись клиента проверялась, только если её прислали:
+   * `checkClientSignature` возвращал `{ok:true, present:false}`. Следствие
+   * было хуже, чем «нет дополнительной защиты»: любой владелец ключа воркера
+   * (привязка через `/worker/handshake` — TOFU, без выкупа) мог назвать
+   * `clientAddress` любого кошелька с деньгами и получить награду за его
+   * счёт. Запрет самоплаты (2.29.24) закрывает только «заплатить себе», а
+   * «заплатить чужими деньгами» оставался открыт.
+   *
+   * Правило: есть `clientAddress` — есть списание — нужна подпись. Не «если
+   * прислана». `debit(clientAddress, gross)` вызывается безусловно при
+   * наличии адреса, поэтому обойти это поле нельзя.
+   *
+   * Исключение одно и названо явно: стенд (`DEMO_MODE=1` и одновременно
+   * `TARNET_REQUIRE_PAYMENT=0`). Там денег нет, и 1400+ проверок арифметики
+   * дёргают `/work` с меткой клиента, не подписывая её. На проде гейт
+   * оплаты включён, поэтому демо-исключение не срабатывает. */
+  const rawClientSignature = body.client_signature ?? body.clientSignature;
+  if (body.clientAddress && !rawClientSignature) {
+    const demoStand = CONFIG.DEMO_MODE === true && CONFIG.REQUIRE_PAYMENT === false;
+    if (!demoStand) {
+      return res.status(401).json({
+        error: 'CLIENT_SIGNATURE_REQUIRED',
+        code: 'CLIENT_SIGNATURE_REQUIRED',
+        note: 'clientAddress назван — подпись клиента обязательна: платить чужими деньгами нельзя',
+        charged: false,
+        payload_template: 'clientAddress:workerAddress:tokens:tier:actionId',
+      });
+    }
+  }
+
   /* Подпись воркера — обязательная.
    *
    * До этого `/work` принимал работу от имени ЛЮБОГО адреса без всякой
@@ -6731,6 +6801,10 @@ function handleWork(req, res) {
        * до ядра: повтор того же actionId — идемпотентный возврат существующего
        * состояния, а не второе начисление. */
       actionId: body.actionId,
+      /* Привязка чека к гранту (2.29.25). Грант доказывает право на работу,
+       * но не деньги; чек без ссылки на грант нельзя сверить с тем, что
+       * воркер действительно выполнял задачу по этому праву. */
+      grantTaskId: typeof body.grantTaskId === 'string' ? body.grantTaskId : null,
       /* Ставка комиссии зависит от способа оплаты: 5% обычная, 2% при
        * оплате из внутреннего баланса TAR. Условие — названный клиент:
        * без clientAddress списывать не с кого, и льготная ставка была бы
@@ -6843,6 +6917,10 @@ function handleWork(req, res) {
      * конфликт ключей. Вернуть чужой чек значило бы отдать его первому, кто
      * угадает id. */
     if (e.code === 'ACTION_ID_CONFLICT') return res.status(409).json({ error: e.message, actionId: req.body?.actionId ?? null });
+    /* Ссылка на грант не того формата — 400, а не 500: запрос корректен по
+     * остальным полям, чинится клиентом. Молча записать мусор в чек хуже:
+     * аудит решил бы, что чек привязан к праву. */
+    if (e.code === 'BAD_GRANT_TASK_ID') return res.status(400).json({ error: e.message, code: 'BAD_GRANT_TASK_ID', grantTaskId: req.body?.grantTaskId ?? null });
     /* Блокирующий аудит казны — 500, а не 400: клиент прислал корректный
      * запрос, сломано состояние сервера. Отдаём audit целиком, иначе дежурный
      * видит «что-то упало» без expected/actual/delta и идёт читать базу
@@ -10224,6 +10302,23 @@ async function runInference(req, res) {
     storeWallet(w);
     clientAddress = w.address;
     clientProvisioned = true;
+  }
+
+  /* Подпись клиента: та же логика, что в `/work` (2.29.25). Если адрес
+   * назван клиентом (а не создан сервером), он станет плательщиком — значит
+   * подпись обязательна. Пустой кошелёк, созданный сервером под этот вызов,
+   * исключением не является только потому, что он наш: платить нечего, но и
+   * чужих денег там нет по построению. */
+  if (!clientProvisioned && !(body.client_signature ?? body.clientSignature)) {
+    const demoStand = CONFIG.DEMO_MODE === true && CONFIG.REQUIRE_PAYMENT === false;
+    if (!demoStand) {
+      return res.status(401).json({
+        error: 'CLIENT_SIGNATURE_REQUIRED',
+        code: 'CLIENT_SIGNATURE_REQUIRED',
+        note: 'clientAddress назван — подпись клиента обязательна',
+        charged: false,
+      });
+    }
   }
 
   /* Подпись клиента, если передана, обязана сойтись. Проверяем до инференса:

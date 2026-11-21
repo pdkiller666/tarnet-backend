@@ -148,6 +148,12 @@ async function spawnServer(envOverrides = {}, opts = {}) {
        * HMAC-ом ДО отправки и проверить именно выбор прошлой схемы. В проде
        * переменной нет — секрет случаен на старте. */
       TARNET_SPOT_CHECK_SECRET: TEST_SPOT_SECRET,
+      /* Закрытый пилот (2.29.25). Bootstrap stake/reputation выдаются только
+       * адресам из белого списка. На стенде `*` разрешён, потому что гейт
+       * оплаты выключен (`TARNET_REQUIRE_PAYMENT=0`): денег нет, и сотни
+       * проверок арифметики регистрируют свежие узлы. На проде wildcard
+       * не срабатывает. Отдельные секции проверяют оба поведения. */
+      TARNET_PILOT_WHITELIST: '*',
       ...envOverrides,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -12237,6 +12243,9 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
         maxTokens: 256,
         clientAddress: clientAddr,
         clientPubkey: client.pub.toString('hex'),
+        /* Получатель гранта (2.29.25): право подписывается на конкретного
+         * воркера, иначе его можно предъявить чужому узлу. */
+        workerAddress: workerAddr,
         epoch: 10,
         timestamp: Date.now(),
         nonce: '0x' + nodeCrypto.randomBytes(8).toString('hex'),
@@ -12247,7 +12256,7 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     };
 
     const good = mkGrant();
-    const v = tg.verifyGrant(good, { store, models: installed });
+    const v = tg.verifyGrant(good, { store, models: installed, workerAddress: workerAddr });
     ok('64.1 валидный грант принят: taskId и адрес клиента',
       v.ok === true && v.taskId === good.taskId && v.clientAddress === clientAddr,
       v.ok ? v.taskId : v);
@@ -12256,7 +12265,7 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
      * намерение от права. Портим байт, а не поле: поле поймал бы п. 3. */
     const sigBad = mkGrant();
     sigBad.signature = Buffer.from(nodeCrypto.randomBytes(64)).toString('base64');
-    const vSig = tg.verifyGrant(sigBad, { store, models: installed });
+    const vSig = tg.verifyGrant(sigBad, { store, models: installed, workerAddress: workerAddr });
     ok('64.2 битая подпись → E_SIG/bad_signature',
       vSig.ok === false && vSig.code === 'E_SIG' && vSig.reason === 'bad_signature',
       vSig.code + '/' + vSig.reason);
@@ -12265,9 +12274,9 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
      * работу дважды одним правом. Nonce запоминается только после
      * успешной проверки. */
     const replay = mkGrant();
-    const vFirst = tg.verifyGrant(replay, { store, models: installed });
+    const vFirst = tg.verifyGrant(replay, { store, models: installed, workerAddress: workerAddr });
     if (vFirst.ok) store.record(vFirst.clientAddress, replay.nonce, vFirst.epoch);
-    const vSecond = tg.verifyGrant(replay, { store, models: installed });
+    const vSecond = tg.verifyGrant(replay, { store, models: installed, workerAddress: workerAddr });
     ok('64.3 повтор nonce → E_REPLAY/nonce_reused',
       vFirst.ok === true && vSecond.ok === false &&
       vSecond.code === 'E_REPLAY' && vSecond.reason === 'nonce_reused',
@@ -12277,13 +12286,13 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
      * монотонность держит: иначе повтор с меньшим epoch прошёл бы после
      * перезапуска и сброса кольца nonce. */
     const older = mkGrant({ epoch: 5 });
-    const vOld = tg.verifyGrant(older, { store, models: installed });
+    const vOld = tg.verifyGrant(older, { store, models: installed, workerAddress: workerAddr });
     ok('64.4 epoch меньше принятого → E_REPLAY/epoch_regressed',
       vOld.ok === false && vOld.code === 'E_REPLAY' && vOld.reason === 'epoch_regressed',
       vOld.code + '/' + vOld.reason);
 
     const stale = mkGrant({ timestamp: Date.now() - tg.GRANT_MAX_SKEW_MS - 60000 });
-    const vStale = tg.verifyGrant(stale, { store, models: installed });
+    const vStale = tg.verifyGrant(stale, { store, models: installed, workerAddress: workerAddr });
     ok('64.5 просроченный грант → E_WINDOW',
       vStale.ok === false && vStale.code === 'E_WINDOW',
       vStale.code + '/' + vStale.reason);
@@ -12291,22 +12300,48 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
     /* Модель: две разные причины, и обе — E_MODEL, но с разным reason.
      * Клиент по reason понимает, идти ли `type:'models'` за дайджестом. */
     const notInst = mkGrant({ modelId: 'нет-такой:1b' });
-    const vNotInst = tg.verifyGrant(notInst, { store, models: installed });
+    const vNotInst = tg.verifyGrant(notInst, { store, models: installed, workerAddress: workerAddr });
     ok('64.6 модели нет у воркера → E_MODEL/not_installed',
       vNotInst.ok === false && vNotInst.code === 'E_MODEL' && vNotInst.reason === 'not_installed',
       vNotInst.code + '/' + vNotInst.reason);
 
     const wrongHash = mkGrant({ modelHash: 'sha256:' + 'b'.repeat(64) });
-    const vHash = tg.verifyGrant(wrongHash, { store, models: installed });
+    const vHash = tg.verifyGrant(wrongHash, { store, models: installed, workerAddress: workerAddr });
     ok('64.7 дайджест не совпал → E_MODEL/hash_mismatch',
       vHash.ok === false && vHash.code === 'E_MODEL' && vHash.reason === 'hash_mismatch',
       vHash.code + '/' + vHash.reason);
 
     const tooMany = mkGrant({ maxTokens: tg.DEFAULT_MAX_TOKENS_PER_TASK + 1 });
-    const vTok = tg.verifyGrant(tooMany, { store, models: installed });
+    const vTok = tg.verifyGrant(tooMany, { store, models: installed, workerAddress: workerAddr });
     ok('64.8 больше потолка → E_TOKENS/above_limit',
       vTok.ok === false && vTok.code === 'E_TOKENS' && vTok.reason === 'above_limit',
       vTok.code + '/' + vTok.reason);
+
+    /* 64.9 Привязка к получателю (2.29.25). Грант подписан на воркера A,
+     * предъявлен воркеру B: подпись клиента сходится, но адресат другой.
+     * Без этой проверки оплаченная работа выполнялась бы не тем узлом, на
+     * который выписан грант, и чек B не был бы связан с правом. */
+    const anotherWorker = mkKey();
+    const anotherWorkerAddr = tg.addressFromPublicKey(anotherWorker.pub);
+    const wrongWorker = mkGrant();
+    const vWrongWorker = tg.verifyGrant(wrongWorker, {
+      store, models: installed, workerAddress: anotherWorkerAddr
+    });
+    ok('64.9 чужой воркер → E_WORKER_MISMATCH/worker_mismatch',
+      vWrongWorker.ok === false && vWrongWorker.code === 'E_WORKER_MISMATCH'
+        && vWrongWorker.reason === 'worker_mismatch',
+      vWrongWorker.code + '/' + vWrongWorker.reason);
+
+    /* Грант без поля workerAddress — не «старый формат», а неподписанное
+     * право: принять его значит вернуть подмену адресата. */
+    const noWorker = mkGrant();
+    delete noWorker.workerAddress;
+    noWorker.signature = tg.signGrant(noWorker, client.priv);
+    const vNoWorker = tg.verifyGrant(noWorker, { store, models: installed, workerAddress: workerAddr });
+    ok('64.10 грант без workerAddress → E_WORKER_MISMATCH/worker_missing',
+      vNoWorker.ok === false && vNoWorker.code === 'E_WORKER_MISMATCH'
+        && vNoWorker.reason === 'worker_missing',
+      vNoWorker.code + '/' + vNoWorker.reason);
 
     /* ---------- обработчик кадра ---------- */
     const handler = th.createTaskHandler({
@@ -12580,6 +12615,120 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       sum.body?.receiptsAudit);
     ok('66.5 синтетика из /batch-test не считается живой работой', syn > 0,
       { syn });
+  }
+
+
+  /* ---------- 67. Гигиена 2.29.25 (B.1–B.3) ---------- */
+  section('67. B.1–B.3: подпись клиента, белый список, привязка гранта');
+
+  /* --- 67.1 bootstrap только по белому списку -----------------------
+   * Прод-подобный сервер: гейт оплаты включён, демо выключено, список пуст.
+   * Регистрация узла не должна давать ни stake, ни reputation: бесплатный
+   * вход = бесплатная атака. */
+  {
+    const prodLike = await spawnServer({
+      DEMO_MODE: '0', TARNET_REQUIRE_PAYMENT: '1', TARNET_PILOT_WHITELIST: '',
+    });
+    try {
+      const addr = runAddress('nowl');
+      const r = await apiAt(prodLike.base, '/node', 'POST', { address: addr });
+      ok('67.1 узел вне белого списка → stake=0, reputation=0',
+        r.status === 200 && Number(r.body?.stake) === 0
+          && Number(r.body?.reputation) === 0 && r.body?.bootstrapGranted === false,
+        { status: r.status, stake: r.body?.stake, reputation: r.body?.reputation });
+      ok('67.1 узел вне списка не получает веса маршрутизации',
+        Number(r.body?.routingWeight) === 0, r.body?.routingWeight);
+    } finally {
+      prodLike.stop();
+    }
+  }
+
+  /* --- 67.2 адрес из белого списка получает bootstrap -----------------
+   * Тот же сервер, но список содержит один адрес: он получает 10/0.5,
+   * соседний — по-прежнему 0/0. Проверяются оба, иначе «список работает»
+   * означало бы «работает для всех». */
+  {
+    const allowed = runAddress('inwl');
+    const denied = runAddress('outwl');
+    const wl = await spawnServer({ TARNET_REQUIRE_PAYMENT: '0', TARNET_PILOT_WHITELIST: allowed });
+    try {
+      const rIn = await apiAt(wl.base, '/node', 'POST', { address: allowed });
+      ok('67.2 адрес из белого списка → stake=10, reputation=0.5',
+        Number(rIn.body?.stake) === 10 && Number(rIn.body?.reputation) === 0.5
+          && rIn.body?.bootstrapGranted === true,
+        { stake: rIn.body?.stake, reputation: rIn.body?.reputation, granted: rIn.body?.bootstrapGranted });
+      const rOut = await apiAt(wl.base, '/node', 'POST', { address: denied });
+      ok('67.2 соседний адрес вне списка → 0/0',
+        Number(rOut.body?.stake) === 0 && Number(rOut.body?.reputation) === 0,
+        { stake: rOut.body?.stake, reputation: rOut.body?.reputation });
+    } finally {
+      wl.stop();
+    }
+  }
+
+  /* --- 67.3 платить чужими деньгами без подписи нельзя ---------------
+   * Прод-подобный сервер: REQUIRE_PAYMENT=1. Запрос называет clientAddress
+   * и НЕ присылает client_signature. До 2.29.25 такой запрос проходил
+   * проверку подписи клиента («если прислана») и списывал деньги с чужого
+   * кошелька. Теперь это 401 CLIENT_SIGNATURE_REQUIRED до любых записей. */
+  {
+    const prodLike = await spawnServer({ DEMO_MODE: '0', TARNET_REQUIRE_PAYMENT: '1' });
+    try {
+      const worker = runAddress('sc-w');
+      const victim = runAddress('sc-c');
+      const r = await apiAt(prodLike.base, '/work', 'POST', {
+        workerAddress: worker, clientAddress: victim, tokens: 1000, tier: 'base',
+        response: 'x', actionId: runId('sc-unsigned'), nosig: true,
+      });
+      ok('67.3 /work с чужим clientAddress без подписи → 401 CLIENT_SIGNATURE_REQUIRED',
+        r.status === 401 && r.body?.code === 'CLIENT_SIGNATURE_REQUIRED',
+        { status: r.status, code: r.body?.code });
+      ok('67.3 отказ приходит до списания (charged: false)',
+        r.body?.charged === false, r.body?.charged);
+
+      /* Положительный контроль: та же форма, но с валидной подписью.
+       * 401 быть не должно — дальше сервер вправе отказать по своей
+       * причине (например, ключ воркера не привязан), но не молчанием. */
+      const pair = crypto.generateKeyPairSync('ed25519');
+      const pubPem = pair.publicKey.export({ type: 'spki', format: 'pem' });
+      const wallet = await apiAt(prodLike.base, '/wallet', 'POST', { publicKeyPem: pubPem });
+      const cli = wallet.body?.address;
+      const canonical = [cli, worker, '1000', 'base', 'sc-signed'].join(':');
+      const sigB64 = crypto.sign(null, Buffer.from(canonical, 'utf8'), pair.privateKey).toString('base64');
+      const rS = await apiAt(prodLike.base, '/work', 'POST', {
+        workerAddress: worker, clientAddress: cli, tokens: 1000, tier: 'base',
+        response: 'y', actionId: 'sc-signed', client_signature: sigB64, nosig: true,
+      });
+      ok('67.3 с подписью клиента проверка подписи пройдена (не 401)',
+        rS.status !== 401 && rS.body?.code !== 'CLIENT_SIGNATURE_REQUIRED',
+        { status: rS.status, code: rS.body?.code, error: rS.body?.error });
+    } finally {
+      prodLike.stop();
+    }
+  }
+
+  /* --- 67.4 чек привязан к гранту ------------------------------------
+   * grant.taskId попадает в чек как grantTaskId. Без этого аудит не может
+   * сверить «право» и «работу»: грант доказывает разрешение, чек — выплату. */
+  {
+    const grantTaskId = '0x' + crypto.randomBytes(16).toString('hex');
+    const r = await api('/work', 'POST', {
+      workerAddress: wB, tokens: 400000, tier: 'base', response: 'grant-bound work',
+      actionId: runId('grant-bind'), grantTaskId,
+    });
+    ok('67.4 чек создан по работе с грантом', r.status === 201 && Boolean(r.body?.receipt),
+      { status: r.status, reason: r.body?.reason });
+    ok('67.4 receipt.grantTaskId = grant.taskId',
+      r.body?.receipt?.grantTaskId === grantTaskId,
+      { got: r.body?.receipt?.grantTaskId, want: grantTaskId });
+
+    const bad = await api('/work', 'POST', {
+      workerAddress: wB, tokens: 400000, tier: 'base', response: 'bad grant ref',
+      actionId: runId('grant-bad'), grantTaskId: 'not-a-task-id',
+    });
+    ok('67.4 мусор в grantTaskId → 400 BAD_GRANT_TASK_ID',
+      bad.status === 400 && bad.body?.code === 'BAD_GRANT_TASK_ID',
+      { status: bad.status, code: bad.body?.code });
   }
 
   console.log('\n' + '─'.repeat(50));

@@ -100,13 +100,32 @@ async function signedWork(base, body) {
     ok('чеков не появилось', Number(sum.body?.receipts ?? 0) === 0 || sum.body?.receipts === undefined,
       { receipts: sum.body?.receipts });
 
-    // клиент с нулевым балансом
-    const w = await api(A.base, '/wallet', 'POST');
+    /* Клиент с нулевым балансом.
+     *
+     * 2.29.25: названный clientAddress — это списание, и подпись клиента
+     * обязательна. Раньше здесь проверялся только нехватку денег, но
+     * «платить чужими деньгами» проходило без подписи вовсе. Поэтому
+     * случай разбит на два: без подписи — 401 до любых списаний; с
+     * подписью — 402 PAYMENT_FAILED, то есть отказ по деньгам, а не по
+     * личности. */
+    const clientPair = crypto.generateKeyPairSync('ed25519');
+    const clientPubPem = clientPair.publicKey.export({ type: 'spki', format: 'pem' });
+    const w = await api(A.base, '/wallet', 'POST', { publicKeyPem: clientPubPem });
     const poorClient = w.body.address;
+
+    const unsigned = await signedWork(A.base, {
+      tokens: 1000000, tier: 'base', response: 'y', actionId: 'gate-2a', clientAddress: poorClient,
+    });
+    ok('/work с чужим clientAddress без подписи → 401 CLIENT_SIGNATURE_REQUIRED',
+      unsigned.status === 401 && unsigned.body?.code === 'CLIENT_SIGNATURE_REQUIRED', unsigned);
+
+    const canonical = [poorClient, ADDR.toLowerCase(), '1000000', 'base', 'gate-2'].join(':');
+    const clientSig = crypto.sign(null, Buffer.from(canonical), clientPair.privateKey).toString('base64');
     const poor = await signedWork(A.base, {
       tokens: 1000000, tier: 'base', response: 'y', actionId: 'gate-2', clientAddress: poorClient,
+      client_signature: clientSig,
     });
-    ok('/work с пустым клиентом → 402 PAYMENT_FAILED',
+    ok('/work с пустым клиентом и подписью → 402 PAYMENT_FAILED',
       poor.status === 402 && poor.body?.code === 'PAYMENT_FAILED', poor);
 
     const bal2 = await api(A.base, `/balance/${ADDR}`);

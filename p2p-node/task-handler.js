@@ -150,7 +150,8 @@ export function createTaskHandler({
         store,
         now: now(),
         ...(maxTokensLimit ? { maxTokensLimit } : {}),
-        models: installed
+        models: installed,
+        workerAddress
       })
     } catch (e) {
       /* Исключение в проверке — это наш дефект, а не вина клиента. Но

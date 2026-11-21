@@ -312,7 +312,8 @@ function normalizeDigest(v) {
 export function verifyGrant(grant, {  store = null,
   now = Date.now(),
   maxTokensLimit = DEFAULT_MAX_TOKENS_PER_TASK,
-  models = null
+  models = null,
+  workerAddress = null
 } = {}) {
   const fail = (code, reason) => ({
     ok: false,
@@ -348,6 +349,24 @@ export function verifyGrant(grant, {  store = null,
     return fail('E_SIG', 'bad_pubkey')
   }
   if (derived !== declared) return fail('E_SIG', 'pubkey_address_mismatch')
+
+  /* 3.5. Грант привязан к ПОЛУЧАТЕЛЮ (2.29.25).
+   *
+   * Само право подписано клиентом и больше ничего не ограничивало: грант
+   * на воркера A можно было предъявить воркеру B, и тот выполнял бы
+   * оплаченную работу, которая в чек B не попадала бы как работа по этому
+   * праву. Подпись клиента подтверждает «я разрешаю такую задачу», но не
+   * «именно этот воркер её выполнит». Привязка закрывает подмену адресата.
+   *
+   * Поле `workerAddress` входит в JCS-строку подписи, потому что
+   * `grantPayload` берёт весь объект минус `signature`. Отдельного
+   * поля в строке подписи не нужно — достаточно, чтобы оно было в гранте. */
+  const grantWorker = String(grant.workerAddress || '').toLowerCase()
+  if (!grantWorker) return fail('E_WORKER_MISMATCH', 'worker_missing')
+  if (!workerAddress) return fail('E_WORKER_MISMATCH', 'worker_unknown')
+  if (grantWorker !== String(workerAddress).toLowerCase()) {
+    return fail('E_WORKER_MISMATCH', 'worker_mismatch')
+  }
 
   /* 4. Окно свежести. */
   const ts = Number(grant.timestamp)
