@@ -47,6 +47,20 @@ const p2pBridge = require('./p2p-bridge-client');
  * тестом, а не глазами. См. комментарий в `dispatch-gate.js`. */
 const dispatchGate = require('./dispatch-gate');
 
+/* ===== Секрет spot-check (2.29.24) =====
+ *
+ * Им подписывается выбор работы для слепой проверки: bucket =
+ * HMAC-SHA256(SPOT_CHECK_SECRET, taskId) % 100. Воркер получает taskId и
+ * собственный ответ ДО расчёта, поэтому seed не может выводиться только из
+ * них — иначе он предскажет bucket и подсунет дешёвую модель на работах вне
+ * выборки. Секрет живёт только в этом процессе и в ответы не попадает.
+ *
+ * Никакого захардкоженного дефолта: если TARNET_SPOT_CHECK_SECRET не задан,
+ * берётся 32 случайных байта на старте. Это значит, что перезапуск сервиса
+ * пересобирает выборку — и это честно: предсказуемый секрет не секрет.
+ * Для юнит-проверок секрет можно задать окружением (фиксированный ключ). */
+const SPOT_CHECK_SECRET = process.env.TARNET_SPOT_CHECK_SECRET || crypto.randomBytes(32);
+
 /* Capabilities Discovery как ФАКТ СЕТИ, а не как догадка о чужой машине
  * (2.26.0, Блок 1.3).
  *
@@ -1721,6 +1735,28 @@ ensureColumn('work_receipts', 'cumulativeCwu', 'cumulativeCwu REAL');
 ensureColumn('work_receipts', 'cumulativeTar', 'cumulativeTar REAL');
 ensureColumn('work_receipts', 'receiptHash', 'receiptHash TEXT');
 ensureColumn('work_receipts', 'payloadVersion', 'payloadVersion INTEGER DEFAULT 1');
+/* synthetic — чек создан синтетикой, а не реальным воркером (2.29.24).
+ *
+ * Поле нужно /summary: сумма всех чеков уже сейчас включает записи
+ * /batch-test (демо-узлы `batch-node-*`), и по одному числу `receipts`
+ * нельзя понять, сколько там живого труда. Разметка хранится в БД, а не
+ * вычисляется на чтении: у настоящего воркера адрес неотличим от
+ * демонстрационного по форме, и угадывать его на лету — тот же дефект,
+ * что и любой другой вывод по внешнему виду. */
+ensureColumn('work_receipts', 'synthetic', 'synthetic INTEGER NOT NULL DEFAULT 0');
+/* Бэкфилл для чеков, выпущенных до появления колонки: demo=1 уже был
+ * признаком демо-выпуска, а адреса батча детерминированы. Оба условия
+ * проверяются один раз на старте и только для неразмеченных строк, поэтому
+ * повторный запуск ничего не переписывает. */
+{
+  const batchAddrs = [];
+  for (let i = 1; i <= 50; i++) {
+    batchAddrs.push('0x' + crypto.createHash('sha256').update(`batch-node-${i}`).digest('hex').slice(0, 40));
+  }
+  const ph = batchAddrs.map(() => '?').join(',');
+  run(`UPDATE work_receipts SET synthetic = 1
+       WHERE synthetic = 0 AND (demo = 1 OR workerAddress IN (${ph}))`, batchAddrs);
+}
 
 /* Бэкфилл цепи для чеков, выпущенных до сцепки. Детерминирован: порядок — по
  * глобальному seq внутри воркера, старт — от генезис-хеша. Хеш исторического
@@ -2705,11 +2741,26 @@ function lookupActionId(id) {
 /* ===== Ядро начисления =====
  * Единственный путь, которым в системе появляются токены. Никаких условий
  * «если повезло»: при γ=1 начисление всегда, при γ=0 — никогда. */
-function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, response, actionId, flush = false, demo = false, paymentMode = null, promptHashVerified = null, allowUnpaid = false }) {
+function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, response, actionId, flush = false, demo = false, paymentMode = null, promptHashVerified = null, allowUnpaid = false, synthetic = false }) {
   const t = normalizeTier(tier);
   if (!t) {
     const err = new Error(`tier must be one of ${TIERS.join('|')}`);
     err.code = 'BAD_TIER';
+    throw err;
+  }
+  /* Самоплата (2.29.24). Клиент и воркер — один и тот же кошелёк.
+   *
+   * Закрывает наивную атаку одного кошелька: дебет и кредит возвращаются в
+   * один адрес, а block reward приходит из эмиссии, то есть работа
+   * оплачивается деньгами, которых не было.
+   *
+   * НЕ закрывает 2-wallet Sybil: два Ed25519 ключа генерируются за 1 мс, и
+   * проверка «адреса разные» проходит на ура. Настоящий фикс — Level 3
+   * (burn-and-mint / ваучер), а не эта проверка. Не читать её как защиту
+   * сети: она только убирает самый дешёвый способ накрутки. */
+  if (clientAddress && String(clientAddress).toLowerCase() === String(workerAddress).toLowerCase()) {
+    const err = new Error('clientAddress must differ from workerAddress (self-dealing rejected)');
+    err.code = 'SELF_DEALING';
     throw err;
   }
   const node = get('SELECT address, stake, reputation, isTeeAttested FROM nodes WHERE address = ?', [workerAddress]);
@@ -2799,7 +2850,7 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
      * поэтому проваленной работы в pending_work нет и перепроверять нечего. */
     ? { gamma: 1, sampled: false, bucket: null, checks: {}, passed: true, reason: 'demo_flush' }
     : verifyQuality({ actionId: auditSeed, tokens, response: response || 'ok',
-      adapterId: adapterId || BASE_MODEL, promptHashVerified });
+      adapterId: adapterId || BASE_MODEL, promptHashVerified, spotCheckSecret: SPOT_CHECK_SECRET });
 
   /* 1.5) Батчинг коротких работ. Работа дешевле порога не пропадает и не
    * превращается в чек на ноль: она копится в pending_work и суммируется со
@@ -3016,6 +3067,11 @@ function recordWork({ workerAddress, clientAddress, tokens, tier, adapterId, res
       batchedFrom,
       adapterDeletedAt: adapter ? adapter.deletedAt : null,
       demo,
+      /* Синтетика шире demo: demo — это «без оплаты», synthetic — «создано
+       * не реальным воркером». /batch-test создаёт и то и другое, но
+       * принудительный flush остаётся demo без притворства живым трудом? Нет:
+       * он тоже не настоящая работа, поэтому demo подразумевает synthetic. */
+      synthetic: synthetic || demo,
     });
 
     /* Накопление израсходовано: чек выпущен на суммарный объём. Удаление в
@@ -6559,6 +6615,31 @@ function handleWork(req, res) {
     return res.status(400).json({ error: 'actionId must be a non-empty string when provided', actionId: body.actionId });
   }
 
+  /* Самоплата — отказ на входе (2.29.24). Проверка в recordWork остаётся
+   * второй линией: сюда можно попасть обходным путём, а ядро должно
+   * отказывать само. Комментарий о границах защиты — в recordWork. */
+  if (body.clientAddress && String(body.clientAddress).toLowerCase() === String(body.workerAddress).toLowerCase()) {
+    return res.status(400).json({
+      error: 'SELF_DEALING',
+      code: 'SELF_DEALING',
+      note: 'clientAddress и workerAddress совпадают: самоплата запрещена',
+      charged: false,
+    });
+  }
+
+  /* Гейт оплаты — до подписи и до любых записей (2.29.24). Ядро проверяет
+   * то же самое, но позже: без этой строки неоплаченный запрос успевал
+   * пройти ввод и вернуть 400 «не хватает клиента» вперемешку с ошибками
+   * формы. Здесь отказ однозначен: 402, платить некому или нечем. */
+  if (CONFIG.REQUIRE_PAYMENT && !body.clientAddress) {
+    return res.status(402).json({
+      error: 'CLIENT_REQUIRED',
+      code: 'CLIENT_REQUIRED',
+      note: 'clientAddress обязателен: /work без оплаты не начисляет',
+      charged: false,
+    });
+  }
+
   /* Подпись воркера — обязательная.
    *
    * До этого `/work` принимал работу от имени ЛЮБОГО адреса без всякой
@@ -6756,6 +6837,7 @@ function handleWork(req, res) {
   } catch (e) {
     if (e.code === 'BAD_TIER') return res.status(400).json({ error: e.message, tier: req.body?.tier ?? null });
     if (e.code === 'UNKNOWN_WORKER') return res.status(400).json({ error: e.message, workerAddress: req.body?.workerAddress });
+    if (e.code === 'SELF_DEALING') return res.status(400).json({ error: e.message, code: 'SELF_DEALING', charged: false });
     if (e.code === 'ADAPTER_DELETED') return res.status(409).json({ error: e.message, adapterId: req.body?.adapterId ?? null });
     /* Тот же actionId уже принадлежит другому воркеру — это не ретрай, а
      * конфликт ключей. Вернуть чужой чек значило бы отдать его первому, кто
@@ -7796,6 +7878,24 @@ app.get('/summary', async (_req, res) => {
                       FROM work_receipts GROUP BY tier ORDER BY tier`);
   const settledCount = get('SELECT COUNT(*) AS c FROM onchain_settlements').c;
 
+  /* Синтетика отдельно от живого труда (2.29.24).
+   *
+   * `receipts` ниже — сумма ВСЕХ чеков, включая /batch-test. До этой правки
+   * читатель не мог узнать, сколько из них настоящие: демо-узлы пишут в тот
+   * же леджер, и число выглядело как показатель сети. Теперь разбивка лежит
+   * рядом: realReceipts + synthetic.receipts = receipts, и сходимость
+   * проверяемая, а не обещанная. */
+  const syntheticRow = get(`SELECT COUNT(*) AS c,
+                                   COALESCE(SUM(cwu), 0) AS cwu,
+                                   COALESCE(SUM(rewardTar), 0) AS tar
+                            FROM work_receipts WHERE synthetic = 1`);
+  const realRow = get(`SELECT COUNT(*) AS c,
+                              COALESCE(SUM(cwu), 0) AS cwu,
+                              COALESCE(SUM(rewardTar), 0) AS tar
+                       FROM work_receipts WHERE synthetic = 0`);
+  const syntheticReceipts = Number(syntheticRow?.c ?? 0);
+  const realReceipts = Number(realRow?.c ?? 0);
+
   /* ===== Сжигание: ДВА источника, которые нельзя складывать молча =====
    *
    * Сожжённые TAR приходят из двух таблиц: рабочие чеки (`work_receipts`)
@@ -7868,6 +7968,22 @@ app.get('/summary', async (_req, res) => {
 
   res.json({
     receipts: Number(t.receipts),
+    /* Живой труд и синтетика — разные факты, а не одно число (2.29.24).
+     * Сумма обязана сходиться с `receipts`; если нет — появился третий
+     * источник чеков, не размеченный ни как real, ни как synthetic. */
+    realReceipts,
+    synthetic: {
+      receipts: syntheticReceipts,
+      cwu: Number(Number(syntheticRow?.cwu ?? 0).toFixed(6)),
+      tar: Number(Number(syntheticRow?.tar ?? 0).toFixed(6)),
+      note: 'синтетические чеки: /batch-test и demo-пути, не живой труд',
+    },
+    receiptsAudit: {
+      real: realReceipts,
+      synthetic: syntheticReceipts,
+      total: Number(t.receipts),
+      holds: realReceipts + syntheticReceipts === Number(t.receipts),
+    },
     workers: get('SELECT COUNT(DISTINCT workerAddress) AS c FROM work_receipts').c,
     /* Воркеры P2P — рядом с `workers`, и это не дубль, а другой факт.
      * `workers` — сколько адресов УЖЕ отработали (история из work_receipts),
@@ -11465,6 +11581,19 @@ const BATCH_MAX_ITERATIONS = 5000;
 const BATCH_CHUNK = 100;
 
 app.post('/batch-test', wrapAsync(async (req, res) => {
+  /* Демо-эндпоинт создаёт синтетических воркеров и пишет чеки в тот же
+   * леджер, что и настоящая работа. Открытым он не должен быть ни на проде,
+   * ни в чистом локальном запуске: один POST без клиента и без оплаты
+   * начислил бы эмиссию в никуда. Поэтому только явный DEMO_MODE=1, та же
+   * ручка, что у /demo/flush-work. */
+  if (!CONFIG.DEMO_MODE) {
+    return res.status(403).json({
+      error: 'DEMO_MODE_REQUIRED',
+      note: '/batch-test доступен только при DEMO_MODE=1 в окружении сервера',
+      demoMode: false,
+    });
+  }
+
   const body = req.body || {};
   /* Ключи батча обязаны быть уникальны для каждого запуска. Раньше здесь
    * стоял `batch-${i}` — детерминированный, и после того как POST /work
@@ -11514,6 +11643,10 @@ app.post('/batch-test', wrapAsync(async (req, res) => {
           const out = recordWork({
             workerAddress: worker.address, tokens, tier, adapterId,
             response: `batch work ${i}`, actionId: `batch-${batchRun}-${i}`,
+            /* Синтетика — явно: чек не должен попасть в realReceipts /summary
+             * и выглядеть живым трудом. demo снимает гейт оплаты, synthetic
+             * размечает запись в леджере. */
+            demo: true, synthetic: true,
           });
           results.push({
             iteration: i, tier, adapterId,

@@ -137,6 +137,17 @@ async function spawnServer(envOverrides = {}, opts = {}) {
        * заметно. Строгий режим проверяется отдельно (`check-payment-gate.js`
        * и секция 53) на сервере с дефолтным значением. */
       TARNET_REQUIRE_PAYMENT: '0',
+      /* Демо-эндпоинты (2.29.24). `/batch-test` теперь требует явного
+       * DEMO_MODE=1, а не «случайно открыт». Приёмка проверяет его напрямую,
+       * поэтому включает флаг осознанно — и отдельно проверяет, что БЕЗ флага
+       * эндпоинт отвечает 403 (секция 60.1). */
+      DEMO_MODE: '1',
+      /* Фиксированный секрет spot-check для юнит-режима (2.29.24).
+       * Без него сервер берёт randomBytes(32) и выборка аудита непредсказуема
+       * даже для теста; с ним тест может вычислить ожидаемый bucket
+       * HMAC-ом ДО отправки и проверить именно выбор прошлой схемы. В проде
+       * переменной нет — секрет случаен на старте. */
+      TARNET_SPOT_CHECK_SECRET: TEST_SPOT_SECRET,
       ...envOverrides,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -353,6 +364,13 @@ async function api(path, method = 'GET', body, extraHeaders) {
  * на «первый/единственный» чек воркера. */
 const RUN = Date.now().toString(16) + process.pid.toString(16).padStart(4, '0');
 const runId = (tag) => `${tag}-${RUN}`;
+/* Фиксированный секрет spot-check для тестового сервера (2.29.24).
+ * Сервер без TARNET_SPOT_CHECK_SECRET берёт randomBytes(32), и тогда тест
+ * не может воспроизвести bucket и проверка 8.10/8.12 стала бы случайной.
+ * Это именно тестовый ключ и живёт только здесь — в проде переменной нет. */
+const TEST_SPOT_SECRET = 'test-spot-check-secret-2.29.24';
+const spotBucket = (taskId) => crypto.createHmac('sha256', TEST_SPOT_SECRET)
+  .update(String(taskId)).digest().readUInt32BE(0) % 100;
 /* Адрес тестового воркера — ВАЛИДНЫЙ hex из 40 символов.
  *
  * Раньше здесь был `'0x' + (tag + RUN).padEnd(40,'0')`, то есть адрес вида
@@ -879,7 +897,7 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
   for (let n = 1; n <= 5000 && !respFail; n++) {
     const cand = ' '.repeat(n);
     const id = deriveId(cand);
-    const bucket = crypto.createHash('sha256').update(id).digest().readUInt32BE(0) % 100;
+    const bucket = spotBucket(id);
     if (bucket < 5) { respFail = cand; idFail = id; }
   }
   const rej = await api('/work', 'POST', {
@@ -1057,7 +1075,9 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
    * ключом (bucket >= 5). Вердикт обязан остаться прежним — 422.
    *
    * Без разведения seed и ключа этот тест краснеет: там 201 и оплаченный чек. */
-  const bucketOf = (s) => crypto.createHash('sha256').update(s).digest().readUInt32BE(0) % 100;
+  /* HMAC с тем же тестовым секретом, что у сервера: без секрета bucket
+   * воркер не вычислит, и старый sha256-подбор больше не работает. */
+  const bucketOf = spotBucket;
   let safeKey = null;
   for (let n = 0; n < 5000 && safeKey === null; n++) {
     const cand = `bribe-${runId('s')}-${n}`;
@@ -12441,6 +12461,125 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       ok('65.10 лог пишется в файл stage10-test.log',
         /stage10-test\.log/.test(text));
     }
+  }
+
+  /* ---------- 66. Гигиена безопасности 2.29.24 (A.1–A.5) ---------- */
+  section('66. Гигиена безопасности: DEMO_MODE, оплата, самоплата, HMAC-аудит');
+
+  /* --- 66.1 /batch-test без DEMO_MODE → 403 -------------------------
+   * Раньше эндпоинт был открыт всем и писал чеки в тот же леджер. Защита
+   * проверяется на отдельном сервере с выключенным флагом: на основном он
+   * включён, иначе 8.11 не смогла бы работать. */
+  {
+    const noDemo = await spawnServer({ DEMO_MODE: '0' });
+    try {
+      const r = await apiAt(noDemo.base, '/batch-test', 'POST', { numWorkers: 1, iterations: 1 });
+      ok('66.1 /batch-test без DEMO_MODE → 403 DEMO_MODE_REQUIRED',
+        r.status === 403 && r.body?.error === 'DEMO_MODE_REQUIRED',
+        { status: r.status, error: r.body?.error });
+    } finally {
+      noDemo.stop();
+    }
+  }
+
+  /* --- 66.2 /work без оплаты при строгом флаге → 402 -----------------
+   * Гейт в начале обработчика: отказ до подписи и до любых записей.
+   * На основном сервере флаг выключен (стенд), поэтому нужен свой. */
+  {
+    const strict = await spawnServer({ TARNET_REQUIRE_PAYMENT: '1' });
+    try {
+      const w = runAddress('strict');
+      await apiAt(strict.base, '/node', 'POST', { address: w, stake: 50000, reputation: 0.9 });
+      await bindWorker(w, strict.base);
+      const r = await apiAt(strict.base, '/work', 'POST', {
+        workerAddress: w, tokens: 1000000, tier: 'base', response: 'strict', actionId: runId('strict-1'),
+      });
+      ok('66.2 /work без clientAddress при REQUIRE_PAYMENT=1 → 402 CLIENT_REQUIRED',
+        r.status === 402 && r.body?.code === 'CLIENT_REQUIRED',
+        { status: r.status, code: r.body?.code });
+      const sum = await apiAt(strict.base, '/summary');
+      ok('66.2 после отказа чеков нет', Number(sum.body?.receipts ?? 0) === 0,
+        { receipts: sum.body?.receipts });
+    } finally {
+      strict.stop();
+    }
+  }
+
+  /* --- 66.3 Самоплата: clientAddress === workerAddress → 400 ---------
+   * Проверка в обработчике и вторая линия в recordWork. Граница защиты
+   * названа в коде: 2-wallet Sybil она не закрывает. */
+  {
+    const wSelf = runAddress('self');
+    await api('/node', 'POST', { address: wSelf, stake: 50000, reputation: 0.9 });
+    const r = await api('/work', 'POST', {
+      workerAddress: wSelf, clientAddress: wSelf,
+      tokens: 1000000, tier: 'base', response: 'self-deal', actionId: runId('self-1'),
+    });
+    ok('66.3 clientAddress === workerAddress → 400 SELF_DEALING',
+      r.status === 400 && r.body?.code === 'SELF_DEALING',
+      { status: r.status, code: r.body?.code, error: r.body?.error });
+    const bal = await api(`/balance/${wSelf}`);
+    ok('66.3 самоплата не начислила ничего',
+      Number(bal.body?.balanceTar ?? 0) === 0, bal.body?.balanceTar);
+  }
+
+  /* --- 66.4 Spot-check seed = HMAC(секрет, taskId) -------------------
+   * Детерминирован, но непредсказуем без секрета: sha256(taskId) воркер
+   * считает сам, а HMAC — нет. Поэтому bucket сервера обязан отличаться
+   * от sha256-предсказания хотя бы на одном из кандидатов, и при этом
+   * повторный расчёт с тем же секретом даёт тот же bucket. */
+  {
+    const econ = require('./economics');
+    const findMismatch = () => {
+      for (let n = 0; n < 200; n++) {
+        const id = `${runId('hmac')}-${n}`;
+        const withSecret = econ.spotCheckDecision(id, TEST_SPOT_SECRET);
+        const plain = econ.spotCheckDecision(id);
+        const again = econ.spotCheckDecision(id, TEST_SPOT_SECRET);
+        if (again.bucket !== withSecret.bucket || again.sampled !== withSecret.sampled) {
+          return { id, withSecret, plain, deterministic: false };
+        }
+        if (withSecret.bucket !== plain.bucket) return { id, withSecret, plain, deterministic: true };
+      }
+      return null;
+    };
+    const m = findMismatch();
+    ok('66.4 HMAC(секрет, taskId) детерминирован и отличается от sha256(taskId)',
+      m !== null && m.deterministic === true,
+      m ? { id: m.id, hmacBucket: m.withSecret.bucket, shaBucket: m.plain.bucket } : 'no mismatch found');
+
+    /* И сам сервер считает именно HMAC: его bucket для известного taskId
+     * совпадает с локальным HMAC и не совпадает с sha256-предсказанием. */
+    const wH = runAddress('hmac');
+    await api('/node', 'POST', { address: wH, stake: 50000, reputation: 0.9 });
+    const resp = 'h';
+    const auditId = crypto.createHash('sha256')
+      .update(`${wH}::100:base::${resp}`).digest('hex').slice(0, 32);
+    const r = await api('/work', 'POST', {
+      workerAddress: wH, tokens: 100, tier: 'base', response: resp, actionId: runId('hmac-api'),
+    });
+    const reported = r.body?.quality?.bucket;
+    ok('66.4 сервер отдаёт bucket по HMAC, а не по sha256 содержимого',
+      reported === spotBucket(auditId) && reported !== econ.spotCheckDecision(auditId).bucket,
+      { reported, hmac: spotBucket(auditId), sha: econ.spotCheckDecision(auditId).bucket, status: r.status });
+  }
+
+  /* --- 66.5 /summary: синтетика отделена от живого труда -------------
+   * Сумма частей обязана сходиться с `receipts`, иначе появился третий
+   * источник чеков, не размеченный ни как real, ни как synthetic. */
+  {
+    const sum = await api('/summary');
+    const real = Number(sum.body?.realReceipts ?? -1);
+    const syn = Number(sum.body?.synthetic?.receipts ?? -1);
+    ok('66.5 /summary отдаёт realReceipts и synthetic.receipts',
+      real >= 0 && syn >= 0, { real, syn });
+    ok('66.5 realReceipts + synthetic.receipts = receipts',
+      real + syn === Number(sum.body?.receipts),
+      { real, syn, receipts: sum.body?.receipts, audit: sum.body?.receiptsAudit });
+    ok('66.5 receiptAudit.holds = true', sum.body?.receiptsAudit?.holds === true,
+      sum.body?.receiptsAudit);
+    ok('66.5 синтетика из /batch-test не считается живой работой', syn > 0,
+      { syn });
   }
 
   console.log('\n' + '─'.repeat(50));

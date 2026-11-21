@@ -88,8 +88,10 @@ async function signedWork(base, body) {
     await api(A.base, '/node', 'POST', { address: ADDR, stake: 50000, reputation: 0.9 });
 
     const noClient = await signedWork(A.base, { tokens: 1000000, tier: 'base', response: 'x', actionId: 'gate-1' });
-    ok('/work без clientAddress → 400 CLIENT_REQUIRED',
-      noClient.status === 400 && noClient.body?.code === 'CLIENT_REQUIRED', noClient);
+    /* 2.29.24: гейт стоит в начале /work и отвечает 402, а не 400. Разница
+     * смысловая: запрос полный (просто платить не с кого) — это отказ оплаты. */
+    ok('/work без clientAddress → 402 CLIENT_REQUIRED',
+      noClient.status === 402 && noClient.body?.code === 'CLIENT_REQUIRED', noClient);
 
     const bal = await api(A.base, `/balance/${ADDR}`);
     ok('воркеру НЕ начислено', Number(bal.body?.balanceTar ?? 0) === 0, bal.body);

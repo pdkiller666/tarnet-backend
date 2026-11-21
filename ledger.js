@@ -66,7 +66,7 @@ class CumulativeLedger {
     feeGrossTar = 0, feeRewardTar, blockRewardTar, rewardTar,
     burnTar, treasuryTar, royaltyTar,
     epoch, omega = 0, share = 0, adapterId = null, actionId = null,
-    batchedFrom = null, adapterDeletedAt = null, demo = false,
+    batchedFrom = null, adapterDeletedAt = null, demo = false, synthetic = false,
   }) {
     if (!workerAddress) throw new Error('workerAddress is required');
     const prev = this.lastFor(workerAddress);
@@ -119,8 +119,8 @@ class CumulativeLedger {
           adapterId, actionId, timestamp, prevSignature, signature, signatureAlg, createdAt,
           batchedFrom, adapterDeletedAt,
           workerSeq, prevReceiptHash, cumulativeCwu, cumulativeTar, receiptHash, payloadVersion,
-          demo)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          demo, synthetic)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [seq, workerAddress, round(cwu), tier,
         round(feeGrossTar), round(feeRewardTar), round(blockRewardTar), round(rewardTar),
         round(burnTar), round(treasuryTar), round(royaltyTar), cumulativeTotal,
@@ -130,7 +130,7 @@ class CumulativeLedger {
         batchedFrom && batchedFrom.length ? JSON.stringify(batchedFrom) : null,
         adapterDeletedAt,
         workerSeq, prevReceiptHash, cumulativeCwu, cumulativeTar, receiptHash, 2,
-        demo ? 1 : 0],
+        demo ? 1 : 0, (demo || synthetic) ? 1 : 0],
     );
 
     return this.get(seq);

@@ -43,8 +43,34 @@ class CWUCalculator {
  * воспроизводимо, не зависит от состояния процесса и не подкручивается. */
 const SPOT_CHECK_SAMPLE_PCT = 5; // 5% работ проверяются по существу
 
-function spotCheckDecision(actionId) {
-  const h = crypto.createHash('sha256').update(String(actionId)).digest();
+/* Выбор работы для слепой проверки (2.29.24).
+ *
+ * БЫЛО: bucket = sha256(actionId) % 100. Всё, что нужно для bucket, воркер
+ * знал ДО отправки: seed выводился из содержимого работы (tokens, response,
+ * tier), а response он и так выбирает сам. Значит, он мог перебрать ответы
+ * до отправки и подсунуть дешёвую модель ровно на тех работах, где bucket
+ * >= 5, то есть купить себе проход аудита без работы. Симметрично: на
+ * работах с bucket < 5 он мог честно отработать.
+ *
+ * СТАЛО: bucket = HMAC-SHA256(SERVER_SPOT_CHECK_SECRET, taskId) % 100.
+ * Секрет живёт только на координаторе и в ответ не попадает, поэтому
+ * предсказать bucket до отправки нельзя — остаётся шанс 5%, и он одинаков
+ * для любой стратегии воркера. `taskId` — по-прежнему отпечаток содержимого
+ * работы, а не клиентский ключ: он нужен лишь как детерминированный вход
+ * HMAC, чтобы тот же труд давал тот же вердикт при повторе.
+ *
+ * Без секрета функция считает старый sha256: это нужно юнит-проверкам,
+ * которые решают задачу локально, и не является рабочим режимом сервера —
+ * сервер всегда передаёт секрет (см. server.js, SPOT_CHECK_SECRET).
+ *
+ * ЧЕГО ЭТО НЕ ЗАКРЫВАЕТ: сервер по-прежнему единственный, кто знает
+ * секрет, то есть доверие к координатору остаётся. Честная замена —
+ * Stage 12 → Commit-Reveal, когда центрального сервера не будет вовсе. */
+function spotCheckDecision(actionId, secret = null) {
+  const input = String(actionId);
+  const h = secret
+    ? crypto.createHmac('sha256', secret).update(input).digest()
+    : crypto.createHash('sha256').update(input).digest();
   const bucket = h.readUInt32BE(0) % 100;
   return { sampled: bucket < SPOT_CHECK_SAMPLE_PCT, bucket };
 }
@@ -71,8 +97,8 @@ function spotCheckDecision(actionId) {
  * минуса. `false` означает «хеш был, но не сошёлся или не прислан» и валит
  * проверку. Разница обязательна: иначе отсутствие механизма выглядело бы
  * как его успешное прохождение. */
-function verifyQuality({ actionId, tokens, response, adapterId, promptHashVerified } = {}) {
-  const { sampled, bucket } = spotCheckDecision(actionId);
+function verifyQuality({ actionId, tokens, response, adapterId, promptHashVerified, spotCheckSecret = null } = {}) {
+  const { sampled, bucket } = spotCheckDecision(actionId, spotCheckSecret);
   const tokensNum = Number(tokens);
   const checks = {
     positiveTokens: Number.isFinite(tokensNum) && tokensNum > 0,
