@@ -36,6 +36,20 @@ const DEFAULT_AGREEMENT_THRESHOLD = 0.8;
  * любом тексте и поднимали бы сходство у несвязанных ответов. */
 const MIN_TOKEN_LEN = 2;
 
+/* ЦИФРА ЛЮБОЙ ДЛИНЫ — ЭТО ТОКЕН, И ЭТО НЕ ПЕДАНТИЗМ (2.29.22, долг A.9).
+ * Правило MIN_TOKEN_LEN выбрасывало одиночные цифры вместе с предлогами:
+ * `tokenize('5')` и `tokenize('3.')` давали ОБА пустой массив, а `similarity`
+ * на двух пустых наборах возвращала 1 — то есть «ответы согласны на 100%».
+ * На прогоне 20.11 это дало ложное согласие на `text-2` («5» против «3.»),
+ * где выбрали неверный ответ, и на `text-4`. Ответ «5» — это ответ, а не
+ * предлог; выбрасывать его нельзя. */
+const NUMERIC_TOKEN = /^\d+(?:[.,]\d+)?$/;
+
+/* Ответ «числовой», если в нём есть цифра и он короткий. Шесть слов — это
+ * «220 км», «2 часа», «около 3500 граммов»; всё длиннее — уже рассуждение,
+ * и правило чисел к нему не применяется. */
+const NUMERIC_MAX_WORDS = 6;
+
 /** Нормализация: регистр, пробелы. Пунктуация не важна — её срежет токенизатор. */
 function normalize(text) {
   return String(text == null ? '' : text).toLowerCase().replace(/\s+/g, ' ').trim();
@@ -49,7 +63,9 @@ function normalize(text) {
 function tokenize(text) {
   const norm = normalize(text);
   if (!norm) return [];
-  return norm.split(/[^\p{L}\p{N}_]+/u).filter(t => t.length >= MIN_TOKEN_LEN);
+  return norm
+    .split(/[^\p{L}\p{N}_]+/u)
+    .filter(t => t.length >= MIN_TOKEN_LEN || NUMERIC_TOKEN.test(t));
 }
 
 /**
@@ -59,7 +75,13 @@ function tokenize(text) {
 function similarity(a, b) {
   const ta = tokenize(a);
   const tb = tokenize(b);
-  if (ta.length === 0 && tb.length === 0) return 1;
+  /* Оба набора пусты — это НЕ «согласие». Пустой набор значит «токенизатор
+   * ничего не увидел», а не «тексты совпали». Считать это единицей — значит
+   * объявлять согласием любую пару, где оба ответа короче двух символов
+   * (см. историю с «5» против «3.» в комментарии к NUMERIC_TOKEN).
+   * Равенство текстов проверяется по нормализованной строке: если они
+   * действительно одинаковы, согласие настоящее. */
+  if (ta.length === 0 && tb.length === 0) return normalize(a) === normalize(b) ? 1 : 0;
   if (ta.length === 0 || tb.length === 0) return 0;
 
   const counts = new Map();
@@ -139,6 +161,25 @@ function lengthOf(text) {
 }
 
 /**
+ * Ответ «числовой»: содержит цифру и не длиннее NUMERIC_MAX_WORDS слов.
+ * На таких задачах длина — анти-сигнал (см. правило 4 в `synthesize`).
+ */
+function isNumericAnswer(text) {
+  const s = String(text == null ? '' : text).trim();
+  if (!s || !/\d/.test(s)) return false;
+  return s.split(/\s+/).filter(Boolean).length <= NUMERIC_MAX_WORDS;
+}
+
+/**
+ * Ответ — «голое» число: `410`, `-3.5`, `2,5`. Хвостовая точка («391.») и
+ * объяснение вокруг числа («80*105=8400») голым числом НЕ считаются: это
+ * следы рассуждения, а не ответ.
+ */
+function isCleanNumber(text) {
+  return /^-?\d+(?:[.,]\d+)?$/.test(String(text == null ? '' : text).trim());
+}
+
+/**
  * Выбирает один из двух ответов.
  *
  * Порядок правил важен и объяснён:
@@ -154,8 +195,18 @@ function lengthOf(text) {
  *  3. Согласие (≥ порога) → первый. Второй не добавляет информации, а менять
  *     выбор на «более длинный» при согласии значило бы поощрять
  *     многословие.
- *  4. Иначе — более длинный. Это НЕ «более правильный», а «более полный»;
- *     поле `reason` так и говорит.
+ *  4. Числовой ответ (оба ответа короткие и с цифрой) — сначала «голое»
+ *     число, потом меньше мусора вокруг числа, потом короче. **Правило
+ *     длины здесь перевёрнуто, и это исправление дефекта, а не вкус.**
+ *     Прогон 20.11 показал: на числовых задачах более длинный ответ
+ *     систематически означает «подробнее объяснил неверное» — `longer`
+ *     потерял 4 задачи из 5 (`arith-1` `410` против `391.`, `arith-5`
+ *     `200` против `125.`, `unit-2` `2` против `120`, `logic-3` `8`
+ *     против `10.`). Когда ответ — одно число, полнота и правильность
+ *     расходятся.
+ *  5. Иначе (проза) — более длинный. Это НЕ «более правильный», а «более
+ *     полный»; поле `reason` так и говорит. Для прозы это правило осталось:
+ *     там длина действительно коррелирует с полнотой.
  *
  * @param {string} first
  * @param {string} second
@@ -229,7 +280,44 @@ function synthesize(first, second, opts = {}) {
     };
   }
 
-  /* Правило 4: длина. */
+  /* Правило 4: числовой ответ — длина ПРОТИВ правильности. */
+  if (isNumericAnswer(a) && isNumericAnswer(b)) {
+    const cleanA = isCleanNumber(a);
+    const cleanB = isCleanNumber(b);
+    if (cleanA !== cleanB) {
+      /* Голое число побеждает «391.» и «80*105=8400»: хвост — след
+       * рассуждения, а не ответ. */
+      return {
+        pick: cleanA ? 'first' : 'second',
+        reason: 'numeric_clean',
+        similarity: Number(sim.toFixed(4)),
+        lengths: { first: lenA, second: lenB },
+        syntax,
+      };
+    }
+    if (lenA !== lenB) {
+      /* Оба не голые (или оба голые, но разной длины): короче — увереннее.
+       * `120` против `2` — верный ответ короче ровно потому, что в нём нет
+       * лишнего шага пересчёта. */
+      return {
+        pick: lenB < lenA ? 'second' : 'first',
+        reason: 'numeric_shorter',
+        similarity: Number(sim.toFixed(4)),
+        lengths: { first: lenA, second: lenB },
+        syntax,
+      };
+    }
+    /* Одинаковая длина и одинаковый «класс» — сигнала нет, первый. */
+    return {
+      pick: 'first',
+      reason: 'numeric_tie',
+      similarity: Number(sim.toFixed(4)),
+      lengths: { first: lenA, second: lenB },
+      syntax,
+    };
+  }
+
+  /* Правило 5: проза — более длинный. */
   const pick = lenB > lenA ? 'second' : 'first';
   return {
     pick,
