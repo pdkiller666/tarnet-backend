@@ -31,7 +31,7 @@ sudo ./scripts/backup.sh
 Ожидаемый вывод — одна строка JSON:
 
 ```json
-{"ok":true,"archive":"/var/backups/tarnet/tarnet-2026-11-11T20-24-25.tar.gz",
+{"ok":true,"archive":"/var/backups/tarnet/tarnet-2026-11-23T16-07-49.tar.gz",
  "bytes":1100271,"sha256":"1e2f04f7...","db_bytes":2310144,"files":27,
  "commit":"6559b6704c...","ts":"2026-11-11T20:24:26+03:00"}
 ```
@@ -55,10 +55,10 @@ sudo ./scripts/backup.sh
 
 ```bash
 # со старого хоста на локальную машину
-scp root@195.63.131.172:/var/backups/tarnet/tarnet-2026-11-11T20-24-25.tar.gz ./
+scp root@195.63.131.172:/var/backups/tarnet/tarnet-2026-11-23T16-07-49.tar.gz ./
 
 # с локальной машины на новый хост
-scp tarnet-2026-11-11T20-24-25.tar.gz root@NEW_HOST:/root/
+scp tarnet-2026-11-23T16-07-49.tar.gz root@NEW_HOST:/root/
 ```
 
 Проверка целостности после переноса — обе суммы должны совпасть:
@@ -86,9 +86,18 @@ cd /opt/tarnet/backend-api && git rev-parse --short HEAD
 # на старом хосте
 cd /opt/tarnet/backend-api && git bundle create /tmp/tarnet.bundle --tags main
 scp /tmp/tarnet.bundle root@NEW_HOST:/tmp/
-# на новом
-git clone /tmp/tarnet.bundle /opt/tarnet/backend-api
+# на новом — ОБЯЗАТЕЛЬНО -b main
+# без него: "warning: remote HEAD refers to nonexistent ref, unable to checkout",
+# дерево остаётся пустым, и следующий `git rev-parse --short HEAD` печатает
+# fatal: Needed a single revision
+# (проверено 23.11.2026 на migration/tarnet-repo.bundle)
+git clone -b main /tmp/tarnet.bundle /opt/tarnet/backend-api
 ```
+
+Флаг `--repo=<путь к бандлу>` у `bootstrap.sh` для этого **не годится**: он делает
+`git clone` без `-b` и умирает на проверке `[ -f "$DIR/server.js" ]`. Рабочий путь без
+GitHub — клонировать бандл самому (как выше), затем запускать `bootstrap.sh` из этого
+каталога: он увидит готовый `$DIR/.git` и сделает `fetch --all` + `reset --hard origin/main`.
 
 ---
 
@@ -98,13 +107,16 @@ git clone /tmp/tarnet.bundle /opt/tarnet/backend-api
 ssh root@NEW_HOST
 cd /opt/tarnet/backend-api
 sudo ./scripts/bootstrap.sh --domain=tarnet.example.com \
-     --restore=/root/tarnet-2026-11-11T20-24-25.tar.gz
+     --restore=/root/tarnet-2026-11-23T16-07-49.tar.gz
 ```
 
-Скрипт идёт по шагам и печатает `[01]…[11]`. Что должно быть в конце:
+Скрипт идёт по шагам и печатает `[01]…[12]` (двенадцать, не одиннадцать:
+`проверки окружения`, `swap`, `пакеты`, `каталоги`, `код`, `зависимости`,
+`восстановление данных`, `systemd`, `caddy`, `firewall`, `запуск`, `проверка`).
+Что должно быть в конце:
 
 ```
-[11] проверка
+[12] проверка
      ✅ локально /health 200, buildVersion <совпадает с package.json>
      ✅ снаружи https://tarnet.example.com/health → 200
 
@@ -121,8 +133,13 @@ sudo ./scripts/bootstrap.sh --domain=tarnet.example.com \
 | `[05] код` | `git clone` упал → переноси bundle (см. шаг 3) |
 | `[06] зависимости` | `npm ci` в `p2p-node` — **отдельный** lock; корневой его не покрывает. `onnxruntime-node не грузится` → нет `libstdc++` или не тот arch |
 | `[07] восстановление` | `нет secrets/master.key` → БД нерасшифровываема, архив неполный, пересобери бэкап |
-| `[09] systemd` | `systemd не видит TARNET_PUBLIC_URL` → drop-in не применился, `daemon-reload` не прошёл |
-| `[11] проверка` | `снаружи → 000` → A-запись ещё не указывает на новый хост |
+| `[08] systemd` | `systemd не видит TARNET_PUBLIC_URL` → drop-in не применился, `daemon-reload` не прошёл |
+| `[09] caddy` | `caddy validate` не прошёл или сертификат не выпущен — смотри A-запись и `journalctl -u caddy` |
+| `[12] проверка` | `снаружи → 000` → A-запись ещё не указывает на новый хост |
+
+`ok:true` в финальном JSON **не значит**, что снаружи всё хорошо: внешняя проверка
+только предупреждает (`warn`), а не падает. Смотри отдельное поле `health_external` —
+при проблемах с DNS там будет `000`, и это единственное место, где это видно.
 
 ---
 
@@ -133,7 +150,7 @@ dig +short tarnet.example.com
 # должен вернуть IP нового хоста
 ```
 
-Порядок важен: **сначала** A-запись, **потом** ждать. Caddy выпустит сертификат сам, как только домен начнёт резолвиться сюда. Если поменять DNS после `bootstrap.sh` — внешняя проверка упадёт на шаге `[11]`, это ожидаемо, повтори:
+Порядок важен: **сначала** A-запись, **потом** ждать. Caddy выпустит сертификат сам, как только домен начнёт резолвиться сюда. Если поменять DNS после `bootstrap.sh` — внешняя проверка упадёт на шаге `[12]`, это ожидаемо, повтори:
 
 ```bash
 curl -I https://tarnet.example.com/health
