@@ -110,7 +110,7 @@ fi
 say "пакеты"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq || die "apt-get update"
-apt-get install -y -qq ca-certificates curl gnupg git tar gzip openssl ufw \
+apt-get install -y -qq ca-certificates curl gnupg git tar gzip openssl ufw fail2ban \
   debian-keyring debian-archive-keyring apt-transport-https >/dev/null 2>&1 \
   || die "apt-get install базовых пакетов"
 
@@ -144,6 +144,56 @@ if ! command -v caddy >/dev/null 2>&1; then
 fi
 command -v caddy >/dev/null 2>&1 || die "caddy не установился"
 ok "caddy $(caddy version | head -1 | cut -d' ' -f1)"
+
+# Лимит журнала. На старом хосте SystemMaxUse не был задан вообще: за 29 дней
+# журнал вырос до 587 МБ из 40 ГБ диска, и это повторится на любом хосте.
+# Ставим в drop-in, а не в journald.conf: drop-in переживает обновление пакета,
+# которое перезаписывает основной файл.
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/99-tarnet.conf <<'EOF'
+[Journal]
+SystemMaxUse=500M
+EOF
+systemctl restart systemd-journald >/dev/null 2>&1 || warn "systemd-journald не перезапустился — лимит применится при следующей загрузке"
+ok "журнал ограничен 500 МБ ($(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[MG]' | head -1))"
+
+# Litestream. Бинаря нет в apt, а без него непрерывной репликации БД в S3 нет:
+# юнит уйдёт в бесконечный restart. Архив содержит litestream-tarnet.yml с
+# ключами, поэтому бинарь обязан стоять рядом — иначе репликация мертва молча.
+if ! command -v litestream >/dev/null 2>&1; then
+  LS_ARCH=amd64
+  [ "$(uname -m)" = "aarch64" ] && LS_ARCH=arm64
+  LS_URL="https://github.com/benbjohnson/litestream/releases/download/v0.3.13/litestream-v0.3.13-linux-${LS_ARCH}.tar.gz"
+  LS_TMP=$(mktemp -d)
+  if curl -fsSL --max-time 120 "$LS_URL" -o "$LS_TMP/litestream.tgz" 2>/dev/null \
+     && tar xzf "$LS_TMP/litestream.tgz" -C "$LS_TMP" 2>/dev/null \
+     && install -m 0755 "$LS_TMP/litestream" /usr/local/bin/litestream; then
+    ok "litestream $(/usr/local/bin/litestream version 2>/dev/null | head -1 | cut -d' ' -f1)"
+  else
+    warn "litestream не скачался ($LS_ARCH) — репликация в S3 будет выключена"
+  fi
+  rm -rf "$LS_TMP"
+else
+  ok "litestream уже установлен: $(litestream version 2>/dev/null | head -1 | cut -d' ' -f1)"
+fi
+
+# fail2ban: пакет ставится выше, но дефолтный jail не защищает SSH так, как
+# на проде. Политика та же (3 попытки, бан 1 ч) — переносим её явно.
+if [ -d /etc/fail2ban ] && [ ! -f /etc/fail2ban/jail.local ]; then
+  cat > /etc/fail2ban/jail.local <<'EOF'
+[DEFAULT]
+maxretry = 3
+bantime = 1h
+findtime = 10m
+
+[sshd]
+enabled = true
+EOF
+  systemctl restart fail2ban >/dev/null 2>&1 && ok "fail2ban: jail sshd (3 попытки, бан 1 ч)" \
+    || warn "fail2ban не перезапустился"
+else
+  ok "fail2ban: jail.local уже есть, не перезаписываю"
+fi
 
 # ---------------------------------------------------------------------------
 say "каталоги"
@@ -252,7 +302,11 @@ fi
 
 # ---------------------------------------------------------------------------
 say "systemd"
-UNITS="tarnet.service p2p-bridge.service tarnet-seed2.service tarnet-prune-distill.service tarnet-prune-distill.timer"
+# Шесть боевых сервисов, не четыре. Второй сид и мост — отдельные процессы
+# со своими peer-id.bin и портами (4001, 4002). Если их не поставить, хост
+# поднимется здоровым, но воркеры владельца не найдут узел и discovery умрёт
+# молча — /health при этом вернёт 200.
+UNITS="tarnet.service p2p-bridge.service tarnet-seed2.service litestream-tarnet.service tarnet-prune-distill.service tarnet-prune-distill.timer"
 for u in $UNITS; do
   [ -f "$DIR/deploy/systemd/$u" ] || die "нет $DIR/deploy/systemd/$u"
   install -m 0644 -o root -g root "$DIR/deploy/systemd/$u" "/etc/systemd/system/$u"

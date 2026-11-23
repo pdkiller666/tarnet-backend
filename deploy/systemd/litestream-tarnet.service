@@ -1,0 +1,17 @@
+[Unit]
+Description=Litestream replication for TarNet database
+Documentation=https://litestream.io
+After=network-online.target tarnet.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/litestream replicate -config /etc/litestream-tarnet.yml
+Restart=always
+RestartSec=5s
+# База 1.9 МБ: лимит не про размер, а про то, чтобы утечка не съела 40 ГБ.
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
