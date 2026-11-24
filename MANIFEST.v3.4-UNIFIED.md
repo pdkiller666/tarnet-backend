@@ -5946,17 +5946,15 @@ status sshd` → `Banned IP list`), после чего вход тем же к�
 правился в одной строке — константа `INSTALL_PUBLIC_URL`. Версия остаётся `2.29.26`,
 тег `v2.29.26-migration-complete`.
 
-**Замена адресов — 42 вхождения в активных инструкциях.** `docs/DEMO-SCRIPT.md`,
+**Замена адресов — 46 вхождений: 42 в инструкциях, 4 в коде.** `docs/DEMO-SCRIPT.md`,
 `docs/DEMO-RUNBOOK.md`, `docs/NAT-TEST.md`, `docs/NAT-TEST-SHORT.md`, `docs/REBOOT-TEST.md`,
 `docs/EMAIL-TEMPLATE.md`, `docs/PITCH-DECK.md`, `docs/WEBRTC-BROWSER-TEST.md`,
 `docs/STAGE-10-CHECKLIST.md`, `scripts/stage10-test.bat` — `v1107336.hosted-by-vdsina.com`
 → `tarnet.online`. Плюс сняты дефолты в коде, которые вернули бы старый адрес при пустой
 переменной: `server.js` (`INSTALL_PUBLIC_URL`), `p2p-node/p2p-worker.js` (`BOOTSTRAP_BASE`),
-`p2p-node/public-addr.js` (пример в комментарии), `worker-demo.js`, `dist/tarnet-worker.js`.
+`p2p-node/public-addr.js` (пример в комментарии), `worker-demo.js`. Ещё `dist/tarnet-worker.js` содержал тот же адрес, но это сборка из `gitignore`-каталога `dist/`: в коммит она не входит и пересобирается из исправленного `build-worker.js`, так что правкой репозитория не является.
 
-**33 вхождения оставлены намеренно.** Все — внутри записей с датой замера (`MANIFEST`
-§Б.10–Б.45, `PROJECT-HISTORY` §1534–6566, `docs/REALITY-CHECK-v4.md`,
-`docs/VISION-8-COMPONENTS.md`, `docs/PRE-FLIGHT-RECON.md`). Строка «Замер `24.10.2026`,
+**38 вхождений оставлены намеренно.** Все — внутри записей с датой замера или описания старого хоста: `MANIFEST` (17: §Б.10–Б.45 и эта запись), `PROJECT-HISTORY` (13: §1534–6566 и запись 24.11), `PROJECT-MAP` (1: «старый хост выводится после приёмки»), `ROADMAP` (2: замер 06.11 и строка `listen`), `docs/MIGRATION.md` (2), `docs/REALITY-CHECK-v4.md` (1), `docs/VISION-8-COMPONENTS.md` (1), `docs/PRE-FLIGHT-RECON.md` (1: цитата `verify.sh:45` на момент разведки). Строка «Замер `24.10.2026`,
 стенд `https://…`» с новым доменом стала бы ложью: в октябре `tarnet.online` не было.
 Хроника отвечает на «что было», поэтому старый адрес в ней — факт.
 
