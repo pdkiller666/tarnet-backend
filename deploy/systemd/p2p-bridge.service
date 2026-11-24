@@ -33,7 +33,7 @@ Environment=P2P_PORT=4001
 # получит multiaddr вида /ip4/0.0.0.0/... и не сможет подключиться, хотя
 # Peer ID будет валидным. Порт берётся из P2P_PORT — в URL его нет осознанно:
 # за прокси 443, а libp2p слушает 4001.
-Environment=P2P_PUBLIC_URL=https://v1107336.hosted-by-vdsina.com
+Environment=P2P_PUBLIC_URL=https://tarnet.online
 
 # Ключ узла ВНЕ рабочего дерева. Рабочее дерево переписывается `git reset
 # --hard` при каждом деплое; ключ там означал бы, что любая раскатка

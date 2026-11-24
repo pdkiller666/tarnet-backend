@@ -38,7 +38,7 @@
  */
 'use strict';
 
-const DEFAULT_URL = process.env.TARNET_PUBLIC_URL || 'https://v1107336.hosted-by-vdsina.com';
+const DEFAULT_URL = process.env.TARNET_PUBLIC_URL || 'https://tarnet.online';
 const NAME = 'Илья';
 
 function arg(name, fallback) {

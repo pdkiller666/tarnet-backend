@@ -33,7 +33,7 @@ Environment=P2P_PORT=4002
 # Порт в URL указан ЯВНО. Без него public-addr.js возьмёт порт прослушивания,
 # но лучше не полагаться на неявное совпадение: адрес объявляется пирам, и
 # опечатка здесь означала бы «peerId есть, адрес ведёт в пустоту».
-Environment=P2P_PUBLIC_URL=https://v1107336.hosted-by-vdsina.com:4002
+Environment=P2P_PUBLIC_URL=https://tarnet.online:4002
 
 # Отдельный ключ — отдельный peerId. См. комментарий в [Unit].
 Environment=P2P_DATA_DIR=/var/lib/tarnet/p2p-seed2

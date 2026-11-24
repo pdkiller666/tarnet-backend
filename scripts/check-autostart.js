@@ -33,7 +33,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const DEFAULT_URL = process.env.TARNET_PUBLIC_URL || 'https://v1107336.hosted-by-vdsina.com';
+const DEFAULT_URL = process.env.TARNET_PUBLIC_URL || 'https://tarnet.online';
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
 /**

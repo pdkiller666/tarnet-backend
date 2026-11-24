@@ -363,8 +363,26 @@ EOF
   warn "deploy/Caddyfile.tpl нет — сгенерирован встроенный конфиг"
 fi
 caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 || die "Caddyfile невалиден"
-systemctl enable --now caddy >/dev/null 2>&1 || die "caddy не запустился"
-ok "Caddyfile применён, caddy active"
+
+# RESTART, А НЕ `enable --now` (2.29.26, найдено первым живым переездом).
+# `apt-get install caddy` в том же прогоне уже поднял юнит через
+# postinst — с ДЕФОЛТНЫМ Caddyfile, который слушает только `:80` и отдаёт
+# файловый сервер. Для уже запущенного юнита `enable --now` — no-op:
+# состояние `active` есть, перечитывать конфиг никто не обязан. В итоге
+# `caddy validate` зелёный, `ok "Caddyfile применён"` напечатан, а `:443`
+# не слушается и ACME не может выпустить сертификат — установка выглядит
+# успешной и не работает. `restart` применяет конфиг всегда, поэтому
+# порядок не зависит от того, был ли юнит запущен раньше.
+systemctl enable caddy >/dev/null 2>&1 || die "caddy не включён в автозапуск"
+systemctl restart caddy >/dev/null 2>&1 || die "caddy не запустился"
+sleep 1
+systemctl is-active --quiet caddy || die "caddy не active после restart"
+# Проверка ФАКТА, а не кода возврата: слушается ли 443. Без неё следующий
+# шаг падал бы на ACME с невнятной причиной, а `ok` выше уже соврал бы.
+if ! ss -tln 2>/dev/null | grep -qE ':443\b'; then
+  die "caddy active, но :443 не слушается — конфиг не применён"
+fi
+ok "Caddyfile применён, caddy active, :443 слушается"
 
 # ---------------------------------------------------------------------------
 say "firewall"

@@ -28,7 +28,7 @@
 
 set -uo pipefail
 
-VPS="${TARNET_VPS:-root@195.63.131.172}"
+VPS="${TARNET_VPS:-root@193.57.139.10}"
 SSH_KEY="${TARNET_SSH_KEY:-$HOME/.openclaw/ssh/tarnet_vps}"
 SSH_OPTS=(-i "$SSH_KEY" -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
 REMOTE_FILE="/root/.ssh/authorized_keys"

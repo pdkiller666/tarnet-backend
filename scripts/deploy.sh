@@ -33,7 +33,7 @@ if [ -z "$GH_CREDS" ]; then
     [ -r "$_c" ] && { GH_CREDS="$_c"; break; }
   done
 fi
-VPS="${TARNET_VPS:-root@195.63.131.172}"
+VPS="${TARNET_VPS:-root@193.57.139.10}"
 # Ключ лежит на ПОСТОЯННОМ томе: ~/.ssh — overlay-слой контейнера и
 # исчезает при пересборке (08.11–09.11 так терялся доступ). ensure.sh
 # восстанавливает симлинк из постоянного тома, если его нет.
@@ -51,7 +51,7 @@ SERVICE="${TARNET_SERVICE:-tarnet}"
 # и приёмка P1.1 не могла закрыться при формально зелёном деплое.
 BRIDGE_SERVICE="${TARNET_BRIDGE_SERVICE:-p2p-bridge}"
 HEALTH_LOCAL="http://127.0.0.1:3001/health"
-PUBLIC_URL="${TARNET_PUBLIC_URL:-https://v1107336.hosted-by-vdsina.com}"
+PUBLIC_URL="${TARNET_PUBLIC_URL:-https://tarnet.online}"
 MSG="${1:-}"
 
 # Флаг в позиционном аргументе — это почти всегда ошибка вызова, а не сообщение

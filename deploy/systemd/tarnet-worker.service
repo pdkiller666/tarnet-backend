@@ -24,7 +24,7 @@ StateDirectory=tarnet-worker
 StateDirectoryMode=0700
 Environment=HOME=/var/lib/tarnet-worker
 
-Environment=TARNET_API_URL=https://v1107336.hosted-by-vdsina.com
+Environment=TARNET_API_URL=https://tarnet.online
 # Класс железа, а не ставка CWU. Прод — 1 vCPU / 1642 MB, поэтому `nano`.
 # `expert` здесь был бы заявкой на мощность, которой нет, и веса маршрутизации
 # (4 вместо 0.1) уводили бы на этот узел чужие задачи.
