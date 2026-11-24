@@ -5939,3 +5939,45 @@ status sshd` → `Banned IP list`), после чего вход тем же к�
 **Урок.** Проверка, которая ходит на хост много раз, обязана начинаться с одного дешёвого
 коннекта и падать на нём. Иначе инструмент диагностики сам становится источником отказа —
 и отказ выглядит как авария прода, хотя прод цел.
+
+### Б.113. 24.11.2026 — старый домен вычищен из активных инструкций, P1.5 зафиксирован (`2.29.26-migration-complete`)
+
+**Что это за релиз.** Docs-only плюс дефолты скриптов: логика ядра не менялась, `server.js`
+правился в одной строке — константа `INSTALL_PUBLIC_URL`. Версия остаётся `2.29.26`,
+тег `v2.29.26-migration-complete`.
+
+**Замена адресов — 42 вхождения в активных инструкциях.** `docs/DEMO-SCRIPT.md`,
+`docs/DEMO-RUNBOOK.md`, `docs/NAT-TEST.md`, `docs/NAT-TEST-SHORT.md`, `docs/REBOOT-TEST.md`,
+`docs/EMAIL-TEMPLATE.md`, `docs/PITCH-DECK.md`, `docs/WEBRTC-BROWSER-TEST.md`,
+`docs/STAGE-10-CHECKLIST.md`, `scripts/stage10-test.bat` — `v1107336.hosted-by-vdsina.com`
+→ `tarnet.online`. Плюс сняты дефолты в коде, которые вернули бы старый адрес при пустой
+переменной: `server.js` (`INSTALL_PUBLIC_URL`), `p2p-node/p2p-worker.js` (`BOOTSTRAP_BASE`),
+`p2p-node/public-addr.js` (пример в комментарии), `worker-demo.js`, `dist/tarnet-worker.js`.
+
+**33 вхождения оставлены намеренно.** Все — внутри записей с датой замера (`MANIFEST`
+§Б.10–Б.45, `PROJECT-HISTORY` §1534–6566, `docs/REALITY-CHECK-v4.md`,
+`docs/VISION-8-COMPONENTS.md`, `docs/PRE-FLIGHT-RECON.md`). Строка «Замер `24.10.2026`,
+стенд `https://…`» с новым доменом стала бы ложью: в октябре `tarnet.online` не было.
+Хроника отвечает на «что было», поэтому старый адрес в ней — факт.
+
+**Два пункта задания не подтвердились при проверке — записаны по факту.**
+- `scripts/check-webrtc.js` **не содержит** `DEFAULT_URL`: базовый адрес —
+  `TARNET_BASE || http://127.0.0.1:3001`, старого домена в файле нет.
+- `scripts/check-autostart.js` уже имел дефолт `https://tarnet.online` — правки не требовалось.
+  Реально требовался только `scripts/stage10-test.bat` (`BASE`), сохранён чистым ASCII
+  с CRLF (223 пары) — иначе CMD читает UTF-8 как OEM и ломает разбор меток.
+
+**Провайдер — со слов владельца, замером не подтверждён.** Владелец называет HOSTKEY.
+RDAP для `193.57.139.10` отдаёт `DOMREGKZ_NET` (`193.57.139.0/24`), страна `FI`,
+abuse-роль `IPSMAIN`, организация `Domains Registration LLP`; `PTR` отсутствует, `whois`
+на gateway нет. В документах записано измеряемое: IP, `srv-15054`, Ubuntu 24.04.3.
+
+**«Оставить старый хост на сутки» отменено замером.** `195.63.131.172`: `:22`, `:80`, `:443`
+— timeout по 6000 мс; DNS `v1107336.hosted-by-vdsina.com` — `NXDOMAIN`. Держать нечего,
+откат «одной правкой DNS» невозможен. Копии данных: работающая машина + S3-реплика
+Litestream + два архива (`sha256 9c969ffa…` сверен на обоих).
+
+**Чего это НЕ доказывает.** Деплой коммита на хост не выполнен: `:22` закрыт баном fail2ban
+на собственный IP (`bantime=1h`), `verify.sh` не дошёл до SSH-шагов. На поведение прода
+это не влияет: `TARNET_PUBLIC_URL` задан drop-in'ом `deploy/systemd/tarnet.service.d/public-url.conf`.
+Живой воркер после переезда не подключался (`active_workers: 0`).

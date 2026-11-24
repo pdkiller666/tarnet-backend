@@ -24,9 +24,9 @@
 **Как проверить обе стороны.**
 
 ```bash
-curl -s "https://v1107336.hosted-by-vdsina.com/p2p/discover?model=qwen2.5-coder:1.5b"
+curl -s "https://tarnet.online/p2p/discover?model=qwen2.5-coder:1.5b"
 # ожидание: "found": 1, "rejected": []
-curl -s https://v1107336.hosted-by-vdsina.com/health
+curl -s https://tarnet.online/health
 # ожидание: active_p2p_workers: 1, p2p_model_families: ["qwen2.5-coder"], llm_mode: "worker"
 ```
 
@@ -64,8 +64,8 @@ deterministic_fallback`, `reason: no_workers`) было честным нулё�
 
 ```powershell
 cd "$env:LOCALAPPDATA\TarNet"
-$env:TARNET_API_URL="https://v1107336.hosted-by-vdsina.com"
-$env:TARNET_PUBLIC_URL="https://v1107336.hosted-by-vdsina.com"
+$env:TARNET_API_URL="https://tarnet.online"
+$env:TARNET_PUBLIC_URL="https://tarnet.online"
 $env:P2P_MODEL_FAMILIES="qwen2.5-coder"
 $env:P2P_DEVICE_CLASS="cpu"
 $env:P2P_RUNTIMES="ollama"
@@ -75,7 +75,7 @@ node tarnet-worker.js --test-p2p
 Строки, которые должны появиться (точные, из `p2p-node/p2p-worker.js`):
 
 ```
-[p2p-worker] адрес из bootstrap: /dns4/v1107336.hosted-by-vdsina.com/tcp/4001/p2p/12D3KooW…
+[p2p-worker] адрес из bootstrap: /dns4/tarnet.online/tcp/4001/p2p/12D3KooW…
 [p2p-worker] подключено: 12D3KooW…
 [p2p-worker] hello отправлен от 0x…
 [p2p-worker] поток задач открыт: …

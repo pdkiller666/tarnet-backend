@@ -20,7 +20,7 @@
 
 | # | Что | Как проверить | Если нет |
 |---|---|---|---|
-| 1 | Воркер установлен | папка `%LOCALAPPDATA%\TarNet` и в ней `start.cmd` | скачать установщик с прода: `https://v1107336.hosted-by-vdsina.com/install/install.bat` (в репозитории лежит только шаблон `install/install.bat.tpl`, готового `.bat` там нет — его собирает сервер) |
+| 1 | Воркер установлен | папка `%LOCALAPPDATA%\TarNet` и в ней `start.cmd` | скачать установщик с прода: `https://tarnet.online/install/install.bat` (в репозитории лежит только шаблон `install/install.bat.tpl`, готового `.bat` там нет — его собирает сервер) |
 | 2 | Автозапуск создан | в `shell:startup` лежит `TarNet Worker.lnk` | переустановить; установщик пишет `Autostart: worker starts automatically when you sign in`, а при неудаче — `WARNING: could not create the autostart shortcut` |
 | 3 | ПК привязан | в PWA вкладка «Мои устройства» показывает этот ПК | привязать кодом: кнопка с кодом в PWA → 6 цифр в окно воркера |
 | 4 | Адрес этого ПК известен | `type %USERPROFILE%\.tarnet\worker.json` → есть `address: "0x…40 hex"` | без него критерий ослабнет до «хоть один воркер», и тест ничего не докажет про **этот** ПК |
@@ -40,7 +40,7 @@
 сравнивать. Выполнять в `cmd` на этом ПК:
 
 ```bat
-curl -s https://v1107336.hosted-by-vdsina.com/health
+curl -s https://tarnet.online/health
 ```
 
 Запишите три числа: `active_workers`, `active_p2p_workers`, `buildVersion`.

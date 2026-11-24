@@ -55,7 +55,7 @@ import { createTaskHandler } from './task-handler.js'
 import { NonceStore } from './task-grant.js'
 
 const BOOTSTRAP_BASE = (
-  process.env.TARNET_PUBLIC_URL || 'https://v1107336.hosted-by-vdsina.com'
+  process.env.TARNET_PUBLIC_URL || 'https://tarnet.online'
 ).replace(/\/+$/, '')
 
 /* Сколько ждать ответа bootstrap. Короткий таймаут намеренно: это discovery,

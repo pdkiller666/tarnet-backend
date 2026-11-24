@@ -28,7 +28,7 @@
 выглядеть как «клиент сломан», хотя проверять было нечего.
 
 ```bash
-BASE=https://v1107336.hosted-by-vdsina.com
+BASE=https://tarnet.online
 curl -s $BASE/health | node -pe 'const j=JSON.parse(require("fs").readFileSync(0));`workers=${j.active_p2p_workers} build=${j.buildVersion}`'
 curl -s "$BASE/p2p/discover?model=qwen2.5-coder:1.5b" | node -pe 'JSON.parse(require("fs").readFileSync(0)).found'
 ```

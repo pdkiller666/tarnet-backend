@@ -2,7 +2,7 @@
 
 > **Проверено на `2.26.6` (коммит `bf5b38d` + правки `2.26.6`).** Если на проде другая
 > версия — NAT-тест не запускать, сначала докатить. Проверить одной командой:
-> `curl -s https://v1107336.hosted-by-vdsina.com/health | grep -o '"buildVersion":"[^"]*"'`.
+> `curl -s https://tarnet.online/health | grep -o '"buildVersion":"[^"]*"'`.
 > Причина простая: разделы ниже описывают поля и пути, которые менялись между
 > сборками, и отчёт со старой версии не отличим от отчёта о дефекте новой.
 
@@ -45,7 +45,7 @@ P2P — самая частая ошибка.
 - Windows: `%LOCALAPPDATA%\TarNet`
 
 Установщик скачивается на странице `/app/` с сервера
-(`https://v1107336.hosted-by-vdsina.com/app/`).
+(`https://tarnet.online/app/`).
 
 ### 1.1. Убедиться, что транспорт реально встал
 
@@ -133,7 +133,7 @@ WS работал, и всё выглядело исправным. Это ис�
 Порядок при исправном старте:
 
 ```
-[p2p-worker] bootstrap: https://v1107336.hosted-by-vdsina.com/p2p/bootstrap
+[p2p-worker] bootstrap: https://tarnet.online/p2p/bootstrap
 [p2p-worker] мой peerId: 12D3KooW…
 [p2p-worker] адрес из bootstrap: /dns4/…/tcp/4001/p2p/12D3KooW…
 [p2p-worker] подключено: 12D3KooW…
@@ -185,7 +185,7 @@ node scripts/check-autostart.js --window 60 --interval 5
 ### 4.3. Сырой ответ сервера
 
 ```bash
-curl -s https://v1107336.hosted-by-vdsina.com/p2p/status
+curl -s https://tarnet.online/p2p/status
 ```
 
 Поля, которые важны:

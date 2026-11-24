@@ -34,7 +34,7 @@ function classifyHost (host) {
  * Разбирает `P2P_PUBLIC_URL` в список multiaddr.
  *
  * Поддерживаются формы, которые реально встречаются в systemd-юнитах:
- *   `https://v1107336.hosted-by-vdsina.com`   — публичный URL прокси
+ *   `https://tarnet.online`   — публичный URL прокси
  *   `http://1.2.3.4:4001`                     — прямой адрес с портом
  *   `1.2.3.4:4001`                            — без схемы
  *   `/ip4/1.2.3.4/tcp/4001`                   — уже multiaddr

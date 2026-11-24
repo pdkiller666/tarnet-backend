@@ -30,7 +30,7 @@ rem  install/install.bat.tpl, same reason.
 rem ============================================================
 setlocal EnableDelayedExpansion
 
-set "BASE=https://v1107336.hosted-by-vdsina.com"
+set "BASE=https://tarnet.online"
 set "LOG=%~dp0stage10-test.log"
 set "MODE=%~1"
 

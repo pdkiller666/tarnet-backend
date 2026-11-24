@@ -1,6 +1,6 @@
 # DEMO-RUNBOOK — показ TarNet инвестору
 
-**Версия:** `2.17.0-ws-utility` · **Стенд:** `https://v1107336.hosted-by-vdsina.com`
+**Версия:** `2.17.0-ws-utility` · **Стенд:** `https://tarnet.online`
 **Приёмка:** 980/980 ✅ (`test-dpouw.js`) + 25/25 (`test-mesh.js`) = **1005 проверок**
 **Сверено:** 2026-10-24 07:30 MSK. Хеш сборки здесь намеренно не указан — он меняется
 каждый деплой, и такая строка устаревает быстрее, чем её успевают прочитать.
@@ -14,7 +14,7 @@
 ## ⚠ Для демо инвестору — ТОЛЬКО боевой URL
 
 ```
-✅ https://v1107336.hosted-by-vdsina.com      ← только это
+✅ https://tarnet.online      ← только это
 ❌ https://*.trycloudflare.com               ← НЕЛЬЗЯ для показа
 ```
 
@@ -28,7 +28,7 @@
 
 - **Quick tunnel (`*.trycloudflare.com`) — только для dev.** Внутренняя
   проверка, отладка, `curl` с ноутбука. Инвесторам и в переписках — никогда.
-- **Инвесторам — только боевой URL** `https://v1107336.hosted-by-vdsina.com`.
+- **Инвесторам — только боевой URL** `https://tarnet.online`.
 - **Named tunnel** — если появится домен на Cloudflare. Только он даёт
   постоянное имя; quick tunnel меняет hostname при каждом старте.
 
@@ -40,7 +40,7 @@
 Проверка перед показом, что открыт именно боевой стенд:
 
 ```bash
-curl -s https://v1107336.hosted-by-vdsina.com/health \
+curl -s https://tarnet.online/health \
   | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).buildVersion))"
 # ожидаем: 2.17.0-ws-utility  (и cloudflared_processes: 0)
 ```
@@ -53,7 +53,7 @@ curl -s https://v1107336.hosted-by-vdsina.com/health \
 ## Шаг 1. Открыть `/app/` на телефоне
 
 ```
-https://v1107336.hosted-by-vdsina.com/app/
+https://tarnet.online/app/
 ```
 
 Телефон подключается к тому же узлу, что и ПК: это PWA, ставится на домашний
@@ -85,7 +85,7 @@ https://v1107336.hosted-by-vdsina.com/app/
 ## Шаг 3. Открыть `/health` в браузере — показать `delta: 0`
 
 ```
-https://v1107336.hosted-by-vdsina.com/health
+https://tarnet.online/health
 ```
 
 Смотреть три поля:
@@ -107,7 +107,7 @@ https://v1107336.hosted-by-vdsina.com/health
 ## Шаг 4. Открыть `/p2p/status` — показать 3 узла
 
 ```
-https://v1107336.hosted-by-vdsina.com/p2p/status
+https://tarnet.online/p2p/status
 ```
 
 ```json
@@ -122,7 +122,7 @@ https://v1107336.hosted-by-vdsina.com/p2p/status
 **Проверка, которую стоит показать живьём** (она убедительнее экрана):
 
 ```bash
-curl -s -X POST https://v1107336.hosted-by-vdsina.com/inference/onion \
+curl -s -X POST https://tarnet.online/inference/onion \
   -H 'Content-Type: application/json' \
   -d '{"routeNodes":["0x2491ab72f3cdfa132059df7e5cf08a0ea4c9fe25","0xabe139a759a3e77649eabc45fa5319e7085b2610","0x3281abaf01c3d746d09934b8e3a64344c0de3640"],"prompt":"demo"}'
 ```
@@ -134,8 +134,8 @@ curl -s -X POST https://v1107336.hosted-by-vdsina.com/inference/onion \
 ## Шаг 5. Запустить `worker.js` на ПК — показать `llm_mode: worker`
 
 ```bash
-curl -O https://v1107336.hosted-by-vdsina.com/download/worker.js
-TARNET_API_URL=https://v1107336.hosted-by-vdsina.com node worker.js
+curl -O https://tarnet.online/download/worker.js
+TARNET_API_URL=https://tarnet.online node worker.js
 ```
 
 Файл качать **заново перед каждым показом**, не переиспользовать скачанный
@@ -143,7 +143,7 @@ TARNET_API_URL=https://v1107336.hosted-by-vdsina.com node worker.js
 
 Размер файла не константа и меняется с каждой правкой воркера, поэтому
 **не сверяйте его с числом из документа** — сверяйте с коммитом. Проверять так:
-`curl -s https://v1107336.hosted-by-vdsina.com/download/worker.js | sha256sum`
+`curl -s https://tarnet.online/download/worker.js | sha256sum`
 и сравнить с `sha256` того же файла в репозитории. История чисел: 13430 →
 16509 → 19511 → 19925 (на `e1ad5ef`) → 25342 (на `5427097`, после
 исправления `modelId`). Зависимостей нет, нужен Node 18+.
@@ -159,7 +159,7 @@ TARNET_API_URL=https://v1107336.hosted-by-vdsina.com node worker.js
 
 ```bash
 for m in qwen2.5-coder-7b deepseek-r1-distill-1.5b; do
-  curl -s -X POST https://v1107336.hosted-by-vdsina.com/inference \
+  curl -s -X POST https://tarnet.online/inference \
     -H 'Content-Type: application/json' \
     -d "{\"prompt\":\"test\",\"clientAddress\":\"$ADDR\",\"modelId\":\"$m\"}" \
     | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s);console.log(r.model_id,"→",r.model,"|",r.source)})'
@@ -271,9 +271,9 @@ done
 ```bash
 ADDR=0x1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d
 curl -s -o /dev/null -w '%{http_code}\n' \
-  "https://v1107336.hosted-by-vdsina.com/install/install.bat?addr=$ADDR"   # 200
+  "https://tarnet.online/install/install.bat?addr=$ADDR"   # 200
 curl -s -o /dev/null -w '%{http_code}\n' \
-  "https://v1107336.hosted-by-vdsina.com/install/install.bat"              # 400
+  "https://tarnet.online/install/install.bat"              # 400
 ```
 
 ---
@@ -323,7 +323,7 @@ systemctl show tarnet -p Environment | tr ' ' '\n' | grep DEMO_MODE   # → DEMO
 Проверка, что флаг действительно в живом процессе (unit мог не примениться):
 
 ```bash
-curl -s -X POST https://v1107336.hosted-by-vdsina.com/demo/flush-work \
+curl -s -X POST https://tarnet.online/demo/flush-work \
   -H 'Content-Type: application/json' \
   -d '{"workerAddress":"0x0000000000000000000000000000000000000001"}'
 # 403 → флаг не применился; 404 → флаг есть, накопления нет (это успех)
@@ -347,7 +347,7 @@ systemctl show tarnet -p Environment | tr ' ' '\n' | grep -c DEMO_MODE   # → 0
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-  https://v1107336.hosted-by-vdsina.com/demo/flush-work \
+  https://tarnet.online/demo/flush-work \
   -H 'Content-Type: application/json' \
   -d '{"workerAddress":"0x0000000000000000000000000000000000000001"}'
 # ожидаем 403
@@ -372,7 +372,7 @@ echo "DEMO_RUNBOOK: выключить DEMO_MODE на tarnet после пока
 ### Как вызвать
 
 ```bash
-curl -s -X POST https://v1107336.hosted-by-vdsina.com/demo/flush-work \
+curl -s -X POST https://tarnet.online/demo/flush-work \
   -H 'Content-Type: application/json' \
   -d '{"workerAddress":"0x..."}' | python3 -m json.tool
 ```

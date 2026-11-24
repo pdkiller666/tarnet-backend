@@ -14,7 +14,7 @@
  * ЗАВИСИМОСТЕЙ НЕТ: нужен только Node 18+ (встроенный fetch).
  *
  * ЗАПУСК:
- *   TARNET_API_URL=https://v1107336.hosted-by-vdsina.com node tarnet-worker.js
+ *   TARNET_API_URL=https://tarnet.online node tarnet-worker.js
  */
 
 const os = require('os');

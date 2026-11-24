@@ -3437,7 +3437,7 @@ const INSTALL_ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
 /* Публичный адрес стенда для подстановки внутрь скрипта. Именно константа,
  * а не req.get('host'): см. пункт 2 выше. */
 const INSTALL_PUBLIC_URL = (process.env.TARNET_PUBLIC_URL
-  || 'https://v1107336.hosted-by-vdsina.com').replace(/\/+$/, '');
+  || 'https://tarnet.online').replace(/\/+$/, '');
 
 /* Значение уходит внутрь .bat и .command, где опасны кавычки, %, ^, &, |, <, >
  * и перевод строки. Проверяем формат URL целиком, а не ищем отдельные

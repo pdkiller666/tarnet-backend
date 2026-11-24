@@ -12,7 +12,7 @@
 Открой на ПК страницу:
 
 ```
-https://v1107336.hosted-by-vdsina.com/app/
+https://tarnet.online/app/
 ```
 
 Нажми кнопку установки воркера. Установщик сам скачает воркер и транспорт (`p2p-node`),
@@ -76,7 +76,7 @@ node ~/.tarnet/scripts/check-autostart.js --window 60 --interval 5
 Либо просто открой в браузере:
 
 ```
-https://v1107336.hosted-by-vdsina.com/p2p/status
+https://tarnet.online/p2p/status
 ```
 
 ---

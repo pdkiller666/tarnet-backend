@@ -31,7 +31,7 @@
 ## Шаг 0 — Проверить, что стенд жив (15 секунд)
 
 ```bash
-curl -s https://v1107336.hosted-by-vdsina.com/health | head -c 200
+curl -s https://tarnet.online/health | head -c 200
 ```
 
 Ожидаемо: `HTTP 200`, в теле `"status":"ok"`, `"buildVersion":"2.17.0-ws-utility"`.
@@ -44,18 +44,18 @@ curl -s https://v1107336.hosted-by-vdsina.com/health | head -c 200
 
 **Зачем инвестору:** сеть — это не схема на слайде, а процесс на его машине.
 
-1. Открыть PWA: `https://v1107336.hosted-by-vdsina.com/app/`
+1. Открыть PWA: `https://tarnet.online/app/`
 2. Скопировать свой адрес из-под баланса (40 hex после `0x`).
 3. Поставить воркер на свою машину — установщик подставит адрес сам:
 
    **Windows:**
    ```
-   https://v1107336.hosted-by-vdsina.com/install/install.bat?addr=ВАШ_АДРЕС
+   https://tarnet.online/install/install.bat?addr=ВАШ_АДРЕС
    ```
 
    **macOS:**
    ```
-   https://v1107336.hosted-by-vdsina.com/install/install.command?addr=ВАШ_АДРЕС
+   https://tarnet.online/install/install.command?addr=ВАШ_АДРЕС
    ```
 
    Оба эндпоинта проверены: `HTTP 200` с адресом, `400 addr required` без него.
@@ -64,7 +64,7 @@ curl -s https://v1107336.hosted-by-vdsina.com/health | head -c 200
 
    ```
    TarNet worker
-   сервер:  https://v1107336.hosted-by-vdsina.com
+   сервер:  https://tarnet.online
    адрес:   0x…   ← должен совпасть с адресом в PWA
    бэкенд:  ollama (или fallback)
    ```
@@ -167,8 +167,8 @@ curl -s https://v1107336.hosted-by-vdsina.com/health | head -c 200
 **Зачем инвестору:** цифры можно пересчитать самому.
 
 ```bash
-curl -s https://v1107336.hosted-by-vdsina.com/health   | python3 -m json.tool | grep -A6 conservation
-curl -s https://v1107336.hosted-by-vdsina.com/summary  | python3 -m json.tool | head -20
+curl -s https://tarnet.online/health   | python3 -m json.tool | grep -A6 conservation
+curl -s https://tarnet.online/summary  | python3 -m json.tool | head -20
 ```
 
 **Проверенный снимок прода (28.10.2026, 21:15 MSK):**
