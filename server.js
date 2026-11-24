@@ -771,6 +771,17 @@ ensureColumn('worker_tasks', 'maxTokens', 'maxTokens INTEGER');
  * и не «провалила»). */
 ensureColumn('worker_tasks', 'promptHash', 'promptHash TEXT');
 ensureColumn('worker_tasks', 'promptHashVerified', 'promptHashVerified INTEGER');
+/* Чем задача реально ушла воркеру (2.29.27, Этап 10 п. 5).
+ *
+ * ПОЧЕМУ КОЛОНКА, А НЕ ВЫВОД ПО ХОДУ. Транспортов три (`ws`, `p2p`, `poll`),
+ * и до этой правки ни один из них не оставлял следа в строке задачи. Отчёт
+ * «работает по WebRTC» или «доставлено каналом» держался бы на логе, которого
+ * у отчёта нет. Теперь транспорт — факт в БД, и он переживает перезапуск.
+ *
+ * ПОЧЕМУ NULL — ЧЕСТНОЕ ЗНАЧЕНИЕ. Старые строки его не имеют, и подставлять
+ * туда `http` значило бы утверждать, как шла доставка, которую никто не
+ * записывал. */
+ensureColumn('worker_tasks', 'dispatchedVia', 'dispatchedVia TEXT');
 
 /* ===== P1.1b: вызовы инструментов от модели =====
  *
@@ -8273,7 +8284,7 @@ const wsInbound = createWsInbound({
      * держать задачу за ним — значит дать ей истечь при живых узлах. */
     const back = run(
       `UPDATE worker_tasks SET status = 'pending', claimedAt = NULL, workerAddress = NULL,
-         intendedWorker = NULL, requeues = COALESCE(requeues, 0) + 1
+         intendedWorker = NULL, dispatchedVia = NULL, requeues = COALESCE(requeues, 0) + 1
        WHERE taskId = ? AND status = 'claimed'`,
       [taskId],
     );
@@ -8402,7 +8413,8 @@ async function dispatchTaskOverP2p({
   /* Атомарный claim — до отправки, как и на WS. Иначе воркер мог бы
    * получить одну задачу и кадром, и опросом, и посчитать дважды. */
   const claimed = run(
-    `UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?, intendedWorker = ?
+    `UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?, intendedWorker = ?,
+           dispatchedVia = 'p2p'
      WHERE taskId = ? AND status = 'pending'`,
     [Date.now(), addr, addr, taskId],
   );
@@ -8444,7 +8456,7 @@ async function dispatchTaskOverP2p({
     const err = (reply && reply.error) || 'UNKNOWN';
     if (P2P_SAFE_TO_REQUEUE.has(err)) {
       run(`UPDATE worker_tasks SET status = 'pending', claimedAt = NULL, workerAddress = NULL,
-             intendedWorker = NULL
+             intendedWorker = NULL, dispatchedVia = NULL
            WHERE taskId = ? AND status = 'claimed'`, [taskId]);
       console.log(`p2p: задача ${taskId} не ушла (${err}) — оставлена в очереди для poll`);
       return { attempted: true, delivered: false, reason: err };
@@ -8463,7 +8475,7 @@ async function dispatchTaskOverP2p({
     const err = r.reason || r.error || 'EXEC_FAILED';
     if (P2P_SAFE_TO_REQUEUE.has(err)) {
       run(`UPDATE worker_tasks SET status = 'pending', claimedAt = NULL, workerAddress = NULL,
-             intendedWorker = NULL
+             intendedWorker = NULL, dispatchedVia = NULL
            WHERE taskId = ? AND status = 'claimed'`, [taskId]);
     } else {
       run(`UPDATE worker_tasks SET status = 'failed' WHERE taskId = ? AND status = 'claimed'`, [taskId]);
@@ -8634,7 +8646,8 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
 
   if (wsAddr && wsKeyField) {
     const claimed = run(
-      `UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?, intendedWorker = ?
+      `UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?, intendedWorker = ?,
+             dispatchedVia = 'ws'
        WHERE taskId = ? AND status = 'pending'`,
       [now, wsAddr, String(wsAddr).toLowerCase(), taskId],
     );
@@ -8663,7 +8676,7 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
         /* Задачу никто не получил — привязку снимаем, иначе строка останется
          * нацеленной на сокет, которого уже нет, и poll её не отдаст. */
         run(`UPDATE worker_tasks SET status = 'pending', claimedAt = NULL, workerAddress = NULL,
-               intendedWorker = NULL
+               intendedWorker = NULL, dispatchedVia = NULL
              WHERE taskId = ? AND status = 'claimed'`, [taskId]);
       }
     }
@@ -8729,6 +8742,11 @@ function enqueueWorkerTask({ prompt, model, tier, workerAddress = null, maxToken
            * что именно случилось на этом ПК. */
           errorDetail: row.errorDetail || null,
           workerAddress: row.workerAddress,
+          /* Чем задача фактически ушла воркеру (2.29.27): 'ws' | 'p2p' |
+           * 'poll'. null — строка старше учёта или задача ещё не доставлена.
+           * Клиенту нужно это поле, чтобы отчёт «работает по WebRTC» или
+           * «доставлено каналом» опирался на факт, а не на обещание. */
+          dispatchedVia: row.dispatchedVia || null,
           /* Три состояния, как и в БД (2.23.3): true — хеш сошёлся,
            * false — не прислан или не сошёлся, null — задача старше
            * механизма, сверять было нечего. Схлопывать null в false здесь
@@ -9178,7 +9196,8 @@ app.get('/worker/poll', (req, res) => {
     });
   }
 
-  const claimed = run(`UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?
+  const claimed = run(`UPDATE worker_tasks SET status = 'claimed', claimedAt = ?, workerAddress = ?,
+         dispatchedVia = 'poll'
        WHERE taskId = ? AND status = 'pending'`,
     [now, workerAddress, task.taskId]);
   if (!claimed || Number(claimed.changes) !== 1) {
@@ -9617,6 +9636,51 @@ async function runInference(req, res) {
   const canonicalPrompt = conv.from === 'messages'
     ? conversation.messagesToPrompt(history)
     : null;
+  /* --- Явный отказ на прямой транспорт (2.29.27, Этап 10 п. 5) ---
+   *
+   * ПОЧЕМУ ОТКАЗ, А НЕ МОЛЧАЛИВЫЙ ФОЛБЭК. Клиент мог бы попросить
+   * `transport:'webrtc'`, поверить ответу 200 и считать, что задача ушла
+   * по DataChannel, — а на деле она бы ушла WS-кадром или опросом.
+   * Молчаливая подмена транспорта — тот же класс лжи, что и выдача
+   * заглушки за ответ модели.
+   *
+   * ПОЧЕМУ ИМЕННО 501. Это не ошибка клиента (400) и не отказ сервера
+   * по нагрузке (503): возможность объявлена в плане, но не реализована
+   * в коде — стандартный смысл 501 Not Implemented. Ответ несёт
+   * `implemented: false` и список того, что есть, чтобы клиент не
+   * догадывался.
+   *
+   * ЧТО ЕСТЬ СЕЙЧАС. Три реальных транспорта доставки задачи воркеру:
+   * `ws` (сокет), `p2p` (libp2p-канал) и `poll` (HTTP-опрос). Фактический
+   * транспорт пишется в `worker_tasks.dispatchedVia` и отдаётся в ответе
+   * как `dispatched_via`. */
+  const requestedTransport = typeof body.transport === 'string'
+    ? body.transport.trim().toLowerCase()
+    : null;
+  if (requestedTransport === 'webrtc' || requestedTransport === 'datachannel') {
+    console.log(`inference: отказ по транспорту '${requestedTransport}' — ` +
+      'WebRTC-доставка задачи не реализована (есть ws, p2p, poll)');
+    return res.status(501).json({
+      error: 'TRANSPORT_NOT_IMPLEMENTED',
+      code: 'TRANSPORT_NOT_IMPLEMENTED',
+      requested_transport: requestedTransport,
+      implemented: false,
+      /* Явный перечень того, что работает: клиент не должен угадывать. */
+      available_transports: ['ws', 'p2p', 'poll'],
+      /* Почему отказ, а не тихий переход на WS: подмена транспорта сделала
+       * бы отчёт «работает по WebRTC» неправдой без единого сигнала. */
+      note: 'Задача по WebRTC-DataChannel не доставляется: серверного пути нет. ' +
+        'Уберите поле `transport` или укажите ws|p2p|poll.',
+    });
+  }
+  if (requestedTransport && !['ws', 'p2p', 'poll', 'http'].includes(requestedTransport)) {
+    return res.status(400).json({
+      error: 'UNKNOWN_TRANSPORT',
+      code: 'UNKNOWN_TRANSPORT',
+      requested_transport: requestedTransport,
+      available_transports: ['ws', 'p2p', 'poll'],
+    });
+  }
   const adapterId = typeof body.adapterId === 'string' && body.adapterId.length ? body.adapterId : BASE_MODEL;
   /* let, а не const: при фолбэке Tier 6 на локальный воркер тир
    * переписывается на base (external-тир не имеет κ). С const это
@@ -11460,6 +11524,11 @@ async function runInference(req, res) {
     suggested_model: suggested ? suggested.modelId : null,
     worker: workerAddress,
     workerAddress,
+    /* Чем задача фактически ушла воркеру (2.29.27). Пришло из строки задачи
+     * через resolve — то есть это записанный факт, а не вывод из режима
+     * маршрута. null — ветка не через worker_tasks (external_api) или
+     * строка старше учёта. */
+    dispatched_via: result.dispatchedVia || null,
     routing,
     /* Private Swarm: что реально произошло. null = клиент не просил. При
      * запросе поле есть всегда: либо состоявшаяся параллель с победителем и

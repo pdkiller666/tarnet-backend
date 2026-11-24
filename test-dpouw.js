@@ -12745,6 +12745,35 @@ async function signedPollPath(addr, extraQs = '', base = BASE) {  await bindWork
       { status: bad.status, code: bad.body?.code });
   }
 
+  /* --- 67.5 явный отказ на прямой транспорт (2.29.27, Этап 10 п. 5) ---
+   * Серверного пути доставки задачи по WebRTC-DataChannel нет. Значит
+   * запрос с `transport:'webrtc'` обязан получить отказ, а не 200 с тихой
+   * подменой на WS. Проверяем обе стороны: отказ и перечень живых путей. */
+  {
+    const wr = await api('/inference', 'POST', {
+      prompt: 'transport refusal probe', clientAddress: wA,
+      transport: 'webrtc', maxTokens: 16,
+    });
+    ok('67.5 transport:webrtc → 501 TRANSPORT_NOT_IMPLEMENTED',
+      wr.status === 501 && wr.body?.code === 'TRANSPORT_NOT_IMPLEMENTED',
+      { status: wr.status, code: wr.body?.code });
+    ok('67.5 отказ перечисляет рабочие транспорты',
+      Array.isArray(wr.body?.available_transports)
+        && wr.body.available_transports.includes('ws')
+        && wr.body.available_transports.includes('p2p')
+        && wr.body.available_transports.includes('poll')
+        && wr.body?.implemented === false,
+      { got: wr.body?.available_transports, implemented: wr.body?.implemented });
+
+    const ur = await api('/inference', 'POST', {
+      prompt: 'unknown transport probe', clientAddress: wA,
+      transport: 'carrier-pigeon', maxTokens: 16,
+    });
+    ok('67.5 неизвестный транспорт → 400 UNKNOWN_TRANSPORT',
+      ur.status === 400 && ur.body?.code === 'UNKNOWN_TRANSPORT',
+      { status: ur.status, code: ur.body?.code });
+  }
+
   console.log('\n' + '─'.repeat(50));
   console.log(`Итого: ${pass} ✅   ${fail} ❌${skipped ? `   ${skipped} ⏭️  SKIP` : ''}`);
   if (fail) {

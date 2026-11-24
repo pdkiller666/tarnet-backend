@@ -1,4 +1,4 @@
-# TarNet / Synapse — dPoUW backend (`2.29.26`)
+# TarNet / Synapse — dPoUW backend (`2.29.27`)
 
 Демонстрационный стенд экономики **Deterministic Proof-of-Useful-Work**.
 Каждая подтверждённая единица работы даёт точное, заранее вычислимое
