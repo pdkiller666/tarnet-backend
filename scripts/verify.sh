@@ -37,8 +37,9 @@ if [ -z "$GH_CREDS" ]; then
   done
 fi
 VPS="${TARNET_VPS:-root@193.57.139.10}"
-# Ключ — с постоянного тома (см. комментарий в deploy.sh).
-SSH_KEY="${TARNET_SSH_KEY:-$HOME/.openclaw/ssh/tarnet_vps}"
+# Ключ — с постоянного тома, тот, что авторизован на текущем хосте (см. deploy.sh:
+# дефолт на ключ старой VDSina давал отказы publickey и включал fail2ban).
+SSH_KEY="${TARNET_SSH_KEY:-$HOME/.openclaw/ssh/tarnet_migrate}"
 [ -r "$SSH_KEY" ] || { [ -x "$HOME/.openclaw/ssh/ensure.sh" ] && "$HOME/.openclaw/ssh/ensure.sh" >&2 || true; }
 REMOTE_DIR="${TARNET_REMOTE_DIR:-/opt/tarnet/backend-api}"
 SERVICE="${TARNET_SERVICE:-tarnet}"
@@ -313,6 +314,34 @@ if [ "$LOCAL_DIRTY" = "0" ]; then
 else
   no "локальное дерево" "$LOCAL_DIRTY незакоммиченных путей (деплой их не увидит)"
 fi
+
+# ---------- 1b. preflight SSH: ОДИН коннект вместо семи ----------
+# ПОЧЕМУ. Каждый отказ `Permission denied (publickey)` fail2ban считает попыткой
+# (maxretry=3, bantime=1h). Ниже семь SSH-вызовов: с неверным ключом они давали
+# семь отказов подряд, и verify.sh банил сам себя — 24.11 доступ с gateway
+# закрылся на час, а выглядело это как «VPS умер» (прод при этом отвечал
+# `health:200`). Проверяем доступ один раз и падаем сразу с точной причиной.
+# IdentitiesOnly — не предлагать лишние ключи: каждый лишний тоже отказ.
+SSH_PREFLIGHT_ERR=$(mktemp)
+if ! ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o IdentitiesOnly=yes \
+     -o NumberOfPasswordPrompts=0 "$VPS" true 2>"$SSH_PREFLIGHT_ERR"; then
+  ERR=$(tr '\n' ' ' <"$SSH_PREFLIGHT_ERR" | cut -c1-160)
+  rm -f "$SSH_PREFLIGHT_ERR"
+  case "$ERR" in
+    *"Connection refused"*)
+      no "SSH до VPS" "порт 22 отказал — вероятно fail2ban забанил этот IP (бан 1 ч)" ;;
+    *"Permission denied"*)
+      no "SSH до VPS" "ключ $SSH_KEY не авторизован ($ERR)" ;;
+    *"timed out"*|*"No route"*)
+      no "SSH до VPS" "хост не отвечает ($ERR)" ;;
+    *)
+      no "SSH до VPS" "$ERR" ;;
+  esac
+  printf '  \033[33m⚠\033[0m  %-26s %s\n' "что делать" "проверить снаружи: curl -sS -o /dev/null -w '%{http_code}' $PUBLIC_URL/health; ключ: TARNET_SSH_KEY=... bash scripts/verify.sh"
+  printf '\n\033[31mПРОБЛЕМ: %d\033[0m — остальные проверки не запускал, чтобы не добивать fail2ban\n\n' "$FAIL"
+  exit 1
+fi
+rm -f "$SSH_PREFLIGHT_ERR"
 
 # ---------- 2. VPS: HEAD, чистота, файлы ----------
 VPS_INFO=$(ssh "${SSH_OPTS[@]}" "$VPS" "bash -s" -- "$REMOTE_DIR" <<'REMOTE' 2>/dev/null

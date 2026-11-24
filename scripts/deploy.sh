@@ -34,10 +34,13 @@ if [ -z "$GH_CREDS" ]; then
   done
 fi
 VPS="${TARNET_VPS:-root@193.57.139.10}"
-# Ключ лежит на ПОСТОЯННОМ томе: ~/.ssh — overlay-слой контейнера и
-# исчезает при пересборке (08.11–09.11 так терялся доступ). ensure.sh
-# восстанавливает симлинк из постоянного тома, если его нет.
-SSH_KEY="${TARNET_SSH_KEY:-$HOME/.openclaw/ssh/tarnet_vps}"
+# Ключ: по умолчанию — тот, что авторизован на ТЕКУЩЕМ хосте (после переезда 24.11).
+# `tarnet_vps` остался от старой VDSina 195.63.131.172: она с 24.11 не отвечает,
+# а этот ключ на новом хосте даёт `Permission denied (publickey)` — и КАЖДЫЙ
+# такой отказ fail2ban считает попыткой (maxretry=3, bantime=1h). Дефолт на
+# мёртвый ключ сам себя банил: 24.11 verify.sh сделал 7 отказов подряд и закрыл
+# доступ с gateway на час. Ошибка была не в хосте, а в этой строке.
+SSH_KEY="${TARNET_SSH_KEY:-$HOME/.openclaw/ssh/tarnet_migrate}"
 [ -r "$SSH_KEY" ] || { [ -x "$HOME/.openclaw/ssh/ensure.sh" ] && "$HOME/.openclaw/ssh/ensure.sh" >&2 || true; }
 REMOTE_DIR="${TARNET_REMOTE_DIR:-/opt/tarnet/backend-api}"
 REMOTE_BUNDLE="/tmp/tarnet-deploy.bundle"

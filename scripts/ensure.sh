@@ -29,7 +29,9 @@
 set -uo pipefail
 
 VPS="${TARNET_VPS:-root@193.57.139.10}"
-SSH_KEY="${TARNET_SSH_KEY:-$HOME/.openclaw/ssh/tarnet_vps}"
+# Ключ текущего хоста (см. deploy.sh): `tarnet_vps` от старой VDSina на новом
+# хосте даёт отказ publickey, а fail2ban считает каждый отказ попыткой.
+SSH_KEY="${TARNET_SSH_KEY:-$HOME/.openclaw/ssh/tarnet_migrate}"
 SSH_OPTS=(-i "$SSH_KEY" -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
 REMOTE_FILE="/root/.ssh/authorized_keys"
 
