@@ -719,14 +719,41 @@ else
   skip "WebRTC живьём" "TARNET_SLOW_TESTS=1 — прогон поднимает мост ~20 с"
 fi
 
-H_PUB=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/health")
-[ "$H_PUB" = "200" ] && ok "/health снаружи" "HTTP 200" || no "/health снаружи" "HTTP $H_PUB"
+# ---------- 3.x внешние проверки: повтор, а не один выстрел ----------
+# ПОЧЕМУ ПОВТОР. 24.11 замер: `tarnet.online` в 3 из 20 запросов с gateway
+# резолвился в старый парковочный `95.163.244.138` (TTL 86400), хотя все 16
+# адресов `ns1/ns2.reg.ru` отдавали `193.57.139.10` — то есть зона верна, а
+# кэш одного из upstream-резолверов отстал. Одиночный `curl` ловил этот
+# кэш и давал `404` размером 10371 Б за 2.4 с вместо 56422 Б за 0.1 с.
+# Итог: красный пункт «/app/ снаружи», хотя сервер отвечал 200 — и красный
+# читался бы как «сломан PWA», то есть уводил диагностику в исправный узел.
+# Пять попыток различают «сервер отдаёт не то» и «один резолвер опоздал».
+# Печатается, с какой попытки пришло 200: если только с третьей — это факт
+# про DNS, и он должен быть виден, а не спрятан за зелёным.
+probe_url() {
+  local url="$1" attempt code first_bad=""
+  for attempt in 1 2 3 4 5; do
+    code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || echo 000)
+    if [ "$code" = "200" ]; then
+      if [ "$attempt" = "1" ]; then
+        ok "$2" "HTTP 200"
+      else
+        ok "$2" "HTTP 200 с попытки $attempt из 5 — отстаёт кэш DNS, не сервер"
+      fi
+      return 0
+    fi
+    [ -z "$first_bad" ] && first_bad="$code"
+    sleep 1
+  done
+  no "$2" "HTTP $first_bad на всех 5 попытках — это сервер, а не DNS ($url)"
+  return 1
+}
 
-H_APP=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/app/")
-[ "$H_APP" = "200" ] && ok "/app/ снаружи" "HTTP 200" || no "/app/ снаружи" "HTTP $H_APP"
+probe_url "$PUBLIC_URL/health" "/health снаружи" || true
 
-H_DL=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/download/worker.js")
-[ "$H_DL" = "200" ] && ok "/download/worker.js" "HTTP 200" || no "/download/worker.js" "HTTP $H_DL"
+probe_url "$PUBLIC_URL/app/" "/app/ снаружи" || true
+
+probe_url "$PUBLIC_URL/download/worker.js" "/download/worker.js" || true
 
 # ---------- 4.4 оба seed отвечают в /p2p/bootstrap ----------
 # ПОЧЕМУ ОТДЕЛЬНАЯ ПРОВЕРКА. `2.25.4` ставит второй seed отдельным юнитом,
@@ -779,7 +806,19 @@ esac
 # литералом: литерал прошел бы и в том случае, если бы /config отдавал
 # захаРДкоженное число, разошедшееся с реальной комиссией. Ловим именно
 # расхождение endpoint ↔ код.
-CFG_JSON=$(curl -s -m 20 "$PUBLIC_URL/config" 2>/dev/null)
+# Повтор, а не один выстрел: та же причина, что у probe_url выше — кэш DNS
+# иногда отдаёт старый парковочный IP, и вместо JSON приходит HTML. Это не
+# расхождение endpoint ↔ код, поэтому красный здесь был бы ложным; настоящий
+# MISMATCH отличается тем, что JSON пришёл, но числа другие.
+CFG_JSON=""
+for attempt in 1 2 3 4 5; do
+  CFG_JSON=$(curl -s -m 20 "$PUBLIC_URL/config" 2>/dev/null)
+  case "$CFG_JSON" in
+    "{"*) break ;;
+    *) CFG_JSON=""; sleep 1 ;;
+  esac
+done
+[ -z "$CFG_JSON" ] && CFG_JSON="PARSE_ERR|пять попыток вернули не JSON (кэш DNS отдаёт чужой хост)"
 CFG_VERDICT=$(printf '%s' "$CFG_JSON" | node -e '
 let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
   try{
