@@ -66,8 +66,15 @@ console.log('== ветка ==');
 console.log(branch.out.trim() || '(пусто)');
 if (!branch.ok) { console.error('ПУШ ВЕТКИ НЕ УДАЛСЯ'); process.exit(1); }
 
-const tagPush = git(['-c', 'credential.helper=', 'push', url, `refs/tags/${tag}`]);
-console.log('== тег ==');
+/* `--force` нужен, когда тег уже уехал на GitHub, а коммит под ним пришлось
+ * поправить (например, в записях нашлись неверные числа). Без флага push
+ * отвергается как «already exists», и легко принять это за успех: ветка-то
+ * уехала. Флаг явный, а не по умолчанию: сдвиг опубликованного тега — решение,
+ * которое надо принять, а не побочный эффект перезапуска команды. */
+const force = process.argv.includes('--force');
+const tagRef = `refs/tags/${tag}`;
+const tagPush = git(['-c', 'credential.helper=', 'push', ...(force ? ['--force'] : []), url, tagRef]);
+console.log(`== тег${force ? ' (--force)' : ''} ==`);
 console.log(tagPush.out.trim() || '(пусто)');
 if (!tagPush.ok) { console.error('ПУШ ТЕГА НЕ УДАЛСЯ'); process.exit(1); }
 
