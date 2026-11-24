@@ -549,11 +549,33 @@ done
 printf '/health на VPS:   HTTP %s (попытка %s/3)\n' "${H_LOCAL:-нет ответа}" "$H_LOCAL_TRY"
 [ "$H_LOCAL" = "200" ] || { rollback_hint; die "/health на VPS вернул $H_LOCAL после 3 попыток"; }
 
-H_PUB=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/health")
-H_APP=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/app/")
-printf '/health снаружи: HTTP %s\n/app/ снаружи:   HTTP %s\n' "$H_PUB" "$H_APP"
-[ "$H_PUB" = "200" ] || { rollback_hint; die "/health снаружи вернул $H_PUB"; }
-[ "$H_APP" = "200" ] || { rollback_hint; die "/app/ снаружи вернул $H_APP"; }
+# Внешние проверки опрашиваются так же, с повтором, и по той же причине.
+# ПОЧЕМУ: 24.11.2026 деплой 69e26b3 (2.29.27) упал с «/app/ снаружи вернул 404»,
+# хотя следующие пять curl'ов дали 200, а verify.sh — 26/26 зелёных.
+# Один транзиентный ответ (окно между рестартом юнитов и готовностью статики,
+# кэш Caddy) выдавал себя за регрессию и предлагал откат рабочего прода: такой
+# ложный провал маскирует настоящие поломки, и откат пропустят.
+H_PUB=""
+H_PUB_TRY=0
+for i in 1 2 3; do
+  H_PUB_TRY=$i
+  H_PUB=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/health")
+  [ "$H_PUB" = "200" ] && break
+  if [ "$i" -lt 3 ]; then sleep 2; fi
+done
+printf '/health снаружи: HTTP %s (попытка %s/3)\n' "${H_PUB:-нет ответа}" "$H_PUB_TRY"
+[ "$H_PUB" = "200" ] || { rollback_hint; die "/health снаружи вернул $H_PUB после 3 попыток"; }
+
+H_APP=""
+H_APP_TRY=0
+for i in 1 2 3; do
+  H_APP_TRY=$i
+  H_APP=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/app/")
+  [ "$H_APP" = "200" ] && break
+  if [ "$i" -lt 3 ]; then sleep 2; fi
+done
+printf '/app/ снаружи:   HTTP %s (попытка %s/3)\n' "${H_APP:-нет ответа}" "$H_APP_TRY"
+[ "$H_APP" = "200" ] || { rollback_hint; die "/app/ снаружи вернул $H_APP после 3 попыток"; }
 
 # ---------- 7. уборка ----------
 rm -f "$LOCAL_BUNDLE"
